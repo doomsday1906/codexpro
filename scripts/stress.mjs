@@ -588,8 +588,13 @@ async function runNodeFallbackSearchLimitStress() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-stress-node-search-'));
   await fs.writeFile(path.join(root, 'exact.txt'), 'needle one\nneedle two\n', 'utf8');
   await fs.writeFile(path.join(root, 'overflow.txt'), 'needle one\nneedle two\nneedle three\n', 'utf8');
-  const client = await initClient(root, { PATH: '/usr/bin:/bin' });
+  const emptyPath = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-stress-node-search-bin-'));
+  const emptyHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-stress-node-search-home-'));
+  let client;
   try {
+    const shellPath = emptyPath.replaceAll("'", "'\\\''");
+    await fs.writeFile(path.join(emptyHome, '.profile'), `PATH='${shellPath}'\nexport PATH\n`, 'utf8');
+    client = await initClient(root, { PATH: emptyPath, Path: emptyPath, HOME: emptyHome, USERPROFILE: emptyHome });
     const opened = await client.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
     const exact = await client.request('tools/call', {
       name: 'search',
@@ -610,7 +615,9 @@ async function runNodeFallbackSearchLimitStress() {
     });
     assert(String(regex.structuredContent.error).toLowerCase().includes('regex search requires ripgrep'), `node fallback accepted regex search: ${JSON.stringify(regex.structuredContent)}`);
   } finally {
-    client.close();
+    client?.close();
+    await fs.rm(emptyPath, { recursive: true, force: true });
+    await fs.rm(emptyHome, { recursive: true, force: true });
   }
 }
 
