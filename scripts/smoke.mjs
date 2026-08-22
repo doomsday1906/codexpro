@@ -82,6 +82,14 @@ await fs.writeFile(path.join(alternateWorkspace, 'selected.txt'), 'alternate wor
 await fs.writeFile(path.join(tmp, 'demo.txt'), 'alpha\nread\nread\nomega\n', 'utf8');
 await fs.writeFile(path.join(tmp, 'other.txt'), 'keep\n', 'utf8');
 await fs.writeFile(path.join(tmp, 'patch-race.txt'), 'patch race initial\n', 'utf8');
+const readManyPaths = Array.from({ length: 8 }, (_, index) => `read-many-${index + 1}.txt`);
+for (const [index, filePath] of readManyPaths.entries()) {
+  await fs.writeFile(path.join(tmp, filePath), `read-many-${index + 1} first\nread-many-${index + 1} second\n`, 'utf8');
+}
+await fs.mkdir(path.join(tmp, 'read-many-directory'));
+await fs.writeFile(path.join(tmp, 'read-many-max-bytes.txt'), 'x'.repeat(2_001), 'utf8');
+await fs.writeFile(path.join(tmp, 'read-many-large.txt'), 'large\n' + 'x'.repeat(7_000) + '\n', 'utf8');
+await fs.writeFile(path.join(tmp, 'read-many-oversize.txt'), 'x'.repeat(180_001), 'utf8');
 await fs.writeFile(path.join(tmp, 'config.txt'), 'OPENAI_API_KEY=sk-realSecretValue123\n', 'utf8');
 await fs.writeFile(path.join(tmp, 'AGENTS.md'), '# Smoke Agents\n\n- Preserve demo.txt.\n', 'utf8');
 const codexHistoryDir = path.join(tmp, 'codex-history');
@@ -206,7 +214,7 @@ try {
   symlinkEscapePath = 'secret-link-dir/secret.txt';
   await fs.symlink(outside, path.join(tmp, 'secret-link-dir'), 'junction');
 }
-for (const args of [['init'], ['config', 'core.quotePath', 'true'], ['add', 'demo.txt', 'other.txt', 'patch-race.txt', 'AGENTS.md', 'package.json', 'src/auth.ts', 'test/auth.test.ts', 'search-overflow.txt', 'é.ts', '旧名.ts']]) {
+for (const args of [['init'], ['config', 'core.quotePath', 'true'], ['add', 'demo.txt', 'other.txt', 'patch-race.txt', ...readManyPaths, 'read-many-max-bytes.txt', 'read-many-large.txt', 'read-many-oversize.txt', 'AGENTS.md', 'package.json', 'src/auth.ts', 'test/auth.test.ts', 'search-overflow.txt', 'é.ts', '旧名.ts']]) {
   const result = spawnSync('git', args, { cwd: tmp, encoding: 'utf8' });
   if (result.status !== 0) {
     throw new Error(`git ${args.join(' ')} failed: ${result.stderr || result.stdout}`);
@@ -236,7 +244,7 @@ await client.request('initialize', {
 client.notify('notifications/initialized');
 const tools = await client.request('tools/list', {});
 const toolNames = tools.tools.map((tool) => tool.name);
-for (const expected of ['server_config', 'runtime_status', 'codexpro_self_test', 'codexpro_inventory', 'list_workspaces', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'inspect_workspace', 'tree', 'search', 'load_skill', 'read', 'view_image', 'write', 'edit', 'apply_patch', 'import_file', 'bash', 'git_status', 'git_diff', 'show_changes', 'read_handoff', 'wait_for_handoff', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
+for (const expected of ['server_config', 'runtime_status', 'codexpro_self_test', 'codexpro_inventory', 'list_workspaces', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'inspect_workspace', 'tree', 'search', 'load_skill', 'read', 'read_many', 'view_image', 'write', 'edit', 'apply_patch', 'import_file', 'bash', 'git_status', 'git_diff', 'show_changes', 'read_handoff', 'wait_for_handoff', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
   if (!toolNames.includes(expected)) throw new Error(`missing tool: ${expected}`);
 }
 const toolCardUri = 'ui://widget/codexpro-tool-card-v10.html';
@@ -538,6 +546,17 @@ for (const leaked of ['ghp_abcdefghijklmnopqrstuvwxyz123456', 'verysecretcodexpr
 if (!tokenPayload.includes('/Users/rebel/.codexpro/cloudflare-tunnel-token')) {
   throw new Error('redaction hid a non-secret Cloudflare token-file path');
 }
+const secretBatch = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: { workspace_id: ws, items: [{ path: 'config.txt' }, { path: 'tokens.txt' }] }
+});
+const secretBatchPayload = JSON.stringify(secretBatch);
+for (const leaked of ['sk-realSecretValue123', 'ghp_abcdefghijklmnopqrstuvwxyz123456', 'verysecretcodexprotoken123', 'secretsecret12345', 'shortcodextoken', 'sk-ant-abcdefghijklmnopqrstuvwxyz123456', 'jsonsecretvalueabcdefghijklmnop', 'yamlsecretvalueabcdefghijklmnop', '2abcDEFghiJKLmnopQRSTuvWXyz_1234567890', 'eyJhbGciOiJIUzI1NiJ9.eyJ0dW5uZWwiOiJjb2RleHBybyJ9.signature1234567890']) {
+  if (secretBatchPayload.includes(leaked)) throw new Error(`read_many leaked token-like content: ${leaked}`);
+}
+if (!secretBatchPayload.includes('[REDACTED_SECRET]') || !secretBatchPayload.includes('/Users/rebel/.codexpro/cloudflare-tunnel-token')) {
+  throw new Error('read_many redaction did not preserve the secret/file-path distinction');
+}
 await expectToolError('write', { workspace_id: ws, path: 'notes.md', content: 'OPENAI_API_KEY=sk-realSecretValue123\n' }, /Secret-looking content is blocked/);
 await expectToolError('write', { workspace_id: ws, path: 'token.txt', content: 'codexpro_token=shorttok\n' }, /Secret-looking content is blocked/);
 await expectToolError('write', { workspace_id: ws, path: 'notes.yaml', content: 'api_key: yamlsecretvalueabcdefghijklmnop\n' }, /Secret-looking content is blocked/);
@@ -727,6 +746,93 @@ if (process.platform !== 'win32') {
 }
 const symlinkRead = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: symlinkEscapePath } });
 if (!symlinkRead.isError) throw new Error('symlink escape read was not blocked');
+const rangeRead = await client.request('tools/call', {
+  name: 'read',
+  arguments: { workspace_id: ws, path: 'demo.txt', start_line: 2, end_line: 3 }
+});
+const rangeBatch = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: { workspace_id: ws, items: [{ path: 'demo.txt', start_line: 2, end_line: 3 }] }
+});
+const rangeBatchResult = rangeBatch.structuredContent.results?.[0]?.result;
+if (
+  rangeRead.isError ||
+  rangeBatch.isError ||
+  !rangeBatchResult ||
+  rangeBatchResult.text !== rangeRead.structuredContent.text ||
+  rangeBatchResult.startLine !== rangeRead.structuredContent.startLine ||
+  rangeBatchResult.endLine !== rangeRead.structuredContent.endLine ||
+  rangeBatchResult.totalLines !== rangeRead.structuredContent.totalLines
+) {
+  throw new Error(`read_many range did not preserve read parity: ${JSON.stringify({ read: rangeRead.structuredContent, batch: rangeBatch.structuredContent })}`);
+}
+
+let individualReadCalls = 0;
+const individualContents = [];
+for (const filePath of readManyPaths) {
+  individualReadCalls += 1;
+  const individual = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: filePath } });
+  if (individual.isError) throw new Error(`individual read failed for ${filePath}: ${JSON.stringify(individual)}`);
+  individualContents.push(individual.structuredContent.text);
+}
+let batchReadCalls = 0;
+batchReadCalls += 1;
+const eightFileBatch = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: { workspace_id: ws, items: readManyPaths.map((path) => ({ path })) }
+});
+const eightFileResults = eightFileBatch.structuredContent.results ?? [];
+if (
+  eightFileBatch.isError ||
+  individualReadCalls !== 8 ||
+  batchReadCalls !== 1 ||
+  eightFileResults.length !== 8 ||
+  eightFileResults.some((item, index) => item.index !== index || item.path !== readManyPaths[index] || !item.ok || item.result?.text !== individualContents[index])
+) {
+  throw new Error(`read_many eight-file coverage or invocation proof failed: ${JSON.stringify({ individualReadCalls, batchReadCalls, results: eightFileResults })}`);
+}
+if (Buffer.byteLength(JSON.stringify(eightFileBatch), 'utf8') > 60_000) {
+  throw new Error(`read_many default response exceeded its declared 60000-byte budget: ${Buffer.byteLength(JSON.stringify(eightFileBatch), 'utf8')}`);
+}
+
+const partialBatch = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: {
+    workspace_id: ws,
+    items: [
+      { path: readManyPaths[0] },
+      { path: 'read-many-missing.txt' },
+      { path: '.env' },
+      { path: 'pixel.png' },
+      { path: 'read-many-max-bytes.txt', max_bytes: 1000 },
+      { path: 'read-many-oversize.txt' },
+      { path: symlinkEscapePath },
+      { path: 'read-many-directory' },
+      { path: readManyPaths[1] }
+    ]
+  }
+});
+const partialResults = partialBatch.structuredContent.results ?? [];
+if (
+  partialBatch.isError ||
+  partialResults.length !== 9 ||
+  partialResults.some((item, index) => item.index !== index) ||
+  !partialResults[0]?.ok ||
+  !partialResults[8]?.ok ||
+  partialResults.slice(1, 8).some((item) => item.ok || typeof item.path !== 'string' || typeof item.error !== 'string' || item.error.length > 512)
+) {
+  throw new Error(`read_many item-local failures did not preserve siblings/order: ${JSON.stringify(partialBatch.structuredContent)}`);
+}
+for (const [index, pattern] of [[1, /ENOENT|no such file/i], [2, /blocked/i], [3, /binary/i], [4, /too large/i], [5, /too large/i], [6, /symlink|outside workspace/i], [7, /not a file/i]]) {
+  if (!pattern.test(partialResults[index].error)) throw new Error(`read_many item ${index} lost expected local error: ${partialResults[index].error}`);
+}
+await expectToolError('read_many', { workspace_id: ws, items: [] }, /at least 1/);
+await expectToolError('read_many', { workspace_id: ws, items: Array.from({ length: 33 }, () => ({ path: readManyPaths[0] })) }, /at most 32/);
+await expectToolError('read_many', { workspace_id: ws, items: [{ path: readManyPaths[0], workspace_id: ws }] }, /Unrecognized key/);
+await expectToolError('read_many', { workspace_id: ws, items: [{ path: readManyPaths[0] }], unexpected: true }, /Unrecognized key/);
+await expectToolError('read_many', { workspace_id: ws, items: [{ path: 'read-many-large.txt' }], max_total_bytes: 4_000 }, /aggregate response exceeds/);
+await expectToolError('read_many', { workspace_id: ws, items: [{ path: readManyPaths[0] }], max_total_bytes: 100_001 }, /less than or equal to 100000/);
+await expectToolError('read_many', { workspace_id: 'ws_000000000000000000000000', items: [{ path: readManyPaths[0] }] }, /Unknown workspace_id/);
 for (const linkPath of danglingSymlinks) {
   await expectToolError('write', { workspace_id: ws, path: linkPath, content: 'escaped write\n' }, /symlink/i);
 }
@@ -1198,8 +1304,8 @@ async function assertToolMode(mode, expected, hidden, extraEnv = {}) {
   modeClient.close();
 }
 
-await assertToolMode('', ['codexpro', 'server_config', 'runtime_status', 'codexpro_self_test', 'open_current_workspace', 'open_workspace', 'inspect_workspace', 'tree', 'search', 'load_skill', 'read', 'view_image', 'write', 'edit', 'apply_patch', 'import_file', 'bash', 'show_changes', 'read_handoff', 'wait_for_handoff', 'export_pro_context', 'handoff_to_agent'], ['codexpro_inventory', 'workspace_snapshot', 'git_status', 'git_diff', 'codex_context', 'handoff_to_codex']);
-await assertToolMode('minimal', ['codexpro', 'server_config', 'runtime_status', 'codexpro_self_test', 'open_current_workspace', 'open_workspace', 'read', 'write', 'edit', 'apply_patch', 'import_file', 'bash', 'show_changes'], ['inspect_workspace', 'tree', 'search', 'load_skill', 'view_image', 'read_handoff', 'wait_for_handoff', 'export_pro_context', 'handoff_to_agent', 'codex_context']);
+await assertToolMode('', ['codexpro', 'server_config', 'runtime_status', 'codexpro_self_test', 'open_current_workspace', 'open_workspace', 'inspect_workspace', 'tree', 'search', 'load_skill', 'read', 'read_many', 'view_image', 'write', 'edit', 'apply_patch', 'import_file', 'bash', 'show_changes', 'read_handoff', 'wait_for_handoff', 'export_pro_context', 'handoff_to_agent'], ['codexpro_inventory', 'workspace_snapshot', 'git_status', 'git_diff', 'codex_context', 'handoff_to_codex']);
+await assertToolMode('minimal', ['codexpro', 'server_config', 'runtime_status', 'codexpro_self_test', 'open_current_workspace', 'open_workspace', 'read', 'read_many', 'write', 'edit', 'apply_patch', 'import_file', 'bash', 'show_changes'], ['inspect_workspace', 'tree', 'search', 'load_skill', 'view_image', 'read_handoff', 'wait_for_handoff', 'export_pro_context', 'handoff_to_agent', 'codex_context']);
 await assertToolMode('', ['codexpro', 'server_config', 'runtime_status', 'show_changes', 'search'], ['inspect_workspace'], { CODEXPRO_ANALYSIS: '0' });
 
 const handoffWriteClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--write', 'handoff'], {

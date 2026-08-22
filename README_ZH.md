@@ -73,7 +73,7 @@ codexpro start
 
 在 workspace write 模式（常规 agent 设置）下：
 
-- 读取、搜索、检查仓库
+- 读取单个文件或有界批量文件、搜索并检查仓库
 - 用 `write`、`edit` 或受保护的 `apply_patch` 编辑
 - 用 `import_file` 导入 ChatGPT 附件
 - 用 `bash` 运行白名单检查

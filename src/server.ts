@@ -7,7 +7,7 @@ import { z } from "zod";
 import type { CodexProConfig } from "./config.js";
 import { WorkspaceManager, PathGuard, CodexProError, type Workspace } from "./guard.js";
 import { processIsAlive, readRuntimeConnection, readRuntimeFailure } from "./profileStore.js";
-import { repoTree, readTextFile, writeTextFile, editTextFile, ensureAiBridge, withFileWriteLocks } from "./fsOps.js";
+import { repoTree, readTextFile, writeTextFile, editTextFile, ensureAiBridge, withFileWriteLocks, type ReadFileResult } from "./fsOps.js";
 import { viewWorkspaceImage } from "./imageOps.js";
 import { importAttachmentFile } from "./importOps.js";
 import { searchWorkspace } from "./searchOps.js";
@@ -22,6 +22,86 @@ import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
+// read_many owns a smaller aggregate response contract than the single-read
+// path. maxOutputBytes is not a universal read cap, but it remains the outer
+// configured ceiling when it is lower than this tool's own maximum.
+const READ_MANY_MAX_ITEMS = 32;
+const READ_MANY_MIN_TOTAL_BYTES = 4_000;
+const READ_MANY_DEFAULT_MAX_TOTAL_BYTES = 60_000;
+const READ_MANY_MAX_TOTAL_BYTES = 100_000;
+const READ_MANY_RESPONSE_FRAMING_RESERVE_BYTES = 1_024;
+const READ_MANY_MAX_PATH_CHARS = 2_000;
+const READ_MANY_MAX_ERROR_CHARS = 512;
+
+type ReadManyItem = {
+  path: string;
+  start_line?: number;
+  end_line?: number;
+  max_bytes?: number;
+};
+
+type ReadManyResult =
+  | { index: number; path: string; ok: true; result: ReadFileResult }
+  | { index: number; path: string; ok: false; error: string };
+
+function boundedReadManyError(error: unknown): string {
+  const value = errorText(error);
+  if (value.length <= READ_MANY_MAX_ERROR_CHARS) return value;
+  return `${value.slice(0, READ_MANY_MAX_ERROR_CHARS - 20)}...[error truncated]`;
+}
+
+function readManyText(workspace: Workspace, results: ReadManyResult[], maxTotalBytes: number): string {
+  const lines = [
+    "# Read Many",
+    "",
+    `Workspace: ${workspace.root}`,
+    `Items returned: ${results.length}`,
+    `Aggregate response budget: ${maxTotalBytes} bytes`,
+    ""
+  ];
+  for (const item of results) {
+    if (item.ok) {
+      lines.push(
+        `- [${item.index}] ${item.path}: ok; ${item.result.startLine}-${item.result.endLine} of ${item.result.totalLines} lines, ${item.result.bytes} file bytes.`,
+        "",
+        `## Item ${item.index}: ${item.path}`,
+        "",
+        "```text",
+        item.result.text,
+        "```"
+      );
+    } else {
+      lines.push(`- [${item.index}] ${item.path}: error; ${item.error}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function readManyResponse(workspace: Workspace, results: ReadManyResult[], maxTotalBytes: number): any {
+  return textResult(readManyText(workspace, results, maxTotalBytes), {
+    workspace_id: workspace.id,
+    root: workspace.root,
+    max_items: READ_MANY_MAX_ITEMS,
+    max_total_bytes: maxTotalBytes,
+    item_count: results.length,
+    results
+  });
+}
+
+function serializedReadManyResponseBytes(response: any): number {
+  const structured = response?.structuredContent && typeof response.structuredContent === "object"
+    ? response.structuredContent
+    : {};
+  const tagged = {
+    ...response,
+    structuredContent: {
+      codexpro_tool: "read_many",
+      codexpro_title: "Read Many",
+      ...structured
+    }
+  };
+  return Buffer.byteLength(JSON.stringify(tagged), "utf8");
+}
 
 function errorText(error: unknown): string {
   if (error instanceof Error) return redactSensitiveText(`${error.name}: ${error.message}`);
@@ -88,6 +168,19 @@ function errorResult(error: unknown): any {
 
 function validateToolArgs(name: string, options: Record<string, unknown>, args: unknown): any {
   const inputSchema = options.inputSchema;
+  if (
+    inputSchema &&
+    typeof inputSchema === "object" &&
+    !Array.isArray(inputSchema) &&
+    typeof (inputSchema as { safeParse?: unknown }).safeParse === "function"
+  ) {
+    const parsed = (inputSchema as z.ZodTypeAny).safeParse(args ?? {});
+    if (parsed.success) return parsed.data;
+    const details = parsed.error.issues
+      .map((issue) => `${issue.path.length ? issue.path.join(".") : "arguments"}: ${issue.message}`)
+      .join("; ");
+    throw new CodexProError(`Invalid arguments for ${name}: ${details}`);
+  }
   if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) return args ?? {};
   const shape: Record<string, z.ZodTypeAny> = {};
   for (const [key, value] of Object.entries(inputSchema)) {
@@ -324,6 +417,7 @@ const MINIMAL_TOOL_NAMES = [
   "open_current_workspace",
   "open_workspace",
   "read",
+  "read_many",
   "write",
   "edit",
   "apply_patch",
@@ -360,6 +454,7 @@ const FULL_TOOL_NAMES = [
   "tree",
   "search",
   "read",
+  "read_many",
   "view_image",
   "write",
   "edit",
@@ -1899,6 +1994,69 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       });
       const text = `# Read File\n\nPath: ${result.path}\nLines: ${result.startLine}-${result.endLine} of ${result.totalLines}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}\n\n\`\`\`text\n${result.text}\n\`\`\``;
       return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "read_many",
+    {
+      title: "Read Many",
+      description: `Read 1-${READ_MANY_MAX_ITEMS} bounded text files in input order by composing read. Each item may set start_line, end_line, and max_bytes using read's semantics. Item failures are isolated with {index,path,error}; the request has a ${READ_MANY_DEFAULT_MAX_TOTAL_BYTES}-byte default and ${READ_MANY_MAX_TOTAL_BYTES}-byte maximum serialized response budget including a ${READ_MANY_RESPONSE_FRAMING_RESERVE_BYTES}-byte framing reserve (lowered by maxOutputBytes when configured).`,
+      inputSchema: z.object({
+        workspace_id: z.string().optional().describe("Workspace id for the entire batch from open_workspace. Per-item workspace ids are not accepted."),
+        items: z.array(
+          z.object({
+            path: z.string()
+              .min(1)
+              .max(READ_MANY_MAX_PATH_CHARS)
+              .refine((value) => value.trim().length > 0, "path must not be empty"),
+            start_line: z.number().int().min(1).optional().describe("First line to read. Default: 1."),
+            end_line: z.number().int().min(1).optional().describe("Last line to read. Default: end of file."),
+            max_bytes: z.number().int().min(1000).max(2000000).optional().describe("Maximum file bytes. Capped by server config.")
+          }).strict()
+        ).min(1).max(READ_MANY_MAX_ITEMS).describe(`Non-empty ordered batch of at most ${READ_MANY_MAX_ITEMS} text-file reads.`),
+        max_total_bytes: z.number().int().min(READ_MANY_MIN_TOTAL_BYTES).max(READ_MANY_MAX_TOTAL_BYTES).optional().describe(`Hard serialized response budget in bytes. Default: ${READ_MANY_DEFAULT_MAX_TOTAL_BYTES}; minimum: ${READ_MANY_MIN_TOTAL_BYTES}; maximum: ${READ_MANY_MAX_TOTAL_BYTES}.`)
+      }).strict(),
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Reading multiple files...",
+        "openai/toolInvocation/invoked": "Multiple files read"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const configuredMaxTotalBytes = Math.min(READ_MANY_MAX_TOTAL_BYTES, config.maxOutputBytes);
+      const requestedMaxTotalBytes = args.max_total_bytes ?? Math.min(READ_MANY_DEFAULT_MAX_TOTAL_BYTES, configuredMaxTotalBytes);
+      if (requestedMaxTotalBytes > configuredMaxTotalBytes) {
+        throw new CodexProError(`max_total_bytes (${requestedMaxTotalBytes}) exceeds the configured read_many response limit (${configuredMaxTotalBytes} bytes).`);
+      }
+
+      const results: ReadManyResult[] = [];
+      for (const [index, item] of (args.items as ReadManyItem[]).entries()) {
+        let result: ReadManyResult;
+        try {
+          const readResult = await readTextFile(config, guard, workspace, item.path, {
+            startLine: item.start_line,
+            endLine: item.end_line,
+            maxBytes: item.max_bytes
+          });
+          result = { index, path: item.path, ok: true, result: readResult };
+        } catch (error) {
+          result = { index, path: item.path, ok: false, error: boundedReadManyError(error) };
+        }
+
+        const candidateResults = [...results, result];
+        const candidate = readManyResponse(workspace, candidateResults, requestedMaxTotalBytes);
+        if (serializedReadManyResponseBytes(candidate) + READ_MANY_RESPONSE_FRAMING_RESERVE_BYTES > requestedMaxTotalBytes) {
+          throw new CodexProError(`read_many aggregate response exceeds max_total_bytes (${requestedMaxTotalBytes} bytes); no items were omitted.`);
+        }
+        results.push(result);
+      }
+
+      return readManyResponse(workspace, results, requestedMaxTotalBytes);
     }
   );
 

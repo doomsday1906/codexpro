@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added the bounded read-only `read_many` MCP tool for ordered text-file batches with existing read/path protections, isolated item errors, and a hard aggregate response budget.
+
 ## 0.30.0 (2026-08-08)
 
 - Published the multi-project allowlist that was already on `main`: `codexpro settings set --project`, `--clear-projects`, session-local `open_workspace` selection, and matching FAQ guidance. npm `0.29.0` did not include those commits, which caused empty Allowed Roots reports after following current docs.

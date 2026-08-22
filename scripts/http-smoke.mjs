@@ -531,7 +531,7 @@ try {
 
   const queryTools = await listTools(`${baseUrl}/mcp?codexpro_token=${encodeURIComponent(token)}`);
   const queryToolNames = toolNames(queryTools);
-  for (const expected of ['server_config', 'runtime_status', 'codexpro_self_test', 'codexpro_inventory', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'tree', 'search', 'load_skill', 'git_status', 'git_diff', 'show_changes', 'read_handoff', 'wait_for_handoff', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
+  for (const expected of ['server_config', 'runtime_status', 'codexpro_self_test', 'codexpro_inventory', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'tree', 'search', 'load_skill', 'read', 'read_many', 'git_status', 'git_diff', 'show_changes', 'read_handoff', 'wait_for_handoff', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
     if (!queryToolNames.includes(expected)) {
       throw new Error(`URL-token MCP tools/list missing ${expected}; got ${queryToolNames.join(', ')}`);
     }
@@ -739,6 +739,10 @@ try {
     if (!omittedAText.includes('nested repo A')) {
       throw new Error(`first nested HTTP session did not retain repo A selection: ${omittedAText}`);
     }
+    const omittedABatch = await callTool(firstClient, 'read_many', { items: [{ path: 'selected.txt' }] });
+    if (omittedABatch.structuredContent.results?.[0]?.result?.text?.includes('nested repo A') !== true) {
+      throw new Error(`first nested HTTP session read_many did not retain repo A selection: ${JSON.stringify(omittedABatch.structuredContent)}`);
+    }
 
     const firstList = await callTool(firstClient, 'list_workspaces');
     if (firstList.structuredContent.selected_workspace_id !== nestedAId) {
@@ -759,6 +763,10 @@ try {
       if (!explicitAText.includes('nested repo A')) {
         throw new Error(`fresh HTTP session could not reconstruct nested repo A from workspace_id: ${explicitAText}`);
       }
+      const explicitABatch = await callTool(secondClient, 'read_many', { workspace_id: nestedAId, items: [{ path: 'selected.txt' }] });
+      if (explicitABatch.structuredContent.root !== realNestedRepoA || explicitABatch.structuredContent.results?.[0]?.result?.text?.includes('nested repo A') !== true) {
+        throw new Error(`fresh HTTP session read_many could not reconstruct nested repo A from workspace_id: ${JSON.stringify(explicitABatch.structuredContent)}`);
+      }
 
       const openedB = await callTool(secondClient, 'open_workspace', {
         root: nestedRepoB,
@@ -777,6 +785,10 @@ try {
       if (!omittedBText.includes('nested repo B')) {
         throw new Error(`second nested HTTP session did not retain repo B selection: ${omittedBText}`);
       }
+      const omittedBBatch = await callTool(secondClient, 'read_many', { items: [{ path: 'selected.txt' }] });
+      if (omittedBBatch.structuredContent.results?.[0]?.result?.text?.includes('nested repo B') !== true) {
+        throw new Error(`second nested HTTP session read_many did not retain repo B selection: ${JSON.stringify(omittedBBatch.structuredContent)}`);
+      }
 
       const secondList = await callTool(secondClient, 'list_workspaces');
       if (
@@ -790,6 +802,10 @@ try {
       await expectToolError(secondClient, 'read', {
         workspace_id: 'ws_000000000000000000000000',
         path: 'selected.txt'
+      }, /Unknown workspace_id/);
+      await expectToolError(secondClient, 'read_many', {
+        workspace_id: 'ws_000000000000000000000000',
+        items: [{ path: 'selected.txt' }]
       }, /Unknown workspace_id/);
     });
 
@@ -1005,7 +1021,7 @@ try {
   await waitForHealthJson(`http://127.0.0.1:${connectionTestPort}/healthz`);
   const tools = await listTools(`http://127.0.0.1:${connectionTestPort}/mcp`);
   const names = toolNames(tools);
-  for (const expected of ['read', 'tree', 'search', 'load_skill']) {
+  for (const expected of ['read', 'read_many', 'tree', 'search', 'load_skill']) {
     if (!names.includes(expected)) throw new Error(`connection-test missing ${expected}; got ${names.join(', ')}`);
   }
   for (const hidden of ['codexpro', 'codexpro_self_test', 'write', 'edit', 'apply_patch', 'bash', 'export_pro_context', 'handoff_to_agent', 'handoff_to_codex']) {

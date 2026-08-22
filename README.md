@@ -63,7 +63,7 @@ If plugin creation fails, run `codexpro connection-test` and check whether ChatG
 
 With workspace write mode (the normal agent setup):
 
-- read, search, and inspect the repo
+- read individual files or bounded batches, search, and inspect the repo
 - edit with `write`, `edit`, or guarded `apply_patch`
 - import ChatGPT attachments with `import_file`
 - run allowlisted checks with `bash`
