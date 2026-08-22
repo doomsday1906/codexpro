@@ -41,11 +41,17 @@ export interface RuntimeConnection {
   version?: number;
   root?: string;
   pid?: number;
+  runId?: string;
+  startedAt?: string;
   updatedAt?: string;
+  runtimePid?: number | null;
   endpoint?: string;
   localBase?: string;
   localStatusUrl?: string;
   tunnel?: TunnelMode | string;
+  tunnelPid?: number | null;
+  tunnelStatus?: "starting" | "running" | "disabled" | "unknown" | string;
+  headless?: boolean;
   mode?: ConnectorMode | string;
   bash?: BashMode | string;
   bashTranscript?: BashTranscriptMode | string;
@@ -56,6 +62,27 @@ export interface RuntimeConnection {
   toolMode?: ToolMode | string;
   toolCards?: boolean;
 }
+
+export type RuntimeFailureComponent = "http_child" | "tunnel" | "launcher";
+
+export interface RuntimeFailureRecord {
+  version?: number;
+  root?: string;
+  runId?: string;
+  component?: RuntimeFailureComponent | string;
+  event?: "unexpected_exit" | "startup_failure" | "spawn_error" | string;
+  phase?: string;
+  failedAt?: string;
+  launcherPid?: number;
+  httpPid?: number;
+  tunnelPid?: number;
+  tunnel?: TunnelMode | string;
+  exitCode?: number | null;
+  signal?: string | null;
+  detail?: string;
+}
+
+export const RUNTIME_FAILURE_MAX_BYTES = 16_384;
 
 export function codexProHome(): string {
   const customHome = process.env.CODEXPRO_HOME;
@@ -89,6 +116,10 @@ export function runtimeDir(): string {
 
 export function runtimeStatusPathForRoot(root: string): string {
   return path.join(runtimeDir(), `${profileIdForRoot(root)}.json`);
+}
+
+export function runtimeFailurePathForRoot(root: string): string {
+  return path.join(runtimeDir(), `${profileIdForRoot(root)}.last-failure.json`);
 }
 
 function readJsonFile(filePath: string): unknown {
@@ -159,7 +190,24 @@ export function readRuntimeConnection(root: string): RuntimeConnection {
   return typed;
 }
 
-function processIsAlive(pid: number): boolean {
+export function readRuntimeFailure(root: string): RuntimeFailureRecord | null {
+  const failurePath = runtimeFailurePathForRoot(root);
+  try {
+    const stat = fs.statSync(failurePath);
+    if (!stat.isFile() || stat.size > RUNTIME_FAILURE_MAX_BYTES) return null;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return null;
+    return null;
+  }
+
+  const failure = readJsonFile(failurePath);
+  if (!failure || typeof failure !== "object" || Array.isArray(failure)) return null;
+  const typed = failure as RuntimeFailureRecord;
+  if (typed.root && canonicalRootForIdentity(typed.root) !== canonicalRootForIdentity(root)) return null;
+  return typed;
+}
+
+export function processIsAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);

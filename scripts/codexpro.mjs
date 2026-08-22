@@ -19,6 +19,8 @@ import {
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const UNTRACKED_FILE_HASH_BYTES = 64 * 1024;
 const UNTRACKED_SYMLINK_TARGET_BYTES = 512;
+const RUNTIME_FAILURE_DETAIL_MAX_BYTES = 2048;
+const RUNTIME_FAILURE_RECORD_MAX_BYTES = 16_384;
 
 function packageVersion() {
   return JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')).version;
@@ -653,6 +655,10 @@ function runtimeStatusPathForRoot(root) {
   return path.join(runtimeDir(), `${profileIdForRoot(root)}.json`);
 }
 
+function runtimeFailurePathForRoot(root) {
+  return path.join(runtimeDir(), `${profileIdForRoot(root)}.last-failure.json`);
+}
+
 function readJsonFile(filePath) {
   try {
     return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -710,19 +716,61 @@ function saveWorkspaceProfile(root, profile) {
   return filePath;
 }
 
+function boundedRedactedText(value, maxBytes) {
+  const redacted = redactForLog(String(value ?? ''));
+  const buffer = Buffer.from(redacted, 'utf8');
+  if (buffer.byteLength <= maxBytes) return redacted;
+  const suffix = `\n...[diagnostic detail truncated to ${maxBytes} bytes]`;
+  const suffixBytes = Buffer.byteLength(suffix, 'utf8');
+  const prefixBytes = Math.max(0, maxBytes - suffixBytes);
+  return `${buffer.subarray(0, prefixBytes).toString('utf8')}${suffix}`;
+}
+
+function writeAtomicJson(filePath, payload, maxBytes = RUNTIME_FAILURE_RECORD_MAX_BYTES) {
+  const serialized = `${JSON.stringify(payload, null, 2)}\n`;
+  if (Buffer.byteLength(serialized, 'utf8') > maxBytes) {
+    throw new Error(`Runtime diagnostic record exceeds ${maxBytes} bytes.`);
+  }
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const tempPath = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`);
+  let descriptor = -1;
+  try {
+    descriptor = fs.openSync(tempPath, 'wx', 0o600);
+    fs.writeFileSync(descriptor, serialized, 'utf8');
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = -1;
+    fs.renameSync(tempPath, filePath);
+    try {
+      const directoryDescriptor = fs.openSync(dir, 'r');
+      try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
+    } catch {}
+  } finally {
+    if (descriptor !== -1) {
+      try { fs.closeSync(descriptor); } catch {}
+    }
+    try { fs.rmSync(tempPath, { force: true }); } catch {}
+  }
+}
+
 function saveRuntimeConnection(root, details, options = {}) {
   const filePath = runtimeStatusPathForRoot(root);
-  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const payload = {
     version: 1,
     root,
     pid: process.pid,
+    runId: options.runId ?? null,
+    startedAt: options.startedAt ?? null,
     runtimePid: options.runtimePid ?? null,
     updatedAt: new Date().toISOString(),
-    endpoint: details.endpoint,
-    localBase: options.localBase ?? '',
-    localStatusUrl: details.localStatusUrl ? details.localStatusUrl.replace(/codexpro_token=[^&]+/, 'codexpro_token=<redacted>') : '',
+    endpoint: boundedRedactedText(details.endpoint ?? '', 2048),
+    localBase: boundedRedactedText(options.localBase ?? '', 512),
+    localStatusUrl: details.localStatusUrl ? boundedRedactedText(details.localStatusUrl.replace(/codexpro_token=[^&]+/, 'codexpro_token=<redacted>'), 1024) : '',
     tunnel: options.tunnel ?? '',
+    tunnelPid: options.tunnelPid ?? null,
+    tunnelStatus: options.tunnelStatus ?? 'unknown',
+    headless: Boolean(options.headless),
     mode: options.mode ?? '',
     bash: options.bash ?? '',
     bashTranscript: options.bashTranscript ?? '',
@@ -733,10 +781,19 @@ function saveRuntimeConnection(root, details, options = {}) {
     toolMode: options.toolMode ?? '',
     toolCards: Boolean(options.toolCards)
   };
-  fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
-  try {
-    fs.chmodSync(filePath, 0o600);
-  } catch {}
+  writeAtomicJson(filePath, payload);
+  return filePath;
+}
+
+function saveRuntimeFailure(root, failure) {
+  const filePath = runtimeFailurePathForRoot(root);
+  const payload = {
+    version: 1,
+    root,
+    ...failure,
+    detail: failure.detail ? boundedRedactedText(failure.detail, RUNTIME_FAILURE_DETAIL_MAX_BYTES) : undefined
+  };
+  writeAtomicJson(filePath, payload, RUNTIME_FAILURE_RECORD_MAX_BYTES);
   return filePath;
 }
 
@@ -1429,8 +1486,17 @@ function redactForLog(value) {
   return String(value)
     .replace(/\bsk-[A-Za-z0-9_-]{10,}\b/g, '[REDACTED_SECRET]')
     .replace(/\b(?:sk-ant-[A-Za-z0-9_-]{10,}|gh[opsru]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9_-]{20,})\b/g, '[REDACTED_SECRET]')
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_SECRET]')
+    .replace(/((?:\bngrok\s+config\s+add-authtoken|\bcloudflared\s+service\s+install|--(?:token|access-token|auth-token|api[_-]?key|authtoken))(?:=|[ \t]+))(?:"[^"\r\n]*"|'[^'\r\n]*'|`[^`\r\n]*`|[^\s"'`<>]+)/gi, '$1[REDACTED_SECRET]')
     .replace(/\b(Authorization\s*:\s*Bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi, '$1[REDACTED_SECRET]')
-    .replace(/([?&](?:codexpro_token|token|access_token|auth_token|api[_-]?key)=)[^&\s"'`<>]{8,}/gi, '$1[REDACTED_SECRET]')
+    .replace(/\b(Authorization\s*:\s*)[^\r\n]*/gi, '$1[REDACTED_SECRET]')
+    .replace(/\b((?:https?|wss?):\/\/)[^/\s:@]+:[^@\s/]+@/gi, '$1[REDACTED_SECRET]@')
+    .replace(/([?&](?:codexpro_token|token|access_token|auth_token|api[_-]?key)=)[^&\s"'`<>]+/gi, '$1[REDACTED_SECRET]')
+    .replace(/\b(codexpro_token\s*=\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|`[^`\r\n]*`|[^\s"'`<>]+)/gi, '$1[REDACTED_SECRET]')
+    .replace(/\b[A-Z][A-Z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Z0-9_]{0,64}\s*=\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|`[^`\r\n]*`|[A-Za-z0-9_./+=-]+)/g, (match) => {
+      const index = match.indexOf('=');
+      return index < 0 ? '[REDACTED_SECRET]' : `${match.slice(0, index).trimEnd()}= [REDACTED_SECRET]`;
+    })
     .replace(/(["']?[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}["']?\s*:\s*)(?:"[^"\r\n]{12,512}"|'[^'\r\n]{12,512}'|`[^`\r\n]{12,512}`|[A-Za-z0-9_./+=-]{20,512})/gi, '$1[REDACTED_SECRET]')
     .replace(/\b[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}\s*=\s*(?:"[^"\r\n]{12,512}"|'[^'\r\n]{12,512}'|`[^`\r\n]{12,512}`|[A-Za-z0-9_./+=-]{20,512})/gi, (match) => {
       const index = match.indexOf('=');
@@ -3768,26 +3834,114 @@ function runControlPanel(details, cleanup = cleanupChildren) {
   });
 }
 
-function waitForUnexpectedRuntimeExit(server, cleanup = cleanupChildren) {
-  return new Promise((_, reject) => {
-    const fail = (code, signal, error) => {
-      cleanup();
-      const detail = error
-        ? error instanceof Error ? error.message : String(error)
-        : `code=${code ?? 'null'} signal=${signal ?? 'null'}`;
-      reject(new Error(`CodexPro HTTP runtime exited unexpectedly (${detail}).`));
-    };
-    if (server.exitCode !== null || server.signalCode !== null) {
-      fail(server.exitCode, server.signalCode);
-      return;
+let activeRuntimeContext = null;
+
+function createRuntimeLifecycle(root, metadata = {}) {
+  let cleanupFn = () => {};
+  let cleaned = false;
+  let intentionalShutdown = false;
+  let failureRecord = null;
+  let rejectFailure;
+  const failurePromise = new Promise((_, reject) => { rejectFailure = reject; });
+  // A child can fail while launcher startup is still awaiting health/tunnel readiness.
+  // Keep the rejection available for holdRuntime without triggering an unhandled rejection.
+  failurePromise.catch(() => {});
+
+  const context = {
+    root,
+    runId: metadata.runId ?? randomBytes(16).toString('hex'),
+    startedAt: metadata.startedAt ?? new Date().toISOString(),
+    phase: 'starting',
+    tunnel: metadata.tunnel ?? 'unknown',
+    httpChild: null,
+    tunnelChild: null,
+    setPhase(value) {
+      context.phase = String(value || 'unknown').slice(0, 64);
+    },
+    setCleanup(fn) {
+      cleanupFn = typeof fn === 'function' ? fn : () => {};
+    },
+    markIntentional() {
+      intentionalShutdown = true;
+    },
+    cleanup() {
+      intentionalShutdown = true;
+      if (cleaned) return;
+      cleaned = true;
+      cleanupFn();
+    },
+    hasFailure() {
+      return Boolean(failureRecord);
+    },
+    failure() {
+      return failureRecord;
+    },
+    wait() {
+      return failurePromise;
+    },
+    recordFailure(component, event, details = {}) {
+      if (intentionalShutdown || failureRecord) return failureRecord;
+      const child = component === 'http_child' ? context.httpChild : component === 'tunnel' ? context.tunnelChild : null;
+      const tail = child && typeof child.codexproLogTail === 'function' ? child.codexproLogTail() : '';
+      const detail = details.detail ?? tail ?? '';
+      const record = {
+        runId: context.runId,
+        component,
+        event,
+        phase: context.phase,
+        failedAt: new Date().toISOString(),
+        launcherPid: process.pid,
+        httpPid: context.httpChild?.pid ?? null,
+        tunnelPid: context.tunnelChild?.pid ?? null,
+        tunnel: context.tunnel,
+        exitCode: details.exitCode ?? child?.exitCode ?? null,
+        signal: details.signal ?? child?.signalCode ?? null,
+        ...(detail ? { detail } : {})
+      };
+      try {
+        saveRuntimeFailure(root, record);
+      } catch (error) {
+        console.error(`[codexpro] Could not persist runtime failure record: ${redactForLog(error instanceof Error ? error.message : String(error))}`);
+      }
+      failureRecord = record;
+      const detailForError = `component=${component} code=${record.exitCode ?? 'null'} signal=${record.signal ?? 'null'}`;
+      const failureError = new Error(`CodexPro runtime failed unexpectedly (${detailForError}).`);
+      failureError.codexproRuntimeFailure = true;
+      rejectFailure(failureError);
+      return record;
+    },
+    recordLauncherFailure(error) {
+      if (failureRecord || intentionalShutdown) return failureRecord;
+      const httpExited = context.httpChild && (context.httpChild.exitCode !== null || context.httpChild.signalCode !== null);
+      const tunnelExited = context.tunnelChild && (context.tunnelChild.exitCode !== null || context.tunnelChild.signalCode !== null);
+      const component = httpExited ? 'http_child' : tunnelExited ? 'tunnel' : 'launcher';
+      const detail = error instanceof Error ? error.message : String(error ?? 'launcher startup failure');
+      return context.recordFailure(component, 'startup_failure', { detail });
+    },
+    attach(child, component) {
+      if (!child) return;
+      if (component === 'http_child') context.httpChild = child;
+      if (component === 'tunnel') context.tunnelChild = child;
+      child.once('error', (error) => {
+        context.recordFailure(component, 'spawn_error', { detail: error instanceof Error ? error.message : String(error) });
+      });
+      child.once('exit', (code, signal) => {
+        context.recordFailure(component, 'unexpected_exit', { exitCode: code, signal });
+      });
+      if (child.exitCode !== null || child.signalCode !== null) {
+        queueMicrotask(() => context.recordFailure(component, 'unexpected_exit', {
+          exitCode: child.exitCode,
+          signal: child.signalCode
+        }));
+      }
     }
-    server.once('error', (error) => fail(null, null, error));
-    server.once('exit', (code, signal) => fail(code, signal));
-  });
+  };
+  return context;
 }
 
-function holdRuntime(server, details, cleanup, headless) {
-  return headless ? waitForUnexpectedRuntimeExit(server, cleanup) : runControlPanel(details, cleanup);
+function holdRuntime(runtime, details, cleanup, headless) {
+  if (headless) return runtime.wait();
+  return Promise.race([runControlPanel(details, cleanup), runtime.wait()]);
 }
 
 async function main() {
@@ -3969,6 +4123,7 @@ async function main() {
     CODEXPRO_TOOL_CARDS: toolCards ? '1' : '0',
     CODEXPRO_CONNECTION_TEST: connectionTest ? '1' : '0',
     CODEXPRO_MODE: mode,
+    CODEXPRO_RUNTIME_KIND: 'http',
     CODEXPRO_TUNNEL_MODE: tunnel === 'none' ? '0' : '1',
     CODEXPRO_ALLOW_NO_HTTP_TOKEN: args.noAuth ? '1' : '0'
   };
@@ -4012,24 +4167,38 @@ async function main() {
   ]);
 
   const verboseLogs = Boolean(args.logRequests || process.env.CODEXPRO_LOG_REQUESTS === '1');
+  const runtime = createRuntimeLifecycle(root, {
+    runId: randomBytes(16).toString('hex'),
+    startedAt: new Date().toISOString(),
+    tunnel
+  });
+  activeRuntimeContext = runtime;
   statusLine('wait', 'Starting local MCP server');
   const server = spawnLogged('codexpro', process.execPath, [httpPath], { cwd: projectRoot, env: serverEnv, verbose: verboseLogs });
+  runtime.attach(server, 'http_child');
   let cloudflared;
   let cleanupTunnelCredentials = () => {};
-  const cleanup = () => {
+  const performCleanup = () => {
     cleanupTunnelCredentials();
     cleanupChildren();
     clearRuntimeConnection(root);
   };
+  runtime.setCleanup(performCleanup);
+  const cleanup = () => runtime.cleanup();
   process.on('SIGINT', () => { cleanup(); process.exit(130); });
   process.on('SIGTERM', () => { cleanup(); process.exit(143); });
 
   const localBase = `http://${host}:${port}`;
+  runtime.setPhase('http_startup');
   await waitForHealth(`${localBase}/healthz`, token);
   statusLine('ok', `Local MCP ready at ${localBase}/mcp`);
+  runtime.setPhase('runtime_startup');
   const runtimeOptions = {
     localBase,
     tunnel,
+    runId: runtime.runId,
+    startedAt: runtime.startedAt,
+    headless,
     mode,
     toolMode,
     write,
@@ -4040,7 +4209,9 @@ async function main() {
     requireBashSession,
     toolCards,
     connectionTest,
-    runtimePid: server.pid ?? null
+    runtimePid: server.pid ?? null,
+    tunnelPid: null,
+    tunnelStatus: tunnel === 'none' ? 'disabled' : 'starting'
   };
 
   if (tunnel === 'none') {
@@ -4064,8 +4235,9 @@ async function main() {
       requireBashSession,
       connectionTest
     });
+    runtime.setPhase('running');
     saveRuntimeConnection(root, details, runtimeOptions);
-    await holdRuntime(server, details, cleanup, headless);
+    await holdRuntime(runtime, details, cleanup, headless);
     return;
   }
 
@@ -4076,7 +4248,9 @@ async function main() {
     const configPath = ngrokConfigPath(root, args, profile);
     if (configPath) ngrokArgs.push('--config', configPath);
     statusLine('wait', `Opening ngrok endpoint for ${publicBase}`);
+    runtime.setPhase('tunnel_startup');
     cloudflared = spawnLogged('ngrok', ngrokPath, ngrokArgs, { cwd: root, env: process.env, verbose: verboseLogs });
+    runtime.attach(cloudflared, 'tunnel');
     try {
       await waitForPublicHealth(publicBase, token, cloudflared, 'ngrok');
     } catch (error) {
@@ -4093,6 +4267,9 @@ async function main() {
       ].join('\n');
       throw new Error(`${error instanceof Error ? error.message : String(error)}${tail ? `\n\nRecent ngrok output:\n${tail}` : ''}${hint}`);
     }
+    runtimeOptions.tunnelPid = cloudflared.pid ?? null;
+    runtimeOptions.tunnelStatus = 'running';
+    runtime.setPhase('running');
     const details = printConnectorBlock(`${publicBase}/mcp`, token, {
       localBase,
       headless,
@@ -4110,7 +4287,7 @@ async function main() {
       connectionTest
     });
     saveRuntimeConnection(root, details, runtimeOptions);
-    await holdRuntime(server, details, cleanup, headless);
+    await holdRuntime(runtime, details, cleanup, headless);
     return;
   }
 
@@ -4122,7 +4299,9 @@ async function main() {
     if (httpsPort !== '443') tailscaleArgs.push(`--https=${httpsPort}`);
     tailscaleArgs.push(localBase);
     statusLine('wait', `Opening Tailscale Funnel for ${publicBase}`);
+    runtime.setPhase('tunnel_startup');
     cloudflared = spawnLogged('tailscale', tailscalePath, tailscaleArgs, { cwd: root, env: process.env, verbose: verboseLogs });
+    runtime.attach(cloudflared, 'tunnel');
     try {
       await waitForPublicHealth(publicBase, token, cloudflared, 'Tailscale Funnel');
     } catch (error) {
@@ -4139,6 +4318,9 @@ async function main() {
       ].join('\n');
       throw new Error(`${error instanceof Error ? error.message : String(error)}${tail ? `\n\nRecent tailscale output:\n${tail}` : ''}${hint}`);
     }
+    runtimeOptions.tunnelPid = cloudflared.pid ?? null;
+    runtimeOptions.tunnelStatus = 'running';
+    runtime.setPhase('running');
     const details = printConnectorBlock(`${publicBase}/mcp`, token, {
       localBase,
       headless,
@@ -4156,7 +4338,7 @@ async function main() {
       connectionTest
     });
     saveRuntimeConnection(root, details, runtimeOptions);
-    await holdRuntime(server, details, cleanup, headless);
+    await holdRuntime(runtime, details, cleanup, headless);
     return;
   }
 
@@ -4165,6 +4347,8 @@ async function main() {
     console.error('\ncloudflared was not found. The local MCP server is still running.');
     console.error('Install Cloudflare Tunnel, rerun without --no-install-cloudflared, or run with --tunnel none for local clients.');
     console.error('Downloads: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/');
+    runtimeOptions.tunnelStatus = 'unknown';
+    runtime.setPhase('running');
     const details = printConnectorBlock(`${localBase}/mcp`, token, {
       localBase,
       headless,
@@ -4182,12 +4366,13 @@ async function main() {
       connectionTest
     });
     saveRuntimeConnection(root, details, runtimeOptions);
-    await holdRuntime(server, details, cleanup, headless);
+    await holdRuntime(runtime, details, cleanup, headless);
     return;
   }
 
   if (tunnel === 'cloudflare') {
     statusLine('wait', 'Opening Cloudflare quick tunnel');
+    runtime.setPhase('tunnel_startup');
     const proxyUrl = outboundProxyFromEnv(process.env);
     let publicBase = '';
     if (proxyUrl) {
@@ -4197,6 +4382,7 @@ async function main() {
       cleanupTunnelCredentials = removeCredentials;
       try {
         cloudflared = spawnLogged('cloudflared', cloudflaredPath, ['tunnel', '--url', localBase, '--credentials-file', credentialsPath, 'run', quickTunnel.id], { cwd: root, env: process.env, verbose: verboseLogs });
+        runtime.attach(cloudflared, 'tunnel');
       } catch (error) {
         removeCredentials();
         throw error;
@@ -4207,8 +4393,12 @@ async function main() {
       publicBase = `https://${quickTunnel.hostname}`;
     } else {
       cloudflared = spawnLogged('cloudflared', cloudflaredPath, ['tunnel', '--url', localBase], { cwd: root, env: process.env, verbose: verboseLogs });
+      runtime.attach(cloudflared, 'tunnel');
       publicBase = await waitForCloudflareUrl(cloudflared);
     }
+    runtimeOptions.tunnelPid = cloudflared.pid ?? null;
+    runtimeOptions.tunnelStatus = 'running';
+    runtime.setPhase('running');
     const details = printConnectorBlock(`${publicBase}/mcp`, token, {
       localBase,
       headless,
@@ -4226,7 +4416,7 @@ async function main() {
       connectionTest
     });
     saveRuntimeConnection(root, details, runtimeOptions);
-    await holdRuntime(server, details, cleanup, headless);
+    await holdRuntime(runtime, details, cleanup, headless);
     return;
   }
 
@@ -4255,10 +4445,12 @@ async function main() {
   }
 
   statusLine('wait', `Starting Cloudflare named tunnel for ${publicBase}`);
+  runtime.setPhase('tunnel_startup');
   const cloudflaredEnv = cloudflareToken && !cloudflareTokenFile
     ? { ...process.env, TUNNEL_TOKEN: cloudflareToken }
     : process.env;
   cloudflared = spawnLogged('cloudflared', cloudflaredPath, cloudflaredArgs, { cwd: root, env: cloudflaredEnv, verbose: verboseLogs });
+  runtime.attach(cloudflared, 'tunnel');
   try {
     await waitForPublicHealth(publicBase, token, cloudflared);
   } catch (error) {
@@ -4279,6 +4471,9 @@ async function main() {
     ].join('\n');
     throw new Error(`${error instanceof Error ? error.message : String(error)}${tail ? `\n\nRecent cloudflared output:\n${tail}` : ''}${hint}`);
   }
+  runtimeOptions.tunnelPid = cloudflared.pid ?? null;
+  runtimeOptions.tunnelStatus = 'running';
+  runtime.setPhase('running');
   const details = printConnectorBlock(`${publicBase}/mcp`, token, {
     localBase,
     headless,
@@ -4296,11 +4491,16 @@ async function main() {
     connectionTest
   });
   saveRuntimeConnection(root, details, runtimeOptions);
-  await holdRuntime(server, details, cleanup, headless);
+  await holdRuntime(runtime, details, cleanup, headless);
 }
 
 main().catch((error) => {
-  cleanupChildren();
+  if (activeRuntimeContext) {
+    if (!activeRuntimeContext.hasFailure()) activeRuntimeContext.recordLauncherFailure(error);
+    activeRuntimeContext.cleanup();
+  } else {
+    cleanupChildren();
+  }
   const message = error instanceof Error ? error.message : String(error);
   console.error(`Error: ${message}`);
   if (process.env.CODEXPRO_DEBUG === '1' && error instanceof Error && error.stack) {

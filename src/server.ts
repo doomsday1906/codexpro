@@ -6,6 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { CodexProConfig } from "./config.js";
 import { WorkspaceManager, PathGuard, CodexProError, type Workspace } from "./guard.js";
+import { processIsAlive, readRuntimeConnection, readRuntimeFailure } from "./profileStore.js";
 import { repoTree, readTextFile, writeTextFile, editTextFile, ensureAiBridge, withFileWriteLocks } from "./fsOps.js";
 import { viewWorkspaceImage } from "./imageOps.js";
 import { importAttachmentFile } from "./importOps.js";
@@ -318,6 +319,7 @@ function registerToolCompat(
 const MINIMAL_TOOL_NAMES = [
   SUPERTOOL_NAME,
   "server_config",
+  "runtime_status",
   "codexpro_self_test",
   "open_current_workspace",
   "open_workspace",
@@ -346,6 +348,7 @@ const STANDARD_TOOL_NAMES = [
 const FULL_TOOL_NAMES = [
   SUPERTOOL_NAME,
   "server_config",
+  "runtime_status",
   "codexpro_self_test",
   "codexpro_inventory",
   "load_skill",
@@ -926,6 +929,96 @@ const LOCAL_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, des
 const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
 const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 
+function runtimeStatusPayload(config: CodexProConfig): Record<string, unknown> {
+  let runtime: ReturnType<typeof readRuntimeConnection> = {};
+  try {
+    runtime = readRuntimeConnection(config.defaultRoot);
+  } catch {
+    runtime = {};
+  }
+
+  let failure: ReturnType<typeof readRuntimeFailure> = null;
+  try {
+    failure = readRuntimeFailure(config.defaultRoot);
+  } catch {
+    failure = null;
+  }
+
+  const launcherPid = typeof runtime.pid === "number" ? runtime.pid : null;
+  const launcherMatchesParent = launcherPid !== null && launcherPid === process.ppid;
+  const isHttpChild = runtime.runtimePid === process.pid || process.env.CODEXPRO_RUNTIME_KIND === "http";
+  const launcherStatus = launcherPid === null
+    ? "unknown"
+    : launcherMatchesParent && processIsAlive(launcherPid)
+      ? "running"
+      : "unknown";
+  const tunnelPid = typeof runtime.tunnelPid === "number" ? runtime.tunnelPid : null;
+  const tunnelType = String(runtime.tunnel ?? process.env.CODEXPRO_TUNNEL ?? "unknown");
+  const tunnelStatus = tunnelPid !== null && launcherMatchesParent
+    ? processIsAlive(tunnelPid) ? "running" : "stopped"
+    : launcherMatchesParent && runtime.tunnel
+      ? String(runtime.tunnelStatus ?? "unknown")
+      : "unknown";
+  const startedAt = typeof runtime.startedAt === "string" && runtime.startedAt ? runtime.startedAt : null;
+  const startedMs = startedAt ? Date.parse(startedAt) : Number.NaN;
+  const uptimeSeconds = Number.isFinite(startedMs)
+    ? Math.max(0, Math.floor((Date.now() - startedMs) / 1000))
+    : Math.max(0, Math.floor(process.uptime()));
+  const currentRunId = typeof runtime.runId === "string" && runtime.runId ? runtime.runId : null;
+  const failureRunId = typeof failure?.runId === "string" && failure.runId ? failure.runId : null;
+  const failureRelation = failure
+    ? currentRunId && failureRunId === currentRunId ? "current" : "previous"
+    : "none";
+  const lastFailure = failure
+    ? {
+        run_id: failureRunId,
+        component: String(failure.component ?? "unknown"),
+        event: String(failure.event ?? "unknown"),
+        phase: String(failure.phase ?? "unknown"),
+        failed_at: failure.failedAt ?? null,
+        exit_code: failure.exitCode ?? null,
+        signal: failure.signal ?? null,
+        detail: failure.detail ?? null,
+        launcher_pid: failure.launcherPid ?? null,
+        http_pid: failure.httpPid ?? null,
+        tunnel_pid: failure.tunnelPid ?? null,
+        tunnel: failure.tunnel ?? null,
+        relation_to_current_run: failureRelation
+      }
+    : null;
+
+  return {
+    health: "healthy",
+    runtime_source: isHttpChild ? "live_http_process" : "live_mcp_process",
+    process: {
+      role: isHttpChild ? "http_child" : "mcp_process",
+      pid: process.pid,
+      status: "running"
+    },
+    launcher: {
+      pid: launcherPid,
+      status: launcherStatus
+    },
+    http_child: {
+      pid: isHttpChild ? process.pid : null,
+      status: isHttpChild ? "running" : "unknown"
+    },
+    tunnel: {
+      type: tunnelType,
+      pid: tunnelPid,
+      status: tunnelStatus
+    },
+    run_id: currentRunId,
+    startup_timestamp: startedAt,
+    uptime_seconds: uptimeSeconds,
+    endpoint: `http://${config.host}:${config.port}/mcp`,
+    mode: process.env.CODEXPRO_MODE ?? "unknown",
+    headless: typeof runtime.headless === "boolean" ? runtime.headless : null,
+    last_failure: lastFailure,
+    last_failure_relation: failureRelation
+  };
+}
+
 export function createCodexProServer(config: CodexProConfig): McpServer {
   const workspaces = new WorkspaceManager(config);
   const reviewCheckpoints = new Map<string, string>();
@@ -1065,6 +1158,39 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         registeredToolCount: registeredToolNames(server).length
       };
       return textResult(`# CodexPro Server Config\n\n${JSON.stringify(safeConfig, null, 2)}`, safeConfig);
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "runtime_status",
+    {
+      title: "Runtime Status",
+      description: "Read-only live CodexPro process status plus one bounded sanitized last-failure record. It never restarts or changes runtime state.",
+      inputSchema: {},
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Reading CodexPro runtime status...",
+        "openai/toolInvocation/invoked": "CodexPro runtime status ready"
+      }
+    },
+    async () => {
+      const status = runtimeStatusPayload(config);
+      const text = [
+        "# CodexPro Runtime Status",
+        "",
+        `Health: ${status.health}`,
+        `HTTP child: ${JSON.stringify(status.http_child)}`,
+        `Launcher: ${JSON.stringify(status.launcher)}`,
+        `Tunnel: ${JSON.stringify(status.tunnel)}`,
+        `Endpoint: ${status.endpoint}`,
+        `Run: ${status.run_id ?? "unknown"}`,
+        `Uptime: ${status.uptime_seconds} seconds`,
+        `Last failure: ${status.last_failure_relation}`,
+        status.last_failure ? JSON.stringify(status.last_failure, null, 2) : "No durable failure record."
+      ].join("\n");
+      return textResult(text, status);
     }
   );
 
