@@ -180,6 +180,18 @@ async function callTool(client, name, args = {}) {
   return result;
 }
 
+async function expectToolError(client, name, args, pattern) {
+  const result = await client.callTool({ name, arguments: args });
+  if (!result.isError) {
+    throw new Error(`expected ${name} to fail, got ${JSON.stringify(result.structuredContent)}`);
+  }
+  const text = result.content?.find?.((part) => part.type === 'text')?.text ?? JSON.stringify(result.structuredContent);
+  if (pattern && !pattern.test(text)) {
+    throw new Error(`expected ${name} failure to match ${pattern}, got: ${text}`);
+  }
+  return text;
+}
+
 async function expectSessionNotFound(response, label) {
   const body = await response.json();
   if (
@@ -206,6 +218,24 @@ function postToolsListWithSession(baseUrl, token, sessionId) {
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-http-smoke-'));
 const alternateRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-http-alternate-'));
+const nestedAllowedParent = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-http-nested-parent-'));
+const nestedRepoA = path.join(nestedAllowedParent, 'repo-a');
+const nestedRepoB = path.join(nestedAllowedParent, 'repo-b');
+const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-http-outside-'));
+await fs.mkdir(nestedRepoA, { recursive: true });
+await fs.mkdir(nestedRepoB, { recursive: true });
+const realNestedRepoA = await fs.realpath(nestedRepoA);
+const realNestedRepoB = await fs.realpath(nestedRepoB);
+await fs.writeFile(path.join(nestedRepoA, 'selected.txt'), 'nested repo A\n', 'utf8');
+await fs.writeFile(path.join(nestedRepoB, 'selected.txt'), 'nested repo B\n', 'utf8');
+await fs.writeFile(path.join(outsideRoot, 'secret.txt'), 'outside workspace\n', 'utf8');
+let nestedSymlinkCreated = false;
+try {
+  await fs.symlink(outsideRoot, path.join(nestedRepoA, 'outside-link'), 'dir');
+  nestedSymlinkCreated = true;
+} catch (error) {
+  if (process.platform !== 'win32' || error?.code !== 'EPERM') throw error;
+}
 await fs.writeFile(path.join(alternateRoot, 'selected.txt'), 'http alternate workspace\n', 'utf8');
 const profileHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-http-profile-home-'));
 await fs.mkdir(path.join(root, '.codex', 'skills', 'http-smoke-skill'), { recursive: true });
@@ -252,7 +282,7 @@ const child = spawn('node', ['dist/http.js'], {
     HOST: '0.0.0.0',
     PORT: String(genericPort),
     CODEXPRO_ROOT: root,
-    CODEXPRO_ALLOWED_ROOTS: [root, alternateRoot].join(path.delimiter),
+    CODEXPRO_ALLOWED_ROOTS: [root, alternateRoot, nestedAllowedParent].join(path.delimiter),
     CODEXPRO_HOST: '127.0.0.1',
     CODEXPRO_PORT: String(port),
     CODEXPRO_HTTP_TOKEN: token,
@@ -692,6 +722,110 @@ try {
       throw new Error(`first HTTP session lost its workspace selection: ${JSON.stringify(firstList.structuredContent)}`);
     }
   });
+
+  let nestedAId;
+  let nestedBId;
+  await withClient(mcpUrl, async (firstClient) => {
+    const openedA = await callTool(firstClient, 'open_workspace', {
+      root: nestedRepoA,
+      include_tree: false
+    });
+    nestedAId = openedA.structuredContent.workspace_id;
+    if (openedA.structuredContent.root !== realNestedRepoA) {
+      throw new Error(`nested repo A opened with non-canonical root: ${openedA.structuredContent.root}; expected ${realNestedRepoA}`);
+    }
+    const omittedA = await callTool(firstClient, 'read', { path: 'selected.txt' });
+    const omittedAText = omittedA.content?.find?.((part) => part.type === 'text')?.text ?? '';
+    if (!omittedAText.includes('nested repo A')) {
+      throw new Error(`first nested HTTP session did not retain repo A selection: ${omittedAText}`);
+    }
+
+    const firstList = await callTool(firstClient, 'list_workspaces');
+    if (firstList.structuredContent.selected_workspace_id !== nestedAId) {
+      throw new Error(`first nested HTTP session selected the wrong workspace: ${JSON.stringify(firstList.structuredContent)}`);
+    }
+
+    await expectToolError(firstClient, 'open_workspace', { root: outsideRoot, include_tree: false }, /outside allowed roots/);
+    if (nestedSymlinkCreated) {
+      await expectToolError(firstClient, 'read', { workspace_id: nestedAId, path: 'outside-link/secret.txt' }, /symlink|outside workspace/i);
+    }
+
+    await withClient(mcpUrl, async (secondClient) => {
+      const explicitA = await callTool(secondClient, 'read', { workspace_id: nestedAId, path: 'selected.txt' });
+      if (explicitA.structuredContent.root !== realNestedRepoA) {
+        throw new Error(`fresh explicit repo A lookup returned non-canonical root: ${explicitA.structuredContent.root}; expected ${realNestedRepoA}`);
+      }
+      const explicitAText = explicitA.content?.find?.((part) => part.type === 'text')?.text ?? '';
+      if (!explicitAText.includes('nested repo A')) {
+        throw new Error(`fresh HTTP session could not reconstruct nested repo A from workspace_id: ${explicitAText}`);
+      }
+
+      const openedB = await callTool(secondClient, 'open_workspace', {
+        root: nestedRepoB,
+        include_tree: false
+      });
+      nestedBId = openedB.structuredContent.workspace_id;
+      if (openedB.structuredContent.root !== realNestedRepoB) {
+        throw new Error(`nested repo B opened with non-canonical root: ${openedB.structuredContent.root}; expected ${realNestedRepoB}`);
+      }
+      if (nestedAId === nestedBId) {
+        throw new Error(`distinct nested roots unexpectedly aliased to ${nestedAId}`);
+      }
+
+      const omittedB = await callTool(secondClient, 'read', { path: 'selected.txt' });
+      const omittedBText = omittedB.content?.find?.((part) => part.type === 'text')?.text ?? '';
+      if (!omittedBText.includes('nested repo B')) {
+        throw new Error(`second nested HTTP session did not retain repo B selection: ${omittedBText}`);
+      }
+
+      const secondList = await callTool(secondClient, 'list_workspaces');
+      if (
+        secondList.structuredContent.selected_workspace_id !== nestedBId
+        || !secondList.structuredContent.workspaces.some((workspace) => workspace.id === nestedAId)
+        || !secondList.structuredContent.workspaces.some((workspace) => workspace.id === nestedBId)
+      ) {
+        throw new Error(`second nested HTTP session did not preserve local selection and opened identities: ${JSON.stringify(secondList.structuredContent)}`);
+      }
+
+      await expectToolError(secondClient, 'read', {
+        workspace_id: 'ws_000000000000000000000000',
+        path: 'selected.txt'
+      }, /Unknown workspace_id/);
+    });
+
+    const firstAfterSecond = await callTool(firstClient, 'read', { path: 'selected.txt' });
+    const firstAfterSecondText = firstAfterSecond.content?.find?.((part) => part.type === 'text')?.text ?? '';
+    if (!firstAfterSecondText.includes('nested repo A')) {
+      throw new Error(`first nested HTTP session lost repo A selection after second session closed: ${firstAfterSecondText}`);
+    }
+  });
+
+  let driftSymlinkCreated = false;
+  try {
+    await fs.rm(nestedRepoA, { recursive: true, force: true });
+    await fs.symlink(nestedRepoB, nestedRepoA, 'dir');
+    driftSymlinkCreated = true;
+  } catch (error) {
+    if (process.platform !== 'win32' || error?.code !== 'EPERM') throw error;
+  }
+  if (driftSymlinkCreated) {
+    await withClient(mcpUrl, async (driftClient) => {
+      const driftResult = await driftClient.callTool({
+        name: 'read',
+        arguments: { workspace_id: nestedAId, path: 'selected.txt' }
+      });
+      if (!driftResult.isError) {
+        throw new Error(`stale nested repo A workspace_id unexpectedly resolved after A→B replacement: ${JSON.stringify(driftResult.structuredContent)}`);
+      }
+      const driftPayload = JSON.stringify(driftResult);
+      if (!/workspace id|canonical root|identity/i.test(driftPayload)) {
+        throw new Error(`stale nested repo A workspace_id failed for an unexpected reason: ${driftPayload}`);
+      }
+      if (driftPayload.includes(realNestedRepoB) || driftPayload.includes('nested repo B')) {
+        throw new Error(`stale nested repo A workspace_id exposed nested repo B after identity drift: ${driftPayload}`);
+      }
+    });
+  }
 
   await withClient(mcpUrl, async (client) => {
     const list = await callTool(client, 'list_workspaces');

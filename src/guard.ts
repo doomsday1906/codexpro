@@ -40,6 +40,20 @@ function workspaceIdForRoot(realRoot: string): string {
   return `ws_${createHash("sha256").update(realRoot).digest("hex").slice(0, 24)}`;
 }
 
+// Workspace ids are process-scoped identities, while selection remains local to
+// each WorkspaceManager/MCP session. Store only canonical roots here; callers
+// must still pass them through openWorkspace so the current allowed-root and
+// filesystem checks are applied before a workspace is reconstructed.
+const processWorkspaceRoots = new Map<string, string>();
+
+function rememberWorkspaceRoot(id: string, realRoot: string): void {
+  const existingRoot = processWorkspaceRoots.get(id);
+  if (existingRoot && existingRoot !== realRoot) {
+    throw new CodexProError(`Workspace id collision: ${id} identifies both ${existingRoot} and ${realRoot}.`);
+  }
+  processWorkspaceRoots.set(id, realRoot);
+}
+
 function maybeRealpath(existingPath: string): string | undefined {
   try {
     return fs.realpathSync.native(existingPath);
@@ -100,6 +114,7 @@ export class WorkspaceManager {
     }
 
     const id = workspaceIdForRoot(realRoot);
+    rememberWorkspaceRoot(id, realRoot);
     const workspace = { id, root: realRoot, openedAt: new Date().toISOString() };
     this.workspaces.set(id, workspace);
     if (options.select !== false) this.selectedWorkspaceId = id;
@@ -116,8 +131,23 @@ export class WorkspaceManager {
     }
     const workspace = this.workspaces.get(id);
     if (!workspace) {
+      const rememberedRoot = processWorkspaceRoots.get(id);
+      if (rememberedRoot) {
+        const reconstructed = this.openWorkspace(rememberedRoot, { select: false });
+        if (reconstructed.id !== id) {
+          throw new CodexProError(`Workspace id no longer matches its canonical root: ${id}. Call open_workspace again.`);
+        }
+        return reconstructed;
+      }
+
       const configuredRoot = this.config.allowedRoots.find((allowedRoot) => workspaceIdForRoot(allowedRoot) === id);
-      if (configuredRoot) return this.openWorkspace(configuredRoot, { select: false });
+      if (configuredRoot) {
+        const reconstructed = this.openWorkspace(configuredRoot, { select: false });
+        if (reconstructed.id !== id) {
+          throw new CodexProError(`Workspace id no longer matches its canonical root: ${id}. Call open_workspace again.`);
+        }
+        return reconstructed;
+      }
     }
     if (!workspace) {
       throw new CodexProError(`Unknown workspace_id: ${id}. Call open_workspace first.`);
