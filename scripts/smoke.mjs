@@ -89,6 +89,7 @@ for (const [index, filePath] of readManyPaths.entries()) {
 await fs.mkdir(path.join(tmp, 'read-many-directory'));
 await fs.writeFile(path.join(tmp, 'read-many-max-bytes.txt'), 'x'.repeat(2_001), 'utf8');
 await fs.writeFile(path.join(tmp, 'read-many-large.txt'), 'large\n' + 'x'.repeat(7_000) + '\n', 'utf8');
+await fs.writeFile(path.join(tmp, 'read-many-near-limit.txt'), 'n'.repeat(1_000), 'utf8');
 await fs.writeFile(path.join(tmp, 'read-many-oversize.txt'), 'x'.repeat(180_001), 'utf8');
 await fs.writeFile(path.join(tmp, 'config.txt'), 'OPENAI_API_KEY=sk-realSecretValue123\n', 'utf8');
 await fs.writeFile(path.join(tmp, 'AGENTS.md'), '# Smoke Agents\n\n- Preserve demo.txt.\n', 'utf8');
@@ -267,6 +268,20 @@ async function expectToolError(name, args, pattern, targetClient = client) {
     throw new Error(`${name} error did not match ${pattern}: ${text}`);
   }
 }
+function serializedToolResultBytes(result) {
+  return Buffer.byteLength(JSON.stringify(result), 'utf8');
+}
+function toolResultText(result) {
+  return result.content?.find?.((part) => part.type === 'text')?.text ?? JSON.stringify(result.structuredContent);
+}
+function assertBoundedReadManyError(result, label, budget = 4_000) {
+  const bytes = serializedToolResultBytes(result);
+  if (!result.isError || bytes > budget || !/Invalid arguments for read_many/.test(toolResultText(result))) {
+    throw new Error(`${label} was not a bounded invalid-arguments result: ${JSON.stringify({ bytes, result })}`);
+  }
+  return bytes;
+}
+let configuredMaxOutputBytesReadManyResultBytes = null;
 for (const visualTool of toolNames) {
   if (hasWidgetMeta(visualTool) || hasToolCardStatusMeta(visualTool)) throw new Error(`${visualTool} exposed widget metadata while CODEXPRO_TOOL_CARDS is off`);
 }
@@ -360,6 +375,17 @@ if (spawnSync(process.platform === 'win32' ? 'where' : 'sh', process.platform ==
     if (limitedSearch.isError || limitedSearch.structuredContent.truncated !== true) {
       throw new Error(`ripgrep output limit did not return a bounded truncated result: ${JSON.stringify(limitedSearch.structuredContent)}`);
     }
+    const limitedReadMany = await limitedSearchClient.request('tools/call', {
+      name: 'read_many',
+      arguments: { items: [{ path: 'demo.txt' }], max_total_bytes: 60_000 }
+    });
+    if (!limitedReadMany.isError || !/configured read_many response limit/i.test(toolResultText(limitedReadMany))) {
+      throw new Error(`configured maxOutputBytes did not remain an outer read_many ceiling: ${JSON.stringify(limitedReadMany)}`);
+    }
+    if (serializedToolResultBytes(limitedReadMany) > 4_000) {
+      throw new Error(`configured maxOutputBytes rejection exceeded its 4000-byte outer ceiling: ${serializedToolResultBytes(limitedReadMany)}`);
+    }
+    configuredMaxOutputBytesReadManyResultBytes = serializedToolResultBytes(limitedReadMany);
     const afterLimitedSearch = await limitedSearchClient.request('tools/call', { name: 'server_config', arguments: {} });
     if (afterLimitedSearch.isError || afterLimitedSearch.structuredContent.bashMode !== 'off') {
       throw new Error('ripgrep output limit left the MCP server unavailable');
@@ -494,6 +520,116 @@ const inventory = await client.request('tools/call', { name: 'codexpro_inventory
 if (inventory.structuredContent.codexpro_tool !== 'codexpro_inventory') throw new Error('inventory result was not tagged for widget rendering');
 const opened = await client.request('tools/call', { name: 'open_workspace', arguments: { root: tmp, include_tree: true } });
 const ws = opened.structuredContent.workspace_id;
+const highCardinalityItem = { path: 'demo.txt' };
+for (let index = 0; index < 4_000; index += 1) {
+  highCardinalityItem[`evil_${String(index).padStart(4, '0')}`] = true;
+}
+const malformedItemKeys = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: { workspace_id: ws, max_total_bytes: 4_000, items: [highCardinalityItem] }
+});
+const malformedItemKeysBytes = assertBoundedReadManyError(malformedItemKeys, 'high-cardinality item keys');
+if (JSON.stringify(malformedItemKeys).includes('evil_')) {
+  throw new Error('high-cardinality item-key validation echoed arbitrary unknown key names');
+}
+
+const highCardinalityTopLevel = { workspace_id: ws, max_total_bytes: 4_000, items: [{ path: 'demo.txt' }] };
+for (let index = 0; index < 4_000; index += 1) {
+  highCardinalityTopLevel[`top_evil_${String(index).padStart(4, '0')}`] = true;
+}
+const malformedTopLevelKeys = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: highCardinalityTopLevel
+});
+const malformedTopLevelKeysBytes = assertBoundedReadManyError(malformedTopLevelKeys, 'high-cardinality top-level keys');
+if (JSON.stringify(malformedTopLevelKeys).includes('top_evil_')) {
+  throw new Error('high-cardinality top-level validation echoed arbitrary unknown key names');
+}
+
+const malformedManyIssues = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: {
+    workspace_id: 42,
+    max_total_bytes: 'not-a-number-secret=sk-invalid-argument',
+    items: [{ path: 99, start_line: 'bad', max_bytes: null, evil_secret_value: 'ghp_invalid-argument-secret' }],
+    unexpected_top_level: 'Bearer invalid-argument-secret'
+  }
+});
+const malformedManyIssuesBytes = assertBoundedReadManyError(malformedManyIssues, 'many simultaneous validation issues');
+const malformedManyIssuesPayload = JSON.stringify(malformedManyIssues);
+for (const leaked of ['not-a-number-secret=sk-invalid-argument', 'ghp_invalid-argument-secret', 'Bearer invalid-argument-secret', 'evil_secret_value', 'unexpected_top_level']) {
+  if (malformedManyIssuesPayload.includes(leaked)) throw new Error(`malformed validation output leaked ${leaked}`);
+}
+
+const malformedSecretArgs = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: {
+    workspace_id: ws,
+    max_total_bytes: 4_000,
+    items: [{ path: 'demo.txt', ['OPENAI_API_KEY=sk-secret-malformed-name']: 'ghp_secret-malformed-value' }],
+    ['codexpro_token=secret-malformed-top-level']: 'Bearer secret-malformed-value'
+  }
+});
+const malformedSecretBytes = assertBoundedReadManyError(malformedSecretArgs, 'secret-bearing malformed arguments');
+const malformedSecretPayload = JSON.stringify(malformedSecretArgs);
+for (const leaked of ['OPENAI_API_KEY=sk-secret-malformed-name', 'ghp_secret-malformed-value', 'codexpro_token=secret-malformed-top-level', 'Bearer secret-malformed-value']) {
+  if (malformedSecretPayload.includes(leaked)) throw new Error(`malformed validation output leaked secret-bearing material: ${leaked}`);
+}
+
+const smallFourKSuccess = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: { workspace_id: ws, max_total_bytes: 4_000, items: [{ path: 'demo.txt' }] }
+});
+const smallFourKSuccessBytes = serializedToolResultBytes(smallFourKSuccess);
+if (smallFourKSuccess.isError || smallFourKSuccessBytes >= 3_000) {
+  throw new Error(`small read_many success was not comfortably below 4000 bytes: ${JSON.stringify({ bytes: smallFourKSuccessBytes, result: smallFourKSuccess })}`);
+}
+
+const nearFourKSuccess = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: { workspace_id: ws, max_total_bytes: 4_000, items: [{ path: 'read-many-near-limit.txt' }] }
+});
+const nearFourKSuccessBytes = serializedToolResultBytes(nearFourKSuccess);
+if (nearFourKSuccess.isError || nearFourKSuccessBytes < 2_500 || nearFourKSuccessBytes > 4_000) {
+  throw new Error(`near-limit read_many success did not fit its requested 4000-byte budget: ${JSON.stringify({ bytes: nearFourKSuccessBytes, result: nearFourKSuccess })}`);
+}
+
+const explicitAggregateOverflow = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: { workspace_id: ws, max_total_bytes: 4_000, items: [{ path: 'read-many-large.txt' }] }
+});
+const explicitAggregateOverflowBytes = serializedToolResultBytes(explicitAggregateOverflow);
+if (!explicitAggregateOverflow.isError || !/aggregate response exceeds/i.test(toolResultText(explicitAggregateOverflow)) || explicitAggregateOverflowBytes > 4_000) {
+  throw new Error(`read_many aggregate overflow did not preserve its bounded explicit error: ${JSON.stringify({ bytes: explicitAggregateOverflowBytes, result: explicitAggregateOverflow })}`);
+}
+
+const max100KSuccess = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: { workspace_id: ws, max_total_bytes: 100_000, items: [{ path: 'demo.txt' }] }
+});
+const max100KSuccessBytes = serializedToolResultBytes(max100KSuccess);
+if (max100KSuccess.isError || max100KSuccess.structuredContent.max_total_bytes !== 100_000 || max100KSuccessBytes > 100_000) {
+  throw new Error(`read_many max_total_bytes=100000 did not work: ${JSON.stringify({ bytes: max100KSuccessBytes, result: max100KSuccess })}`);
+}
+
+const max100KPlusOne = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: { workspace_id: ws, max_total_bytes: 100_001, items: [{ path: 'demo.txt' }] }
+});
+const max100KPlusOneBytes = assertBoundedReadManyError(max100KPlusOne, 'max_total_bytes=100001', 100_001);
+
+const readManyValidationProof = {
+  malformedItemKeysBytes,
+  malformedTopLevelKeysBytes,
+  malformedManyIssuesBytes,
+  malformedSecretBytes,
+  smallFourKSuccessBytes,
+  nearFourKSuccessBytes,
+  explicitAggregateOverflowBytes,
+  max100KSuccessBytes,
+  max100KPlusOneBytes,
+  configuredMaxOutputBytesReadManyResultBytes
+};
 const viewedImage = await client.request('tools/call', { name: 'view_image', arguments: { workspace_id: ws, path: 'pixel.png' } });
 const imagePart = viewedImage.content?.find?.((part) => part.type === 'image');
 if (!imagePart?.data || imagePart.mimeType !== 'image/png' || viewedImage.structuredContent.width !== 1 || viewedImage.structuredContent.height !== 1) {
@@ -791,8 +927,9 @@ if (
 ) {
   throw new Error(`read_many eight-file coverage or invocation proof failed: ${JSON.stringify({ individualReadCalls, batchReadCalls, results: eightFileResults })}`);
 }
-if (Buffer.byteLength(JSON.stringify(eightFileBatch), 'utf8') > 60_000) {
-  throw new Error(`read_many default response exceeded its declared 60000-byte budget: ${Buffer.byteLength(JSON.stringify(eightFileBatch), 'utf8')}`);
+const eightFileBatchBytes = serializedToolResultBytes(eightFileBatch);
+if (eightFileBatch.structuredContent.max_total_bytes !== 60_000 || eightFileBatchBytes > 60_000) {
+  throw new Error(`read_many default response exceeded its declared 60000-byte budget: ${JSON.stringify({ bytes: eightFileBatchBytes, max_total_bytes: eightFileBatch.structuredContent.max_total_bytes })}`);
 }
 
 const partialBatch = await client.request('tools/call', {
@@ -826,12 +963,12 @@ if (
 for (const [index, pattern] of [[1, /ENOENT|no such file/i], [2, /blocked/i], [3, /binary/i], [4, /too large/i], [5, /too large/i], [6, /symlink|outside workspace/i], [7, /not a file/i]]) {
   if (!pattern.test(partialResults[index].error)) throw new Error(`read_many item ${index} lost expected local error: ${partialResults[index].error}`);
 }
-await expectToolError('read_many', { workspace_id: ws, items: [] }, /at least 1/);
-await expectToolError('read_many', { workspace_id: ws, items: Array.from({ length: 33 }, () => ({ path: readManyPaths[0] })) }, /at most 32/);
-await expectToolError('read_many', { workspace_id: ws, items: [{ path: readManyPaths[0], workspace_id: ws }] }, /Unrecognized key/);
-await expectToolError('read_many', { workspace_id: ws, items: [{ path: readManyPaths[0] }], unexpected: true }, /Unrecognized key/);
+await expectToolError('read_many', { workspace_id: ws, items: [] }, /Invalid arguments for read_many/);
+await expectToolError('read_many', { workspace_id: ws, items: Array.from({ length: 33 }, () => ({ path: readManyPaths[0] })) }, /Invalid arguments for read_many/);
+await expectToolError('read_many', { workspace_id: ws, items: [{ path: readManyPaths[0], workspace_id: ws }] }, /Invalid arguments for read_many/);
+await expectToolError('read_many', { workspace_id: ws, items: [{ path: readManyPaths[0] }], unexpected: true }, /Invalid arguments for read_many/);
 await expectToolError('read_many', { workspace_id: ws, items: [{ path: 'read-many-large.txt' }], max_total_bytes: 4_000 }, /aggregate response exceeds/);
-await expectToolError('read_many', { workspace_id: ws, items: [{ path: readManyPaths[0] }], max_total_bytes: 100_001 }, /less than or equal to 100000/);
+await expectToolError('read_many', { workspace_id: ws, items: [{ path: readManyPaths[0] }], max_total_bytes: 100_001 }, /Invalid arguments for read_many/);
 await expectToolError('read_many', { workspace_id: 'ws_000000000000000000000000', items: [{ path: readManyPaths[0] }] }, /Unknown workspace_id/);
 for (const linkPath of danglingSymlinks) {
   await expectToolError('write', { workspace_id: ws, path: linkPath, content: 'escaped write\n' }, /symlink/i);
@@ -1789,4 +1926,5 @@ if (!lowerContext.content?.[0]?.text?.includes('Lowercase instruction file loade
   throw new Error('codex_context did not include lowercase agents.md content');
 }
 lowerClient.close();
+console.log(`✓ read_many closure proof ${JSON.stringify({ ...readManyValidationProof, eightFileBatchBytes })}`);
 console.log('✓ smoke test passed');

@@ -33,12 +33,37 @@ const READ_MANY_RESPONSE_FRAMING_RESERVE_BYTES = 1_024;
 const READ_MANY_MAX_PATH_CHARS = 2_000;
 const READ_MANY_MAX_ERROR_CHARS = 512;
 
-type ReadManyItem = {
-  path: string;
-  start_line?: number;
-  end_line?: number;
-  max_bytes?: number;
-};
+const READ_MANY_ITEM_SCHEMA = z.object({
+  path: z.string()
+    .min(1)
+    .max(READ_MANY_MAX_PATH_CHARS)
+    .refine((value) => value.trim().length > 0, "path must not be empty"),
+  start_line: z.number().int().min(1).optional().describe("First line to read. Default: 1."),
+  end_line: z.number().int().min(1).optional().describe("Last line to read. Default: end of file."),
+  max_bytes: z.number().int().min(1000).max(2000000).optional().describe("Maximum file bytes. Capped by server config.")
+}).strict();
+
+const READ_MANY_ARGUMENTS_SCHEMA = z.object({
+  workspace_id: z.string().optional().describe("Workspace id for the entire batch from open_workspace. Per-item workspace ids are not accepted."),
+  items: z.array(READ_MANY_ITEM_SCHEMA)
+    .min(1)
+    .max(READ_MANY_MAX_ITEMS)
+    .describe(`Non-empty ordered batch of at most ${READ_MANY_MAX_ITEMS} text-file reads.`),
+  max_total_bytes: z.number().int().min(READ_MANY_MIN_TOTAL_BYTES).max(READ_MANY_MAX_TOTAL_BYTES).optional().describe(`Hard serialized response budget in bytes. Default: ${READ_MANY_DEFAULT_MAX_TOTAL_BYTES}; minimum: ${READ_MANY_MIN_TOTAL_BYTES}; maximum: ${READ_MANY_MAX_TOTAL_BYTES}.`)
+}).strict();
+
+// The MCP SDK validates tool arguments before invoking the handler. Keep this
+// transport envelope permissive so high-cardinality unknown keys cannot be
+// expanded into an SDK-generated validation result. READ_MANY_ARGUMENTS_SCHEMA
+// below remains the strict source of truth and is formatted by RepoConnect.
+const READ_MANY_TRANSPORT_SCHEMA = z.object({
+  workspace_id: z.unknown().optional().describe("Workspace id for the entire batch from open_workspace."),
+  items: z.unknown().optional().describe(`Ordered batch of at most ${READ_MANY_MAX_ITEMS} text-file reads.`),
+  max_total_bytes: z.unknown().optional().describe(`Serialized response budget in bytes. Default: ${READ_MANY_DEFAULT_MAX_TOTAL_BYTES}; minimum: ${READ_MANY_MIN_TOTAL_BYTES}; maximum: ${READ_MANY_MAX_TOTAL_BYTES}.`)
+}).passthrough();
+
+type ReadManyItem = z.infer<typeof READ_MANY_ITEM_SCHEMA>;
+type ReadManyArguments = z.infer<typeof READ_MANY_ARGUMENTS_SCHEMA>;
 
 type ReadManyResult =
   | { index: number; path: string; ok: true; result: ReadFileResult }
@@ -48,6 +73,37 @@ function boundedReadManyError(error: unknown): string {
   const value = errorText(error);
   if (value.length <= READ_MANY_MAX_ERROR_CHARS) return value;
   return `${value.slice(0, READ_MANY_MAX_ERROR_CHARS - 20)}...[error truncated]`;
+}
+
+function boundedReadManyValidationError(issues: readonly z.ZodIssue[]): CodexProError {
+  const categories = new Set<string>();
+  for (const issue of issues) {
+    switch (issue.code) {
+      case "unrecognized_keys":
+        categories.add("unexpected keys");
+        break;
+      case "invalid_type":
+        categories.add("invalid field types");
+        break;
+      case "too_small":
+        categories.add("values below allowed limits");
+        break;
+      case "too_big":
+        categories.add("values above allowed limits");
+        break;
+      default:
+        categories.add("schema constraints");
+        break;
+    }
+  }
+  const summary = categories.size > 0 ? [...categories].join(", ") : "schema constraints";
+  return new CodexProError(`Invalid arguments for read_many: ${summary}. Unknown keys and invalid values are rejected.`);
+}
+
+function parseReadManyArguments(args: unknown): ReadManyArguments {
+  const parsed = READ_MANY_ARGUMENTS_SCHEMA.safeParse(args ?? {});
+  if (parsed.success) return parsed.data;
+  throw boundedReadManyValidationError(parsed.error.issues);
 }
 
 function readManyText(workspace: Workspace, results: ReadManyResult[], maxTotalBytes: number): string {
@@ -2014,21 +2070,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Read Many",
       description: `Read 1-${READ_MANY_MAX_ITEMS} bounded text files in input order by composing read. Each item may set start_line, end_line, and max_bytes using read's semantics. Item failures are isolated with {index,path,error}; the request has a ${READ_MANY_DEFAULT_MAX_TOTAL_BYTES}-byte default and ${READ_MANY_MAX_TOTAL_BYTES}-byte maximum serialized response budget including a ${READ_MANY_RESPONSE_FRAMING_RESERVE_BYTES}-byte framing reserve (lowered by maxOutputBytes when configured).`,
-      inputSchema: z.object({
-        workspace_id: z.string().optional().describe("Workspace id for the entire batch from open_workspace. Per-item workspace ids are not accepted."),
-        items: z.array(
-          z.object({
-            path: z.string()
-              .min(1)
-              .max(READ_MANY_MAX_PATH_CHARS)
-              .refine((value) => value.trim().length > 0, "path must not be empty"),
-            start_line: z.number().int().min(1).optional().describe("First line to read. Default: 1."),
-            end_line: z.number().int().min(1).optional().describe("Last line to read. Default: end of file."),
-            max_bytes: z.number().int().min(1000).max(2000000).optional().describe("Maximum file bytes. Capped by server config.")
-          }).strict()
-        ).min(1).max(READ_MANY_MAX_ITEMS).describe(`Non-empty ordered batch of at most ${READ_MANY_MAX_ITEMS} text-file reads.`),
-        max_total_bytes: z.number().int().min(READ_MANY_MIN_TOTAL_BYTES).max(READ_MANY_MAX_TOTAL_BYTES).optional().describe(`Hard serialized response budget in bytes. Default: ${READ_MANY_DEFAULT_MAX_TOTAL_BYTES}; minimum: ${READ_MANY_MIN_TOTAL_BYTES}; maximum: ${READ_MANY_MAX_TOTAL_BYTES}.`)
-      }).strict(),
+      inputSchema: READ_MANY_TRANSPORT_SCHEMA,
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
         ...toolCardMeta(),
@@ -2037,15 +2079,16 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       }
     },
     async (args) => {
-      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const validatedArgs = parseReadManyArguments(args);
+      const workspace = workspaces.getWorkspace(validatedArgs.workspace_id);
       const configuredMaxTotalBytes = Math.min(READ_MANY_MAX_TOTAL_BYTES, config.maxOutputBytes);
-      const requestedMaxTotalBytes = args.max_total_bytes ?? Math.min(READ_MANY_DEFAULT_MAX_TOTAL_BYTES, configuredMaxTotalBytes);
+      const requestedMaxTotalBytes = validatedArgs.max_total_bytes ?? Math.min(READ_MANY_DEFAULT_MAX_TOTAL_BYTES, configuredMaxTotalBytes);
       if (requestedMaxTotalBytes > configuredMaxTotalBytes) {
         throw new CodexProError(`max_total_bytes (${requestedMaxTotalBytes}) exceeds the configured read_many response limit (${configuredMaxTotalBytes} bytes).`);
       }
 
       const results: ReadManyResult[] = [];
-      for (const [index, item] of (args.items as ReadManyItem[]).entries()) {
+      for (const [index, item] of validatedArgs.items.entries()) {
         let result: ReadManyResult;
         try {
           const readResult = await readTextFile(config, guard, workspace, item.path, {
