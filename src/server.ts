@@ -1039,27 +1039,37 @@ function runtimeStatusPayload(config: CodexProConfig): Record<string, unknown> {
     failure = null;
   }
 
-  const launcherPid = typeof runtime.pid === "number" ? runtime.pid : null;
+  const persistedLauncherPid = typeof runtime.pid === "number" ? runtime.pid : null;
+  const persistedHttpPid = typeof runtime.runtimePid === "number" ? runtime.runtimePid : null;
+  const isHttpChild = persistedHttpPid === process.pid || process.env.CODEXPRO_RUNTIME_KIND === "http";
+  // A durable record becomes current-run metadata only when it identifies this
+  // HTTP child and its actual live launcher parent. A live PID by itself is not
+  // ownership proof (it may belong to an unrelated process or a reused PID).
+  const runtimeOwnedByCurrentHttpProcess = isHttpChild
+    && persistedHttpPid === process.pid
+    && persistedLauncherPid === process.ppid
+    && processIsAlive(process.ppid);
+  const trustedRuntime = runtimeOwnedByCurrentHttpProcess ? runtime : {};
+  const launcherPid = runtimeOwnedByCurrentHttpProcess ? persistedLauncherPid : null;
   const launcherMatchesParent = launcherPid !== null && launcherPid === process.ppid;
-  const isHttpChild = runtime.runtimePid === process.pid || process.env.CODEXPRO_RUNTIME_KIND === "http";
   const launcherStatus = launcherPid === null
     ? "unknown"
     : launcherMatchesParent && processIsAlive(launcherPid)
       ? "running"
       : "unknown";
-  const tunnelPid = typeof runtime.tunnelPid === "number" ? runtime.tunnelPid : null;
-  const tunnelType = String(runtime.tunnel ?? process.env.CODEXPRO_TUNNEL ?? "unknown");
+  const tunnelPid = typeof trustedRuntime.tunnelPid === "number" ? trustedRuntime.tunnelPid : null;
+  const tunnelType = String(trustedRuntime.tunnel ?? process.env.CODEXPRO_TUNNEL ?? "unknown");
   const tunnelStatus = tunnelPid !== null && launcherMatchesParent
     ? processIsAlive(tunnelPid) ? "running" : "stopped"
-    : launcherMatchesParent && runtime.tunnel
-      ? String(runtime.tunnelStatus ?? "unknown")
+    : launcherMatchesParent && trustedRuntime.tunnel
+      ? String(trustedRuntime.tunnelStatus ?? "unknown")
       : "unknown";
-  const startedAt = typeof runtime.startedAt === "string" && runtime.startedAt ? runtime.startedAt : null;
+  const startedAt = typeof trustedRuntime.startedAt === "string" && trustedRuntime.startedAt ? trustedRuntime.startedAt : null;
   const startedMs = startedAt ? Date.parse(startedAt) : Number.NaN;
   const uptimeSeconds = Number.isFinite(startedMs)
     ? Math.max(0, Math.floor((Date.now() - startedMs) / 1000))
     : Math.max(0, Math.floor(process.uptime()));
-  const currentRunId = typeof runtime.runId === "string" && runtime.runId ? runtime.runId : null;
+  const currentRunId = typeof trustedRuntime.runId === "string" && trustedRuntime.runId ? trustedRuntime.runId : null;
   const failureRunId = typeof failure?.runId === "string" && failure.runId ? failure.runId : null;
   const failureRelation = failure
     ? currentRunId && failureRunId === currentRunId ? "current" : "previous"
@@ -1108,7 +1118,7 @@ function runtimeStatusPayload(config: CodexProConfig): Record<string, unknown> {
     uptime_seconds: uptimeSeconds,
     endpoint: `http://${config.host}:${config.port}/mcp`,
     mode: process.env.CODEXPRO_MODE ?? "unknown",
-    headless: typeof runtime.headless === "boolean" ? runtime.headless : null,
+    headless: typeof trustedRuntime.headless === "boolean" ? trustedRuntime.headless : null,
     last_failure: lastFailure,
     last_failure_relation: failureRelation
   };
