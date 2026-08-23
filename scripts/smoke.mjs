@@ -250,6 +250,57 @@ for (const expected of ['server_config', 'runtime_status', 'codexpro_self_test',
 }
 const toolCardUri = 'ui://widget/codexpro-tool-card-v10.html';
 const toolsByName = new Map(tools.tools.map((tool) => [tool.name, tool]));
+function resolveJsonSchema(root, schema) {
+  let current = schema;
+  const seen = new Set();
+  while (current?.$ref) {
+    if (seen.has(current.$ref)) throw new Error(`cyclic JSON schema reference: ${current.$ref}`);
+    seen.add(current.$ref);
+    if (!current.$ref.startsWith('#/')) throw new Error(`unsupported JSON schema reference: ${current.$ref}`);
+    current = current.$ref.slice(2).split('/').reduce((value, key) => value?.[key.replace(/~1/g, '/').replace(/~0/g, '~')], root);
+  }
+  return current;
+}
+const readManyInputSchema = toolsByName.get('read_many')?.inputSchema;
+const readManySchema = resolveJsonSchema(readManyInputSchema, readManyInputSchema);
+const readManyItemSchema = resolveJsonSchema(readManyInputSchema, readManySchema?.properties?.items?.items);
+if (
+  readManySchema?.type !== 'object' ||
+  readManySchema?.additionalProperties !== false ||
+  JSON.stringify(Object.keys(readManySchema.properties ?? {}).sort()) !== JSON.stringify(['items', 'max_total_bytes', 'workspace_id']) ||
+  JSON.stringify(readManySchema.required ?? []) !== JSON.stringify(['items'])
+) {
+  throw new Error(`read_many tools/list top-level schema was not the accepted strict object: ${JSON.stringify(readManySchema)}`);
+}
+if (
+  readManySchema.properties.workspace_id?.type !== 'string' ||
+  readManySchema.required.includes('workspace_id') ||
+  readManySchema.properties.items?.type !== 'array' ||
+  readManySchema.properties.items?.minItems !== 1 ||
+  readManySchema.properties.items?.maxItems !== 32 ||
+  readManySchema.properties.max_total_bytes?.type !== 'integer' ||
+  readManySchema.properties.max_total_bytes?.minimum !== 4000 ||
+  readManySchema.properties.max_total_bytes?.maximum !== 100000 ||
+  readManySchema.required.includes('max_total_bytes')
+) {
+  throw new Error(`read_many tools/list top-level fields were not truthful: ${JSON.stringify(readManySchema)}`);
+}
+if (
+  readManyItemSchema?.type !== 'object' ||
+  readManyItemSchema?.additionalProperties !== false ||
+  JSON.stringify(Object.keys(readManyItemSchema.properties ?? {}).sort()) !== JSON.stringify(['end_line', 'max_bytes', 'path', 'start_line']) ||
+  JSON.stringify(readManyItemSchema.required ?? []) !== JSON.stringify(['path']) ||
+  readManyItemSchema.properties.path?.type !== 'string' ||
+  readManyItemSchema.properties.start_line?.type !== 'integer' ||
+  readManyItemSchema.properties.start_line?.minimum !== 1 ||
+  readManyItemSchema.properties.end_line?.type !== 'integer' ||
+  readManyItemSchema.properties.end_line?.minimum !== 1 ||
+  readManyItemSchema.properties.max_bytes?.type !== 'integer' ||
+  readManyItemSchema.properties.max_bytes?.minimum !== 1000 ||
+  readManyItemSchema.properties.max_bytes?.maximum !== 2000000
+) {
+  throw new Error(`read_many tools/list item schema was not the accepted strict object: ${JSON.stringify(readManyItemSchema)}`);
+}
 function hasWidgetMeta(name) {
   const meta = toolsByName.get(name)?._meta ?? {};
   return meta.ui?.resourceUri === toolCardUri && meta['openai/outputTemplate'] === toolCardUri;
@@ -545,6 +596,17 @@ const malformedTopLevelKeysBytes = assertBoundedReadManyError(malformedTopLevelK
 if (JSON.stringify(malformedTopLevelKeys).includes('top_evil_')) {
   throw new Error('high-cardinality top-level validation echoed arbitrary unknown key names');
 }
+const wrappedMalformedTopLevelKeys = await client.request('tools/call', {
+  name: 'codexpro',
+  arguments: { action: 'read_many', args: highCardinalityTopLevel }
+});
+const wrappedMalformedTopLevelKeysBytes = assertBoundedReadManyError(wrappedMalformedTopLevelKeys, 'high-cardinality top-level keys through codexpro wrapper');
+if (
+  JSON.stringify(wrappedMalformedTopLevelKeys).includes('top_evil_') ||
+  toolResultText(wrappedMalformedTopLevelKeys) !== toolResultText(malformedTopLevelKeys)
+) {
+  throw new Error(`codexpro wrapper malformed read_many parity failed: ${JSON.stringify({ direct: malformedTopLevelKeys, wrapped: wrappedMalformedTopLevelKeys })}`);
+}
 
 const malformedManyIssues = await client.request('tools/call', {
   name: 'read_many',
@@ -584,6 +646,21 @@ const smallFourKSuccessBytes = serializedToolResultBytes(smallFourKSuccess);
 if (smallFourKSuccess.isError || smallFourKSuccessBytes >= 3_000) {
   throw new Error(`small read_many success was not comfortably below 4000 bytes: ${JSON.stringify({ bytes: smallFourKSuccessBytes, result: smallFourKSuccess })}`);
 }
+const wrappedSmallFourKSuccess = await client.request('tools/call', {
+  name: 'codexpro',
+  arguments: {
+    action: 'read_many',
+    args: { workspace_id: ws, max_total_bytes: 4_000, items: [{ path: 'demo.txt' }] }
+  }
+});
+if (wrappedSmallFourKSuccess.isError) {
+  throw new Error(`codexpro wrapper valid read_many call failed: ${JSON.stringify(wrappedSmallFourKSuccess)}`);
+}
+for (const key of ['workspace_id', 'max_total_bytes', 'item_count', 'results']) {
+  if (JSON.stringify(wrappedSmallFourKSuccess.structuredContent?.[key]) !== JSON.stringify(smallFourKSuccess.structuredContent?.[key])) {
+    throw new Error(`codexpro wrapper valid read_many parity lost ${key}: ${JSON.stringify({ direct: smallFourKSuccess.structuredContent?.[key], wrapped: wrappedSmallFourKSuccess.structuredContent?.[key] })}`);
+  }
+}
 
 const nearFourKSuccess = await client.request('tools/call', {
   name: 'read_many',
@@ -621,6 +698,7 @@ const max100KPlusOneBytes = assertBoundedReadManyError(max100KPlusOne, 'max_tota
 const readManyValidationProof = {
   malformedItemKeysBytes,
   malformedTopLevelKeysBytes,
+  wrappedMalformedTopLevelKeysBytes,
   malformedManyIssuesBytes,
   malformedSecretBytes,
   smallFourKSuccessBytes,

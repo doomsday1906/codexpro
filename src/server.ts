@@ -62,6 +62,14 @@ const READ_MANY_TRANSPORT_SCHEMA = z.object({
   max_total_bytes: z.unknown().optional().describe(`Serialized response budget in bytes. Default: ${READ_MANY_DEFAULT_MAX_TOTAL_BYTES}; minimum: ${READ_MANY_MIN_TOTAL_BYTES}; maximum: ${READ_MANY_MAX_TOTAL_BYTES}.`)
 }).passthrough();
 
+// The SDK uses one schema for both tools/list JSON conversion and tools/call
+// validation. Publish the strict shape while delegating SDK validation to the
+// permissive transport envelope; RepoConnect then applies the bounded strict
+// READ_MANY_ARGUMENTS_SCHEMA parser in the handler path.
+const READ_MANY_PUBLIC_SCHEMA = z.object(READ_MANY_ARGUMENTS_SCHEMA.shape).strict();
+READ_MANY_PUBLIC_SCHEMA.safeParse = ((args: unknown) => READ_MANY_TRANSPORT_SCHEMA.safeParse(args)) as typeof READ_MANY_PUBLIC_SCHEMA.safeParse;
+READ_MANY_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => READ_MANY_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof READ_MANY_PUBLIC_SCHEMA.safeParseAsync;
+
 type ReadManyItem = z.infer<typeof READ_MANY_ITEM_SCHEMA>;
 type ReadManyArguments = z.infer<typeof READ_MANY_ARGUMENTS_SCHEMA>;
 
@@ -223,7 +231,7 @@ function errorResult(error: unknown): any {
 }
 
 function validateToolArgs(name: string, options: Record<string, unknown>, args: unknown): any {
-  const inputSchema = options.inputSchema;
+  const inputSchema = options.runtimeInputSchema ?? options.inputSchema;
   if (
     inputSchema &&
     typeof inputSchema === "object" &&
@@ -441,13 +449,14 @@ function registerToolCompat(
     }
   };
 
+  const { runtimeInputSchema: _runtimeInputSchema, ...descriptorOptions } = options;
   const securitySchemes = [{ type: "noauth" }];
   const fullOptions: Record<string, unknown> = {
     securitySchemes,
-    ...options,
+    ...descriptorOptions,
     _meta: {
       securitySchemes,
-      ...(options._meta as Record<string, unknown> | undefined)
+      ...(descriptorOptions._meta as Record<string, unknown> | undefined)
     }
   };
 
@@ -2070,7 +2079,8 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Read Many",
       description: `Read 1-${READ_MANY_MAX_ITEMS} bounded text files in input order by composing read. Each item may set start_line, end_line, and max_bytes using read's semantics. Item failures are isolated with {index,path,error}; the request has a ${READ_MANY_DEFAULT_MAX_TOTAL_BYTES}-byte default and ${READ_MANY_MAX_TOTAL_BYTES}-byte maximum serialized response budget including a ${READ_MANY_RESPONSE_FRAMING_RESERVE_BYTES}-byte framing reserve (lowered by maxOutputBytes when configured).`,
-      inputSchema: READ_MANY_TRANSPORT_SCHEMA,
+      inputSchema: READ_MANY_PUBLIC_SCHEMA,
+      runtimeInputSchema: READ_MANY_TRANSPORT_SCHEMA,
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
         ...toolCardMeta(),
