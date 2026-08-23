@@ -24,19 +24,27 @@ export function redactDiagnosticText(text: string): string {
   return policyRedactDiagnosticText(text);
 }
 
-export function truncateUtf8(text: string, maxBytes: number, suffix = ""): string {
-  return policyTruncateUtf8(text, maxBytes, suffix);
-}
+type RedactStructuredOptions = { context?: RedactionContext };
 
-export function redactStructured<T>(value: T, depth = 0): T {
-  if (depth > 8) return value;
-  if (typeof value === "string") return redactSensitiveText(value) as T;
+export function redactStructured<T>(value: T, optionsOrDepth: RedactStructuredOptions | number = {}, depth = 0): T {
+  const context = typeof optionsOrDepth === "number" ? "source" : optionsOrDepth.context ?? "source";
+  const currentDepth = typeof optionsOrDepth === "number" ? optionsOrDepth : depth;
+  if (currentDepth > 8) return value;
+  if (typeof value === "string") return redactSensitiveText(value, { context }) as T;
   if (!value || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map((item) => redactStructured(item, depth + 1)) as T;
+  if (Array.isArray(value)) return value.map((item) => redactStructured(item, { context }, currentDepth + 1)) as T;
 
   const out: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value)) {
-    out[key] = redactStructured(item, depth + 1);
+    out[key] = redactStructured(item, { context }, currentDepth + 1);
   }
   return out as T;
+}
+
+export function redactDiagnosticStructured<T>(value: T): T {
+  return redactStructured(value, { context: "diagnostic" });
+}
+
+export function truncateUtf8(text: string, maxBytes: number, suffix = ""): string {
+  return policyTruncateUtf8(text, maxBytes, suffix);
 }

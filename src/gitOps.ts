@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, PathGuard } from "./guard.js";
-import { redactSensitiveText } from "./redact.js";
+import { redactDiagnosticText, redactSensitiveText } from "./redact.js";
 
 function runGit(workspace: Workspace, args: string[], maxOutputBytes: number): string {
   const result = spawnSync("git", args, {
@@ -12,12 +12,12 @@ function runGit(workspace: Workspace, args: string[], maxOutputBytes: number): s
     env: { ...process.env, NO_COLOR: "1" }
   });
   if (result.error) {
-    return `git unavailable or failed: ${result.error.message}`;
+    return redactDiagnosticText(`git unavailable or failed: ${result.error.message}`);
   }
   if (result.status !== 0) {
     const stderr = result.stderr?.trim() || "";
     const stdout = result.stdout?.trim() || "";
-    return stderr || stdout || `git exited with status ${result.status}`;
+    return redactDiagnosticText(stderr || stdout || `git exited with status ${result.status}`);
   }
   return redactSensitiveText(result.stdout.trim() || "(no output)");
 }

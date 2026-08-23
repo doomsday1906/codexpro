@@ -5,7 +5,7 @@ import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, PathGuard } from "./guard.js";
 import { listFiles, textScanByteLimit } from "./fsOps.js";
-import { redactSensitiveText } from "./redact.js";
+import { redactDiagnosticText, redactSensitiveText } from "./redact.js";
 import { searchWorkspaceStructured, type AnalysisSearchIntent, type StructuredSearchResult } from "./analysis/index.js";
 
 export interface SearchOptions {
@@ -200,7 +200,7 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
       groups: { definitions: [], references: [], tests: [], configuration: [], documentation: [], other: [] },
       matches: [],
       coverage: { inventoryFiles: 0, analyzedFiles: 0, scannedBytes: 0, symbolCount: 0, relationshipCount: 0, truncated: true, warnings: [] },
-      warnings: [`Repository analysis unavailable: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}`],
+      warnings: [`Repository analysis unavailable: ${redactDiagnosticText(error instanceof Error ? error.message : String(error))}`],
       cache: { hit: false, key: "unavailable" }
     };
   }

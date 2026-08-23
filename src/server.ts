@@ -18,7 +18,7 @@ import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
 import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
-import { hasSecretValue, redactDiagnosticText, redactSensitiveText, redactStructured, truncateUtf8 } from "./redact.js";
+import { hasSecretValue, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactStructured, truncateUtf8 } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
@@ -169,8 +169,8 @@ function serializedReadManyResponseBytes(response: any): number {
 }
 
 function errorText(error: unknown): string {
-  if (error instanceof Error) return redactSensitiveText(`${error.name}: ${error.message}`);
-  return redactSensitiveText(String(error));
+  if (error instanceof Error) return redactDiagnosticText(`${error.name}: ${error.message}`);
+  return redactDiagnosticText(String(error));
 }
 
 function compactStructuredContent<T>(value: T, depth = 0): T {
@@ -195,6 +195,28 @@ function textResult(text: string, structuredContent: Record<string, unknown> = {
     structuredContent: redactStructured(structuredContent),
     _meta: meta
   };
+}
+
+function diagnosticResult(result: any): any {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const safe = { ...result };
+  if (Array.isArray(safe.content)) {
+    safe.content = safe.content.map((part: any) => {
+      if (!part || typeof part !== "object" || typeof part.text !== "string") return part;
+      return { ...part, text: redactDiagnosticText(part.text) };
+    });
+  }
+  if ("structuredContent" in safe) safe.structuredContent = redactDiagnosticStructured(safe.structuredContent);
+  if ("_meta" in safe) safe._meta = redactDiagnosticStructured(safe._meta);
+  return safe;
+}
+
+function diagnosticTextResult(text: string, structuredContent: Record<string, unknown> = {}, meta: Record<string, unknown> = {}): any {
+  return diagnosticResult({
+    content: [{ type: "text", text }],
+    structuredContent,
+    _meta: meta
+  });
 }
 
 function countTextLines(value: string | undefined): number {
@@ -224,10 +246,10 @@ function bashTextResult(config: CodexProConfig, result: Awaited<ReturnType<typeo
 }
 
 function errorResult(error: unknown): any {
+  const message = errorText(error);
   return {
     isError: true,
-    content: [{ type: "text", text: errorText(error) }],
-    structuredContent: { error: errorText(error) }
+    ...diagnosticTextResult(message, { error: message })
   };
 }
 
@@ -841,7 +863,7 @@ async function applyWorkspacePatch(
       env: { ...process.env, NO_COLOR: "1" }
     });
     if (check.error || check.status !== 0) {
-      throw new CodexProError(redactSensitiveText(check.stderr?.trim() || check.stdout?.trim() || check.error?.message || "git apply --check failed"));
+      throw new CodexProError(redactDiagnosticText(check.stderr?.trim() || check.stdout?.trim() || check.error?.message || "git apply --check failed"));
     }
 
     const applied = spawnSync("git", ["apply", "--whitespace=nowarn"], {
@@ -852,15 +874,15 @@ async function applyWorkspacePatch(
       env: { ...process.env, NO_COLOR: "1" }
     });
     if (applied.error || applied.status !== 0) {
-      throw new CodexProError(redactSensitiveText(applied.stderr?.trim() || applied.stdout?.trim() || applied.error?.message || "git apply failed"));
+      throw new CodexProError(redactDiagnosticText(applied.stderr?.trim() || applied.stdout?.trim() || applied.error?.message || "git apply failed"));
     }
 
     const diff = redactSensitiveText(patch.trimEnd());
     const stats = diffStats(diff);
     return {
       paths,
-      stdout: redactSensitiveText(applied.stdout?.trim() || ""),
-      stderr: redactSensitiveText(applied.stderr?.trim() || ""),
+      stdout: redactDiagnosticText(applied.stdout?.trim() || ""),
+      stderr: redactDiagnosticText(applied.stderr?.trim() || ""),
       diff,
       additions: stats.additions,
       deletions: stats.deletions,
@@ -2416,7 +2438,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         sessionId: args.session_id
       });
       const text = bashTextResult(config, result);
-      return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result, bash_session_id: result.bashSessionId ?? null });
+      return diagnosticTextResult(text, { workspace_id: workspace.id, root: workspace.root, ...result, bash_session_id: result.bashSessionId ?? null });
     }
   );
 

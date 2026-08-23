@@ -1,5 +1,5 @@
 import type { PathGuard, Workspace } from "../guard.js";
-import { redactSensitiveText } from "../redact.js";
+import { redactDiagnosticText } from "../redact.js";
 import type { AnalysisProvider } from "./types.js";
 
 const providers = new Map<string, AnalysisProvider>();
@@ -20,7 +20,7 @@ export function normalizeProviderPaths(guard: PathGuard, workspace: Workspace, p
     try {
       valid.push(guard.resolve(workspace, candidate).relPath);
     } catch (error) {
-      warnings.push(redactSensitiveText(`Provider path rejected: ${error instanceof Error ? error.message : String(error)}`));
+      warnings.push(redactDiagnosticText(`Provider path rejected: ${error instanceof Error ? error.message : String(error)}`));
     }
   }
   return { paths: [...new Set(valid)], warnings };
