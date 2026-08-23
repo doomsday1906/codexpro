@@ -1174,54 +1174,79 @@ function spawnLogged(name, command, args, options = {}) {
   child.codexproKillTree = Boolean(invocation.killTree);
   const logLines = [];
   const streamState = new Map([
-    ['stdout', { pending: '', overflowing: false }],
-    ['stderr', { pending: '', overflowing: false }]
+    ['stdout', { pending: '', pendingBytes: 0, overflowing: false }],
+    ['stderr', { pending: '', pendingBytes: 0, overflowing: false }]
   ]);
+  const boundedRecord = (value) => {
+    const text = String(value ?? '');
+    const buffer = Buffer.from(text, 'utf8');
+    if (buffer.byteLength <= SPAWN_LOG_PENDING_MAX_BYTES) return text;
+    const marker = `...[${name} diagnostic stream record truncated]\n`;
+    const markerBytes = Buffer.byteLength(marker, 'utf8');
+    const prefixBytes = Math.max(0, SPAWN_LOG_PENDING_MAX_BYTES - markerBytes);
+    return `${buffer.subarray(0, prefixBytes).toString('utf8')}${marker}`;
+  };
   const emitRecord = (stream, record) => {
-    const text = redactForLog(record);
+    const text = boundedRecord(redactForLog(record));
     if (text) {
-      logLines.push(...text.split(/\r?\n/).filter(Boolean).map((line) => `[${name}] ${line}`));
+      const labeled = boundedRecord(`[${name}] ${text}`);
+      logLines.push(...labeled.split(/\r?\n/).filter(Boolean));
       while (logLines.length > 120) logLines.shift();
+      if (verbose) stream.write(labeled);
     }
-    if (verbose && text) stream.write(`[${name}] ${text}`);
   };
   const record = (streamName, stream, chunk) => {
     const state = streamState.get(streamName);
     if (!state) return;
     let incoming = String(chunk);
-    if (state.overflowing) {
-      const newline = incoming.indexOf('\n');
-      if (newline < 0) return;
-      state.overflowing = false;
-      incoming = incoming.slice(newline + 1);
-    }
-    state.pending += incoming;
-    while (true) {
-      const newline = state.pending.indexOf('\n');
-      if (newline < 0) break;
-      const line = state.pending.slice(0, newline + 1);
-      state.pending = state.pending.slice(newline + 1);
-      emitRecord(stream, redactForLog(line));
-    }
-    if (Buffer.byteLength(state.pending, 'utf8') > SPAWN_LOG_PENDING_MAX_BYTES) {
-      emitRecord(stream, `...[${name} diagnostic stream record truncated]\n`);
+    let offset = 0;
+    const enterOverflow = () => {
+      if (!state.overflowing) emitRecord(stream, `...[${name} diagnostic stream record truncated]\n`);
       state.pending = '';
+      state.pendingBytes = 0;
       state.overflowing = true;
+    };
+    while (offset < incoming.length) {
+      if (state.overflowing) {
+        const newline = incoming.indexOf('\n', offset);
+        if (newline < 0) return;
+        state.overflowing = false;
+        offset = newline + 1;
+        continue;
+      }
+      const newline = incoming.indexOf('\n', offset);
+      const end = newline < 0 ? incoming.length : newline + 1;
+      const piece = incoming.slice(offset, end);
+      const pieceBytes = Buffer.byteLength(piece, 'utf8');
+      if (state.pendingBytes + pieceBytes > SPAWN_LOG_PENDING_MAX_BYTES) {
+        enterOverflow();
+        offset = newline < 0 ? incoming.length : newline + 1;
+        continue;
+      }
+      state.pending += piece;
+      state.pendingBytes += pieceBytes;
+      offset = end;
+      if (newline >= 0) {
+        emitRecord(stream, state.pending);
+        state.pending = '';
+        state.pendingBytes = 0;
+      }
     }
   };
   const flushPending = () => {
     for (const [streamName, state] of streamState) {
       if (state.pending) {
         const stream = streamName === 'stdout' ? process.stdout : process.stderr;
-        emitRecord(stream, redactForLog(state.pending));
+        emitRecord(stream, state.pending);
         state.pending = '';
+        state.pendingBytes = 0;
       }
     }
   };
   child.codexproLogTail = () => {
     const pendingLines = [...streamState.values()]
       .filter((state) => state.pending)
-      .map((state) => redactForLog(state.pending))
+      .map((state) => boundedRecord(redactForLog(state.pending)))
       .filter(Boolean)
       .join('\n');
     return pendingLines ? [...logLines, pendingLines].join('\n') : logLines.join('\n');
@@ -1533,6 +1558,10 @@ function shellCommandPreview(parts) {
 const LAUNCHER_REFERENCE_CALL = '[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*\\s*\\([^;\\r\\n]*\\)';
 const LAUNCHER_CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(`\\b(?:codexpro_token|[A-Za-z][A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64})\\s*=\\s*(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|\\x60[^\\x60\\r\\n]*\\x60|${LAUNCHER_REFERENCE_CALL}|[^\\s"'\\x60<>]+)`, 'gi');
 const LAUNCHER_CREDENTIAL_FIELD_PATTERN = new RegExp(`(["']?(?:codexpro_token|[A-Za-z][A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64})["']?\\s*:\\s*)(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|\\x60[^\\x60\\r\\n]*\\x60|${LAUNCHER_REFERENCE_CALL}|[A-Za-z0-9_./+=-]+)`, 'gi');
+const LAUNCHER_CREDENTIAL_LABEL = `[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}`;
+const LAUNCHER_CREDENTIAL_VALUE = `(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|\\x60[^\\x60\\r\\n]*\\x60|${LAUNCHER_REFERENCE_CALL}|[^\\s"'\\x60<>]+)`;
+const LAUNCHER_SEMANTIC_CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(`\\b(${LAUNCHER_CREDENTIAL_LABEL}\\s*=\\s*)${LAUNCHER_CREDENTIAL_VALUE}`, 'gi');
+const LAUNCHER_SEMANTIC_CREDENTIAL_FIELD_PATTERN = new RegExp(`(["']?${LAUNCHER_CREDENTIAL_LABEL}["']?\\s*:\\s*)${LAUNCHER_CREDENTIAL_VALUE}`, 'gi');
 const LAUNCHER_LONG_CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(`\\b[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}\\s*=\\s*(?:"[^"\\r\\n]{12,512}"|'[^'\\r\\n]{12,512}'|\\x60[^\\x60\\r\\n]{12,512}\\x60|[A-Za-z0-9_./+=-]{20,512})`, 'gi');
 const LAUNCHER_LONG_CREDENTIAL_FIELD_PATTERN = /(["']?[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}["']?\s*:\s*)(?:"[^"\r\n]{12,512}"|'[^'\r\n]{12,512}'|`[^`\r\n]{12,512}`|[A-Za-z0-9_./+=-]{20,512})/gi;
 
@@ -1543,10 +1572,11 @@ function launcherIsPlaceholderSecret(value) {
 
 function launcherIsReferenceExpression(value) {
   const normalized = String(value).trim().replace(/[;,]+$/, '').trim();
-  if (!normalized || /["'`]/.test(normalized)) return false;
+  if (!normalized) return false;
+  if (/^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\s*\([^;\r\n]*\)$/.test(normalized)) return true;
+  if (/["'`]/.test(normalized)) return false;
   const memberReference = normalized.match(/^([A-Za-z_$][A-Za-z0-9_$]*)\.(?:[A-Za-z_$][A-Za-z0-9_$]*\.)*[A-Za-z_$][A-Za-z0-9_$]*$/);
-  return (memberReference && /^(?:config|credentials|process|env|settings|secrets|options|runtime|context|this|import|os)$/i.test(memberReference[1]))
-    || /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\s*\([^;\r\n]*\)$/.test(normalized);
+  return Boolean(memberReference && /^(?:config|credentials|process|env|settings|secrets|options|runtime|context|this|import|os)$/i.test(memberReference[1]));
 }
 
 function launcherCredentialValue(match) {
@@ -1573,6 +1603,8 @@ function redactForLog(value) {
     .replace(/\b(Authorization\s*:\s*)[^\r\n]*/gi, '$1[REDACTED_SECRET]')
     .replace(/\b((?:https?|wss?):\/\/)[^/\s:@]+:[^@\s/]+@/gi, '$1[REDACTED_SECRET]@')
     .replace(/([?&](?:codexpro_token|token|access_token|auth_token|api[_-]?key)=)[^&\s"'`<>]+/gi, '$1[REDACTED_SECRET]')
+    .replace(LAUNCHER_SEMANTIC_CREDENTIAL_ASSIGNMENT_PATTERN, (match) => launcherIsPlaceholderSecret(match) || !launcherShouldRedactCredential(match) ? match : launcherRedactAssignment(match))
+    .replace(LAUNCHER_SEMANTIC_CREDENTIAL_FIELD_PATTERN, (match, prefix) => launcherIsPlaceholderSecret(match) || !launcherShouldRedactCredential(match) ? match : `${prefix}[REDACTED_SECRET]`)
     .replace(LAUNCHER_CREDENTIAL_ASSIGNMENT_PATTERN, (match) => launcherIsPlaceholderSecret(match) || !launcherShouldRedactCredential(match) ? match : launcherRedactAssignment(match))
     .replace(LAUNCHER_CREDENTIAL_FIELD_PATTERN, (match, prefix) => launcherIsPlaceholderSecret(match) || !launcherShouldRedactCredential(match) ? match : `${prefix}[REDACTED_SECRET]`)
     .replace(LAUNCHER_LONG_CREDENTIAL_ASSIGNMENT_PATTERN, (match) => launcherIsPlaceholderSecret(match) || !launcherShouldRedactCredential(match) ? match : launcherRedactAssignment(match))

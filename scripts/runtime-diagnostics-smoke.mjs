@@ -198,9 +198,26 @@ function assertNoSecrets(payload, secrets, label) {
 }
 
 const redactionParityCases = [
+  { input: 'TOKEN=QZ7', secret: 'QZ7' },
+  { input: 'PASSWORD=QZ7', secret: 'QZ7' },
+  { input: 'SECRET=QZ7', secret: 'QZ7' },
+  { input: 'API_KEY=QZ7', secret: 'QZ7' },
+  { input: 'api_token=QZ7', secret: 'QZ7' },
+  { input: 'ApiToken=QZ7', secret: 'QZ7' },
+  { input: 'service_token=QZ7', secret: 'QZ7' },
+  { input: 'CODEXPRO_HTTP_TOKEN=QZ7', secret: 'QZ7' },
   { input: 'API_TOKEN=QZ7', secret: 'QZ7' },
   { input: 'API_TOKEN="QZ7"', secret: 'QZ7' },
   { input: '{"API_TOKEN":"QZ7"}', secret: 'QZ7' },
+  { input: '{"TOKEN":"QZ7"}', secret: 'QZ7' },
+  { input: '{"api_token":"QZ7"}', secret: 'QZ7' },
+  { input: '{"service_token":"QZ7"}', secret: 'QZ7' },
+  { input: '{"api_key":"QZ7"}', secret: 'QZ7' },
+  { input: 'password: QZ7', secret: 'QZ7' },
+  { input: 'api_key: QZ7', secret: 'QZ7' },
+  { input: 'service_token: QZ7', secret: 'QZ7' },
+  { input: 'api_token: QZ7', secret: 'QZ7' },
+  { input: 'ApiToken: QZ7', secret: 'QZ7' },
   { input: 'API_TOKEN: QZ7', secret: 'QZ7' },
   { input: 'Authorization: Bearer QZ7', secret: 'QZ7' },
   { input: 'Authorization: Digest QZ7', secret: 'QZ7' },
@@ -218,6 +235,12 @@ const redactionParityCases = [
   { input: 'const API_TOKEN = credentials.token;', harmless: true },
   { input: 'API_TOKEN = process.env.API_TOKEN;', harmless: true },
   { input: 'TOKEN = process.env.TOKEN;', harmless: true },
+  { input: 'const TOKEN = credentials.getToken(user);', harmless: true },
+  { input: 'const TOKEN = credentials.getToken("user");', harmless: true },
+  { input: 'PASSWORD = options.password;', harmless: true },
+  { input: 'const SECRET = context.secrets.current;', harmless: true },
+  { input: 'api_key = settings.apiKey;', harmless: true },
+  { input: 'service_token = runtime.tokens.current;', harmless: true },
   { input: 'const PASSWORD = readPassword();', harmless: true }
 ];
 for (const testCase of redactionParityCases) {
@@ -230,6 +253,7 @@ for (const testCase of redactionParityCases) {
     assert.equal(hasSecretValue(testCase.input), false, `shared redaction classified harmless expression ${testCase.input}`);
   }
 }
+const launcherParityCorpus = redactionParityCases.map((testCase) => testCase.input);
 
 const cleanRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-task003-clean-root-'));
 const cleanHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-task003-clean-home-'));
@@ -313,6 +337,9 @@ const shortJsonToken = 'JZ7';
 const shortJsonHttpToken = 'HZ8';
 const shortYamlToken = 'YZ7';
 const longFieldSecret = 'longfieldtokenabcdefghijklmnop';
+const oversizedBeginningSecret = 'task003-oversized-begin-secret-1234567890';
+const oversizedEndingSecret = 'task003-oversized-end-secret-1234567890';
+const oversizedIncompleteSecret = 'task003-oversized-incomplete-secret-1234567890';
 const splitCredentialChunks = [
   'apiToken = getToken()\n',
   `Authorization: Bearer ${shortBearerSecret}`,
@@ -340,7 +367,8 @@ const splitCredentialChunks = [
   `cloudflared tunnel run --token ${tunnelSecret}\n`,
   `ngrok config add-authtoken ${ngrokSecret}\n`,
   'const API_TOKEN = config.apiToken;\n',
-  'API_TOKEN = process.env.API_TOKEN;\n'
+  'API_TOKEN = process.env.API_TOKEN;\n',
+  ...launcherParityCorpus.map((input) => `${input}\n`)
 ];
 const fakeTunnel = await writeExecutable(path.join(tunnelHome, 'fake-cloudflared.mjs'), `#!/usr/bin/env node
 if (process.argv.includes('--version')) { console.log('cloudflared version 2026.7.2'); process.exit(0); }
@@ -348,12 +376,19 @@ const chunks = ${JSON.stringify(splitCredentialChunks)};
 let index = 0;
 const writeNext = () => {
   if (index >= chunks.length) {
-    process.stderr.write('x'.repeat(100000) + '\\n');
-    process.stdout.write('https://task003-fake.trycloudflare.com\\n');
-    setTimeout(() => process.exit(23), 500);
+    process.stderr.write('TOKEN=task003-oversized-begin-secret-1234567890' + 'x'.repeat(100000) + '\\n');
+    process.stdout.write('TOKEN=QZ7\\n');
+    process.stdout.write('y'.repeat(5000));
+    setImmediate(() => {
+      process.stdout.write('y'.repeat(5000) + 'TOKEN=task003-oversized-end-secret-1234567890\\n');
+      process.stderr.write('z'.repeat(100000) + 'TOKEN=task003-oversized-incomplete-secret-1234567890');
+      process.stdout.write('https://task003-fake.trycloudflare.com\\n');
+      setTimeout(() => process.exit(23), 500);
+    });
     return;
   }
-  process.stderr.write(chunks[index++]);
+  const chunk = chunks[index++];
+  process.stderr.write(chunk);
   setImmediate(writeNext);
 };
 writeNext();
@@ -375,30 +410,19 @@ const hostileSecrets = [
   shortBearerSecret, digestSecret, shortBasicSecret, tokenSchemeSecret, apiKeySecret,
   shortCodexToken, shortCliToken, shortEqualsToken, shortAuthToken, shortApiKey,
   shortQueryCodexToken, shortQueryToken, shortJsonToken, shortJsonHttpToken, shortYamlToken,
-  'sk-ant-abcdefghijklmnopqrstuvwxyz123456', longFieldSecret
+  'sk-ant-abcdefghijklmnopqrstuvwxyz123456', longFieldSecret,
+  oversizedBeginningSecret, oversizedEndingSecret, oversizedIncompleteSecret
 ];
 assertNoSecrets(tunnelFailureRecord, hostileSecrets, 'persisted tunnel failure');
 assertNoSecrets(tunnelFailure.output(), hostileSecrets, 'launcher-visible sanitized diagnostics');
-for (const harmless of ['apiToken = getToken()', 'const API_TOKEN = config.apiToken;', 'API_TOKEN = process.env.API_TOKEN;']) {
+for (const harmless of redactionParityCases.filter((testCase) => testCase.harmless).map((testCase) => testCase.input)) {
   assert.equal(tunnelFailure.output().includes(harmless), true, `launcher redaction over-redacted harmless expression: ${harmless}`);
 }
-const launcherParityCorpus = [
-  'API_TOKEN=QZ7',
-  'API_TOKEN=sk-ant-abcdefghijklmnopqrstuvwxyz123456',
-  '{"API_TOKEN":"JZ7"}',
-  '{"CODEXPRO_HTTP_TOKEN":"HZ8"}',
-  '{"API_TOKEN":"longfieldtokenabcdefghijklmnop"}',
-  'API_TOKEN: YZ7',
-  'Authorization: Bearer QZ7',
-  'Authorization: Digest DZ8',
-  '--token LZ7',
-  '--token=EZ8',
-  '--auth-token HZ9',
-  '--api-key KZ7',
-  '?codexpro_token=UZ8',
-  '?token=VZ9',
-  'https://user:task003-url-secret-1234567890@example.invalid/secret'
-];
+for (const line of tunnelFailure.output().split(/\r?\n/).filter((line) => line.includes('[cloudflared]'))) {
+  assert.ok(Buffer.byteLength(line, 'utf8') <= 8_192, `launcher diagnostic record exceeded 8192 bytes: ${Buffer.byteLength(line, 'utf8')}`);
+}
+assert.match(tunnelFailure.output(), /\[cloudflared\].*\[cloudflared diagnostic stream record truncated\]/);
+assert.ok(Buffer.byteLength(tunnelFailureRecord.detail ?? '', 'utf8') <= 8_192);
 for (const input of launcherParityCorpus) {
   assert.equal(tunnelFailure.output().includes(redactSensitiveText(input)), true, `launcher/shared redaction parity mismatch for ${input}`);
 }
@@ -416,6 +440,7 @@ assert.equal(tunnelRestartStatus.structured.last_failure_relation, 'previous');
 assert.equal(tunnelRestartStatus.structured.tunnel.type, 'none');
 assert.ok(Buffer.byteLength(JSON.stringify(tunnelRestartStatus.structured), 'utf8') <= 16_384);
 assert.ok(Buffer.byteLength(tunnelRestartStatus.text, 'utf8') <= 16_384);
+assert.ok(Buffer.byteLength(tunnelRestartStatus.structured.last_failure?.detail ?? '', 'utf8') <= 8_192);
 assertNoSecrets(tunnelRestartStatus, [...hostileSecrets, 'task003-http-token-1234567890'], 'returned tunnel diagnostics');
 const persistedRuntime = await fs.readFile(tunnelPaths.current, 'utf8');
 assertNoSecrets(persistedRuntime, ['task003-http-token-1234567890', bearerSecret, basicSecret, ngrokSecret, tunnelSecret, urlSecret, 'password@example.invalid'], 'persisted current runtime');

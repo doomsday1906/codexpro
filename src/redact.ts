@@ -9,14 +9,20 @@ const QUERY_TOKEN_PATTERN = /([?&](?:codexpro_token|token|access_token|auth_toke
 const REFERENCE_CALL = `[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*\\s*\\([^;\\r\\n]*\\)`;
 const CODEXPRO_TOKEN_ASSIGNMENT_PATTERN = new RegExp(`\\b(codexpro_token\\s*=\\s*)(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|\\x60[^\\x60\\r\\n]*\\x60|${REFERENCE_CALL}|[^\\s"'\\x60<>]+)`, "gi");
 const CODEXPRO_TOKEN_FIELD_PATTERN = new RegExp(`(["']?codexpro_token["']?\\s*:\\s*)(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|\\x60[^\\x60\\r\\n]*\\x60|${REFERENCE_CALL}|[A-Za-z0-9_./+=-]+)`, "gi");
+const CREDENTIAL_LABEL = `[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}`;
+const CREDENTIAL_VALUE = `(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|\\x60[^\\x60\\r\\n]*\\x60|${REFERENCE_CALL}|[^\\s"'\\x60<>]+)`;
+const CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(`\\b(${CREDENTIAL_LABEL}\\s*=\\s*)${CREDENTIAL_VALUE}`, "gi");
+const CREDENTIAL_FIELD_PATTERN = new RegExp(`(["']?${CREDENTIAL_LABEL}["']?\\s*:\\s*)${CREDENTIAL_VALUE}`, "gi");
 const SHORT_SECRET_ASSIGNMENT_PATTERN = new RegExp(`\\b[A-Z][A-Z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Z0-9_]{0,64}\\s*=\\s*(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|\\x60[^\\x60\\r\\n]*\\x60|${REFERENCE_CALL}|[A-Za-z0-9_./+=-]+)`, "g");
 const SHORT_SECRET_FIELD_PATTERN = new RegExp(`(["']?[A-Z][A-Z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Z0-9_]{0,64}["']?\\s*:\\s*)(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|\\x60[^\\x60\\r\\n]*\\x60|${REFERENCE_CALL}|[A-Za-z0-9_./+=-]+)`, "g");
 const SECRET_ASSIGNMENT_PATTERN = /\b[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}\s*=\s*(?:"[^"\r\n]{12,512}"|'[^'\r\n]{12,512}'|`[^`\r\n]{12,512}`|[A-Za-z0-9_./+=-]{20,512})/gi;
 const SECRET_FIELD_PATTERN = /(["']?[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}["']?\s*:\s*)(?:"[^"\r\n]{12,512}"|'[^'\r\n]{12,512}'|`[^`\r\n]{12,512}`|[A-Za-z0-9_./+=-]{20,512})/gi;
-const SECRET_PATTERNS = [OPENAI_SECRET_PATTERN, COMMON_TOKEN_PATTERN, JWT_TOKEN_PATTERN, BEARER_TOKEN_PATTERN, AUTHORIZATION_HEADER_PATTERN, CREDENTIAL_URL_PATTERN, CLI_TOKEN_PATTERN, QUERY_TOKEN_PATTERN, CODEXPRO_TOKEN_ASSIGNMENT_PATTERN, CODEXPRO_TOKEN_FIELD_PATTERN, SHORT_SECRET_ASSIGNMENT_PATTERN, SHORT_SECRET_FIELD_PATTERN, SECRET_ASSIGNMENT_PATTERN, SECRET_FIELD_PATTERN];
+const SECRET_PATTERNS = [OPENAI_SECRET_PATTERN, COMMON_TOKEN_PATTERN, JWT_TOKEN_PATTERN, BEARER_TOKEN_PATTERN, AUTHORIZATION_HEADER_PATTERN, CREDENTIAL_URL_PATTERN, CLI_TOKEN_PATTERN, QUERY_TOKEN_PATTERN, CODEXPRO_TOKEN_ASSIGNMENT_PATTERN, CODEXPRO_TOKEN_FIELD_PATTERN, CREDENTIAL_ASSIGNMENT_PATTERN, CREDENTIAL_FIELD_PATTERN, SHORT_SECRET_ASSIGNMENT_PATTERN, SHORT_SECRET_FIELD_PATTERN, SECRET_ASSIGNMENT_PATTERN, SECRET_FIELD_PATTERN];
 const CREDENTIAL_EXPRESSION_PATTERNS = new Set([
   CODEXPRO_TOKEN_ASSIGNMENT_PATTERN,
   CODEXPRO_TOKEN_FIELD_PATTERN,
+  CREDENTIAL_ASSIGNMENT_PATTERN,
+  CREDENTIAL_FIELD_PATTERN,
   SHORT_SECRET_ASSIGNMENT_PATTERN,
   SHORT_SECRET_FIELD_PATTERN,
   SECRET_ASSIGNMENT_PATTERN,
@@ -47,6 +53,8 @@ export function redactSensitiveText(text: string): string {
     .replace(AUTHORIZATION_HEADER_PATTERN, (_match, prefix) => `${prefix}[REDACTED_SECRET]`)
     .replace(CREDENTIAL_URL_PATTERN, (_match, prefix) => `${prefix}[REDACTED_SECRET]@`)
     .replace(QUERY_TOKEN_PATTERN, (_match, prefix) => `${prefix}[REDACTED_SECRET]`)
+    .replace(CREDENTIAL_ASSIGNMENT_PATTERN, (match) => isPlaceholderSecret(match) || !shouldRedactCredentialMatch(match) ? match : redactSecretAssignment(match))
+    .replace(CREDENTIAL_FIELD_PATTERN, (match, prefix) => isPlaceholderSecret(match) || !shouldRedactCredentialMatch(match) ? match : `${prefix}[REDACTED_SECRET]`)
     .replace(OPENAI_SECRET_PATTERN, (match) => isPlaceholderSecret(match) ? match : "[REDACTED_SECRET]")
     .replace(COMMON_TOKEN_PATTERN, (match) => isPlaceholderSecret(match) ? match : "[REDACTED_SECRET]")
     .replace(JWT_TOKEN_PATTERN, (match) => isPlaceholderSecret(match) ? match : "[REDACTED_SECRET]");
@@ -88,12 +96,11 @@ function isPlaceholderSecret(value: string): boolean {
 
 function isReferenceExpression(value: string): boolean {
   const normalized = value.trim().replace(/[;,]+$/, "").trim();
-  if (!normalized || /["'`]/.test(normalized)) return false;
+  if (!normalized) return false;
+  if (/^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\s*\([^;\r\n]*\)$/.test(normalized)) return true;
+  if (/["'`]/.test(normalized)) return false;
   const memberReference = normalized.match(/^([A-Za-z_$][A-Za-z0-9_$]*)\.(?:[A-Za-z_$][A-Za-z0-9_$]*\.)*[A-Za-z_$][A-Za-z0-9_$]*$/);
-  return (
-    Boolean(memberReference && /^(?:config|credentials|process|env|settings|secrets|options|runtime|context|this|import|os)$/i.test(memberReference[1])) ||
-    /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\s*\([^;\r\n]*\)$/.test(normalized)
-  );
+  return Boolean(memberReference && /^(?:config|credentials|process|env|settings|secrets|options|runtime|context|this|import|os)$/i.test(memberReference[1]));
 }
 
 function credentialValueFromMatch(match: string): string {
