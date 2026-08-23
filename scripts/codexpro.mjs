@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { createInterface } from 'node:readline/promises';
+import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   CLOUDFLARED_VERSION,
@@ -15,6 +16,11 @@ import {
   readCloudflaredAssetResponse,
   verifyCloudflaredAsset
 } from './cloudflared-release.mjs';
+import {
+  createPrivateKeyScanner,
+  redactDiagnosticText,
+  truncateUtf8
+} from './redaction-policy.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const UNTRACKED_FILE_HASH_BYTES = 64 * 1024;
@@ -718,12 +724,7 @@ function saveWorkspaceProfile(root, profile) {
 
 function boundedRedactedText(value, maxBytes) {
   const redacted = redactForLog(String(value ?? ''));
-  const buffer = Buffer.from(redacted, 'utf8');
-  if (buffer.byteLength <= maxBytes) return redacted;
-  const suffix = `\n...[diagnostic detail truncated to ${maxBytes} bytes]`;
-  const suffixBytes = Buffer.byteLength(suffix, 'utf8');
-  const prefixBytes = Math.max(0, maxBytes - suffixBytes);
-  return `${buffer.subarray(0, prefixBytes).toString('utf8')}${suffix}`;
+  return truncateUtf8(redacted, maxBytes, `\n...[diagnostic detail truncated to ${maxBytes} bytes]`);
 }
 
 function writeAtomicJson(filePath, payload, maxBytes = RUNTIME_FAILURE_RECORD_MAX_BYTES) {
@@ -1174,34 +1175,34 @@ function spawnLogged(name, command, args, options = {}) {
   child.codexproKillTree = Boolean(invocation.killTree);
   const logLines = [];
   const streamState = new Map([
-    ['stdout', { pending: '', pendingBytes: 0, overflowing: false }],
-    ['stderr', { pending: '', pendingBytes: 0, overflowing: false }]
+    ['stdout', { decoder: new StringDecoder('utf8'), scanner: createPrivateKeyScanner(), pending: '', pendingBytes: 0, overflowing: false }],
+    ['stderr', { decoder: new StringDecoder('utf8'), scanner: createPrivateKeyScanner(), pending: '', pendingBytes: 0, overflowing: false }]
   ]);
-  const boundedRecord = (value) => {
-    const text = String(value ?? '');
-    const buffer = Buffer.from(text, 'utf8');
-    if (buffer.byteLength <= SPAWN_LOG_PENDING_MAX_BYTES) return text;
-    const marker = `...[${name} diagnostic stream record truncated]\n`;
-    const markerBytes = Buffer.byteLength(marker, 'utf8');
-    const prefixBytes = Math.max(0, SPAWN_LOG_PENDING_MAX_BYTES - markerBytes);
-    return `${buffer.subarray(0, prefixBytes).toString('utf8')}${marker}`;
-  };
+
+  const boundedRecord = (value) => truncateUtf8(
+    redactForLog(String(value ?? '')),
+    SPAWN_LOG_PENDING_MAX_BYTES,
+    '\n...[' + name + ' diagnostic stream record truncated]'
+  );
   const emitRecord = (stream, record) => {
-    const text = boundedRecord(redactForLog(record));
-    if (text) {
-      const labeled = boundedRecord(`[${name}] ${text}`);
-      logLines.push(...labeled.split(/\r?\n/).filter(Boolean));
-      while (logLines.length > 120) logLines.shift();
-      if (verbose) stream.write(labeled);
-    }
+    const text = redactForLog(record);
+    if (!text) return;
+    const labeled = truncateUtf8(
+      '[' + name + '] ' + text,
+      SPAWN_LOG_PENDING_MAX_BYTES,
+      '\n...[' + name + ' diagnostic stream record truncated]'
+    );
+    if (!labeled) return;
+    logLines.push(...labeled.split(/\r?\n/).filter(Boolean));
+    while (logLines.length > 120) logLines.shift();
+    if (verbose) stream.write(labeled);
   };
-  const record = (streamName, stream, chunk) => {
+  const processText = (streamName, stream, incoming) => {
     const state = streamState.get(streamName);
-    if (!state) return;
-    let incoming = String(chunk);
+    if (!state || !incoming) return;
     let offset = 0;
     const enterOverflow = () => {
-      if (!state.overflowing) emitRecord(stream, `...[${name} diagnostic stream record truncated]\n`);
+      if (!state.overflowing) emitRecord(stream, '...[' + name + ' diagnostic stream record truncated]\n');
       state.pending = '';
       state.pendingBytes = 0;
       state.overflowing = true;
@@ -1220,6 +1221,7 @@ function spawnLogged(name, command, args, options = {}) {
       const pieceBytes = Buffer.byteLength(piece, 'utf8');
       if (state.pendingBytes + pieceBytes > SPAWN_LOG_PENDING_MAX_BYTES) {
         enterOverflow();
+        if (newline >= 0) state.overflowing = false;
         offset = newline < 0 ? incoming.length : newline + 1;
         continue;
       }
@@ -1233,10 +1235,20 @@ function spawnLogged(name, command, args, options = {}) {
       }
     }
   };
+  const record = (streamName, stream, chunk) => {
+    const state = streamState.get(streamName);
+    if (!state) return;
+    const decoded = state.decoder.write(chunk);
+    const safeText = state.scanner.push(decoded, false);
+    processText(streamName, stream, safeText);
+  };
   const flushPending = () => {
     for (const [streamName, state] of streamState) {
+      const stream = streamName === 'stdout' ? process.stdout : process.stderr;
+      const decoded = state.decoder.end();
+      const safeText = state.scanner.push(decoded, true);
+      processText(streamName, stream, safeText);
       if (state.pending) {
-        const stream = streamName === 'stdout' ? process.stdout : process.stderr;
         emitRecord(stream, state.pending);
         state.pending = '';
         state.pendingBytes = 0;
@@ -1246,7 +1258,7 @@ function spawnLogged(name, command, args, options = {}) {
   child.codexproLogTail = () => {
     const pendingLines = [...streamState.values()]
       .filter((state) => state.pending)
-      .map((state) => boundedRecord(redactForLog(state.pending)))
+      .map((state) => boundedRecord(state.pending))
       .filter(Boolean)
       .join('\n');
     return pendingLines ? [...logLines, pendingLines].join('\n') : logLines.join('\n');
@@ -1254,13 +1266,14 @@ function spawnLogged(name, command, args, options = {}) {
   spawnedChildren.add(child);
   child.stdout.on('data', (chunk) => record('stdout', process.stdout, chunk));
   child.stderr.on('data', (chunk) => record('stderr', process.stderr, chunk));
-  child.on('exit', (code, signal) => {
+  child.on('close', (code, signal) => {
     flushPending();
     spawnedChildren.delete(child);
-    if (verbose) console.error(`[${name}] exited code=${code} signal=${signal}`);
+    if (verbose) console.error('[' + name + '] exited code=' + code + ' signal=' + signal);
   });
   return child;
 }
+
 
 function waitForCloudflareUrl(child, timeoutMs = 45000) {
   const re = /https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/g;
@@ -1287,7 +1300,7 @@ function waitForCloudflareUrl(child, timeoutMs = 45000) {
     };
     child.stdout.on('data', onData);
     child.stderr.on('data', onData);
-    child.on('exit', (code) => {
+    child.on('close', (code) => {
       clearTimeout(timer);
       reject(new Error(`cloudflared exited before a URL was found, code=${code}`));
     });
@@ -1300,7 +1313,7 @@ function waitForTunnelStartup(child, label, timeoutMs = 1000) {
     let timer;
     const cleanup = () => {
       clearTimeout(timer);
-      child.off('exit', onExit);
+      child.off('close', onExit);
       child.off('error', onError);
     };
     const settle = (fn, value) => {
@@ -1321,7 +1334,7 @@ function waitForTunnelStartup(child, label, timeoutMs = 1000) {
     };
     timer = setTimeout(() => settle(resolve), timeoutMs);
     timer.unref();
-    child.once('exit', onExit);
+    child.once('close', onExit);
     child.once('error', onError);
   });
 }
@@ -1486,7 +1499,7 @@ function openUrl(url) {
 
 function waitForProcessExit(child) {
   return new Promise((resolve) => {
-    child.once('exit', (code, signal) => resolve({ code, signal }));
+    child.once('close', (code, signal) => resolve({ code, signal }));
   });
 }
 
@@ -1555,60 +1568,8 @@ function shellCommandPreview(parts) {
   }).join(' ');
 }
 
-const LAUNCHER_REFERENCE_CALL = '[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*\\s*\\([^;\\r\\n]*\\)';
-const LAUNCHER_CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(`\\b(?:codexpro_token|[A-Za-z][A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64})\\s*=\\s*(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|\\x60[^\\x60\\r\\n]*\\x60|${LAUNCHER_REFERENCE_CALL}|[^\\s"'\\x60<>]+)`, 'gi');
-const LAUNCHER_CREDENTIAL_FIELD_PATTERN = new RegExp(`(["']?(?:codexpro_token|[A-Za-z][A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64})["']?\\s*:\\s*)(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|\\x60[^\\x60\\r\\n]*\\x60|${LAUNCHER_REFERENCE_CALL}|[A-Za-z0-9_./+=-]+)`, 'gi');
-const LAUNCHER_CREDENTIAL_LABEL = `[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}`;
-const LAUNCHER_CREDENTIAL_VALUE = `(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|\\x60[^\\x60\\r\\n]*\\x60|${LAUNCHER_REFERENCE_CALL}|[^\\s"'\\x60<>]+)`;
-const LAUNCHER_SEMANTIC_CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(`\\b(${LAUNCHER_CREDENTIAL_LABEL}\\s*=\\s*)${LAUNCHER_CREDENTIAL_VALUE}`, 'gi');
-const LAUNCHER_SEMANTIC_CREDENTIAL_FIELD_PATTERN = new RegExp(`(["']?${LAUNCHER_CREDENTIAL_LABEL}["']?\\s*:\\s*)${LAUNCHER_CREDENTIAL_VALUE}`, 'gi');
-const LAUNCHER_LONG_CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(`\\b[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}\\s*=\\s*(?:"[^"\\r\\n]{12,512}"|'[^'\\r\\n]{12,512}'|\\x60[^\\x60\\r\\n]{12,512}\\x60|[A-Za-z0-9_./+=-]{20,512})`, 'gi');
-const LAUNCHER_LONG_CREDENTIAL_FIELD_PATTERN = /(["']?[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}["']?\s*:\s*)(?:"[^"\r\n]{12,512}"|'[^'\r\n]{12,512}'|`[^`\r\n]{12,512}`|[A-Za-z0-9_./+=-]{20,512})/gi;
-
-function launcherIsPlaceholderSecret(value) {
-  const normalized = String(value).toLowerCase();
-  return normalized.includes('[redacted_secret]') || normalized.includes('process.env.') || normalized.includes('import.meta.env.') || normalized.includes('os.environ') || normalized.includes('getenv(') || normalized.includes('replace-me') || normalized.includes('your-token') || normalized.includes('your-api-key-here') || normalized.includes('keep-this-') || normalized === 'sk-...';
-}
-
-function launcherIsReferenceExpression(value) {
-  const normalized = String(value).trim().replace(/[;,]+$/, '').trim();
-  if (!normalized) return false;
-  if (/^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\s*\([^;\r\n]*\)$/.test(normalized)) return true;
-  if (/["'`]/.test(normalized)) return false;
-  const memberReference = normalized.match(/^([A-Za-z_$][A-Za-z0-9_$]*)\.(?:[A-Za-z_$][A-Za-z0-9_$]*\.)*[A-Za-z_$][A-Za-z0-9_$]*$/);
-  return Boolean(memberReference && /^(?:config|credentials|process|env|settings|secrets|options|runtime|context|this|import|os)$/i.test(memberReference[1]));
-}
-
-function launcherCredentialValue(match) {
-  const separator = match.search(/[:=]\s*/);
-  return separator < 0 ? '' : match.slice(separator).replace(/^[:=]\s*/, '');
-}
-
-function launcherShouldRedactCredential(match) {
-  return !launcherIsReferenceExpression(launcherCredentialValue(match));
-}
-
-function launcherRedactAssignment(match) {
-  const index = match.indexOf('=');
-  return index < 0 ? '[REDACTED_SECRET]' : `${match.slice(0, index).trimEnd()}= [REDACTED_SECRET]`;
-}
-
 function redactForLog(value) {
-  return String(value)
-    .replace(/\bsk-[A-Za-z0-9_-]{10,}\b/g, '[REDACTED_SECRET]')
-    .replace(/\b(?:sk-ant-[A-Za-z0-9_-]{10,}|gh[opsru]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9_-]{20,})\b/g, '[REDACTED_SECRET]')
-    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_SECRET]')
-    .replace(/((?:\bngrok\s+config\s+add-authtoken|\bcloudflared\s+service\s+install|--(?:token|access-token|auth-token|api[_-]?key|authtoken))(?:=|[ \t]+))(?:"[^"\r\n]*"|'[^'\r\n]*'|`[^`\r\n]*`|[^\s"'`<>]+)/gi, '$1[REDACTED_SECRET]')
-    .replace(/\b(Authorization\s*:\s*Bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi, '$1[REDACTED_SECRET]')
-    .replace(/\b(Authorization\s*:\s*)[^\r\n]*/gi, '$1[REDACTED_SECRET]')
-    .replace(/\b((?:https?|wss?):\/\/)[^/\s:@]+:[^@\s/]+@/gi, '$1[REDACTED_SECRET]@')
-    .replace(/([?&](?:codexpro_token|token|access_token|auth_token|api[_-]?key)=)[^&\s"'`<>]+/gi, '$1[REDACTED_SECRET]')
-    .replace(LAUNCHER_SEMANTIC_CREDENTIAL_ASSIGNMENT_PATTERN, (match) => launcherIsPlaceholderSecret(match) || !launcherShouldRedactCredential(match) ? match : launcherRedactAssignment(match))
-    .replace(LAUNCHER_SEMANTIC_CREDENTIAL_FIELD_PATTERN, (match, prefix) => launcherIsPlaceholderSecret(match) || !launcherShouldRedactCredential(match) ? match : `${prefix}[REDACTED_SECRET]`)
-    .replace(LAUNCHER_CREDENTIAL_ASSIGNMENT_PATTERN, (match) => launcherIsPlaceholderSecret(match) || !launcherShouldRedactCredential(match) ? match : launcherRedactAssignment(match))
-    .replace(LAUNCHER_CREDENTIAL_FIELD_PATTERN, (match, prefix) => launcherIsPlaceholderSecret(match) || !launcherShouldRedactCredential(match) ? match : `${prefix}[REDACTED_SECRET]`)
-    .replace(LAUNCHER_LONG_CREDENTIAL_ASSIGNMENT_PATTERN, (match) => launcherIsPlaceholderSecret(match) || !launcherShouldRedactCredential(match) ? match : launcherRedactAssignment(match))
-    .replace(LAUNCHER_LONG_CREDENTIAL_FIELD_PATTERN, (match, prefix) => launcherIsPlaceholderSecret(match) || !launcherShouldRedactCredential(match) ? match : `${prefix}[REDACTED_SECRET]`);
+  return redactDiagnosticText(String(value ?? ''));
 }
 
 function redactEnvObject(env) {
@@ -1623,10 +1584,10 @@ function redactEnvObject(env) {
 
 function trimBytes(value, maxBytes) {
   const redacted = redactForLog(value);
-  const buffer = Buffer.from(redacted, 'utf8');
-  if (buffer.byteLength <= maxBytes) return { text: redacted, truncated: false };
+  const bounded = truncateUtf8(redacted, maxBytes, `\n...[output truncated to ${maxBytes} bytes]`);
+  if (bounded === redacted) return { text: redacted, truncated: false };
   return {
-    text: `${buffer.subarray(0, maxBytes).toString('utf8')}\n...[output truncated to ${maxBytes} bytes]`,
+    text: bounded,
     truncated: true
   };
 }
@@ -1821,14 +1782,16 @@ function runProcessCaptured(command, args, options) {
     });
     let stdout = '';
     let stderr = '';
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
     let timedOut = false;
     let closed = false;
-    const appendBounded = (current, chunk) => {
+    const appendBounded = (current, decoded) => {
+      if (!decoded) return current;
       if (Buffer.byteLength(current, 'utf8') > retainedOutputBytes) return current;
-      const next = current + String(chunk);
-      const buffer = Buffer.from(next, 'utf8');
-      return buffer.byteLength > retainedOutputBytes
-        ? buffer.subarray(0, retainedOutputBytes).toString('utf8')
+      const next = current + decoded;
+      return Buffer.byteLength(next, 'utf8') > retainedOutputBytes
+        ? truncateUtf8(next, retainedOutputBytes)
         : next;
     };
     const timer = setTimeout(() => {
@@ -1841,10 +1804,10 @@ function runProcessCaptured(command, args, options) {
     timer.unref();
 
     child.stdout.on('data', (chunk) => {
-      stdout = appendBounded(stdout, chunk);
+      stdout = appendBounded(stdout, stdoutDecoder.write(chunk));
     });
     child.stderr.on('data', (chunk) => {
-      stderr = appendBounded(stderr, chunk);
+      stderr = appendBounded(stderr, stderrDecoder.write(chunk));
     });
     child.on('error', (error) => {
       clearTimeout(timer);
@@ -1861,6 +1824,8 @@ function runProcessCaptured(command, args, options) {
     child.on('close', (exitCode, signal) => {
       closed = true;
       clearTimeout(timer);
+      stdout = appendBounded(stdout, stdoutDecoder.end());
+      stderr = appendBounded(stderr, stderrDecoder.end());
       const out = trimBytes(stdout, maxOutputBytes);
       const err = trimBytes(`${stderr}${timedOut ? `\n[codexpro] Command timed out after ${timeoutMs} ms.` : ''}`, maxOutputBytes);
       resolve({
@@ -2955,18 +2920,19 @@ function createConnectorDetails(endpoint, token, localBase = '') {
 }
 
 function printCreateAppFields(details) {
+  const displayServerUrl = redactForLog(details.serverUrl);
   console.log('Create App fields:');
   console.log('');
   console.log('  Name: CodexPro');
   console.log('  Description: Local coding workspace bridge for ChatGPT.');
   console.log('  Connection: Server URL');
-  console.log(`  Server URL: ${details.serverUrl}`);
+  console.log(`  Server URL: ${displayServerUrl}`);
   console.log('  Authentication: No Authentication / None');
   console.log('');
   if (details.token) {
     console.log('If your ChatGPT UI supports custom headers instead, you can use:');
     console.log('');
-    console.log(`  Authorization: Bearer ${details.token}`);
+    console.log(`  Authorization: Bearer ${redactForLog(details.token)}`);
   } else {
     console.log('Authorization: disabled');
   }
@@ -2975,6 +2941,7 @@ function printCreateAppFields(details) {
 function printConnectorBlock(endpoint, token, options = {}) {
   const details = createConnectorDetails(endpoint, token, options.localBase ?? '');
   const { serverUrl } = details;
+  const displayServerUrl = redactForLog(serverUrl);
   const publicHttps = serverUrl.startsWith('https://');
   const shouldCopy = !options.headless && (options.copyUrl === true || (options.copyUrl !== false && publicHttps));
   const copied = shouldCopy ? copyToClipboard(serverUrl) : { ok: false, command: '' };
@@ -2992,15 +2959,15 @@ function printConnectorBlock(endpoint, token, options = {}) {
   console.log(`  Connector  ${publicHttps ? 'public HTTPS' : 'local HTTP'}`);
   if (copied.ok) {
     console.log(`  URL        copied with ${copied.command}`);
-    console.log(`  Server URL ${serverUrl}`);
+    console.log(`  Server URL ${displayServerUrl}`);
   } else if (shouldCopy) {
     console.log('  URL        copy failed; copy manually:');
-    console.log(serverUrl);
+    console.log(displayServerUrl);
   } else if (options.copyUrl === false && publicHttps) {
     console.log('  URL        not copied; press c to copy or u to show');
   } else if (!publicHttps) {
     console.log('  URL        local HTTP only');
-    console.log(serverUrl);
+    console.log(displayServerUrl);
   }
   if (options.openChatgpt && !options.headless) {
     statusLine(opened ? 'ok' : 'warn', opened ? 'Opened ChatGPT connector settings' : 'Could not open ChatGPT automatically');
@@ -3018,7 +2985,7 @@ function printConnectorBlock(endpoint, token, options = {}) {
     console.log('');
   }
   if (options.headless) {
-    console.log(`CODEXPRO_READY ${serverUrl}`);
+    console.log(`CODEXPRO_READY ${displayServerUrl}`);
   } else {
     console.log('Next: press Enter to open ChatGPT, paste the copied Server URL, choose Authentication: None.');
     console.log('Keys: Enter open | c copy | o status | h help | q quit');
@@ -3910,14 +3877,14 @@ function runControlPanel(details, cleanup = cleanupChildren) {
         console.log(copied.ok ? `\nServer URL copied with ${copied.command}.` : '\nCould not copy automatically.');
         writeControlPrompt();
       } else if (normalized === 'u') {
-        console.log(`\n${details.serverUrl}`);
+        console.log(`\n${redactForLog(details.serverUrl)}`);
         writeControlPrompt();
       } else if (normalized === 'o') {
         if (!details.localStatusUrl) {
           console.log('\nNo local status page URL is available for this run.');
         } else {
           const opened = openUrl(details.localStatusUrl);
-          console.log(opened ? '\nOpened local CodexPro setup/status page.' : `\nCould not open automatically. Open this URL:\n${details.localStatusUrl}`);
+          console.log(opened ? '\nOpened local CodexPro setup/status page.' : `\nCould not open automatically. Open this URL:\n${redactForLog(details.localStatusUrl)}`);
         }
         writeControlPrompt();
       } else if (normalized === 'p') {
@@ -4032,7 +3999,7 @@ function createRuntimeLifecycle(root, metadata = {}) {
       child.once('error', (error) => {
         context.recordFailure(component, 'spawn_error', { detail: error instanceof Error ? error.message : String(error) });
       });
-      child.once('exit', (code, signal) => {
+      child.once('close', (code, signal) => {
         context.recordFailure(component, 'unexpected_exit', { exitCode: code, signal });
       });
       if (child.exitCode !== null || child.signalCode !== null) {
@@ -4608,10 +4575,10 @@ main().catch((error) => {
   } else {
     cleanupChildren();
   }
-  const message = error instanceof Error ? error.message : String(error);
+  const message = redactForLog(error instanceof Error ? error.message : String(error));
   console.error(`Error: ${message}`);
   if (process.env.CODEXPRO_DEBUG === '1' && error instanceof Error && error.stack) {
-    console.error(error.stack);
+    console.error(redactForLog(error.stack));
   }
   process.exit(1);
 });

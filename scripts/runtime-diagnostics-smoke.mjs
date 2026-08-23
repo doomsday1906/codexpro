@@ -9,7 +9,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 const repoRoot = path.resolve('.');
-const { hasSecretValue, redactSensitiveText } = await import('../dist/redact.js');
+const { hasSecretValue, redactDiagnosticText, redactSensitiveText, truncateUtf8 } = await import('../dist/redact.js');
 
 async function getFreePort() {
   return new Promise((resolve, reject) => {
@@ -100,7 +100,7 @@ function launch(root, home, port, options = {}) {
     '--headless',
     '--no-profile'
   ];
-  if ((options.tunnel ?? 'none') === 'none') args.push('--no-auth');
+  if ((options.tunnel ?? 'none') === 'none' && options.noAuth !== false) args.push('--no-auth');
   if (options.token) args.push('--token', options.token);
   if (options.cloudflared) args.push('--cloudflared', options.cloudflared);
   if (options.logRequests) args.push('--log-requests');
@@ -202,6 +202,9 @@ const redactionParityCases = [
   { input: 'PASSWORD=QZ7', secret: 'QZ7' },
   { input: 'SECRET=QZ7', secret: 'QZ7' },
   { input: 'API_KEY=QZ7', secret: 'QZ7' },
+  { input: 'PRIVATE_KEY=QZ7', secret: 'QZ7' },
+  { input: 'MY_PRIVATE_KEY_VALUE=QZ7', secret: 'QZ7' },
+  { input: 'private_key=QZ7', secret: 'QZ7' },
   { input: 'api_token=QZ7', secret: 'QZ7' },
   { input: 'ApiToken=QZ7', secret: 'QZ7' },
   { input: 'service_token=QZ7', secret: 'QZ7' },
@@ -210,6 +213,7 @@ const redactionParityCases = [
   { input: 'API_TOKEN="QZ7"', secret: 'QZ7' },
   { input: '{"API_TOKEN":"QZ7"}', secret: 'QZ7' },
   { input: '{"TOKEN":"QZ7"}', secret: 'QZ7' },
+  { input: '{"PRIVATE_KEY":"QZ7"}', secret: 'QZ7' },
   { input: '{"api_token":"QZ7"}', secret: 'QZ7' },
   { input: '{"service_token":"QZ7"}', secret: 'QZ7' },
   { input: '{"api_key":"QZ7"}', secret: 'QZ7' },
@@ -230,18 +234,24 @@ const redactionParityCases = [
   { input: 'https://user:QZ7@example.invalid/', secret: 'QZ7' },
   { input: 'API_TOKEN=sk-ant-abcdefghijklmnopqrstuvwxyz123456', secret: 'sk-ant-abcdefghijklmnopqrstuvwxyz123456' },
   { input: '{"API_TOKEN":"longfieldtokenabcdefghijklmnop"}', secret: 'longfieldtokenabcdefghijklmnop' },
+  { input: 'TOKEN=keep-this-codexpro-token-stable', harmless: true },
+  { input: 'TOKEN=keep-this-stable-token', harmless: true },
   { input: 'const API_TOKEN = getToken();', harmless: true },
+  { input: 'const TOKEN = getToken(user);', harmless: true },
+  { input: 'const TOKEN = getToken("user");', harmless: true },
+  { input: 'const TOKEN = credentials.getToken(user);', harmless: true },
+  { input: 'const TOKEN = credentials.getToken("user");', harmless: true },
   { input: 'const API_TOKEN = config.apiToken;', harmless: true },
   { input: 'const API_TOKEN = credentials.token;', harmless: true },
   { input: 'API_TOKEN = process.env.API_TOKEN;', harmless: true },
   { input: 'TOKEN = process.env.TOKEN;', harmless: true },
-  { input: 'const TOKEN = credentials.getToken(user);', harmless: true },
-  { input: 'const TOKEN = credentials.getToken("user");', harmless: true },
   { input: 'PASSWORD = options.password;', harmless: true },
-  { input: 'const SECRET = context.secrets.current;', harmless: true },
+  { input: 'const SECRET = runtime.currentSecret;', harmless: true },
   { input: 'api_key = settings.apiKey;', harmless: true },
-  { input: 'service_token = runtime.tokens.current;', harmless: true },
-  { input: 'const PASSWORD = readPassword();', harmless: true }
+  { input: 'service_token = credentials.serviceToken;', harmless: true },
+  { input: 'const PASSWORD = readPassword();', harmless: true },
+  { input: 'const API_KEY = this.apiKey;', harmless: true },
+  { input: 'const PASSWORD = credentials.getPassword();', harmless: true }
 ];
 for (const testCase of redactionParityCases) {
   const redacted = redactSensitiveText(testCase.input);
@@ -251,10 +261,84 @@ for (const testCase of redactionParityCases) {
   } else if (testCase.harmless) {
     assert.equal(redacted, testCase.input, `shared redaction corrupted harmless expression ${testCase.input}`);
     assert.equal(hasSecretValue(testCase.input), false, `shared redaction classified harmless expression ${testCase.input}`);
+    assert.equal(redactDiagnosticText(testCase.input), testCase.input, `diagnostic redaction corrupted harmless source/member expression ${testCase.input}`);
   }
 }
-const launcherParityCorpus = redactionParityCases.map((testCase) => testCase.input);
-
+const exactPlaceholderCases = [
+  'TOKEN=keep-this-codexpro-token-stable',
+  'TOKEN="keep-this-codexpro-token-stable"',
+  'TOKEN=keep-this-stable-token',
+  'TOKEN=process.env.TOKEN'
+];
+assert.equal(redactSensitiveText(exactPlaceholderCases[0]), exactPlaceholderCases[0]);
+assert.equal(redactSensitiveText(exactPlaceholderCases[1]), exactPlaceholderCases[1]);
+assert.equal(redactSensitiveText(exactPlaceholderCases[2]), exactPlaceholderCases[2]);
+assert.equal(redactSensitiveText(exactPlaceholderCases[3]), exactPlaceholderCases[3]);
+const placeholderLikeCredential = 'keep-this-actual-credential-ZXCV1234';
+assert.equal(redactSensitiveText(`TOKEN=${placeholderLikeCredential}`).includes(placeholderLikeCredential), false);
+assert.equal(hasSecretValue(`TOKEN=${placeholderLikeCredential}`), true);
+const ambiguousDiagnosticCall = 'TOKEN=getToken(CALL_LITERAL_7X9)';
+assert.equal(redactSensitiveText(ambiguousDiagnosticCall), ambiguousDiagnosticCall);
+assert.equal(redactDiagnosticText(ambiguousDiagnosticCall).includes('CALL_LITERAL_7X9'), false);
+assert.equal(hasSecretValue(ambiguousDiagnosticCall), false);
+assert.equal(hasSecretValue(ambiguousDiagnosticCall, { context: 'diagnostic' }), true);
+const declaredCall = 'const TOKEN = getToken(CALL_LITERAL_7X9);';
+assert.equal(redactSensitiveText(declaredCall), declaredCall);
+assert.equal(hasSecretValue(declaredCall), false);
+const ambiguousDiagnosticPassword = 'PASSWORD=readPassword(ACTUAL_LITERAL)';
+assert.equal(redactSensitiveText(ambiguousDiagnosticPassword), ambiguousDiagnosticPassword);
+assert.equal(redactDiagnosticText(ambiguousDiagnosticPassword).includes('ACTUAL_LITERAL'), false);
+assert.equal(hasSecretValue(ambiguousDiagnosticPassword), false);
+assert.equal(hasSecretValue(ambiguousDiagnosticPassword, { context: 'diagnostic' }), true);
+const crossLanguageSourceCases = [
+  'const API_TOKEN = getToken();',
+  'const TOKEN = getToken(user);',
+  'const PASSWORD = credentials.getPassword();',
+  'API_TOKEN = runtime.tokens.current;',
+  'TOKEN = os.getenv("TOKEN")',
+  'PASSWORD = getpass.getpass()',
+  'API_KEY = config.get("api_key")',
+  'SECRET = secrets.token_urlsafe(32)',
+  'TOKEN = get_token(user)',
+  'TOKEN = ENV.fetch("TOKEN")',
+  'PASSWORD = credentials.password()',
+  'TOKEN = process.env.TOKEN;',
+  'API_KEY = settings.apiKey;',
+  'PASSWORD = options.password;',
+  'SECRET = runtime.currentSecret;'
+];
+for (const source of crossLanguageSourceCases) {
+  assert.equal(redactSensitiveText(source), source, `source redaction corrupted ${source}`);
+  assert.equal(hasSecretValue(source), false, `source redaction classified ${source}`);
+}
+for (const diagnostic of [ambiguousDiagnosticCall, ambiguousDiagnosticPassword]) {
+  assert.equal(hasSecretValue(diagnostic, { context: 'diagnostic' }), true, `diagnostic call was not classified: ${diagnostic}`);
+  assert.equal(redactDiagnosticText(diagnostic).includes(diagnostic.slice(diagnostic.indexOf('(') + 1, -1)), false, `diagnostic call literal leaked: ${diagnostic}`);
+}
+for (const privateLabel of ['PRIVATE KEY', 'ENCRYPTED PRIVATE KEY', 'RSA PRIVATE KEY', 'EC PRIVATE KEY', 'DSA PRIVATE KEY', 'OPENSSH PRIVATE KEY', 'PGP PRIVATE KEY BLOCK']) {
+  const complete = `-----BEGIN ${privateLabel}-----\nTASK003_PRIVATE_BODY_${privateLabel.replaceAll(' ', '_')}\n-----END ${privateLabel}-----`;
+  const incomplete = `-----BEGIN ${privateLabel}-----\nTASK003_INCOMPLETE_BODY_${privateLabel.replaceAll(' ', '_')}`;
+  assert.equal(hasSecretValue(complete), true, `private-key BEGIN not classified: ${privateLabel}`);
+  assert.equal(hasSecretValue(incomplete), true, `incomplete private-key BEGIN not classified: ${privateLabel}`);
+  assert.equal(redactSensitiveText(complete).includes('TASK003_PRIVATE_BODY'), false, `private-key body leaked: ${privateLabel}`);
+  assert.equal(redactSensitiveText(incomplete).includes('TASK003_INCOMPLETE_BODY'), false, `incomplete private-key body leaked: ${privateLabel}`);
+}
+const mismatchedPrivateEnd = '-----BEGIN RSA PRIVATE KEY-----\nTASK003_MISMATCHED_PRIVATE_BODY\n-----END PRIVATE KEY-----\nTASK003_MISMATCHED_TAIL';
+assert.equal(redactSensitiveText(mismatchedPrivateEnd).includes('TASK003_MISMATCHED'), false, 'mismatched private-key END boundary leaked body');
+const publicCertificate = `-----BEGIN CERTIFICATE-----\nTASK003_PUBLIC_CERTIFICATE\n-----END CERTIFICATE-----`;
+const publicKey = `-----BEGIN PUBLIC KEY-----\nTASK003_PUBLIC_KEY\n-----END PUBLIC KEY-----`;
+assert.equal(redactSensitiveText(publicCertificate), publicCertificate);
+assert.equal(redactSensitiveText(publicKey), publicKey);
+assert.equal(hasSecretValue(publicCertificate), false);
+assert.equal(hasSecretValue(publicKey), false);
+for (const [sample, width] of [['é', 2], ['界', 3], ['😀', 4]]) {
+  const bounded = truncateUtf8(sample.repeat(5000), 8_192, '\n...[byte-cap]');
+  assert.ok(Buffer.byteLength(bounded, 'utf8') <= 8_192, 'UTF-8 ' + width + '-byte sample exceeded cap');
+  assert.equal(bounded.includes('\uFFFD'), false, 'UTF-8 ' + width + '-byte sample split a code point');
+  const aroundBoundary = truncateUtf8('a'.repeat(8_192 - width + 1) + sample + 'tail', 8_192);
+  assert.ok(Buffer.byteLength(aroundBoundary, 'utf8') <= 8_192, 'UTF-8 boundary sample exceeded cap');
+  assert.equal(aroundBoundary.includes('\uFFFD'), false, 'UTF-8 boundary sample split a code point');
+}
 const cleanRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-task003-clean-root-'));
 const cleanHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-task003-clean-home-'));
 const cleanPort = await getFreePort();
@@ -274,6 +358,21 @@ assertNoSecrets(healthy, ['task003-clean-secret'], 'healthy runtime status');
 await stopLauncher(clean);
 await assertMissing(cleanPaths.current, 'clean-shutdown current runtime state');
 await assertMissing(cleanPaths.failure, 'clean-shutdown failure state');
+
+const displayRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-task003-display-root-'));
+const displayHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-task003-display-home-'));
+const displayPort = await getFreePort();
+const displayToken = 'task003-display-token-1234567890';
+const displayPaths = runtimePaths(displayHome, await fs.realpath(displayRoot));
+const display = launch(displayRoot, displayHome, displayPort, { token: displayToken, noAuth: false });
+await waitForJson(displayPaths.current, (value) => Number.isInteger(value.runtimePid), 'redacted display runtime state');
+const displayOutput = display.output();
+const readyLine = displayOutput.split(/\r?\n/).find((line) => line.startsWith('CODEXPRO_READY')) ?? '';
+assert.equal(displayOutput.includes(displayToken), false, 'launcher display output leaked the HTTP token');
+assert.match(readyLine, /codexpro_token=\[REDACTED_SECRET\]/, 'launcher display URL lost its redacted query value');
+assert.equal(readyLine.includes('codexpro_token= [REDACTED_SECRET]'), false, 'launcher display URL gained whitespace after query equals');
+await stopLauncher(display);
+await assertMissing(displayPaths.current, 'redacted display shutdown current runtime state');
 
 const failureRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-task003-http-root-'));
 const failureHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-task003-http-home-'));
@@ -321,6 +420,7 @@ const basicSecret = 'task003-basic-secret-1234567890';
 const ngrokSecret = '2task003NGROKsecretABCDEFGHIJ1234567890';
 const tunnelSecret = 'eyJhbGciOiJIUzI1NiJ9.eyJ0YXNrIjoiMDAzIn0.signature1234567890';
 const urlSecret = 'task003-url-secret-1234567890';
+const launcherTokenSecret = 'task003-http-token-1234567890';
 const shortBearerSecret = 'QZ7';
 const digestSecret = 'DZ8';
 const shortBasicSecret = 'BZ9';
@@ -340,8 +440,28 @@ const longFieldSecret = 'longfieldtokenabcdefghijklmnop';
 const oversizedBeginningSecret = 'task003-oversized-begin-secret-1234567890';
 const oversizedEndingSecret = 'task003-oversized-end-secret-1234567890';
 const oversizedIncompleteSecret = 'task003-oversized-incomplete-secret-1234567890';
+const postBoundaryDiagnostic = 'task003-post-boundary-safe-diagnostic';
+const ambiguousDiagnosticSecret = 'CALL_LITERAL_7X9';
+const completePrivateBodySecret = 'task003-complete-private-body-1234567890';
+const fragmentedPrivateBodySecret = 'task003-fragmented-private-body-1234567890';
+const multibytePrivateBodySecret = 'task003-multibyte-private-body-1234567890';
+const incompletePrivateBodySecret = 'task003-incomplete-private-body-1234567890';
+const boundaryPrivateBodySecret = 'task003-boundary-private-body-1234567890';
+const ambiguousPasswordSecret = 'ACTUAL_LITERAL';
+const launcherPrivateBlockParityCorpus = [
+  `-----BEGIN RSA PRIVATE KEY-----\n${completePrivateBodySecret}\n-----END RSA PRIVATE KEY-----`,
+  `-----BEGIN OPENSSH PRIVATE KEY-----\n${fragmentedPrivateBodySecret}\n-----END OPENSSH PRIVATE KEY-----`,
+  `-----BEGIN PGP PRIVATE KEY BLOCK-----\n${incompletePrivateBodySecret}`
+];
+const launcherParityCorpus = [
+  ...redactionParityCases.map((testCase) => testCase.input),
+  ...launcherPrivateBlockParityCorpus
+];
 const splitCredentialChunks = [
-  'apiToken = getToken()\n',
+  'const API_TOKEN = getToken()\n',
+  `TOKEN=getToken(${ambiguousDiagnosticSecret})\n`,
+  `PASSWORD=readPassword(${ambiguousPasswordSecret})\n`,
+  `TOKEN=${placeholderLikeCredential}\n`,
   `Authorization: Bearer ${shortBearerSecret}`,
   '\n',
   `{"API_TO`,
@@ -366,6 +486,13 @@ const splitCredentialChunks = [
   `https://${urlSecret}:password@example.invalid/secret\n`,
   `cloudflared tunnel run --token ${tunnelSecret}\n`,
   `ngrok config add-authtoken ${ngrokSecret}\n`,
+  `-----BEGIN RSA PRIVATE KEY-----\n${completePrivateBodySecret}\n-----END RSA PRIVATE KEY-----\n`,
+  '-----BEGIN OP',
+  'ENSSH PRIVATE KEY-----\n',
+  `${fragmentedPrivateBodySecret}\n${multibytePrivateBodySecret}\n${'界'.repeat(3000)}\n`,
+  '-----END OP',
+  'ENSSH PRIVATE KEY-----\n',
+  `${'q'.repeat(8_180)}-----BEGIN PRIVATE KEY-----\n${boundaryPrivateBodySecret}\n-----END PRIVATE KEY-----\n`,
   'const API_TOKEN = config.apiToken;\n',
   'API_TOKEN = process.env.API_TOKEN;\n',
   ...launcherParityCorpus.map((input) => `${input}\n`)
@@ -381,7 +508,9 @@ const writeNext = () => {
     process.stdout.write('y'.repeat(5000));
     setImmediate(() => {
       process.stdout.write('y'.repeat(5000) + 'TOKEN=task003-oversized-end-secret-1234567890\\n');
-      process.stderr.write('z'.repeat(100000) + 'TOKEN=task003-oversized-incomplete-secret-1234567890');
+      process.stdout.write('界'.repeat(3000) + '\\n');
+      process.stderr.write('z'.repeat(100000) + 'TOKEN=task003-oversized-incomplete-secret-1234567890' + '\\n-----BEGIN PGP PRIVATE KEY BLOCK-----\\n' + ${JSON.stringify(incompletePrivateBodySecret)} + '界'.repeat(3000) + 'x'.repeat(100000));
+      process.stdout.write(${JSON.stringify(postBoundaryDiagnostic)} + '\\n');
       process.stdout.write('https://task003-fake.trycloudflare.com\\n');
       setTimeout(() => process.exit(23), 500);
     });
@@ -407,24 +536,33 @@ assert.ok(Buffer.byteLength(tunnelFailureRecord.detail ?? '', 'utf8') <= 2048);
 assert.ok((await fs.stat(tunnelPaths.failure)).size <= 16_384);
 const hostileSecrets = [
   bearerSecret, basicSecret, ngrokSecret, tunnelSecret, urlSecret, 'password@example.invalid',
+  launcherTokenSecret,
   shortBearerSecret, digestSecret, shortBasicSecret, tokenSchemeSecret, apiKeySecret,
   shortCodexToken, shortCliToken, shortEqualsToken, shortAuthToken, shortApiKey,
   shortQueryCodexToken, shortQueryToken, shortJsonToken, shortJsonHttpToken, shortYamlToken,
   'sk-ant-abcdefghijklmnopqrstuvwxyz123456', longFieldSecret,
-  oversizedBeginningSecret, oversizedEndingSecret, oversizedIncompleteSecret
+  oversizedBeginningSecret, oversizedEndingSecret, oversizedIncompleteSecret,
+  ambiguousDiagnosticSecret, ambiguousPasswordSecret, placeholderLikeCredential, completePrivateBodySecret, fragmentedPrivateBodySecret, multibytePrivateBodySecret, incompletePrivateBodySecret, boundaryPrivateBodySecret
 ];
 assertNoSecrets(tunnelFailureRecord, hostileSecrets, 'persisted tunnel failure');
 assertNoSecrets(tunnelFailure.output(), hostileSecrets, 'launcher-visible sanitized diagnostics');
+assert.equal(tunnelFailure.output().includes(postBoundaryDiagnostic), true, 'launcher output missed post-boundary stream record');
 for (const harmless of redactionParityCases.filter((testCase) => testCase.harmless).map((testCase) => testCase.input)) {
   assert.equal(tunnelFailure.output().includes(harmless), true, `launcher redaction over-redacted harmless expression: ${harmless}`);
 }
+const emittedDiagnosticRecordBytes = tunnelFailure.output().split(/\r?\n/)
+  .filter((line) => line.includes('[cloudflared]'))
+  .map((line) => Buffer.byteLength(line, 'utf8'));
+for (const bytes of emittedDiagnosticRecordBytes) assert.ok(bytes <= 8_192, `launcher diagnostic record exceeded 8192 bytes: ${bytes}`);
 for (const line of tunnelFailure.output().split(/\r?\n/).filter((line) => line.includes('[cloudflared]'))) {
-  assert.ok(Buffer.byteLength(line, 'utf8') <= 8_192, `launcher diagnostic record exceeded 8192 bytes: ${Buffer.byteLength(line, 'utf8')}`);
+  assert.equal(line.includes('\uFFFD'), false, 'launcher diagnostic record contains a UTF-8 replacement character');
 }
+const maxObservedDiagnosticRecordBytes = Math.max(0, ...emittedDiagnosticRecordBytes);
+console.log(`✓ max observed launcher diagnostic record: ${maxObservedDiagnosticRecordBytes} bytes`);
 assert.match(tunnelFailure.output(), /\[cloudflared\].*\[cloudflared diagnostic stream record truncated\]/);
 assert.ok(Buffer.byteLength(tunnelFailureRecord.detail ?? '', 'utf8') <= 8_192);
 for (const input of launcherParityCorpus) {
-  assert.equal(tunnelFailure.output().includes(redactSensitiveText(input)), true, `launcher/shared redaction parity mismatch for ${input}`);
+  assert.equal(tunnelFailure.output().includes(redactDiagnosticText(input)), true, `launcher/shared redaction parity mismatch for ${input}`);
 }
 const runtimeEntries = await fs.readdir(tunnelPaths.dir);
 assert.equal(runtimeEntries.some((entry) => entry.endsWith('.tmp')), false, `atomic runtime temp file remained: ${runtimeEntries.join(', ')}`);
@@ -453,6 +591,8 @@ const ownershipValidPort = await getFreePort();
 const ownershipValid = launchDirectHttp(ownershipValidRoot, ownershipValidHome, ownershipValidPort);
 const ownershipValidRunId = 'task003-valid-current-run';
 const ownershipValidStartedAt = new Date(Date.now() - 5_000).toISOString();
+const historicalFailureSecret = 'task003-historical-failure-secret-1234567890';
+const historicalFailureBody = 'task003-historical-private-body-1234567890';
 await waitForHttp(ownershipValidPort);
 await writeRuntimeFixture(ownershipValidHome, ownershipValidRoot, {
   pid: process.pid,
@@ -466,7 +606,7 @@ await writeRuntimeFixture(ownershipValidHome, ownershipValidRoot, {
   component: 'launcher',
   event: 'startup_failure',
   failedAt: new Date().toISOString(),
-  detail: 'current failure'
+  detail: 'TOKEN=' + historicalFailureSecret + '\n-----BEGIN PRIVATE KEY-----\n' + historicalFailureBody + '\n-----END PRIVATE KEY-----\n' + 'x'.repeat(5000)
 });
 const ownershipValidStatus = await callRuntimeStatus(ownershipValidPort);
 assert.equal(ownershipValidStatus.structured.run_id, ownershipValidRunId);
@@ -474,6 +614,10 @@ assert.equal(ownershipValidStatus.structured.startup_timestamp, ownershipValidSt
 assert.ok(ownershipValidStatus.structured.uptime_seconds >= 4);
 assert.equal(ownershipValidStatus.structured.launcher.status, 'running');
 assert.equal(ownershipValidStatus.structured.last_failure_relation, 'current');
+assertNoSecrets(ownershipValidStatus, [historicalFailureSecret, historicalFailureBody], 'historical runtime status');
+assert.ok(Buffer.byteLength(ownershipValidStatus.structured.last_failure.detail ?? '', 'utf8') <= 2_048);
+const historicalFailureFile = await fs.readFile(runtimePaths(ownershipValidHome, await fs.realpath(ownershipValidRoot)).failure, 'utf8');
+assert.equal(historicalFailureFile.includes(historicalFailureSecret), true, 'runtime_status rewrote historical failure unexpectedly');
 await stopLauncher(ownershipValid);
 
 const ownershipDeadRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-task003-owner-dead-root-'));

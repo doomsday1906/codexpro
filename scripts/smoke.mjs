@@ -774,6 +774,112 @@ if (!secretBatchPayload.includes('[REDACTED_SECRET]') || !secretBatchPayload.inc
 await expectToolError('write', { workspace_id: ws, path: 'notes.md', content: 'OPENAI_API_KEY=sk-realSecretValue123\n' }, /Secret-looking content is blocked/);
 await expectToolError('write', { workspace_id: ws, path: 'token.txt', content: 'codexpro_token=shorttok\n' }, /Secret-looking content is blocked/);
 await expectToolError('write', { workspace_id: ws, path: 'notes.yaml', content: 'api_key: yamlsecretvalueabcdefghijklmnop\n' }, /Secret-looking content is blocked/);
+const sourceCompatPath = path.join(tmp, 'source_compat.py');
+const sourceCompatInitial = [
+  'import os',
+  'import getpass',
+  'import secrets',
+  '',
+  'TOKEN = os.getenv("TOKEN")',
+  'PASSWORD = getpass.getpass()',
+  'API_KEY = config.get("api_key")',
+  'SECRET = secrets.token_urlsafe(32)',
+  ''
+].join('\n');
+const sourceCompatWrite = await client.request('tools/call', {
+  name: 'write',
+  arguments: { workspace_id: ws, path: 'source_compat.py', content: sourceCompatInitial }
+});
+if (sourceCompatWrite.isError) throw new Error(`MCP write rejected cross-language source: ${toolResultText(sourceCompatWrite)}`);
+if (await fs.readFile(sourceCompatPath, 'utf8') !== sourceCompatInitial) {
+  throw new Error('MCP write corrupted cross-language source expressions');
+}
+const sourceCompatEdited = sourceCompatInitial.replace('TOKEN = os.getenv("TOKEN")', 'TOKEN = os.environ.get("TOKEN")');
+const sourceCompatEdit = await client.request('tools/call', {
+  name: 'edit',
+  arguments: {
+    workspace_id: ws,
+    path: 'source_compat.py',
+    old_text: 'TOKEN = os.getenv("TOKEN")',
+    new_text: 'TOKEN = os.environ.get("TOKEN")',
+    expected_replacements: 1
+  }
+});
+if (sourceCompatEdit.isError) throw new Error(`MCP edit rejected cross-language source: ${toolResultText(sourceCompatEdit)}`);
+if (await fs.readFile(sourceCompatPath, 'utf8') !== sourceCompatEdited) {
+  throw new Error('MCP edit corrupted cross-language source expressions');
+}
+const sourceCompatPatched = sourceCompatEdited.replace('API_KEY = config.get("api_key")', 'API_KEY = settings.apiKey');
+const sourceCompatPatch = await client.request('tools/call', {
+  name: 'apply_patch',
+  arguments: {
+    workspace_id: ws,
+    patch: [
+      'diff --git a/source_compat.py b/source_compat.py',
+      '--- a/source_compat.py',
+      '+++ b/source_compat.py',
+      '@@ -5,4 +5,4 @@',
+      ' TOKEN = os.environ.get("TOKEN")',
+      ' PASSWORD = getpass.getpass()',
+      '-API_KEY = config.get("api_key")',
+      '+API_KEY = settings.apiKey',
+      ' SECRET = secrets.token_urlsafe(32)'
+    ].join('\n') + '\n'
+  }
+});
+if (sourceCompatPatch.isError) throw new Error(`MCP apply_patch rejected cross-language source: ${toolResultText(sourceCompatPatch)}`);
+if (await fs.readFile(sourceCompatPath, 'utf8') !== sourceCompatPatched) {
+  throw new Error('MCP apply_patch corrupted cross-language source expressions');
+}
+await expectToolError('write', {
+  workspace_id: ws,
+  path: 'literal-secret-source.txt',
+  content: 'TOKEN="QZ7"\n'
+}, /Secret-looking content is blocked/);
+if (await fs.access(path.join(tmp, 'literal-secret-source.txt')).then(() => true).catch((error) => {
+  if (error?.code === 'ENOENT') return false;
+  throw error;
+})) {
+  throw new Error('literal-secret MCP write created a file despite the guard');
+}
+await expectToolError('write', {
+  workspace_id: ws,
+  path: 'private-key-source.txt',
+  content: '-----BEGIN PRIVATE KEY-----\nTASK003_MCP_PRIVATE_BODY\n-----END PRIVATE KEY-----\n'
+}, /Secret-looking content is blocked/);
+if (await fs.access(path.join(tmp, 'private-key-source.txt')).then(() => true).catch((error) => {
+  if (error?.code === 'ENOENT') return false;
+  throw error;
+})) {
+  throw new Error('private-key MCP write created a file despite the guard');
+}
+await expectToolError('edit', {
+  workspace_id: ws,
+  path: 'source_compat.py',
+  old_text: 'SECRET = secrets.token_urlsafe(32)',
+  new_text: 'SECRET = "QZ7"',
+  expected_replacements: 1
+}, /Secret-looking content is blocked/);
+if (await fs.readFile(sourceCompatPath, 'utf8') !== sourceCompatPatched) {
+  throw new Error('literal-secret MCP edit changed the source despite the guard');
+}
+await expectToolError('apply_patch', {
+  workspace_id: ws,
+  patch: [
+    'diff --git a/source_compat.py b/source_compat.py',
+    '--- a/source_compat.py',
+    '+++ b/source_compat.py',
+    '@@ -5,4 +5,4 @@',
+    ' TOKEN = os.environ.get("TOKEN")',
+    '-PASSWORD = getpass.getpass()',
+    '+PASSWORD = "QZ7"',
+    ' API_KEY = settings.apiKey',
+    ' SECRET = secrets.token_urlsafe(32)'
+  ].join('\n') + '\n'
+}, /Secret-looking content is blocked/);
+if (await fs.readFile(sourceCompatPath, 'utf8') !== sourceCompatPatched) {
+  throw new Error('literal-secret MCP apply_patch changed the source despite the guard');
+}
 await client.request('tools/call', {
   name: 'write',
   arguments: {

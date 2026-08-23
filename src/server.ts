@@ -18,10 +18,11 @@ import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
 import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
-import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.js";
+import { hasSecretValue, redactDiagnosticText, redactSensitiveText, redactStructured, truncateUtf8 } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
+const RUNTIME_STATUS_FAILURE_DETAIL_MAX_BYTES = 2_048;
 // read_many owns a smaller aggregate response contract than the single-read
 // path. maxOutputBytes is not a universal read cap, but it remains the outer
 // configured ceiling when it is lower than this tool's own maximum.
@@ -1089,6 +1090,12 @@ const LOCAL_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, des
 const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
 const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 
+function boundedRuntimeFailureDetail(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const redacted = redactDiagnosticText(String(value));
+  return truncateUtf8(redacted, RUNTIME_STATUS_FAILURE_DETAIL_MAX_BYTES, `\n...[runtime failure detail truncated to ${RUNTIME_STATUS_FAILURE_DETAIL_MAX_BYTES} bytes]`);
+}
+
 function runtimeStatusPayload(config: CodexProConfig): Record<string, unknown> {
   let runtime: ReturnType<typeof readRuntimeConnection> = {};
   try {
@@ -1148,7 +1155,7 @@ function runtimeStatusPayload(config: CodexProConfig): Record<string, unknown> {
         failed_at: failure.failedAt ?? null,
         exit_code: failure.exitCode ?? null,
         signal: failure.signal ?? null,
-        detail: failure.detail ?? null,
+        detail: boundedRuntimeFailureDetail(failure.detail),
         launcher_pid: failure.launcherPid ?? null,
         http_pid: failure.httpPid ?? null,
         tunnel_pid: failure.tunnelPid ?? null,
