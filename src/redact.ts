@@ -6,7 +6,9 @@ import * as policy from "../scripts/redaction-policy.mjs";
 const {
   hasSecretValue: policyHasSecretValue,
   redactDiagnosticText: policyRedactDiagnosticText,
+  redactSearchQuery: policyRedactSearchQuery,
   redactSensitiveText: policyRedactSensitiveText,
+  redactSensitiveTextPreservingLines: policyRedactSensitiveTextPreservingLines,
   truncateUtf8: policyTruncateUtf8
 } = policy;
 
@@ -20,8 +22,16 @@ export function redactSensitiveText(text: string, options: { context?: Redaction
   return policyRedactSensitiveText(text, options);
 }
 
+export function redactSensitiveTextPreservingLines(text: string, options: { context?: RedactionContext } | RedactionContext = {}): string {
+  return policyRedactSensitiveTextPreservingLines(text, options);
+}
+
 export function redactDiagnosticText(text: string): string {
   return policyRedactDiagnosticText(text);
+}
+
+export function redactSearchQuery(query: string, safeMatchTexts: string[] = []): string {
+  return policyRedactSearchQuery(query, safeMatchTexts);
 }
 
 type RedactStructuredOptions = { context?: RedactionContext };

@@ -1,7 +1,8 @@
 import type { CodexProConfig } from "../config.js";
 import fsp from "node:fs/promises";
+import { TextDecoder } from "node:util";
 import type { PathGuard, Workspace } from "../guard.js";
-import { redactSensitiveText } from "../redact.js";
+import { redactSearchQuery, redactSensitiveTextPreservingLines } from "../redact.js";
 import { detectProjectTypes } from "./classify.js";
 import { getCachedWorkspaceAnalysis, invalidateWorkspaceAnalysis, setCachedWorkspaceAnalysis } from "./cache.js";
 import { extractWorkspaceFiles } from "./extract.js";
@@ -9,6 +10,18 @@ import { buildRelationships } from "./graph.js";
 import { inventoryWorkspace } from "./inventory.js";
 import { classifySearchIntent, emptySearchGroups, groupForFile, sortStructuredMatches } from "./rank.js";
 import type { AnalysisSearchIntent, StructuredSearchMatch, StructuredSearchResult, WorkspaceAnalysis } from "./types.js";
+
+const REDACTED_SEARCH_CONTEXT = "[REDACTED_SECRET]";
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+function decodeSearchBuffer(buffer: Buffer): { text: string; contextAvailable: boolean } {
+  if (buffer.includes(0)) return { text: buffer.toString("utf8"), contextAvailable: false };
+  try {
+    return { text: UTF8_DECODER.decode(buffer), contextAvailable: true };
+  } catch {
+    return { text: buffer.toString("utf8"), contextAvailable: false };
+  }
+}
 
 function cacheKey(workspace: Workspace, fingerprint: string, config: CodexProConfig): string {
   return `${workspace.id}:${fingerprint}:${JSON.stringify(config.analysisLimits)}`;
@@ -95,7 +108,7 @@ export async function searchWorkspaceStructured(
     warnings.push("Grouped results are unavailable for regular expression searches. Lexical regex matching remains delegated to ripgrep.");
     return {
       schemaVersion: 1,
-      query,
+      query: redactSearchQuery(query),
       intent,
       groups,
       matches: [],
@@ -119,14 +132,20 @@ export async function searchWorkspaceStructured(
       break;
     }
     let text: string;
+    let contextAvailable = true;
+    let sourceBytes = 0;
     try {
       const resolved = guard.resolve(workspace, file.path);
-      text = await fsp.readFile(resolved.absPath, "utf8");
+      const buffer = await fsp.readFile(resolved.absPath);
+      sourceBytes = buffer.byteLength;
+      const decoded = decodeSearchBuffer(buffer);
+      text = decoded.text;
+      contextAvailable = decoded.contextAvailable;
     } catch {
       skippedFiles += 1;
       continue;
     }
-    const actualBytes = Buffer.byteLength(text, "utf8");
+    const actualBytes = sourceBytes;
     if (scannedBytes + actualBytes > config.analysisLimits.maxScannedBytes) {
       searchBudgetReached = true;
       break;
@@ -135,9 +154,11 @@ export async function searchWorkspaceStructured(
     scannedBytes += actualBytes;
     const definitions = definitionsByPath.get(file.path) ?? new Map();
     const lines = text.split(/\r?\n/);
+    let redactedLines: string[] | null | undefined = contextAvailable ? undefined : null;
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index];
       if (!line.toLowerCase().includes(lowered)) continue;
+      if (contextAvailable) redactedLines ??= redactSensitiveTextPreservingLines(text).split(/\r?\n/);
       const symbol = definitions.get(index + 1);
       const isDefinition = Boolean(symbol && symbol.name.toLowerCase() === lowered);
       const group = groupForFile(analysis, file.path, isDefinition);
@@ -149,7 +170,7 @@ export async function searchWorkspaceStructured(
       matches.push({
         path: file.path,
         line: index + 1,
-        text: redactSensitiveText(line.trim().slice(0, 400)),
+        text: (redactedLines?.[index] ?? REDACTED_SEARCH_CONTEXT).trim().slice(0, 400),
         group,
         score: isDefinition ? 190 : file.role === "test" ? 160 : 100,
         reasons,
@@ -200,12 +221,13 @@ export async function searchWorkspaceStructured(
   if (candidateLimitReached) warnings.push(`Grouped search retained the first ${candidateLimit} candidates before ranking.`);
 
   for (const match of sortStructuredMatches(matches).slice(0, resultLimit)) groups[match.group].push(match);
+  const orderedMatches = Object.values(groups).flat();
   return {
     schemaVersion: 1,
-    query,
+    query: redactSearchQuery(query, orderedMatches.map((match) => match.text)),
     intent,
     groups,
-    matches: Object.values(groups).flat(),
+    matches: orderedMatches,
     coverage: {
       ...analysis.coverage,
       truncated: analysis.coverage.truncated || searchBudgetReached || candidateLimitReached || skippedFiles > 0,

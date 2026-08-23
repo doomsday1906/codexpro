@@ -197,6 +197,51 @@ function textResult(text: string, structuredContent: Record<string, unknown> = {
   };
 }
 
+function restoreSearchMatchText(safeMatches: unknown, sourceMatches: unknown, sourceLineOnly = false): unknown {
+  if (!Array.isArray(safeMatches) || !Array.isArray(sourceMatches)) return safeMatches;
+  return safeMatches.map((safeMatch, index) => {
+    const sourceMatch = sourceMatches[index];
+    if (!safeMatch || typeof safeMatch !== "object" || !sourceMatch || typeof sourceMatch !== "object") return safeMatch;
+    // `built-in analysis` is the source-line producer; import extraction and
+    // other relationship producers emit derived text that must stay wrapped.
+    if (sourceLineOnly && (sourceMatch as { source?: unknown }).source !== "built-in analysis") return safeMatch;
+    const sourceText = (sourceMatch as { text?: unknown }).text;
+    return typeof sourceText === "string" ? { ...(safeMatch as Record<string, unknown>), text: sourceText } : safeMatch;
+  });
+}
+
+function preserveSearchMatchText(response: any, result: any): any {
+  // Search redacts each matched line against its complete source file. A
+  // second isolated-line pass would erase lawful `credential: identifier`
+  // references, so retain only the already-safe match text while leaving
+  // paths and other structured fields under the generic redaction pass.
+  const structured = response?.structuredContent;
+  if (!structured || typeof structured !== "object" || Array.isArray(structured)) return response;
+  structured.matches = restoreSearchMatchText(structured.matches, result.matches);
+
+  const analysis = structured.analysis;
+  if (analysis && typeof analysis === "object" && !Array.isArray(analysis) && result.analysis) {
+    analysis.matches = restoreSearchMatchText(analysis.matches, result.analysis.matches, true);
+    if (analysis.groups && typeof analysis.groups === "object" && !Array.isArray(analysis.groups)) {
+      for (const [group, sourceMatches] of Object.entries(result.analysis.groups ?? {})) {
+        analysis.groups[group] = restoreSearchMatchText(analysis.groups[group], sourceMatches, true);
+      }
+    }
+  }
+
+  if (Array.isArray(response.content)) {
+    const safeMatches = Array.isArray(structured.matches) ? structured.matches : [];
+    response.content = response.content.map((part: any) => {
+      if (!part || part.type !== "text") return part;
+      const text = safeMatches
+        .map((match: any) => `${match.path}:${match.line}: ${match.text}`)
+        .join("\n") || "No matches.";
+      return { ...part, text };
+    });
+  }
+  return response;
+}
+
 function diagnosticResult(result: any): any {
   if (!result || typeof result !== "object" || Array.isArray(result)) return result;
   const safe = { ...result };
@@ -2064,7 +2109,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         used: result.used
       };
       if (result.analysis) structured.analysis = result.analysis;
-      return textResult(result.text, structured);
+      return preserveSearchMatchText(textResult(result.text, structured), result);
     }
   );
 

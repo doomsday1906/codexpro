@@ -1,11 +1,12 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { TextDecoder } from "node:util";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, PathGuard } from "./guard.js";
 import { listFiles, textScanByteLimit } from "./fsOps.js";
-import { redactDiagnosticText, redactSensitiveText } from "./redact.js";
+import { redactDiagnosticText, redactSearchQuery, redactSensitiveTextPreservingLines } from "./redact.js";
 import { searchWorkspaceStructured, type AnalysisSearchIntent, type StructuredSearchResult } from "./analysis/index.js";
 
 export interface SearchOptions {
@@ -43,6 +44,69 @@ function truncateLine(line: string, max = 400): string {
   return `${line.slice(0, max)}…`;
 }
 
+type RedactedSearchLines = string[] | null;
+const REDACTED_SEARCH_CONTEXT = "[REDACTED_SECRET]";
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+function decodeSearchText(buffer: Buffer): string | null {
+  if (buffer.includes(0)) return null;
+  try {
+    return UTF8_DECODER.decode(buffer);
+  } catch {
+    return null;
+  }
+}
+
+function redactSearchBuffer(buffer: Buffer): RedactedSearchLines {
+  const source = decodeSearchText(buffer);
+  if (source === null) return null;
+  return redactSensitiveTextPreservingLines(source).split(/\r?\n/);
+}
+
+async function readSearchBufferBounded(absPath: string, limit: number): Promise<Buffer | null> {
+  const handle = await fsp.open(absPath, "r");
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > limit) return null;
+    const buffer = Buffer.allocUnsafe(limit + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > limit || offset < stat.size) return null;
+    const finalStat = await handle.stat();
+    if (finalStat.size !== offset || finalStat.mtimeMs !== stat.mtimeMs || finalStat.ctimeMs !== stat.ctimeMs) return null;
+    const result = buffer.subarray(0, offset);
+    return result.includes(0) ? null : result;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function loadRedactedSearchLines(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  relativePath: string
+): Promise<RedactedSearchLines> {
+  try {
+    const resolved = guard.resolve(workspace, relativePath);
+    const buffer = await readSearchBufferBounded(resolved.absPath, textScanByteLimit(config));
+    return buffer ? redactSearchBuffer(buffer) : null;
+  } catch {
+    return null;
+  }
+}
+
+function selectRedactedSearchLine(lines: RedactedSearchLines, lineNumber: number): string {
+  const contextualLine = lines?.[lineNumber - 1];
+  return contextualLine === undefined
+    ? REDACTED_SEARCH_CONTEXT
+    : truncateLine(contextualLine);
+}
+
 async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: Workspace, options: SearchOptions): Promise<SearchResult> {
   const target = guard.resolve(workspace, options.root ?? ".");
   const args = ["--json", "--line-number", "--with-filename", "--no-heading", "--color=never", "--max-columns", "500", "--max-count", "50", "--max-filesize", String(textScanByteLimit(config))];
@@ -53,6 +117,7 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
   // Pass the query via -e so patterns beginning with "-" (e.g. "->", "--flag")
   // are treated as the search term instead of ripgrep options.
   args.push("-e", options.query, "--", target.absPath);
+  const redactedLinesByPath = new Map<string, RedactedSearchLines>();
 
   return new Promise((resolve, reject) => {
     const child = spawn("rg", args, { cwd: workspace.root, env: { ...process.env, NO_COLOR: "1" } });
@@ -70,7 +135,7 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
       stderr += String(chunk);
     });
     child.on("error", reject);
-    child.on("close", (code) => {
+    child.on("close", async (code) => {
       if (code && code > 1) {
         reject(new CodexProError(stderr.trim() || `ripgrep failed with exit code ${code}`));
         return;
@@ -95,7 +160,15 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
         visibleMatches += 1;
         if (matches.length >= options.maxResults) continue;
         const lineText = String(value.data?.lines?.text ?? "").replace(/\r?\n$/, "");
-        matches.push({ path: rel || ".", line: Number(value.data?.line_number ?? 0), text: redactSensitiveText(truncateLine(lineText)) });
+        const lineNumber = Number(value.data?.line_number ?? 0);
+        if (!redactedLinesByPath.has(rel)) {
+          redactedLinesByPath.set(rel, await loadRedactedSearchLines(config, guard, workspace, rel));
+        }
+        matches.push({
+          path: rel || ".",
+          line: lineNumber,
+          text: selectRedactedSearchLine(redactedLinesByPath.get(rel) ?? null, lineNumber)
+        });
       }
       const text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
       resolve({ text, matches, truncated: visibleMatches > matches.length || outputLimited, used: "ripgrep" });
@@ -122,18 +195,19 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
     if (visibleMatches > options.maxResults) break;
     const resolved = guard.resolve(workspace, rel);
     try {
-      const stat = await fsp.stat(resolved.absPath);
-      if (stat.size > scanBytes) continue;
-      const buffer = await fsp.readFile(resolved.absPath);
-      if (buffer.includes(0)) continue;
-      const lines = buffer.toString("utf8").split(/\r?\n/);
+      const buffer = await readSearchBufferBounded(resolved.absPath, scanBytes);
+      if (!buffer) continue;
+      const source = decodeSearchText(buffer);
+      if (source === null) continue;
+      const lines = source.split(/\r?\n/);
+      const redactedLines = redactSearchBuffer(buffer);
       for (let i = 0; i < lines.length; i += 1) {
         const line = lines[i];
         const hit = line.includes(options.query);
         if (hit) {
           visibleMatches += 1;
           if (matches.length < options.maxResults) {
-            matches.push({ path: rel, line: i + 1, text: redactSensitiveText(truncateLine(line)) });
+            matches.push({ path: rel, line: i + 1, text: selectRedactedSearchLine(redactedLines, i + 1) });
           }
           if (visibleMatches > options.maxResults) break;
         }
@@ -173,7 +247,7 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
   if (!config.analysisEnabled) {
     lexical.analysis = {
       schemaVersion: 1,
-      query,
+      query: redactSearchQuery(query, lexical.matches.map((match) => match.text)),
       intent: rawOptions.intent && rawOptions.intent !== "auto" ? rawOptions.intent : "text",
       groups: { definitions: [], references: [], tests: [], configuration: [], documentation: [], other: [] },
       matches: [],
@@ -184,7 +258,7 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
     return lexical;
   }
   try {
-    lexical.analysis = await searchWorkspaceStructured(config, guard, workspace, {
+    const structured = await searchWorkspaceStructured(config, guard, workspace, {
       query,
       intent: rawOptions.intent ?? "auto",
       includeTests: Boolean(rawOptions.includeTests),
@@ -192,10 +266,18 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
       root: options.root,
       maxResults: options.maxResults
     });
+    // Binary/NUL files may be found by lexical ripgrep while analysis has no
+    // decodable inventory or structured matches. Use both redacted producers
+    // before echoing the query, including the regex structured route.
+    structured.query = redactSearchQuery(query, [
+      ...lexical.matches.map((match) => match.text),
+      ...structured.matches.map((match) => match.text)
+    ]);
+    lexical.analysis = structured;
   } catch (error) {
     lexical.analysis = {
       schemaVersion: 1,
-      query,
+      query: redactSearchQuery(query, lexical.matches.map((match) => match.text)),
       intent: rawOptions.intent && rawOptions.intent !== "auto" ? rawOptions.intent : "text",
       groups: { definitions: [], references: [], tests: [], configuration: [], documentation: [], other: [] },
       matches: [],
