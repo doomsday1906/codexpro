@@ -2932,7 +2932,7 @@ function printCreateAppFields(details) {
   if (details.token) {
     console.log('If your ChatGPT UI supports custom headers instead, you can use:');
     console.log('');
-    console.log(`  Authorization: Bearer ${redactForLog(details.token)}`);
+    console.log('  Authorization: Bearer [REDACTED_SECRET]');
   } else {
     console.log('Authorization: disabled');
   }
