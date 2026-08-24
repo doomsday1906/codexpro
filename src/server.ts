@@ -81,11 +81,14 @@ type ReadManyResult =
 // Public source bodies are redacted against the complete file before they are
 // placed in a response. Keep that body as an explicit typed exception to the
 // generic response pass; all paths, hashes, framing, errors, and other
-// metadata continue through recursive redaction.
+// metadata continue through recursive redaction. Text responses use typed
+// segments so a body is protected at the exact construction site rather than
+// by searching for a duplicate value in the finished response.
 type PublicSourceBody = { readonly kind: "public-source-body"; readonly text: string };
+type PublicTextNormal = { readonly kind: "normal"; readonly text: string };
+type PublicTextSegment = PublicTextNormal | PublicSourceBody;
 type PublicSourceField = { readonly path: readonly (string | number)[]; readonly body: PublicSourceBody };
 type TextResultOptions = {
-  readonly sourceBodies?: readonly PublicSourceBody[];
   readonly sourceFields?: readonly PublicSourceField[];
 };
 
@@ -93,21 +96,27 @@ function publicSourceBody(text: string): PublicSourceBody {
   return { kind: "public-source-body", text };
 }
 
-function redactTextWithPublicSourceBodies(text: string, bodies: readonly PublicSourceBody[]): string {
-  let cursor = 0;
+function redactPublicTextSegments(text: string | readonly PublicTextSegment[]): string {
+  const segments: readonly PublicTextSegment[] = typeof text === "string"
+    ? [{ kind: "normal", text }]
+    : text;
   let output = "";
-  let protectedBodyCount = 0;
-  for (const body of bodies) {
-    if (!body.text) continue;
-    const index = text.indexOf(body.text, cursor);
-    if (index < 0) continue;
-    output += redactSensitiveText(text.slice(cursor, index));
-    output += body.text;
-    cursor = index + body.text.length;
-    protectedBodyCount += 1;
+  let normalText = "";
+  const flushNormal = () => {
+    if (!normalText) return;
+    output += redactSensitiveText(normalText);
+    normalText = "";
+  };
+  for (const segment of segments) {
+    if (segment.kind === "public-source-body") {
+      flushNormal();
+      output += segment.text;
+    } else {
+      normalText += segment.text;
+    }
   }
-  if (protectedBodyCount === 0) return redactSensitiveText(text);
-  return output + redactSensitiveText(text.slice(cursor));
+  flushNormal();
+  return output;
 }
 
 function samePublicSourcePath(left: readonly (string | number)[], right: readonly (string | number)[]): boolean {
@@ -122,7 +131,7 @@ function redactStructuredPreservingSourceFields(
 ): unknown {
   if (depth > 8 || value === null || value === undefined) return value;
   const sourceField = fields.find((field) => samePublicSourcePath(field.path, path));
-  if (sourceField && typeof value === "string" && value === sourceField.body.text) return value;
+  if (sourceField && typeof value === "string") return value;
   if (typeof value === "string") return redactSensitiveText(value);
   if (Array.isArray(value)) {
     return value.map((item, index) => redactStructuredPreservingSourceFields(item, fields, [...path, index], depth + 1));
@@ -173,8 +182,8 @@ function parseReadManyArguments(args: unknown): ReadManyArguments {
   throw boundedReadManyValidationError(parsed.error.issues);
 }
 
-function readManyText(workspace: Workspace, results: ReadManyResult[], maxTotalBytes: number): string {
-  const lines = [
+function readManyText(workspace: Workspace, results: ReadManyResult[], maxTotalBytes: number): readonly PublicTextSegment[] {
+  const parts: Array<string | PublicSourceBody> = [
     "# Read Many",
     "",
     `Workspace: ${workspace.root}`,
@@ -184,29 +193,47 @@ function readManyText(workspace: Workspace, results: ReadManyResult[], maxTotalB
   ];
   for (const item of results) {
     if (item.ok) {
-      lines.push(
+      parts.push(
         `- [${item.index}] ${item.path}: ok; ${item.result.startLine}-${item.result.endLine} of ${item.result.totalLines} lines, ${item.result.bytes} file bytes.`,
         "",
         `## Item ${item.index}: ${item.path}`,
         "",
         "```text",
-        item.result.text,
+        publicSourceBody(item.result.text),
         "```"
       );
     } else {
-      lines.push(`- [${item.index}] ${item.path}: error; ${item.error}`);
+      parts.push(`- [${item.index}] ${item.path}: error; ${item.error}`);
     }
   }
-  return lines.join("\n");
+
+  const segments: PublicTextSegment[] = [];
+  let normal = "";
+  let hasPreviousPart = false;
+  const flushNormal = () => {
+    if (!normal) return;
+    segments.push({ kind: "normal", text: normal });
+    normal = "";
+  };
+  for (const part of parts) {
+    if (typeof part === "string") {
+      normal += `${hasPreviousPart ? "\n" : ""}${part}`;
+    } else {
+      if (hasPreviousPart) normal += "\n";
+      flushNormal();
+      segments.push(part);
+    }
+    hasPreviousPart = true;
+  }
+  flushNormal();
+  return segments;
 }
 
 function readManyResponse(workspace: Workspace, results: ReadManyResult[], maxTotalBytes: number): any {
-  const sourceBodies: PublicSourceBody[] = [];
   const sourceFields: PublicSourceField[] = [];
   for (const item of results) {
     if (!item.ok) continue;
     const body = publicSourceBody(item.result.text);
-    sourceBodies.push(body);
     sourceFields.push({ path: ["results", item.index, "result", "text"], body });
   }
   return textResult(readManyText(workspace, results, maxTotalBytes), {
@@ -216,7 +243,7 @@ function readManyResponse(workspace: Workspace, results: ReadManyResult[], maxTo
     max_total_bytes: maxTotalBytes,
     item_count: results.length,
     results
-  }, {}, { sourceBodies, sourceFields });
+  }, {}, { sourceFields });
 }
 
 function serializedReadManyResponseBytes(response: any): number {
@@ -256,13 +283,13 @@ function compactStructuredContent<T>(value: T, depth = 0): T {
 }
 
 function textResult(
-  text: string,
+  text: string | readonly PublicTextSegment[],
   structuredContent: Record<string, unknown> = {},
   meta: Record<string, unknown> = {},
   options: TextResultOptions = {}
 ): any {
   return {
-    content: [{ type: "text", text: redactTextWithPublicSourceBodies(text, options.sourceBodies ?? []) }],
+    content: [{ type: "text", text: redactPublicTextSegments(text) }],
     // Only the explicitly identified source body fields bypass the second
     // source-context pass; every other structured field remains recursive.
     // Public read/read_many pass no custom _meta, so MCP metadata stays the
@@ -2218,10 +2245,16 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         endLine: args.end_line,
         maxBytes: args.max_bytes
       });
-      const text = `# Read File\n\nPath: ${result.path}\nLines: ${result.startLine}-${result.endLine} of ${result.totalLines}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}\n\n\`\`\`text\n${result.text}\n\`\`\``;
       const body = publicSourceBody(result.text);
+      const text = [
+        {
+          kind: "normal" as const,
+          text: `# Read File\n\nPath: ${result.path}\nLines: ${result.startLine}-${result.endLine} of ${result.totalLines}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}\n\n\`\`\`text\n`
+        },
+        body,
+        { kind: "normal" as const, text: "\n\`\`\`" }
+      ] as const;
       return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result }, {}, {
-        sourceBodies: [body],
         sourceFields: [{ path: ["text"], body }]
       });
     }

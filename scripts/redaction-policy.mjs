@@ -225,19 +225,23 @@ function hasAssignmentAnchor(code, offset, value = '') {
 function genericTailEnd(code, end) {
   let index = end;
   while (index < code.length && HORIZONTAL_WHITESPACE.test(code[index])) index += 1;
-  if (code[index] !== '<') return index;
+  if (code[index] !== '<' && code[index] !== '[') return index;
   const start = index;
-  let depth = 0;
+  const expectedClosers = { '<': '>', '[': ']' };
+  const openers = new Set(Object.keys(expectedClosers));
+  const closers = new Set(Object.values(expectedClosers));
+  const stack = [];
   for (; index < code.length; index += 1) {
     if (index - start >= MAX_GENERIC_TAIL_LENGTH) return -1;
     const current = code[index];
-    if (current === '\n' || current === '\r' || (depth > 0 && /[=;{}]/u.test(current))) return -1;
-    if (current === '<') {
-      depth += 1;
-      if (depth > MAX_GENERIC_TAIL_DEPTH) return -1;
-    } else if (current === '>') {
-      depth -= 1;
-      if (depth === 0) return index + 1;
+    if (current === '\n' || current === '\r' || (stack.length > 0 && /[=;{}]/u.test(current))) return -1;
+    if (openers.has(current)) {
+      stack.push(current);
+      if (stack.length > MAX_GENERIC_TAIL_DEPTH) return -1;
+    } else if (closers.has(current)) {
+      if (expectedClosers[stack[stack.length - 1]] !== current) return -1;
+      stack.pop();
+      if (stack.length === 0) return index + 1;
     }
   }
   return -1;
@@ -246,7 +250,7 @@ function genericTailEnd(code, end) {
 function genericTailStart(code, end) {
   let index = end;
   while (index < code.length && HORIZONTAL_WHITESPACE.test(code[index])) index += 1;
-  return code[index] === '<' ? index : -1;
+  return code[index] === '<' || code[index] === '[' ? index : -1;
 }
 
 function genericTailRecordEnd(code, start) {
@@ -257,14 +261,22 @@ function genericTailRecordEnd(code, start) {
   return line.end > line.start && code[line.end - 1] === '\r' ? line.end - 1 : line.end;
 }
 
+function genericTailBoundaryIsValid(code, start, end) {
+  // `]` remains a lawful suffix after an angle generic (`Token<T>[]`), but a
+  // second close bracket after a square tail is an unmatched/malformed tail.
+  if (code[start] === '[') return /^(?:[^\S\r\n]*(?:[,;=)}:]|#|\/\/|\/\*|\r?\n|$))/u.test(code.slice(end));
+  return /^(?:[^\S\r\n]*(?:[,;=)}\]:]|#|\/\/|\/\*|\r?\n|$))/u.test(code.slice(end));
+}
+
 function genericTailInfo(code, end) {
   const start = genericTailStart(code, end);
   if (start < 0) return null;
   const parsedEnd = genericTailEnd(code, end);
+  const balanced = parsedEnd >= 0 && genericTailBoundaryIsValid(code, start, parsedEnd);
   return {
     start,
-    end: parsedEnd >= 0 ? parsedEnd : genericTailRecordEnd(code, start),
-    balanced: parsedEnd >= 0
+    end: balanced ? parsedEnd : genericTailRecordEnd(code, start),
+    balanced
   };
 }
 
@@ -361,12 +373,23 @@ function hasParameterAnchor(code, syntax, offset) {
 }
 
 function hasPythonClassAnchor(code, offset) {
-  const { start } = sourceLineBounds(code, offset);
-  const currentLine = code.slice(start, sourceLineBounds(code, offset).end).replace(/^\s*\d+\s*\|\s?/u, '');
+  const currentBounds = sourceLineBounds(code, offset);
+  const rawCurrentLine = code.slice(currentBounds.start, currentBounds.end);
+  const currentLine = rawCurrentLine.replace(/^\s*\d+\s*\|\s?/u, '');
   const currentIndent = currentLine.match(/^[ \t]*/u)?.[0].length ?? 0;
-  // Walk complete preceding physical lines. A member after another member
-  // must retain the same class envelope as the first annotation.
-  let previousEnd = start;
+  // A direct class-suite annotation starts at the physical line's indentation.
+  // Anything already written on that line is a nested expression/statement,
+  // not a class member, even when the line is inside a class suite.
+  const linePrefixLength = rawCurrentLine.length - currentLine.length;
+  const currentOffsetInLine = Math.max(0, offset - currentBounds.start - linePrefixLength);
+  const currentPrefix = currentLine.slice(0, currentOffsetInLine).trim();
+  if (currentPrefix) return false;
+
+  // Walk complete preceding physical lines. Same- or deeper-indentation
+  // members belong to the current suite and may be skipped; the first
+  // meaningful line at a strictly smaller indentation is the only provenance
+  // boundary that can establish a direct class annotation.
+  let previousEnd = currentBounds.start;
   let inspected = 0;
   while (previousEnd > 0 && inspected < 96) {
     while (previousEnd > 0 && (code[previousEnd - 1] === '\n' || code[previousEnd - 1] === '\r')) previousEnd -= 1;
@@ -376,17 +399,15 @@ function hasPythonClassAnchor(code, offset) {
     inspected += 1;
     if (!previousLine.trim()) continue;
     const previousIndent = previousLine.match(/^[ \t]*/u)?.[0].length ?? 0;
-    if (/^class\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*(?:\([^\n]*\)|\[[^\n]*\]|<[^>\n]*>))?\s*:/u.test(previousLine.trim()) && currentIndent > previousIndent) return true;
-    if (previousIndent <= currentIndent && previousIndent === 0) break;
+    if (previousIndent >= currentIndent) continue;
+    return /^class\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*(?:\([^\n]*\)|\[[^\n]*\]|<[^>\n]*>))?\s*:/u.test(previousLine.trim());
   }
   return false;
 }
 
 function hasBalancedGenericTail(code, end) {
-  if (genericTailStart(code, end) < 0) return true;
-  const tailEnd = genericTailEnd(code, end);
-  if (tailEnd < 0) return false;
-  return /^(?:[^\S\r\n]*(?:[,;=)}\]:]|$))/u.test(code.slice(tailEnd));
+  const tail = genericTailInfo(code, end);
+  return !tail || tail.balanced;
 }
 
 function createSourceSyntax(text) {

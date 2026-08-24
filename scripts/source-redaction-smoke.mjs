@@ -173,6 +173,12 @@ async function writeFixture(root, relativePath, content) {
   await fs.writeFile(target, content, 'utf8');
 }
 
+async function writeRawArtifact(root, name, value) {
+  if (!root) return;
+  await fs.mkdir(root, { recursive: true });
+  await fs.writeFile(path.join(root, `${name}.json`), `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+}
+
 function gitFixture(root) {
   for (const args of [['init'], ['config', 'core.quotePath', 'true'], ['add', '.']]) {
     const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
@@ -238,6 +244,76 @@ const sourcePy = [
   '    token: Token[str]',
   ''
 ].join('\n');
+
+// These Python fixtures separate lawful class/type provenance from nested
+// dictionary and block values. The expected lawful result is the exact source
+// projection; hostile values are asserted independently against raw MCP
+// responses below so an implementation-generated classification cannot bless
+// a value merely because it occurs inside a class suite.
+const pythonProvenanceLawful = [
+  'class DirectRequest:',
+  '    token: Token[str]',
+  '    password: PasswordType',
+  '    api_token: Token[str]',
+  '',
+  '    separated: Token[str]',
+  '',
+  '    class NestedRequest:',
+  '        token: Token[str]',
+  '',
+  'def direct_function(token: Token[str]) -> Token[str]:',
+  '    return token',
+  ''
+].join('\n');
+
+const pythonProvenanceHostile = [
+  'class EarlierLawful:',
+  '    token: Token[str]',
+  '',
+  'class HostileRequest:',
+  '    payload = {token: Token[ACTUAL_LITERAL_SECRET_7X9]}',
+  '    member_payload = {token: Token[client.actualSecret]}',
+  '    call_payload = {password: Password[client.getSecret()]}',
+  '',
+  '    def method(self):',
+  '        nested = {token: Token[ACTUAL_LITERAL_SECRET_7X9]}',
+  '        return nested',
+  '',
+  '    if enabled:',
+  '        nested_token = Token[ACTUAL_LITERAL_SECRET_7X9]',
+  '',
+  '    deeply_nested = {outer: {token: Token[ACTUAL_LITERAL_SECRET_7X9]}}',
+  '',
+  'TOP_LEVEL = {token: Token[ACTUAL_LITERAL_SECRET_7X9]}',
+  ''
+].join('\n');
+
+const pythonProvenanceHostileRedacted = [
+  'class EarlierLawful:',
+  '    token: Token[str]',
+  '',
+  'class HostileRequest:',
+  '    payload = {token: [REDACTED_SECRET]}',
+  '    member_payload = {token: [REDACTED_SECRET]}',
+  '    call_payload = {password: [REDACTED_SECRET]}',
+  '',
+  '    def method(self):',
+  '        nested = {token: [REDACTED_SECRET]}',
+  '        return nested',
+  '',
+  '    if enabled:',
+  '        nested_token= [REDACTED_SECRET]',
+  '',
+  '    deeply_nested = {outer: {token: [REDACTED_SECRET]}}',
+  '',
+  'TOP_LEVEL = {token: [REDACTED_SECRET]}',
+  ''
+].join('\n');
+
+const collisionPath = '2 |   token: Token<string>;';
+const collisionSource = 'type Input = {\n  token: Token<string>;\n};\n';
+const identicalSourceBody = 'type Input = {\n  token: Token<string>;\n};\n';
+const collisionMetadataPath = '2 |   token: [REDACTED_SECRET];';
 
 const safeConfig = [
   'const API_TOKEN = process.env.API_TOKEN;',
@@ -527,7 +603,9 @@ const directSafe = [
   'TOKEN: str = configuredToken',
   'def generic(token: Token[str]) -> Token[str]:',
   'class GenericRequest:\n    token: Token[str]',
-  'class Request:\n    token: Token[str]\n    password: PasswordType'
+  'class Request:\n    token: Token[str]\n    password: PasswordType',
+  'class SquareRequest:\n    token: Token[str]',
+  'def square_parameter(token: Token[str]) -> Token[str]:\n    return token'
 ];
 for (const sample of directSafe) {
   assert.equal(redactSensitiveText(sample), sample, `policy changed lawful source: ${sample}`);
@@ -587,6 +665,36 @@ assert.equal(
   'malformed generic tail stopped before its rejected payload'
 );
 
+const squareTailCases = [
+  ['token: Token[ACTUAL_LITERAL_SECRET_7X9]', 'token: [REDACTED_SECRET]'],
+  ['password: Password[client.getSecret()]', 'password: [REDACTED_SECRET]'],
+  ['token: Token[Wrapper[ACTUAL_LITERAL_SECRET_7X9]]', 'token: [REDACTED_SECRET]'],
+  ['token: Token [ ACTUAL_LITERAL_SECRET_7X9 ]', 'token: [REDACTED_SECRET]'],
+  [
+    'token: Token[ACTUAL_LITERAL_SECRET_7X9\nconst lawful = runtimeToken;',
+    'token: [REDACTED_SECRET]\nconst lawful = runtimeToken;'
+  ],
+  [
+    'token: Token[ACTUAL_LITERAL_SECRET_7X9=LEAK\nconst lawful = runtimeToken;',
+    'token: [REDACTED_SECRET]\nconst lawful = runtimeToken;'
+  ],
+  [
+    'token: Token[ACTUAL_LITERAL_SECRET_7X9>\nconst lawful = runtimeToken;',
+    'token: [REDACTED_SECRET]\nconst lawful = runtimeToken;'
+  ]
+];
+for (const [sample, expected] of squareTailCases) {
+  assert.equal(redactSensitiveText(sample), expected, `square generic tail redaction changed: ${sample}`);
+  assert.equal(hasSecretValue(sample), true, `square generic tail was not classified: ${sample}`);
+}
+for (const sample of [
+  'class SquareTailLawful:\n    token: Token[str]',
+  'def squareTailFunction(token: Token[str]) -> Token[str]:\n    return token'
+]) {
+  assert.equal(redactSensitiveText(sample), sample, `lawful square generic source changed: ${sample}`);
+  assert.equal(hasSecretValue(sample), false, `lawful square generic source classified as secret: ${sample}`);
+}
+
 for (const [query, safeMatchTexts, expected] of [
   ['policyHasSecretValue', ['const { hasSecretValue: policyHasSecretValue } = policy;'], 'policyHasSecretValue'],
   ['client.actualSecret', ['TOKEN= [REDACTED_SECRET]'], '[REDACTED_SECRET]'],
@@ -632,10 +740,16 @@ assert.deepEqual(
 );
 
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-source-redaction-'));
+const rawArtifactDir = process.env.SOURCE_REDACTION_RAW_ARTIFACT_DIR;
 let client;
 try {
   await writeFixture(tmp, 'source.ts', sourceTs);
   await writeFixture(tmp, 'source.py', sourcePy);
+  await writeFixture(tmp, 'python-provenance-lawful.py', pythonProvenanceLawful);
+  await writeFixture(tmp, 'python-provenance-hostile.py', pythonProvenanceHostile);
+  await writeFixture(tmp, collisionPath, collisionSource);
+  await writeFixture(tmp, 'identical-source-a.ts', identicalSourceBody);
+  await writeFixture(tmp, 'identical-source-b.ts', identicalSourceBody);
   await writeFixture(tmp, 'safe-config.js', safeConfig);
   await writeFixture(tmp, 'ranged-lawful.ts', rangedLawfulTs);
   await writeFixture(tmp, 'ranged-lawful.py', rangedLawfulPy);
@@ -689,6 +803,84 @@ try {
   assert.equal(sourcePyRead.content?.[0]?.text.includes(numbered(sourcePy)), true, 'MCP Python read content envelope changed lawful source bytes');
   assert.equal(sourcePyRead.content?.[0]?.text.includes('[REDACTED_SECRET]'), false, 'MCP Python read content envelope redacted lawful source');
 
+  // The filename is deliberately identical to a later ranged source body.
+  // Metadata must take the ordinary policy path while the typed source slot
+  // is protected structurally, otherwise a value-based search can bless the
+  // path and redact the actual body (or bless the wrong repeated occurrence).
+  const collisionFull = assertToolSuccess(await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: workspaceId, path: collisionPath }
+  }), 'structural collision full read');
+  assertReadMetadata(collisionFull, collisionSource, 1, undefined, 'structural collision full read');
+  assert.equal(collisionFull.structuredContent.path, collisionMetadataPath, 'structural collision metadata path was not ordinarily redacted');
+  assert.equal(collisionFull.structuredContent.text, numbered(collisionSource), 'structural collision full source body changed');
+  assert.equal(collisionFull.content?.[0]?.text.includes(`Path: ${collisionPath}`), false, 'structural collision content header preserved the raw path');
+  assert.equal(collisionFull.content?.[0]?.text.includes(`Path: ${collisionMetadataPath}`), true, 'structural collision content header omitted the redacted path');
+  assert.equal(JSON.stringify(collisionFull.structuredContent).includes(`"path":"${collisionPath}"`), false, 'structural collision structured path leaked in complete JSON');
+  assert.equal(JSON.stringify(collisionFull).includes(`"path":"${collisionPath}"`), false, 'structural collision raw path leaked in complete JSON');
+  expectNoRawLiterals(collisionFull, ['ACTUAL_LITERAL_SECRET_7X9', 'client.actualSecret', 'client.getSecret()'], 'structural collision full read');
+  await writeRawArtifact(rawArtifactDir, 'collision-full', collisionFull);
+
+  const collisionRange = assertToolSuccess(await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: workspaceId, path: collisionPath, start_line: 2, end_line: 2 }
+  }), 'structural collision ranged read');
+  assertReadMetadata(collisionRange, collisionSource, 2, 2, 'structural collision ranged read');
+  assert.equal(collisionRange.structuredContent.path, collisionMetadataPath, 'structural collision ranged metadata path was not redacted');
+  assert.equal(collisionRange.structuredContent.text, '2 |   token: Token<string>;', 'structural collision ranged source body was redacted or changed');
+  assert.equal(collisionRange.content?.[0]?.text.includes(`Path: ${collisionPath}`), false, 'structural collision ranged content header preserved the raw path');
+  assert.equal(collisionRange.content?.[0]?.text.includes(`Path: ${collisionMetadataPath}`), true, 'structural collision ranged content header omitted the redacted path');
+  expectNoRawLiterals(collisionRange, ['ACTUAL_LITERAL_SECRET_7X9', 'client.actualSecret', 'client.getSecret()'], 'structural collision ranged read');
+  await writeRawArtifact(rawArtifactDir, 'collision-range', collisionRange);
+
+  const collisionBatchItems = Array.from({ length: 3 }, () => ({ path: collisionPath, start_line: 2, end_line: 2 }));
+  const collisionBatch = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: { workspace_id: workspaceId, items: collisionBatchItems }
+  }), 'structural collision repeated read_many');
+  const collisionResults = collisionBatch.structuredContent.results ?? [];
+  assert.equal(collisionResults.length, collisionBatchItems.length, 'structural collision repeated read_many changed item count');
+  assert.deepEqual(
+    collisionResults.map((item) => ({ index: item.index, path: item.path, ok: item.ok, text: item.result?.text })),
+    collisionBatchItems.map((item, index) => ({ index, path: collisionMetadataPath, ok: true, text: '2 |   token: Token<string>;' })),
+    'structural collision repeated read_many changed item order, metadata, or source slots'
+  );
+  const collisionBatchText = resultText(collisionBatch);
+  assert.equal(collisionBatchText.includes(`Item 0: ${collisionPath}`), false, 'structural collision repeated read_many leaked item 0 path');
+  assert.equal(collisionBatchText.includes(`Item 1: ${collisionPath}`), false, 'structural collision repeated read_many leaked item 1 path');
+  assert.equal(collisionBatchText.includes(`Item 2: ${collisionPath}`), false, 'structural collision repeated read_many leaked item 2 path');
+  for (let index = 0; index < collisionBatchItems.length; index += 1) {
+    assert.equal(collisionBatchText.includes(`Item ${index}: ${collisionMetadataPath}`), true, `structural collision repeated read_many omitted redacted item ${index} path`);
+  }
+  assert.equal(collisionBatchText.split('2 |   token: Token<string>;').length - 1, 3, 'structural collision repeated read_many lost or duplicated a designated source body');
+  assert.equal(JSON.stringify(collisionBatch).includes(`"path":"${collisionPath}"`), false, 'structural collision repeated read_many leaked a raw metadata path');
+  expectNoRawLiterals(collisionBatch, ['ACTUAL_LITERAL_SECRET_7X9', 'client.actualSecret', 'client.getSecret()'], 'structural collision repeated read_many');
+  await writeRawArtifact(rawArtifactDir, 'collision-read-many', collisionBatch);
+
+  const identicalBodyBatch = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: {
+      workspace_id: workspaceId,
+      items: [
+        { path: 'identical-source-a.ts', start_line: 2, end_line: 2 },
+        { path: 'identical-source-b.ts', start_line: 2, end_line: 2 }
+      ]
+    }
+  }), 'identical ranged source-body read_many');
+  const identicalResults = identicalBodyBatch.structuredContent.results ?? [];
+  assert.deepEqual(
+    identicalResults.map((item) => ({ index: item.index, path: item.path, ok: item.ok, text: item.result?.text })),
+    [
+      { index: 0, path: 'identical-source-a.ts', ok: true, text: '2 |   token: Token<string>;' },
+      { index: 1, path: 'identical-source-b.ts', ok: true, text: '2 |   token: Token<string>;' }
+    ],
+    'identical ranged source-body read_many changed designated source slots'
+  );
+  assert.equal(resultText(identicalBodyBatch).split('2 |   token: Token<string>;').length - 1, 2, 'identical ranged source-body read_many did not preserve both equal source bodies');
+  assert.equal(resultText(identicalBodyBatch).includes('Item 0: identical-source-a.ts'), true, 'identical ranged source-body read_many omitted first ordinary metadata path');
+  assert.equal(resultText(identicalBodyBatch).includes('Item 1: identical-source-b.ts'), true, 'identical ranged source-body read_many omitted second ordinary metadata path');
+  await writeRawArtifact(rawArtifactDir, 'identical-read-many', identicalBodyBatch);
+
   const lawfulRangeFixtures = [
     {
       path: 'ranged-lawful.ts',
@@ -736,6 +928,201 @@ try {
       assert.equal(ranged.structuredContent.text.includes('[REDACTED_SECRET]'), false, `${rangeLabel} read redacted lawful source syntax`);
       assert.equal(ranged.content?.[0]?.text.includes(expected.text), true, `${rangeLabel} read content envelope changed lawful source projection`);
       expectNoRawCredential(ranged, `${rangeLabel} read`);
+    }
+  }
+
+  const pythonLawfulRanges = [
+    [2, 4, 'Python consecutive direct class annotations'],
+    [6, 6, 'Python blank-line-separated direct class annotation'],
+    [9, 9, 'Python nested class direct annotation'],
+    [11, 11, 'Python direct function parameter and return annotation']
+  ];
+  const pythonLawfulRead = assertToolSuccess(await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: workspaceId, path: 'python-provenance-lawful.py' }
+  }), 'Python provenance lawful full read');
+  const pythonLawfulExpected = assertReadMetadata(pythonLawfulRead, pythonProvenanceLawful, 1, undefined, 'Python provenance lawful full read');
+  assert.equal(pythonLawfulRead.structuredContent.text, pythonLawfulExpected.text, 'Python provenance lawful full read changed exact source output');
+  assert.equal(pythonLawfulRead.structuredContent.text.includes('[REDACTED_SECRET]'), false, 'Python provenance lawful full read redacted direct class/function syntax');
+  assert.equal(pythonLawfulRead.content?.[0]?.text.includes(pythonLawfulExpected.text), true, 'Python provenance lawful content envelope changed exact source output');
+  expectNoRawCredential(pythonLawfulRead, 'Python provenance lawful full read');
+  for (const [startLine, endLine, label] of pythonLawfulRanges) {
+    const ranged = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: 'python-provenance-lawful.py', start_line: startLine, end_line: endLine }
+    }), `${label} read`);
+    const expected = assertReadMetadata(ranged, pythonProvenanceLawful, startLine, endLine, `${label} read`);
+    assert.equal(ranged.structuredContent.text, expected.text, `${label} read changed exact source output`);
+    assert.equal(ranged.structuredContent.text.includes('[REDACTED_SECRET]'), false, `${label} read redacted lawful source syntax`);
+    assert.equal(ranged.content?.[0]?.text.includes(expected.text), true, `${label} content envelope changed exact source output`);
+    expectNoRawCredential(ranged, `${label} read`);
+  }
+
+  const pythonLawfulBatchItems = pythonLawfulRanges.map(([start_line, end_line]) => ({
+    path: 'python-provenance-lawful.py',
+    start_line,
+    end_line
+  }));
+  const pythonLawfulBatch = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: { workspace_id: workspaceId, items: pythonLawfulBatchItems }
+  }), 'Python provenance lawful read_many');
+  const pythonLawfulResults = pythonLawfulBatch.structuredContent.results ?? [];
+  assert.equal(pythonLawfulResults.length, pythonLawfulBatchItems.length, 'Python provenance lawful read_many changed item count');
+  for (const [index, item] of pythonLawfulBatchItems.entries()) {
+    const expected = projectedRange(pythonProvenanceLawful, item.start_line, item.end_line);
+    const actual = pythonLawfulResults[index];
+    assert.deepEqual(
+      { index: actual.index, path: actual.path, ok: actual.ok, text: actual.result?.text },
+      { index, path: item.path, ok: true, text: expected.text },
+      `Python provenance lawful read_many changed item ${index}`
+    );
+    assert.equal(actual.result.startLine, expected.start, `Python provenance lawful read_many changed item ${index} start line`);
+    assert.equal(actual.result.endLine, expected.end, `Python provenance lawful read_many changed item ${index} end line`);
+    expectNoRawCredential(actual, `Python provenance lawful read_many item ${index}`);
+  }
+  expectNoRawLiterals(pythonLawfulBatch, ['[REDACTED_SECRET]'], 'Python provenance lawful read_many');
+
+  const pythonHostileLiterals = [
+    'QZ7',
+    'ACTUAL_LITERAL_SECRET_7X9',
+    'client.actualSecret',
+    'client.getSecret()',
+    'Token[ACTUAL_LITERAL_SECRET_7X9',
+    'Token[client.actualSecret',
+    'Password[client.getSecret()'
+  ];
+  const pythonHostileRead = assertToolSuccess(await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: workspaceId, path: 'python-provenance-hostile.py' }
+  }), 'Python provenance hostile full read');
+  assertReadMetadata(pythonHostileRead, pythonProvenanceHostile, 1, undefined, 'Python provenance hostile full read');
+  assert.equal(pythonHostileRead.structuredContent.text, numbered(pythonProvenanceHostileRedacted), 'Python provenance hostile full read changed independently-derived sanitized projection');
+  expectRedactedText(pythonHostileRead.structuredContent.text, 'Python provenance hostile full read');
+  expectNoRawLiterals(pythonHostileRead, pythonHostileLiterals, 'Python provenance hostile full read');
+  expectNoRawLiterals(pythonHostileRead.content?.[0]?.text ?? '', pythonHostileLiterals, 'Python provenance hostile content envelope');
+  expectNoRawLiterals(pythonHostileRead._meta, pythonHostileLiterals, 'Python provenance hostile _meta');
+  await writeRawArtifact(rawArtifactDir, 'python-provenance-hostile-full', pythonHostileRead);
+
+  const pythonHostileRanges = [[5, 7], [10, 10], [14, 14], [16, 16], [18, 18]];
+  for (const [startLine, endLine] of pythonHostileRanges) {
+    const ranged = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: 'python-provenance-hostile.py', start_line: startLine, end_line: endLine }
+    }), `Python provenance hostile range ${startLine}-${endLine}`);
+    assertReadMetadata(ranged, pythonProvenanceHostile, startLine, endLine, `Python provenance hostile range ${startLine}-${endLine}`);
+    assert.equal(
+      ranged.structuredContent.text,
+      projectedRange(pythonProvenanceHostileRedacted, startLine, endLine).text,
+      `Python provenance hostile range ${startLine}-${endLine} changed independently-derived sanitized projection`
+    );
+    expectRedactedText(ranged.structuredContent.text, `Python provenance hostile range ${startLine}-${endLine}`);
+    expectNoRawLiterals(ranged, pythonHostileLiterals, `Python provenance hostile range ${startLine}-${endLine}`);
+    expectNoRawLiterals(ranged.content?.[0]?.text ?? '', pythonHostileLiterals, `Python provenance hostile range ${startLine}-${endLine} content envelope`);
+    expectNoRawLiterals(ranged._meta, pythonHostileLiterals, `Python provenance hostile range ${startLine}-${endLine} _meta`);
+  }
+
+  const pythonHostileBatchItems = pythonHostileRanges.map(([start_line, end_line]) => ({
+    path: 'python-provenance-hostile.py',
+    start_line,
+    end_line
+  }));
+  const pythonHostileBatch = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: { workspace_id: workspaceId, items: pythonHostileBatchItems }
+  }), 'Python provenance hostile read_many');
+  const pythonHostileResults = pythonHostileBatch.structuredContent.results ?? [];
+  assert.equal(pythonHostileResults.length, pythonHostileBatchItems.length, 'Python provenance hostile read_many changed item count');
+  for (const [index, item] of pythonHostileBatchItems.entries()) {
+    const actual = pythonHostileResults[index];
+    assert.equal(actual.index, index, `Python provenance hostile read_many changed item ${index} order`);
+    assert.equal(actual.path, item.path, `Python provenance hostile read_many changed item ${index} path`);
+    assert.equal(actual.ok, true, `Python provenance hostile read_many rejected item ${index}`);
+    assert.equal(actual.result.text, projectedRange(pythonProvenanceHostileRedacted, item.start_line, item.end_line).text, `Python provenance hostile read_many changed item ${index} source projection`);
+    expectNoRawCredential(actual, `Python provenance hostile read_many item ${index}`);
+  }
+  expectNoRawLiterals(pythonHostileBatch, pythonHostileLiterals, 'Python provenance hostile read_many complete response');
+  expectNoRawLiterals(pythonHostileBatch._meta, pythonHostileLiterals, 'Python provenance hostile read_many _meta');
+
+  const pythonLawfulSearchCases = [
+    {
+      query: 'Token[str]',
+      regexQuery: 'Token\\[str\\]',
+      expectedLines: pythonProvenanceLawful.split('\n').filter((line) => line.includes('Token[str]'))
+    },
+    {
+      query: 'direct_function',
+      regexQuery: 'direct_function',
+      expectedLines: [pythonProvenanceLawful.split('\n')[10]]
+    }
+  ];
+  for (const { query, regexQuery, expectedLines } of pythonLawfulSearchCases) {
+    for (const [variantName, variantArgs, searchQuery] of [
+      ['plain', {}, query],
+      ['structured', { intent: 'text' }, query],
+      ['regex', { regex: true }, regexQuery],
+      ['structured-regex', { intent: 'text', regex: true }, regexQuery]
+    ]) {
+      const searched = assertToolSuccess(await client.request('tools/call', {
+        name: 'search',
+        arguments: { workspace_id: workspaceId, query: searchQuery, path: 'python-provenance-lawful.py', max_results: 20, ...variantArgs }
+      }), `Python provenance lawful ${variantName} search ${query}`);
+      assert.equal(searched.structuredContent.matches?.length, expectedLines.length, `Python provenance lawful ${variantName} search ${query} changed match count`);
+      for (const [index, expectedLine] of expectedLines.entries()) {
+        const match = searched.structuredContent.matches[index];
+        assert.equal(match.path, 'python-provenance-lawful.py', `Python provenance lawful ${variantName} search ${query} changed match path`);
+        assert.equal(match.text, expectedLine, `Python provenance lawful ${variantName} search ${query} changed exact match text ${index}`);
+      }
+      assert.equal(resultText(searched).includes('[REDACTED_SECRET]'), false, `Python provenance lawful ${variantName} search ${query} redacted lawful source`);
+      expectNoRawCredential(searched, `Python provenance lawful ${variantName} search ${query}`);
+    }
+  }
+
+  const pythonHostileSearchCases = [
+    {
+      query: 'ACTUAL_LITERAL_SECRET_7X9',
+      regexQuery: 'ACTUAL_LITERAL_SECRET_7X9',
+      expectedLines: [5, 10, 14, 16, 18]
+    },
+    {
+      query: 'client.actualSecret',
+      regexQuery: 'client\\.actualSecret',
+      expectedLines: [6]
+    },
+    {
+      query: 'client.getSecret()',
+      regexQuery: 'client\\.getSecret\\(\\)',
+      expectedLines: [7]
+    }
+  ];
+  for (const { query, regexQuery, expectedLines } of pythonHostileSearchCases) {
+    for (const [variantName, variantArgs, searchQuery] of [
+      ['plain', {}, query],
+      ['structured', { intent: 'text' }, query],
+      ['regex', { regex: true }, regexQuery],
+      ['structured-regex', { intent: 'text', regex: true }, regexQuery]
+    ]) {
+      const searched = assertToolSuccess(await client.request('tools/call', {
+        name: 'search',
+        arguments: { workspace_id: workspaceId, query: searchQuery, path: 'python-provenance-hostile.py', max_results: 20, ...variantArgs }
+      }), `Python provenance hostile ${variantName} search ${query}`);
+      assert.deepEqual(searched.structuredContent.matches?.map((match) => match.line), expectedLines, `Python provenance hostile ${variantName} search ${query} changed physical match lines`);
+      for (const match of searched.structuredContent.matches ?? []) {
+        assert.equal(match.path, 'python-provenance-hostile.py', `Python provenance hostile ${variantName} search ${query} changed match path`);
+        expectRedactedText(match.text, `Python provenance hostile ${variantName} search ${query} match`);
+      }
+      const analysis = searched.structuredContent.analysis;
+      if (analysis && Object.prototype.hasOwnProperty.call(analysis, 'query')) {
+        assert.equal(analysis.query, '[REDACTED_SECRET]', `Python provenance hostile ${variantName} search ${query} preserved hostile analysis.query`);
+      }
+      assert.equal(JSON.stringify(searched).includes(searchQuery), false, `Python provenance hostile ${variantName} search ${query} echoed its hostile query`);
+      expectNoRawLiterals(searched, pythonHostileLiterals, `Python provenance hostile ${variantName} search ${query}`);
+      assert.equal(structuredStringFields(searched.structuredContent).some((text) => text.includes(searchQuery)), false, `Python provenance hostile ${variantName} search ${query} leaked through nested structured fields`);
+      assert.equal(structuredStringFields(searched.structuredContent).some((text) => text.includes('[REDACTED_SECRET]')), true, `Python provenance hostile ${variantName} search ${query} omitted redaction marker`);
+      expectRedactedText(resultText(searched), `Python provenance hostile ${variantName} search ${query} envelope`);
+      if (query === 'ACTUAL_LITERAL_SECRET_7X9' && variantName === 'structured-regex') {
+        await writeRawArtifact(rawArtifactDir, 'python-provenance-hostile-structured-regex-search', searched);
+      }
     }
   }
 
