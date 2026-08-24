@@ -198,6 +198,22 @@ function gitFixture(root) {
   if (commit.status !== 0) throw new Error(`git commit failed: ${commit.stderr || commit.stdout}`);
 }
 
+function assertPythonParserAccepted(source, label) {
+  const parserScript = [
+    'import pathlib, py_compile, sys, tempfile',
+    'with tempfile.TemporaryDirectory() as directory:',
+    '    target = pathlib.Path(directory) / "fixture.py"',
+    '    target.write_text(sys.stdin.read(), encoding="utf-8")',
+    '    py_compile.compile(str(target), doraise=True)'
+  ].join('\n');
+  const result = spawnSync(
+    'python3',
+    ['-c', parserScript],
+    { input: source, encoding: 'utf8' }
+  );
+  assert.equal(result.status, 0, `${label} was not accepted by Python: ${result.stderr || result.stdout}`);
+}
+
 const sourceTs = [
   'const isCurrentTransition = (token: PlayerSessionTransitionToken): boolean => true;',
   'const { hasSecretValue: policyHasSecretValue, apiToken: configuredToken } = policy;',
@@ -383,6 +399,124 @@ const pythonMixedProvenanceRedacted = [
   'TOP_LEVEL = {token: [REDACTED_SECRET]}',
   ''
 ].join('\n');
+
+const pythonContinuationExplicitBackslash = '    backslash_payload = { ' + '\\';
+const pythonContinuationExplicitBackslashOnly = '    explicit_only_payload = ' + '\\';
+const pythonContinuationProvenance = [
+  'class ContinuationRequest:',
+  '    direct: Token[str]',
+  '    brace_payload = {',
+  '    token: Token[ACTUAL_LITERAL_SECRET_7X9]',
+  '    }',
+  '',
+  '    square_payload = [',
+  '    Token[str]',
+  '    ]',
+  '',
+  '    paren_payload = (',
+  '    Token[str]',
+  '    )',
+  '',
+  '    call_payload = some_call(',
+  '    token=Token[ACTUAL_LITERAL_SECRET_7X9]',
+  '    )',
+  '',
+  pythonContinuationExplicitBackslash,
+  '    token: Token[ACTUAL_LITERAL_SECRET_7X9]',
+  '    }',
+  '',
+  pythonContinuationExplicitBackslashOnly,
+  '    Token[str]',
+  '',
+  'class MixedContinuation:',
+  '\t    lawful: Token[str]',
+  '\t    mixed_payload = {',
+  '            token: Token[ACTUAL_LITERAL_SECRET_7X9]',
+  '            }',
+  ''
+].join('\n');
+
+const pythonContinuationProvenanceRedacted = [
+  'class ContinuationRequest:',
+  '    direct: Token[str]',
+  '    brace_payload = {',
+  '    token: [REDACTED_SECRET]',
+  '    }',
+  '',
+  '    square_payload = [',
+  '    Token[str]',
+  '    ]',
+  '',
+  '    paren_payload = (',
+  '    Token[str]',
+  '    )',
+  '',
+  '    call_payload = some_call(',
+  '    token= [REDACTED_SECRET]',
+  '    )',
+  '',
+  pythonContinuationExplicitBackslash,
+  '    token: [REDACTED_SECRET]',
+  '    }',
+  '',
+  pythonContinuationExplicitBackslashOnly,
+  '    Token[str]',
+  '',
+  'class MixedContinuation:',
+  '\t    lawful: Token[str]',
+  '\t    mixed_payload = {',
+  '            token: [REDACTED_SECRET]',
+  '            }',
+  ''
+].join('\n');
+
+const pythonContinuationHostileLiterals = [
+  'ACTUAL_LITERAL_SECRET_7X9',
+  'client.getSecret()',
+  'Token[ACTUAL_LITERAL_SECRET_7X9',
+  'Password[client.getSecret()'
+];
+
+assertPythonParserAccepted(pythonContinuationProvenance, 'Python continuation provenance fixture');
+assert.equal(hasSecretValue(pythonContinuationProvenance), true, 'Python continuation provenance fixture was not classified as hostile');
+assert.equal(
+  redactSensitiveText(pythonContinuationProvenance),
+  pythonContinuationProvenanceRedacted,
+  'Python continuation provenance direct policy changed the independently expected projection'
+);
+assert.equal(
+  redactSensitiveText(pythonContinuationProvenance).includes('ACTUAL_LITERAL_SECRET_7X9'),
+  false,
+  'Python continuation provenance direct policy leaked the raw literal'
+);
+
+const pythonContinuationLawfulFixtures = [
+  [
+    'class R:\n    supported = [\n    Token[str]\n    ]',
+    'lawful list continuation'
+  ],
+  [
+    'class R:\n    supported = (\n    Token[str],\n    )',
+    'lawful tuple continuation'
+  ],
+  [
+    'class R:\n    supported = some_call(\n    Token[str]\n    )',
+    'lawful call continuation'
+  ],
+  [
+    'class R:\n    token: Token[str]',
+    'lawful direct annotation'
+  ],
+  [
+    'class R:\n        token: Token[str]',
+    'lawful deeper direct annotation'
+  ]
+];
+for (const [source, label] of pythonContinuationLawfulFixtures) {
+  assertPythonParserAccepted(source, label);
+  assert.equal(redactSensitiveText(source), source, `${label} changed source bytes`);
+  assert.equal(hasSecretValue(source), false, `${label} was classified as hostile`);
+}
 
 const collisionPath = '2 |   token: Token<string>;';
 const collisionSource = 'type Input = {\n  token: Token<string>;\n};\n';
@@ -822,6 +956,7 @@ try {
   await writeFixture(tmp, 'python-provenance-lawful.py', pythonProvenanceLawful);
   await writeFixture(tmp, 'python-provenance-hostile.py', pythonProvenanceHostile);
   await writeFixture(tmp, 'python-mixed-provenance.py', pythonMixedProvenance);
+  await writeFixture(tmp, 'python-continuation-provenance.py', pythonContinuationProvenance);
   await writeFixture(tmp, collisionPath, collisionSource);
   await writeFixture(tmp, 'identical-source-a.ts', identicalSourceBody);
   await writeFixture(tmp, 'identical-source-b.ts', identicalSourceBody);
@@ -1344,6 +1479,210 @@ try {
       expectNoRawCredential(searched, `Python mixed-indentation ${variantName} search ${query}`);
       if (!lawful && query === 'ACTUAL_LITERAL_SECRET_7X9' && variantName === 'structured-regex') {
         await writeRawArtifact(rawArtifactDir, 'python-mixed-provenance-structured-regex-search', searched);
+      }
+    }
+  }
+
+  const pythonContinuationFull = assertToolSuccess(await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: workspaceId, path: 'python-continuation-provenance.py' }
+  }), 'Python continuation provenance full read');
+  const pythonContinuationExpected = assertReadMetadata(
+    pythonContinuationFull,
+    pythonContinuationProvenance,
+    1,
+    undefined,
+    'Python continuation provenance full read'
+  );
+  assert.equal(
+    pythonContinuationFull.structuredContent.text,
+    numbered(pythonContinuationProvenanceRedacted),
+    'Python continuation provenance full read changed the independently expected sanitized projection'
+  );
+  assert.equal(
+    pythonContinuationFull.content?.[0]?.text.includes(numbered(pythonContinuationProvenanceRedacted)),
+    true,
+    'Python continuation provenance full read content envelope changed the sanitized projection'
+  );
+  expectNoHostileResponseFields(
+    pythonContinuationFull,
+    pythonContinuationHostileLiterals,
+    'Python continuation provenance full read'
+  );
+  await writeRawArtifact(rawArtifactDir, 'python-continuation-provenance-full', pythonContinuationFull);
+
+  const pythonContinuationRanges = [
+    [2, 2, 'lawful direct class annotation'],
+    [3, 5, 'same-column brace continuation'],
+    [7, 9, 'lawful same-column square continuation'],
+    [11, 13, 'lawful same-column parenthesis continuation'],
+    [15, 17, 'same-column call continuation'],
+    [19, 21, 'delimiter plus explicit backslash continuation'],
+    [23, 24, 'lawful explicit backslash continuation'],
+    [26, 30, 'mixed tab-space continuation']
+  ];
+  for (const [startLine, endLine, label] of pythonContinuationRanges) {
+    const ranged = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: {
+        workspace_id: workspaceId,
+        path: 'python-continuation-provenance.py',
+        start_line: startLine,
+        end_line: endLine
+      }
+    }), `Python continuation provenance ${label} ranged read`);
+    const expected = assertReadMetadata(
+      ranged,
+      pythonContinuationProvenance,
+      startLine,
+      endLine,
+      `Python continuation provenance ${label} ranged read`
+    );
+    assert.equal(
+      ranged.structuredContent.text,
+      projectedRange(pythonContinuationProvenanceRedacted, startLine, endLine).text,
+      `Python continuation provenance ${label} ranged read changed the sanitized projection`
+    );
+    const expectedContent = label.startsWith('lawful')
+      ? expected.text
+      : projectedRange(pythonContinuationProvenanceRedacted, startLine, endLine).text;
+    assert.equal(
+      ranged.content?.[0]?.text.includes(expectedContent),
+      true,
+      `Python continuation provenance ${label} ranged read content envelope changed the sanitized projection`
+    );
+    if (label.startsWith('lawful')) {
+      assert.equal(ranged.structuredContent.text.includes('[REDACTED_SECRET]'), false, `Python continuation provenance ${label} ranged read redacted lawful syntax`);
+    } else {
+      expectRedactedText(ranged.structuredContent.text, `Python continuation provenance ${label} ranged read`);
+    }
+    expectNoHostileResponseFields(
+      ranged,
+      pythonContinuationHostileLiterals,
+      `Python continuation provenance ${label} ranged read`
+    );
+  }
+
+  const pythonContinuationBatchItems = pythonContinuationRanges.map(([start_line, end_line]) => ({
+    path: 'python-continuation-provenance.py',
+    start_line,
+    end_line
+  }));
+  const pythonContinuationBatch = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: { workspace_id: workspaceId, items: pythonContinuationBatchItems }
+  }), 'Python continuation provenance read_many');
+  const pythonContinuationResults = pythonContinuationBatch.structuredContent.results ?? [];
+  assert.equal(
+    pythonContinuationResults.length,
+    pythonContinuationBatchItems.length,
+    'Python continuation provenance read_many changed item count'
+  );
+  for (const [index, item] of pythonContinuationBatchItems.entries()) {
+    const actual = pythonContinuationResults[index];
+    const expected = projectedRange(pythonContinuationProvenanceRedacted, item.start_line, item.end_line);
+    assert.deepEqual(
+      { index: actual.index, path: actual.path, ok: actual.ok, text: actual.result?.text },
+      { index, path: item.path, ok: true, text: expected.text },
+      `Python continuation provenance read_many changed item ${index}`
+    );
+    assert.equal(actual.result.startLine, expected.start, `Python continuation provenance read_many changed item ${index} start line`);
+    assert.equal(actual.result.endLine, expected.end, `Python continuation provenance read_many changed item ${index} end line`);
+    expectNoRawLiterals(actual, pythonContinuationHostileLiterals, `Python continuation provenance read_many item ${index}`);
+  }
+  expectNoHostileResponseFields(
+    pythonContinuationBatch,
+    pythonContinuationHostileLiterals,
+    'Python continuation provenance read_many'
+  );
+
+  const pythonContinuationSearchCases = [
+    {
+      query: 'Token[str]',
+      regexQuery: 'Token\\[str\\]',
+      expectedLines: [2, 8, 12, 24, 27],
+      lawful: true
+    },
+    {
+      query: 'ACTUAL_LITERAL_SECRET_7X9',
+      regexQuery: 'ACTUAL_LITERAL_SECRET_7X9',
+      expectedLines: [4, 16, 20, 29],
+      lawful: false
+    }
+  ];
+  for (const { query, regexQuery, expectedLines, lawful } of pythonContinuationSearchCases) {
+    for (const [variantName, variantArgs, searchQuery] of [
+      ['plain', {}, query],
+      ['structured', { intent: 'text' }, query],
+      ['regex', { regex: true }, regexQuery],
+      ['structured-regex', { intent: 'text', regex: true }, regexQuery]
+    ]) {
+      const searched = assertToolSuccess(await client.request('tools/call', {
+        name: 'search',
+        arguments: {
+          workspace_id: workspaceId,
+          query: searchQuery,
+          path: 'python-continuation-provenance.py',
+          max_results: 20,
+          ...variantArgs
+        }
+      }), `Python continuation provenance ${variantName} search ${query}`);
+      assert.deepEqual(
+        searched.structuredContent.matches?.map((match) => match.line),
+        expectedLines,
+        `Python continuation provenance ${variantName} search ${query} changed physical match lines`
+      );
+      const rawExpectedLines = expectedLines.map((line) => pythonContinuationProvenance.split('\n')[line - 1]);
+      for (const [index, match] of (searched.structuredContent.matches ?? []).entries()) {
+        assert.equal(match.path, 'python-continuation-provenance.py', `Python continuation provenance ${variantName} search ${query} changed match path`);
+        if (lawful) {
+          assert.equal(match.text, rawExpectedLines[index], `Python continuation provenance ${variantName} search ${query} changed lawful lexical match`);
+        } else {
+          expectRedactedText(match.text, `Python continuation provenance ${variantName} search ${query} lexical match`);
+        }
+      }
+      assert.equal(
+        resultText(searched).includes(lawful ? rawExpectedLines[0] : '[REDACTED_SECRET]'),
+        true,
+        `Python continuation provenance ${variantName} search ${query} changed content envelope`
+      );
+      const analysis = searched.structuredContent.analysis;
+      if (analysis) {
+        expectNoRawLiterals(analysis.matches, pythonContinuationHostileLiterals, `Python continuation provenance ${variantName} search ${query} analysis.matches`);
+        expectNoRawLiterals(analysis.groups, pythonContinuationHostileLiterals, `Python continuation provenance ${variantName} search ${query} analysis.groups`);
+        if (Object.prototype.hasOwnProperty.call(analysis, 'query')) {
+          const expectedAnalysisQuery = lawful && !variantName.includes('regex')
+            ? query
+            : '[REDACTED_SECRET]';
+          assert.equal(
+            analysis.query,
+            expectedAnalysisQuery,
+            `Python continuation provenance ${variantName} search ${query} changed analysis.query`
+          );
+        }
+        if (lawful && variantName === 'structured' && Array.isArray(analysis.matches)) {
+          assert.deepEqual(
+            analysis.matches.map((match) => match.line),
+            expectedLines,
+            `Python continuation provenance ${variantName} search ${query} changed analysis.matches lines`
+          );
+        }
+      }
+      if (lawful) {
+        assert.equal(resultText(searched).includes('[REDACTED_SECRET]'), false, `Python continuation provenance ${variantName} search ${query} redacted lawful content`);
+      } else {
+        expectRedactedText(resultText(searched), `Python continuation provenance ${variantName} search ${query} content envelope`);
+      }
+      expectNoHostileResponseFields(
+        searched,
+        pythonContinuationHostileLiterals,
+        `Python continuation provenance ${variantName} search ${query}`
+      );
+      if (!lawful) {
+        assert.equal(JSON.stringify(searched).includes(searchQuery), false, `Python continuation provenance ${variantName} search ${query} echoed its raw query`);
+        if (query === 'ACTUAL_LITERAL_SECRET_7X9' && variantName === 'structured-regex') {
+          await writeRawArtifact(rawArtifactDir, 'python-continuation-provenance-structured-regex-search', searched);
+        }
       }
     }
   }

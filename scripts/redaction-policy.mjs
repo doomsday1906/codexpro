@@ -163,6 +163,7 @@ function buildDelimiterPairs(code) {
   const stacks = { '(': [], '[': [], '{': [] };
   const closeToOpen = { ')': '(', ']': '[', '}': '{' };
   const openToClose = new Map();
+  const openers = [];
   const enclosing = { '(': new Int32Array(code.length), '{': new Int32Array(code.length) };
   enclosing['('].fill(-1);
   enclosing['{'].fill(-1);
@@ -175,6 +176,7 @@ function buildDelimiterPairs(code) {
     const current = code[index];
     if (stacks[current]) {
       stacks[current].push(index);
+      openers.push(index);
       continue;
     }
     const opener = closeToOpen[current];
@@ -182,7 +184,7 @@ function buildDelimiterPairs(code) {
     const open = stacks[opener].pop();
     openToClose.set(open, index);
   }
-  return { openToClose, enclosing };
+  return { openToClose, openers, enclosing };
 }
 
 function findEnclosingPair(syntax, open, close, offset) {
@@ -392,19 +394,37 @@ function pythonIndentationColumn(line) {
   return column;
 }
 
-function hasPythonClassAnchor(code, offset) {
+function hasPythonDelimiterContinuation(code, syntax, offset) {
   const currentBounds = sourceLineBounds(code, offset);
-  const rawCurrentLine = code.slice(currentBounds.start, currentBounds.end);
-  const currentLine = rawCurrentLine.replace(/^\s*\d+\s*\|\s?/u, '');
+  // A class-looking annotation on a line inside a delimiter continuation is
+  // an expression/value, not a direct class member. Track every opener (not
+  // only braces/parentheses used by the source-anchor helpers) so same-column
+  // dictionary, list, tuple, and call continuations fail closed.
+  for (const opener of syntax?.pairs?.openers ?? []) {
+    if (opener >= currentBounds.start) continue;
+    const close = syntax.pairs.openToClose.get(opener);
+    if (close === undefined || close > offset) return true;
+  }
+
+  // Explicit backslash continuation has no delimiter pair to anchor. Only
+  // the immediately preceding physical line can continue into this one;
+  // strings/comments are already blanked by maskSourceTrivia.
+  if (currentBounds.start > 0) {
+    let previousEnd = currentBounds.start - 1;
+    if (code[previousEnd] === '\n') previousEnd -= 1;
+    if (code[previousEnd] === '\r') previousEnd -= 1;
+    const previousStart = code.lastIndexOf('\n', previousEnd - 1) + 1;
+    if (/\\[ \t]*$/u.test(code.slice(previousStart, previousEnd + 1))) return true;
+  }
+
+  return false;
+}
+
+function hasPythonClassParent(code, offset) {
+  const currentBounds = sourceLineBounds(code, offset);
+  const currentLine = code.slice(currentBounds.start, currentBounds.end).replace(/^\s*\d+\s*\|\s?/u, '');
   const currentIndent = pythonIndentationColumn(currentLine);
   if (currentIndent === null) return false;
-  // A direct class-suite annotation starts at the physical line's indentation.
-  // Anything already written on that line is a nested expression/statement,
-  // not a class member, even when the line is inside a class suite.
-  const linePrefixLength = rawCurrentLine.length - currentLine.length;
-  const currentOffsetInLine = Math.max(0, offset - currentBounds.start - linePrefixLength);
-  const currentPrefix = currentLine.slice(0, currentOffsetInLine).trim();
-  if (currentPrefix) return false;
 
   // Walk complete preceding physical lines. Same- or deeper-indentation
   // members belong to the current suite and may be skipped; the first
@@ -425,6 +445,25 @@ function hasPythonClassAnchor(code, offset) {
     return /^class\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*(?:\([^\n]*\)|\[[^\n]*\]|<[^>\n]*>))?\s*:/u.test(previousLine.trim());
   }
   return false;
+}
+
+function hasPythonClassAnchor(code, syntax, offset) {
+  const currentBounds = sourceLineBounds(code, offset);
+  const rawCurrentLine = code.slice(currentBounds.start, currentBounds.end);
+  const currentLine = rawCurrentLine.replace(/^\s*\d+\s*\|\s?/u, '');
+  const currentIndent = pythonIndentationColumn(currentLine);
+  if (currentIndent === null) return false;
+  if (hasPythonDelimiterContinuation(code, syntax, offset)) return false;
+
+  // A direct class-suite annotation starts at the physical line's indentation.
+  // Anything already written on that line is a nested expression/statement,
+  // not a class member, even when the line is inside a class suite.
+  const linePrefixLength = rawCurrentLine.length - currentLine.length;
+  const currentOffsetInLine = Math.max(0, offset - currentBounds.start - linePrefixLength);
+  const currentPrefix = currentLine.slice(0, currentOffsetInLine).trim();
+  if (currentPrefix) return false;
+
+  return hasPythonClassParent(code, offset);
 }
 
 function hasBalancedGenericTail(code, end) {
@@ -455,7 +494,7 @@ function isCredibleSourceReference(value, text, offset, assignment = '', syntax 
   const typedAnnotation = hasTypedVariableAnnotationAnchor(syntax.code, syntax, offset, assignment, raw);
   const typeLikeBody = hasTypeLikeBodyAnchor(syntax.code, syntax, offset);
   const parameter = hasParameterAnchor(syntax.code, syntax, offset);
-  const pythonClass = hasPythonClassAnchor(syntax.code, offset);
+  const pythonClass = hasPythonClassAnchor(syntax.code, syntax, offset);
   const destructuring = hasDestructuringAnchor(syntax.code, syntax, offset);
   const initializerGeneric = Boolean(genericTail && /=\s*$/u.test(assignment));
   // A generic tail is source syntax only when a surrounding type, parameter,
