@@ -104,10 +104,30 @@ function numbered(text, startLine = 1) {
 }
 
 function expectRedactedText(text, label) {
-  for (const literal of ['QZ7', 'ACTUAL_LITERAL_SECRET_7X9', 'client.actualSecret', 'client.getSecret()']) {
+  for (const literal of [
+    'QZ7',
+    'ACTUAL_LITERAL_SECRET_7X9',
+    'client.actualSecret',
+    'client.getSecret()'
+  ]) {
     assert.equal(text.includes(literal), false, `${label} leaked the raw credential ${literal}`);
   }
   assert.equal(text.includes('[REDACTED_SECRET]'), true, `${label} omitted the redaction marker`);
+}
+
+function expectNoRawCredential(value, label) {
+  const serialized = JSON.stringify(value);
+  for (const literal of [
+    'ACTUAL_LITERAL_SECRET_7X9',
+    'client.actualSecret',
+    'client.getSecret()',
+    'Token<ACTUAL_LITERAL_SECRET_7X9',
+    'Token<client.actualSecret',
+    'Password<client.getSecret()',
+    'Wrapper<Token<'
+  ]) {
+    assert.equal(serialized.includes(literal), false, `${label} leaked ${literal} in its complete serialized response`);
+  }
 }
 
 async function writeFixture(root, relativePath, content) {
@@ -145,11 +165,20 @@ const sourceTs = [
   '} = policy;',
   'const API_KEY: string = configuredToken;',
   'const value: { token: Token<string>; password: string } = input;',
-  'const typedOptions: { token: RuntimeToken; password: CurrentPassword } = input;',
+  'const typedOptions: { token: Token<string>; password: string } = input;',
   'const typedObjectValue: { token: Token<string>; password: string } = {token: runtimeToken,password: currentPassword};',
+  'const typedGenericValue: { token: Token<RuntimeToken>; password: PasswordType } = input;',
+  'const genericOptions = { token: runtimeToken, password: currentPassword };',
+  'const genericFunction = <T>(token: Token<T>): Token<T> => token;',
+  'function genericMethod<T>(token: Token<T>): Token<T> { return token; }',
   'type GenericShape<T> = { token: T; };',
   'interface GenericInterface<T> { token: T; }',
   'class GenericClass<T> { password: P; }',
+  'type Input = { token: Token<string>; };',
+  'interface Credentials<T> { token: Token<T>; password: PasswordType; }',
+  'function f(token: Token<string>): Token<string> { return token; }',
+  'const arrowFn = (token: Token<string>): Token<string> => token;',
+  'const { token: destructuredToken, password: destructuredPassword } = input;',
   ''
 ].join('\n');
 
@@ -165,6 +194,11 @@ const sourcePy = [
   '',
   'options = {apiToken: configuredToken}',
   'TOKEN: str = configuredToken',
+  'def generic(token: Token[str]) -> Token[str]:',
+  '    return token',
+  '',
+  'class GenericRequest:',
+  '    token: Token[str]',
   ''
 ].join('\n');
 
@@ -239,6 +273,43 @@ const negativeFixtures = {
     '}',
     'credentials: { password: client.getSecret() }',
     ''
+  ].join('\n'),
+  'generic-payloads.ts': [
+    'const apiToken = Token<ACTUAL_LITERAL_SECRET_7X9>;',
+    'const generic_token = Token<client.actualSecret>;',
+    'const generic_password = Password<client.getSecret()>;',
+    'const nested_token = Wrapper<Token<ACTUAL_LITERAL_SECRET_7X9>>;',
+    'const API_KEY: string = Token<ACTUAL_LITERAL_SECRET_7X9>;',
+    'const config = { apiToken: Token<ACTUAL_LITERAL_SECRET_7X9> };',
+    'const nested = { token: Wrapper<Token<client.actualSecret>> };',
+    'const spaced = { password: Password <client.getSecret()> };',
+    'const malformed = { token: Token<ACTUAL_LITERAL_SECRET_7X9',
+    'const lawful = { token: runtimeToken };',
+    ''
+  ].join('\n'),
+  'generic-payloads.env': [
+    'apiToken=Token<ACTUAL_LITERAL_SECRET_7X9>',
+    'generic_token=Token<client.actualSecret>',
+    'generic_password=Password <client.getSecret()>',
+    'nested_token=Wrapper<Token<ACTUAL_LITERAL_SECRET_7X9>>',
+    'NEXT_TOKEN=runtimeToken',
+    ''
+  ].join('\n'),
+  'generic-payloads.yaml': [
+    'apiToken: Token <ACTUAL_LITERAL_SECRET_7X9>',
+    'generic_token: Token<client.actualSecret>',
+    'generic_password: Password<client.getSecret()>',
+    'nested_token: Wrapper<Token<ACTUAL_LITERAL_SECRET_7X9>>',
+    'malformed_token: Token<ACTUAL_LITERAL_SECRET_7X9',
+    'next_token: runtimeToken',
+    ''
+  ].join('\n'),
+  'generic-contexts.js': [
+    'const text = "apiToken: Token<ACTUAL_LITERAL_SECRET_7X9>";',
+    '// apiToken: Password<client.getSecret()>',
+    'const config = { apiToken: client.actualSecret };',
+    'const callConfig = { apiToken: client.getSecret() };',
+    ''
   ].join('\n')
 };
 
@@ -263,12 +334,19 @@ const directSafe = [
   'token = credentials.fetch(:token)',
   'const API_KEY: string = configuredToken;',
   'const value: { token: Token<string>; password: string } = input;',
-  'const typedOptions: { token: RuntimeToken; password: CurrentPassword } = input;',
+  'const typedOptions: { token: Token<string>; password: string } = input;',
   'const typedObjectValue: { token: Token<string>; password: string } = {token: runtimeToken,password: currentPassword};',
   'type GenericShape<T> = { token: T; };',
   'interface GenericInterface<T> { token: T; }',
   'class GenericClass<T> { password: P; }',
-  'TOKEN: str = configuredToken'
+  'type Input = { token: Token<string>; };',
+  'interface Credentials<T> { token: Token<T>; password: PasswordType; }',
+  'function f(token: Token<string>): Token<string> { return token; }',
+  'const arrowFn = (token: Token<string>): Token<string> => token;',
+  'const { token: destructuredToken, password: destructuredPassword } = input;',
+  'TOKEN: str = configuredToken',
+  'def generic(token: Token[str]) -> Token[str]:',
+  'class GenericRequest:\n    token: Token[str]'
 ];
 for (const sample of directSafe) {
   assert.equal(redactSensitiveText(sample), sample, `policy changed lawful source: ${sample}`);
@@ -289,6 +367,17 @@ const directUnsafe = [
   'credentials: { password: configuredToken }',
   'credentials: { password: client.actualSecret }',
   'credentials: {\n  password: client.actualSecret\n}',
+  'token: Token<ACTUAL_LITERAL_SECRET_7X9>',
+  'token: Token<client.actualSecret>',
+  'password: Password<client.getSecret()>',
+  'token: Wrapper<Token<ACTUAL_LITERAL_SECRET_7X9>>',
+  'token: Token <ACTUAL_LITERAL_SECRET_7X9>',
+  'token: Token<ACTUAL_LITERAL_SECRET_7X9',
+  'const API_KEY: string = Token<ACTUAL_LITERAL_SECRET_7X9>;',
+  'const config = { apiToken: Token<ACTUAL_LITERAL_SECRET_7X9> };',
+  'const config = { apiToken: Wrapper<Token<ACTUAL_LITERAL_SECRET_7X9>> };',
+  'const config = { apiToken: client.actualSecret };',
+  'const config = { apiToken: client.getSecret() };',
   'const source = "token: configuredToken";',
   '// const source = { token: configuredToken };',
   'const note = "token: client.actualSecret";',
@@ -304,6 +393,18 @@ for (const sample of directUnsafe) {
   assert.equal(hasSecretValue(sample), true, `policy missed unsafe text: ${sample}`);
   expectRedactedText(redacted, `policy ${sample}`);
 }
+const malformedWithFollowingSource = 'token: Token<ACTUAL_LITERAL_SECRET_7X9\nconst lawful = runtimeToken;';
+assert.equal(
+  redactSensitiveText(malformedWithFollowingSource),
+  'token: [REDACTED_SECRET]\nconst lawful = runtimeToken;',
+  'malformed generic tail consumed a later source line or leaked its payload'
+);
+const malformedWithInternalDelimiter = 'token: Token<ACTUAL_LITERAL_SECRET_7X9=LEAK\nconst lawful = runtimeToken;';
+assert.equal(
+  redactSensitiveText(malformedWithInternalDelimiter),
+  'token: [REDACTED_SECRET]\nconst lawful = runtimeToken;',
+  'malformed generic tail stopped before its rejected payload'
+);
 
 for (const [query, safeMatchTexts, expected] of [
   ['policyHasSecretValue', ['const { hasSecretValue: policyHasSecretValue } = policy;'], 'policyHasSecretValue'],
@@ -412,16 +513,23 @@ try {
     ['value: { token', sourceTs.split('\n')[18]],
     ['typedOptions', sourceTs.split('\n')[19]],
     ['typedObjectValue', sourceTs.split('\n')[20]],
-    ['GenericShape', sourceTs.split('\n')[21]],
-    ['GenericInterface', sourceTs.split('\n')[22]],
-    ['GenericClass', sourceTs.split('\n')[23]],
+    ['GenericShape', sourceTs.split('\n')[25]],
+    ['GenericInterface', sourceTs.split('\n')[26]],
+    ['GenericClass', sourceTs.split('\n')[27]],
+    ['type Input', sourceTs.split('\n').find((line) => line.startsWith('type Input'))],
+    ['interface Credentials', sourceTs.split('\n').find((line) => line.startsWith('interface Credentials'))],
+    ['function f(', sourceTs.split('\n').find((line) => line.startsWith('function f('))],
+    ['arrowFn', sourceTs.split('\n').find((line) => line.includes('const arrowFn'))],
+    ['destructuredToken', sourceTs.split('\n').find((line) => line.includes('destructuredToken'))],
     ['PasswordType', sourcePy.split('\n')[3]],
     ['options = {apiToken', sourcePy.split('\n')[9]],
-    ['TOKEN: str', sourcePy.split('\n')[10]]
+    ['TOKEN: str', sourcePy.split('\n')[10]],
+    ['def generic', sourcePy.split('\n').find((line) => line.startsWith('def generic')), 'source.py'],
+    ['GenericRequest', sourcePy.split('\n').find((line) => line.startsWith('class GenericRequest')), 'source.py']
   ];
-  for (const [query, expected] of sourceSearchCases) {
+  for (const [query, expected, explicitPath] of sourceSearchCases) {
     const expectedLines = Array.isArray(expected) ? expected : [expected];
-    const searchPath = query === 'PasswordType' || query.startsWith('options =') || query.startsWith('TOKEN:') ? 'source.py' : 'source.ts';
+    const searchPath = explicitPath ?? (query === 'PasswordType' || query.startsWith('options =') || query.startsWith('TOKEN:') ? 'source.py' : 'source.ts');
     const searched = assertToolSuccess(await client.request('tools/call', { name: 'search', arguments: { workspace_id: workspaceId, query, path: searchPath, max_results: 10 } }), `source search ${query}`);
     assert.equal(searched.structuredContent.matches?.length, expectedLines.length, `source search ${query} returned an unexpected match count`);
     for (const [index, expectedLine] of expectedLines.entries()) {
@@ -430,6 +538,32 @@ try {
       assert.equal(resultText(searched).includes(expectedLine), true, `source search ${query} content envelope changed lawful source text`);
     }
     assert.equal(resultText(searched).includes('[REDACTED_SECRET]'), false, `source search ${query} content envelope redacted lawful source`);
+  }
+
+  const lawfulQueryCases = [
+    ['PlayerSessionTransitionToken', [sourceTs.split('\n')[0]]],
+    ['policyHasSecretValue', [sourceTs.split('\n')[1], sourceTs.split('\n')[14]]]
+  ];
+  for (const [query, expectedLines] of lawfulQueryCases) {
+    for (const [route, routeArgs] of [['plain', {}], ['structured', { intent: 'text' }]]) {
+      const searched = assertToolSuccess(await client.request('tools/call', {
+        name: 'search',
+        arguments: { workspace_id: workspaceId, query, path: 'source.ts', max_results: 10, ...routeArgs }
+      }), `lawful ${route} search ${query}`);
+      assert.deepEqual(
+        searched.structuredContent.matches?.map((match) => match.text),
+        expectedLines,
+        `lawful ${route} search ${query} changed source matches`
+      );
+      assert.equal(resultText(searched).includes('[REDACTED_SECRET]'), false, `lawful ${route} search ${query} redacted source output`);
+      assert.equal(JSON.stringify(searched).includes(query), true, `lawful ${route} search ${query} lost its query in the complete response`);
+      // The plain route intentionally omits the analysis envelope; when it
+      // is present, it must still carry the lawful query unchanged.
+      assert.equal(searched.structuredContent.analysis?.query ?? query, query, `lawful ${route} search ${query} changed analysis.query`);
+      if (route === 'structured') {
+        assert.equal(searched.structuredContent.analysis?.query, query, `lawful structured search ${query} omitted analysis.query`);
+      }
+    }
   }
 
   const structuredSearch = assertToolSuccess(await client.request('tools/call', {
@@ -588,17 +722,36 @@ try {
     const read = assertToolSuccess(await client.request('tools/call', { name: 'read', arguments: { workspace_id: workspaceId, path: relativePath } }), `negative read ${relativePath}`);
     assert.equal(read.structuredContent.path, relativePath, `negative read hid ${relativePath}`);
     expectRedactedText(read.structuredContent.text, `MCP read ${relativePath}`);
+    expectNoRawCredential(read, `MCP read ${relativePath}`);
 
-    const queries = relativePath.startsWith('member') ? ['client.actualSecret', 'client.getSecret()'] : ['QZ7', 'ACTUAL_LITERAL_SECRET_7X9'];
+    const queries = relativePath.startsWith('member')
+      ? ['client.actualSecret', 'client.getSecret()']
+      : relativePath.startsWith('generic')
+        ? ['client.actualSecret', 'client.getSecret()', 'ACTUAL_LITERAL_SECRET_7X9']
+        : ['QZ7', 'ACTUAL_LITERAL_SECRET_7X9'];
     for (const query of queries) {
-      const searched = assertToolSuccess(await client.request('tools/call', { name: 'search', arguments: { workspace_id: workspaceId, query, path: relativePath, max_results: 10 } }), `negative search ${relativePath} ${query}`);
-      assert.ok(searched.structuredContent.matches?.length, `negative search ${relativePath} ${query} returned no raw fixture matches`);
-      for (const match of searched.structuredContent.matches) {
-        assert.equal(match.path, relativePath, `negative search changed ${relativePath} path`);
-        expectRedactedText(match.text, `MCP search ${relativePath} ${query}`);
+      for (const variant of [
+        ['plain', {}],
+        ['structured', { intent: 'text' }],
+        ['regex', { regex: true }],
+        ['structured-regex', { intent: 'text', regex: true }]
+      ]) {
+        const [variantName, variantArgs] = variant;
+        const searched = assertToolSuccess(await client.request('tools/call', {
+          name: 'search',
+          arguments: { workspace_id: workspaceId, query, path: relativePath, max_results: 10, ...variantArgs }
+        }), `negative search ${relativePath} ${query} ${variantName}`);
+        assert.ok(searched.structuredContent.matches?.length, `negative search ${relativePath} ${query} ${variantName} returned no raw fixture matches`);
+        for (const match of searched.structuredContent.matches) {
+          assert.equal(match.path, relativePath, `negative search changed ${relativePath} path`);
+          expectRedactedText(match.text, `MCP search ${relativePath} ${query} ${variantName}`);
+        }
+        expectNoRawCredential(searched, `MCP search ${relativePath} ${query} ${variantName}`);
+        assert.notEqual(searched.structuredContent.analysis?.query, query, `MCP search ${relativePath} ${query} ${variantName} echoed its hostile analysis.query`);
+        assert.equal(JSON.stringify(searched).includes(query), false, `MCP search ${relativePath} ${query} ${variantName} echoed its hostile query in the complete response`);
+        assert.equal(structuredStringFields(searched.structuredContent).some((text) => text.includes(query)), false, `MCP search ${relativePath} ${query} ${variantName} leaked through a nested structured field`);
+        expectRedactedText(resultText(searched), `MCP search ${relativePath} ${query} ${variantName} envelope`);
       }
-      assert.equal(structuredStringFields(searched.structuredContent).some((text) => text.includes(query)), false, `MCP search ${relativePath} ${query} leaked through a nested structured field`);
-      expectRedactedText(resultText(searched), `MCP search ${relativePath} ${query} envelope`);
     }
   }
 
@@ -615,6 +768,7 @@ try {
     assert.equal(item.ok, true, `negative read_many failed ${relativePath}`);
     expectRedactedText(item.result.text, `MCP read_many ${relativePath}`);
   }
+  expectNoRawCredential(negativeBatch, 'MCP read_many complete response');
   const negativeBatchStrings = structuredStringFields(negativeBatch.structuredContent);
   for (const literal of ['QZ7', 'ACTUAL_LITERAL_SECRET_7X9', 'client.actualSecret', 'client.getSecret()']) {
     assert.equal(negativeBatchStrings.some((text) => text.includes(literal)), false, `MCP read_many leaked ${literal} through a nested structured field`);

@@ -46,6 +46,9 @@ const EXACT_PLACEHOLDERS = new Set([
   'sk-...'
 ]);
 const REFERENCE_ROOTS = /^(?:config|credentials|process|env|settings|secrets|options|runtime|context|this|import|os)$/i;
+const HORIZONTAL_WHITESPACE = /[^\S\r\n]/u;
+const MAX_GENERIC_TAIL_LENGTH = 512;
+const MAX_GENERIC_TAIL_DEPTH = 16;
 
 function normalizeCredentialValue(value) {
   let normalized = String(value ?? '').trim().replace(/[;,]+$/, '').trim();
@@ -221,21 +224,53 @@ function hasAssignmentAnchor(code, offset, value = '') {
 
 function genericTailEnd(code, end) {
   let index = end;
-  while (index < code.length && /\s/u.test(code[index])) index += 1;
+  while (index < code.length && HORIZONTAL_WHITESPACE.test(code[index])) index += 1;
   if (code[index] !== '<') return index;
+  const start = index;
   let depth = 0;
   for (; index < code.length; index += 1) {
+    if (index - start >= MAX_GENERIC_TAIL_LENGTH) return -1;
     const current = code[index];
+    if (current === '\n' || current === '\r' || (depth > 0 && /[=;{}]/u.test(current))) return -1;
     if (current === '<') {
       depth += 1;
+      if (depth > MAX_GENERIC_TAIL_DEPTH) return -1;
     } else if (current === '>') {
       depth -= 1;
       if (depth === 0) return index + 1;
-    } else if (depth > 0 && /[=;{}]/u.test(current)) {
-      return -1;
     }
   }
   return -1;
+}
+
+function genericTailStart(code, end) {
+  let index = end;
+  while (index < code.length && HORIZONTAL_WHITESPACE.test(code[index])) index += 1;
+  return code[index] === '<' ? index : -1;
+}
+
+function genericTailRecordEnd(code, start) {
+  const line = sourceLineBounds(code, start);
+  // Once the bounded parser rejects a tail, consume only the rest of the
+  // current physical line. This cannot leak a rejected payload after an
+  // internal delimiter, and it cannot consume a later source line.
+  return line.end > line.start && code[line.end - 1] === '\r' ? line.end - 1 : line.end;
+}
+
+function genericTailInfo(code, end) {
+  const start = genericTailStart(code, end);
+  if (start < 0) return null;
+  const parsedEnd = genericTailEnd(code, end);
+  return {
+    start,
+    end: parsedEnd >= 0 ? parsedEnd : genericTailRecordEnd(code, start),
+    balanced: parsedEnd >= 0
+  };
+}
+
+function credentialValueSpanEnd(text, valueEnd) {
+  const genericTail = genericTailInfo(String(text ?? ''), valueEnd);
+  return genericTail ? genericTail.end : valueEnd;
 }
 
 function hasTypedVariableAnnotationAnchor(code, syntax, offset, assignment = '', value = '') {
@@ -322,7 +357,7 @@ function hasParameterAnchor(code, syntax, offset) {
   if (!arrow && !declaration) return false;
   if (arrow) return true;
   const prefix = sourceAnchorPrefix(code, parens.open);
-  return /(?:^|[\n;{}])\s*(?:(?:export\s+)?(?:async\s+)?function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?|(?:async\s+)?def\s+[A-Za-z_$][A-Za-z0-9_$]*|(?:async\s+)?[A-Za-z_$][A-Za-z0-9_$]*(?:\s*<[^>\n]*>)?)\s*$/u.test(prefix);
+  return /(?:^|[\n;{}])\s*(?:(?:export\s+)?(?:async\s+)?function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*<[^>\n]*>)?)?|(?:async\s+)?def\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*[\[<][^>\]\n]*[\]>])?|(?:async\s+)?[A-Za-z_$][A-Za-z0-9_$]*(?:\s*<[^>\n]*>)?)\s*$/u.test(prefix);
 }
 
 function hasPythonClassAnchor(code, offset) {
@@ -340,19 +375,17 @@ function hasPythonClassAnchor(code, offset) {
     inspected += 1;
     if (!previousLine.trim()) continue;
     const previousIndent = previousLine.match(/^[ \t]*/u)?.[0].length ?? 0;
-    if (/^class\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*\([^\n]*\))?\s*:/u.test(previousLine.trim()) && currentIndent > previousIndent) return true;
+    if (/^class\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*(?:\([^\n]*\)|\[[^\n]*\]|<[^>\n]*>))?\s*:/u.test(previousLine.trim()) && currentIndent > previousIndent) return true;
     if (previousIndent <= currentIndent && previousIndent === 0) break;
   }
   return false;
 }
 
 function hasBalancedGenericTail(code, end) {
-  let index = end;
-  while (index < code.length && /\s/u.test(code[index])) index += 1;
-  if (code[index] !== '<') return true;
+  if (genericTailStart(code, end) < 0) return true;
   const tailEnd = genericTailEnd(code, end);
   if (tailEnd < 0) return false;
-  return /^(?:\s*(?:[,;=)}\]:]|$))/u.test(code.slice(tailEnd));
+  return /^(?:[^\S\r\n]*(?:[,;=)}\]:]|$))/u.test(code.slice(tailEnd));
 }
 
 function createSourceSyntax(text) {
@@ -372,22 +405,38 @@ function isCredibleSourceReference(value, text, offset, assignment = '', syntax 
   // inside the outer source expression, so comparing the complete slice would
   // reject lawful source while still failing to reject strings/comments.
   if (syntax.code[offset] !== original[offset] || syntax.code[valueStart] !== original[valueStart]) return false;
+  const genericTail = genericTailInfo(original, valueEnd);
+  if (genericTail && !genericTail.balanced) return false;
   if (!hasBalancedGenericTail(syntax.code, valueEnd)) return false;
   const typedAnnotation = hasTypedVariableAnnotationAnchor(syntax.code, syntax, offset, assignment, raw);
+  const typeLikeBody = hasTypeLikeBodyAnchor(syntax.code, syntax, offset);
+  const parameter = hasParameterAnchor(syntax.code, syntax, offset);
+  const pythonClass = hasPythonClassAnchor(syntax.code, offset);
+  const destructuring = hasDestructuringAnchor(syntax.code, syntax, offset);
+  const initializerGeneric = Boolean(genericTail && /=\s*$/u.test(assignment));
+  // A generic tail is source syntax only when a surrounding type, parameter,
+  // annotation, or destructuring anchor proves that it is not a value. In an
+  // object/config expression it remains part of the credential-looking value.
+  if (genericTail && (initializerGeneric || !(typedAnnotation || typeLikeBody || parameter || pythonClass || destructuring))) return false;
   const expressionReference = isReferenceExpression(raw, { allowAnyRoot: true });
   if (!reference && !expressionReference) return typedAnnotation && !/=\s*$/u.test(assignment);
   const memberExpression = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/u.test(raw);
   const callExpression = new RegExp(`^${REFERENCE_CALL}$`).test(raw);
+  const objectExpression = hasObjectExpressionAnchor(syntax.code, syntax, offset);
+  // Member/call values nested in an object/config record are ambiguous with
+  // credential material. Keep the existing declaration/parameter/type
+  // compatibility, but fail closed for this value-shaped route.
+  if (objectExpression && (memberExpression || callExpression)) return false;
   const assignmentReference = hasAssignmentAnchor(syntax.code, offset + assignment.length, raw)
     && (callExpression || !memberExpression || isReferenceExpression(raw));
   return hasVariableInitializerAnchor(syntax.code, offset + assignment.length)
     || (expressionReference && assignmentReference)
     || typedAnnotation
-    || hasDestructuringAnchor(syntax.code, syntax, offset)
-    || hasTypeLikeBodyAnchor(syntax.code, syntax, offset)
-    || hasObjectExpressionAnchor(syntax.code, syntax, offset)
-    || hasParameterAnchor(syntax.code, syntax, offset)
-    || hasPythonClassAnchor(syntax.code, offset);
+    || destructuring
+    || typeLikeBody
+    || objectExpression
+    || parameter
+    || pythonClass;
 }
 
 function isSourceDeclaration(text, offset, assignment = '', context = 'source') {
@@ -596,24 +645,50 @@ function redactPrivateKeysPreservingLines(text) {
 
 function redactCredentialAssignment(match, prefix, value, wholeText, offset, context, syntax = undefined) {
   if (safeCredentialReference(value, wholeText, offset, context, prefix, syntax)) return match;
-  if (context === 'source' && syntax && hasTypedVariableAnnotationAnchor(syntax.code, syntax, offset, prefix, value)) {
+  const valueEnd = offset + prefix.length + value.length;
+  const genericTail = genericTailInfo(wholeText, valueEnd);
+  const initializerGeneric = Boolean(genericTail && /=\s*$/u.test(prefix));
+  if (context === 'source' && syntax && !initializerGeneric && (!genericTail || genericTail.balanced) && hasTypedVariableAnnotationAnchor(syntax.code, syntax, offset, prefix, value)) {
     if (!/=\s*$/u.test(prefix)) return match;
     return `${prefix}${REDACTED_SECRET}`;
   }
   const equals = prefix.lastIndexOf('=');
-  return equals >= 0
-    ? `${prefix.slice(0, equals).trimEnd()}= ${REDACTED_SECRET}`
-    : `${prefix}${REDACTED_SECRET}`;
+  if (equals >= 0) {
+    const beforeEquals = prefix.slice(0, equals).trimEnd();
+    // Keep a separator for typed declarations so the follow-up field pass
+    // cannot absorb the assignment operator into the annotation value.
+    const typedSeparator = beforeEquals.includes(':') ? ' ' : '';
+    return `${beforeEquals}${typedSeparator}= ${REDACTED_SECRET}`;
+  }
+  return `${prefix}${REDACTED_SECRET}`;
+}
+
+function replaceCredentialMatches(text, pattern, context, syntax) {
+  pattern.lastIndex = 0;
+  let cursor = 0;
+  let output = '';
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    const prefix = match[1] ?? '';
+    const value = match[2] ?? '';
+    const replacement = redactCredentialAssignment(match[0], prefix, value, text, match.index, context, syntax);
+    const valueEnd = match.index + prefix.length + value.length;
+    const end = replacement === match[0] ? match.index + match[0].length : credentialValueSpanEnd(text, valueEnd);
+    output += text.slice(cursor, match.index) + replacement;
+    cursor = Math.max(cursor, end);
+    if (end > match.index + match[0].length) pattern.lastIndex = end;
+  }
+  return output + text.slice(cursor);
 }
 
 function applyCredentialPatterns(text, context) {
   let output = text;
   const typedSyntax = context === 'source' ? createSourceSyntax(output) : undefined;
-  output = output.replace(TYPED_DECLARATION_ASSIGNMENT_PATTERN, (match, prefix, value, offset, wholeText) => redactCredentialAssignment(match, prefix, value, wholeText, offset, context, typedSyntax));
+  output = replaceCredentialMatches(output, TYPED_DECLARATION_ASSIGNMENT_PATTERN, context, typedSyntax);
   const assignmentSyntax = context === 'source' ? createSourceSyntax(output) : undefined;
-  output = output.replace(CREDENTIAL_ASSIGNMENT_PATTERN, (match, prefix, value, offset, wholeText) => redactCredentialAssignment(match, prefix, value, wholeText, offset, context, assignmentSyntax));
+  output = replaceCredentialMatches(output, CREDENTIAL_ASSIGNMENT_PATTERN, context, assignmentSyntax);
   const fieldSyntax = context === 'source' ? createSourceSyntax(output) : undefined;
-  output = output.replace(CREDENTIAL_FIELD_PATTERN, (match, prefix, value, offset, wholeText) => redactCredentialAssignment(match, prefix, value, wholeText, offset, context, fieldSyntax));
+  output = replaceCredentialMatches(output, CREDENTIAL_FIELD_PATTERN, context, fieldSyntax);
   return output;
 }
 
