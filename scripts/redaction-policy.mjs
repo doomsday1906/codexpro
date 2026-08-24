@@ -372,11 +372,32 @@ function hasParameterAnchor(code, syntax, offset) {
   return /(?:^|[\n;{}])\s*(?:(?:export\s+)?(?:async\s+)?function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*<[^>\n]*>)?)?|(?:async\s+)?def\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*[\[<][^>\]\n]*[\]>])?|(?:async\s+)?[A-Za-z_$][A-Za-z0-9_$]*(?:\s*<[^>\n]*>)?)\s*$/u.test(prefix);
 }
 
+function pythonIndentationColumn(line) {
+  let column = 0;
+  for (const character of line) {
+    if (character === ' ') {
+      column += 1;
+      continue;
+    }
+    if (character === '\t') {
+      column += 8 - (column % 8);
+      continue;
+    }
+    // Python's other leading control/Unicode whitespace forms have semantics
+    // that this bounded source classifier does not model. Fail closed instead
+    // of inventing an indentation ordering for them.
+    if (/\s/u.test(character)) return null;
+    return column;
+  }
+  return column;
+}
+
 function hasPythonClassAnchor(code, offset) {
   const currentBounds = sourceLineBounds(code, offset);
   const rawCurrentLine = code.slice(currentBounds.start, currentBounds.end);
   const currentLine = rawCurrentLine.replace(/^\s*\d+\s*\|\s?/u, '');
-  const currentIndent = currentLine.match(/^[ \t]*/u)?.[0].length ?? 0;
+  const currentIndent = pythonIndentationColumn(currentLine);
+  if (currentIndent === null) return false;
   // A direct class-suite annotation starts at the physical line's indentation.
   // Anything already written on that line is a nested expression/statement,
   // not a class member, even when the line is inside a class suite.
@@ -398,7 +419,8 @@ function hasPythonClassAnchor(code, offset) {
     previousEnd = previousStart;
     inspected += 1;
     if (!previousLine.trim()) continue;
-    const previousIndent = previousLine.match(/^[ \t]*/u)?.[0].length ?? 0;
+    const previousIndent = pythonIndentationColumn(previousLine);
+    if (previousIndent === null) return false;
     if (previousIndent >= currentIndent) continue;
     return /^class\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*(?:\([^\n]*\)|\[[^\n]*\]|<[^>\n]*>))?\s*:/u.test(previousLine.trim());
   }

@@ -140,6 +140,16 @@ function expectNoRawLiterals(value, literals, label) {
   }
 }
 
+function expectNoHostileResponseFields(value, literals, label) {
+  expectNoRawLiterals(value, literals, `${label} complete serialized response`);
+  expectNoRawLiterals(value?.content, literals, `${label} content`);
+  expectNoRawLiterals(value?.structuredContent, literals, `${label} structuredContent`);
+  expectNoRawLiterals(value?._meta, literals, `${label} _meta`);
+  expectNoRawLiterals(value?.structuredContent?.analysis?.matches, literals, `${label} analysis.matches`);
+  expectNoRawLiterals(value?.structuredContent?.analysis?.groups, literals, `${label} analysis.groups`);
+  expectNoRawLiterals(value?.structuredContent?.analysis?.query, literals, `${label} analysis.query`);
+}
+
 function expectRedactedText(text, label) {
   for (const literal of [
     'QZ7',
@@ -305,6 +315,70 @@ const pythonProvenanceHostileRedacted = [
   '        nested_token= [REDACTED_SECRET]',
   '',
   '    deeply_nested = {outer: {token: [REDACTED_SECRET]}}',
+  '',
+  'TOP_LEVEL = {token: [REDACTED_SECRET]}',
+  ''
+].join('\n');
+
+// This fixture keeps a lawful direct class annotation at tab+space column 12,
+// then exercises the parseable mixed-indentation dictionary/block shapes that
+// must not inherit provenance from the surrounding class. The exact first
+// hostile value intentionally matches the reported regression.
+const pythonMixedProvenance = [
+  'class MixedLawful:',
+  '\t    token: Token[str]',
+  '',
+  'class Request:',
+  '        config = {',
+  '\t    token: Token[ACTUAL_LITERAL_SECRET_7X9]',
+  '        }',
+  '        member_payload = {',
+  '\t    token: Token[client.actualSecret]',
+  '        }',
+  '        call_payload = {',
+  '\t    password: Password[client.getSecret()]',
+  '        }',
+  '',
+  '        def method(self):',
+  '\t        nested = {token: Token[ACTUAL_LITERAL_SECRET_7X9]}',
+  '\t        return nested',
+  '',
+  '        if enabled:',
+  '\t    nested_token = Token[ACTUAL_LITERAL_SECRET_7X9]',
+  '',
+  '        deeply_nested = {',
+  '\t    outer: {token: Token[ACTUAL_LITERAL_SECRET_7X9]}',
+  '        }',
+  '',
+  'TOP_LEVEL = {token: Token[ACTUAL_LITERAL_SECRET_7X9]}',
+  ''
+].join('\n');
+
+const pythonMixedProvenanceRedacted = [
+  'class MixedLawful:',
+  '\t    token: Token[str]',
+  '',
+  'class Request:',
+  '        config = {',
+  '\t    token: [REDACTED_SECRET]',
+  '        }',
+  '        member_payload = {',
+  '\t    token: [REDACTED_SECRET]',
+  '        }',
+  '        call_payload = {',
+  '\t    password: [REDACTED_SECRET]',
+  '        }',
+  '',
+  '        def method(self):',
+  '\t        nested = {token: [REDACTED_SECRET]}',
+  '\t        return nested',
+  '',
+  '        if enabled:',
+  '\t    nested_token= [REDACTED_SECRET]',
+  '',
+  '        deeply_nested = {',
+  '\t    outer: {token: [REDACTED_SECRET]}',
+  '        }',
   '',
   'TOP_LEVEL = {token: [REDACTED_SECRET]}',
   ''
@@ -747,6 +821,7 @@ try {
   await writeFixture(tmp, 'source.py', sourcePy);
   await writeFixture(tmp, 'python-provenance-lawful.py', pythonProvenanceLawful);
   await writeFixture(tmp, 'python-provenance-hostile.py', pythonProvenanceHostile);
+  await writeFixture(tmp, 'python-mixed-provenance.py', pythonMixedProvenance);
   await writeFixture(tmp, collisionPath, collisionSource);
   await writeFixture(tmp, 'identical-source-a.ts', identicalSourceBody);
   await writeFixture(tmp, 'identical-source-b.ts', identicalSourceBody);
@@ -1122,6 +1197,153 @@ try {
       expectRedactedText(resultText(searched), `Python provenance hostile ${variantName} search ${query} envelope`);
       if (query === 'ACTUAL_LITERAL_SECRET_7X9' && variantName === 'structured-regex') {
         await writeRawArtifact(rawArtifactDir, 'python-provenance-hostile-structured-regex-search', searched);
+      }
+    }
+  }
+
+  const pythonMixedHostileLiterals = [
+    'ACTUAL_LITERAL_SECRET_7X9',
+    'client.actualSecret',
+    'client.getSecret()',
+    'Token[ACTUAL_LITERAL_SECRET_7X9',
+    'Token[client.actualSecret',
+    'Password[client.getSecret()'
+  ];
+  const pythonMixedRead = assertToolSuccess(await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: workspaceId, path: 'python-mixed-provenance.py' }
+  }), 'Python mixed-indentation provenance full read');
+  assertReadMetadata(pythonMixedRead, pythonMixedProvenance, 1, undefined, 'Python mixed-indentation provenance full read');
+  assert.equal(
+    pythonMixedRead.structuredContent.text,
+    numbered(pythonMixedProvenanceRedacted),
+    'Python mixed-indentation provenance full read changed independently-derived sanitized projection'
+  );
+  assert.equal(pythonMixedRead.structuredContent.text.includes('\t    token: Token[str]'), true, 'Python mixed-indentation lawful class annotation was redacted');
+  expectRedactedText(pythonMixedRead.structuredContent.text, 'Python mixed-indentation provenance full read');
+  expectNoHostileResponseFields(pythonMixedRead, pythonMixedHostileLiterals, 'Python mixed-indentation provenance full read');
+  await writeRawArtifact(rawArtifactDir, 'python-mixed-provenance-full', pythonMixedRead);
+
+  const pythonMixedRanges = [
+    [2, 2, 'lawful mixed direct class annotation'],
+    [5, 7, 'class dictionary literal'],
+    [8, 10, 'class dictionary member value'],
+    [11, 13, 'class dictionary call value'],
+    [15, 17, 'method-nested value'],
+    [19, 20, 'conditional-block-nested value'],
+    [22, 24, 'nested dictionary value'],
+    [26, 26, 'top-level material after class']
+  ];
+  for (const [startLine, endLine, label] of pythonMixedRanges) {
+    const ranged = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: 'python-mixed-provenance.py', start_line: startLine, end_line: endLine }
+    }), `Python mixed-indentation ${label} ranged read`);
+    assertReadMetadata(ranged, pythonMixedProvenance, startLine, endLine, `Python mixed-indentation ${label} ranged read`);
+    assert.equal(
+      ranged.structuredContent.text,
+      projectedRange(pythonMixedProvenanceRedacted, startLine, endLine).text,
+      `Python mixed-indentation ${label} ranged read changed independently-derived sanitized projection`
+    );
+    if (label.startsWith('lawful')) {
+      assert.equal(ranged.structuredContent.text.includes('[REDACTED_SECRET]'), false, `Python mixed-indentation ${label} ranged read redacted lawful source`);
+    } else {
+      expectRedactedText(ranged.structuredContent.text, `Python mixed-indentation ${label} ranged read`);
+    }
+    expectNoHostileResponseFields(ranged, pythonMixedHostileLiterals, `Python mixed-indentation ${label} ranged read`);
+  }
+
+  const pythonMixedBatchItems = pythonMixedRanges.map(([start_line, end_line]) => ({
+    path: 'python-mixed-provenance.py',
+    start_line,
+    end_line
+  }));
+  const pythonMixedBatch = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: { workspace_id: workspaceId, items: pythonMixedBatchItems }
+  }), 'Python mixed-indentation provenance read_many');
+  const pythonMixedResults = pythonMixedBatch.structuredContent.results ?? [];
+  assert.equal(pythonMixedResults.length, pythonMixedBatchItems.length, 'Python mixed-indentation provenance read_many changed item count');
+  for (const [index, item] of pythonMixedBatchItems.entries()) {
+    const actual = pythonMixedResults[index];
+    assert.deepEqual(
+      { index: actual.index, path: actual.path, ok: actual.ok, text: actual.result?.text },
+      {
+        index,
+        path: item.path,
+        ok: true,
+        text: projectedRange(pythonMixedProvenanceRedacted, item.start_line, item.end_line).text
+      },
+      `Python mixed-indentation provenance read_many changed item ${index}`
+    );
+    expectNoRawLiterals(actual, pythonMixedHostileLiterals, `Python mixed-indentation provenance read_many item ${index}`);
+  }
+  expectNoHostileResponseFields(pythonMixedBatch, pythonMixedHostileLiterals, 'Python mixed-indentation provenance read_many');
+
+  const pythonMixedSearchCases = [
+    {
+      query: 'Token[str]',
+      regexQuery: 'Token\\[str\\]',
+      expectedLines: [2],
+      lawful: true
+    },
+    {
+      query: 'ACTUAL_LITERAL_SECRET_7X9',
+      regexQuery: 'ACTUAL_LITERAL_SECRET_7X9',
+      expectedLines: [6, 16, 20, 23, 26],
+      lawful: false
+    },
+    {
+      query: 'client.actualSecret',
+      regexQuery: 'client\\.actualSecret',
+      expectedLines: [9],
+      lawful: false
+    },
+    {
+      query: 'client.getSecret()',
+      regexQuery: 'client\\.getSecret\\(\\)',
+      expectedLines: [12],
+      lawful: false
+    }
+  ];
+  for (const { query, regexQuery, expectedLines, lawful } of pythonMixedSearchCases) {
+    for (const [variantName, variantArgs, searchQuery] of [
+      ['plain', {}, query],
+      ['structured', { intent: 'text' }, query],
+      ['regex', { regex: true }, regexQuery],
+      ['structured-regex', { intent: 'text', regex: true }, regexQuery]
+    ]) {
+      const searched = assertToolSuccess(await client.request('tools/call', {
+        name: 'search',
+        arguments: { workspace_id: workspaceId, query: searchQuery, path: 'python-mixed-provenance.py', max_results: 20, ...variantArgs }
+      }), `Python mixed-indentation ${variantName} search ${query}`);
+      assert.deepEqual(
+        searched.structuredContent.matches?.map((match) => match.line),
+        expectedLines,
+        `Python mixed-indentation ${variantName} search ${query} changed physical match lines`
+      );
+      for (const [index, expectedLine] of expectedLines.entries()) {
+        const match = searched.structuredContent.matches[index];
+        assert.equal(match.path, 'python-mixed-provenance.py', `Python mixed-indentation ${variantName} search ${query} changed match path`);
+        if (lawful) {
+          assert.equal(match.text, pythonMixedProvenance.split('\n')[expectedLine - 1], `Python mixed-indentation ${variantName} search ${query} changed lawful source`);
+        } else {
+          expectRedactedText(match.text, `Python mixed-indentation ${variantName} search ${query} match`);
+        }
+      }
+      if (lawful) {
+        assert.equal(resultText(searched).includes('[REDACTED_SECRET]'), false, `Python mixed-indentation ${variantName} search ${query} redacted lawful source`);
+      } else {
+        const analysis = searched.structuredContent.analysis;
+        if (analysis && Object.prototype.hasOwnProperty.call(analysis, 'query')) {
+          assert.equal(analysis.query, '[REDACTED_SECRET]', `Python mixed-indentation ${variantName} search ${query} preserved hostile analysis.query`);
+        }
+        expectRedactedText(resultText(searched), `Python mixed-indentation ${variantName} search ${query} envelope`);
+        expectNoHostileResponseFields(searched, pythonMixedHostileLiterals, `Python mixed-indentation ${variantName} search ${query}`);
+      }
+      expectNoRawCredential(searched, `Python mixed-indentation ${variantName} search ${query}`);
+      if (!lawful && query === 'ACTUAL_LITERAL_SECRET_7X9' && variantName === 'structured-regex') {
+        await writeRawArtifact(rawArtifactDir, 'python-mixed-provenance-structured-regex-search', searched);
       }
     }
   }
