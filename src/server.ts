@@ -7,7 +7,7 @@ import { z } from "zod";
 import type { CodexProConfig } from "./config.js";
 import { WorkspaceManager, PathGuard, CodexProError, type Workspace } from "./guard.js";
 import { processIsAlive, readRuntimeConnection, readRuntimeFailure } from "./profileStore.js";
-import { repoTree, readTextFile, writeTextFile, editTextFile, ensureAiBridge, withFileWriteLocks, type ReadFileResult } from "./fsOps.js";
+import { repoTree, readPublicTextFile, readTextFile, writeTextFile, editTextFile, ensureAiBridge, withFileWriteLocks, type ReadFileResult } from "./fsOps.js";
 import { viewWorkspaceImage } from "./imageOps.js";
 import { importAttachmentFile } from "./importOps.js";
 import { searchWorkspace } from "./searchOps.js";
@@ -78,6 +78,64 @@ type ReadManyResult =
   | { index: number; path: string; ok: true; result: ReadFileResult }
   | { index: number; path: string; ok: false; error: string };
 
+// Public source bodies are redacted against the complete file before they are
+// placed in a response. Keep that body as an explicit typed exception to the
+// generic response pass; all paths, hashes, framing, errors, and other
+// metadata continue through recursive redaction.
+type PublicSourceBody = { readonly kind: "public-source-body"; readonly text: string };
+type PublicSourceField = { readonly path: readonly (string | number)[]; readonly body: PublicSourceBody };
+type TextResultOptions = {
+  readonly sourceBodies?: readonly PublicSourceBody[];
+  readonly sourceFields?: readonly PublicSourceField[];
+};
+
+function publicSourceBody(text: string): PublicSourceBody {
+  return { kind: "public-source-body", text };
+}
+
+function redactTextWithPublicSourceBodies(text: string, bodies: readonly PublicSourceBody[]): string {
+  let cursor = 0;
+  let output = "";
+  let protectedBodyCount = 0;
+  for (const body of bodies) {
+    if (!body.text) continue;
+    const index = text.indexOf(body.text, cursor);
+    if (index < 0) continue;
+    output += redactSensitiveText(text.slice(cursor, index));
+    output += body.text;
+    cursor = index + body.text.length;
+    protectedBodyCount += 1;
+  }
+  if (protectedBodyCount === 0) return redactSensitiveText(text);
+  return output + redactSensitiveText(text.slice(cursor));
+}
+
+function samePublicSourcePath(left: readonly (string | number)[], right: readonly (string | number)[]): boolean {
+  return left.length === right.length && left.every((part, index) => part === right[index]);
+}
+
+function redactStructuredPreservingSourceFields(
+  value: unknown,
+  fields: readonly PublicSourceField[],
+  path: readonly (string | number)[] = [],
+  depth = 0
+): unknown {
+  if (depth > 8 || value === null || value === undefined) return value;
+  const sourceField = fields.find((field) => samePublicSourcePath(field.path, path));
+  if (sourceField && typeof value === "string" && value === sourceField.body.text) return value;
+  if (typeof value === "string") return redactSensitiveText(value);
+  if (Array.isArray(value)) {
+    return value.map((item, index) => redactStructuredPreservingSourceFields(item, fields, [...path, index], depth + 1));
+  }
+  if (typeof value !== "object") return value;
+
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    out[key] = redactStructuredPreservingSourceFields(item, fields, [...path, key], depth + 1);
+  }
+  return out;
+}
+
 function boundedReadManyError(error: unknown): string {
   const value = errorText(error);
   if (value.length <= READ_MANY_MAX_ERROR_CHARS) return value;
@@ -143,6 +201,14 @@ function readManyText(workspace: Workspace, results: ReadManyResult[], maxTotalB
 }
 
 function readManyResponse(workspace: Workspace, results: ReadManyResult[], maxTotalBytes: number): any {
+  const sourceBodies: PublicSourceBody[] = [];
+  const sourceFields: PublicSourceField[] = [];
+  for (const item of results) {
+    if (!item.ok) continue;
+    const body = publicSourceBody(item.result.text);
+    sourceBodies.push(body);
+    sourceFields.push({ path: ["results", item.index, "result", "text"], body });
+  }
   return textResult(readManyText(workspace, results, maxTotalBytes), {
     workspace_id: workspace.id,
     root: workspace.root,
@@ -150,7 +216,7 @@ function readManyResponse(workspace: Workspace, results: ReadManyResult[], maxTo
     max_total_bytes: maxTotalBytes,
     item_count: results.length,
     results
-  });
+  }, {}, { sourceBodies, sourceFields });
 }
 
 function serializedReadManyResponseBytes(response: any): number {
@@ -189,10 +255,21 @@ function compactStructuredContent<T>(value: T, depth = 0): T {
   return out as T;
 }
 
-function textResult(text: string, structuredContent: Record<string, unknown> = {}, meta: Record<string, unknown> = {}): any {
+function textResult(
+  text: string,
+  structuredContent: Record<string, unknown> = {},
+  meta: Record<string, unknown> = {},
+  options: TextResultOptions = {}
+): any {
   return {
-    content: [{ type: "text", text: redactSensitiveText(text) }],
-    structuredContent: redactStructured(structuredContent),
+    content: [{ type: "text", text: redactTextWithPublicSourceBodies(text, options.sourceBodies ?? []) }],
+    // Only the explicitly identified source body fields bypass the second
+    // source-context pass; every other structured field remains recursive.
+    // Public read/read_many pass no custom _meta, so MCP metadata stays the
+    // existing caller-owned envelope while their structured payload is safe.
+    structuredContent: options.sourceFields?.length
+      ? redactStructuredPreservingSourceFields(structuredContent, options.sourceFields)
+      : redactStructured(structuredContent),
     _meta: meta
   };
 }
@@ -2136,13 +2213,17 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
-      const result = await readTextFile(config, guard, workspace, args.path, {
+      const result = await readPublicTextFile(config, guard, workspace, args.path, {
         startLine: args.start_line,
         endLine: args.end_line,
         maxBytes: args.max_bytes
       });
       const text = `# Read File\n\nPath: ${result.path}\nLines: ${result.startLine}-${result.endLine} of ${result.totalLines}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}\n\n\`\`\`text\n${result.text}\n\`\`\``;
-      return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result });
+      const body = publicSourceBody(result.text);
+      return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result }, {}, {
+        sourceBodies: [body],
+        sourceFields: [{ path: ["text"], body }]
+      });
     }
   );
 
@@ -2175,7 +2256,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       for (const [index, item] of validatedArgs.items.entries()) {
         let result: ReadManyResult;
         try {
-          const readResult = await readTextFile(config, guard, workspace, item.path, {
+          const readResult = await readPublicTextFile(config, guard, workspace, item.path, {
             startLine: item.start_line,
             endLine: item.end_line,
             maxBytes: item.max_bytes

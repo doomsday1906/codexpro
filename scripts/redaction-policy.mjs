@@ -364,14 +364,15 @@ function hasPythonClassAnchor(code, offset) {
   const { start } = sourceLineBounds(code, offset);
   const currentLine = code.slice(start, sourceLineBounds(code, offset).end).replace(/^\s*\d+\s*\|\s?/u, '');
   const currentIndent = currentLine.match(/^[ \t]*/u)?.[0].length ?? 0;
-  let cursor = start - 1;
-  if (code[cursor] === '\n' || code[cursor] === '\r') cursor -= 1;
+  // Walk complete preceding physical lines. A member after another member
+  // must retain the same class envelope as the first annotation.
+  let previousEnd = start;
   let inspected = 0;
-  while (cursor >= 0 && inspected < 96) {
-    const previousEnd = cursor + 1;
-    const previousStart = code.lastIndexOf('\n', cursor) + 1;
+  while (previousEnd > 0 && inspected < 96) {
+    while (previousEnd > 0 && (code[previousEnd - 1] === '\n' || code[previousEnd - 1] === '\r')) previousEnd -= 1;
+    const previousStart = code.lastIndexOf('\n', previousEnd - 1) + 1;
     const previousLine = code.slice(previousStart, previousEnd).replace(/^\s*\d+\s*\|\s?/u, '');
-    cursor = previousStart - 1;
+    previousEnd = previousStart;
     inspected += 1;
     if (!previousLine.trim()) continue;
     const previousIndent = previousLine.match(/^[ \t]*/u)?.[0].length ?? 0;

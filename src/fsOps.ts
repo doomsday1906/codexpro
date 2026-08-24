@@ -6,7 +6,7 @@ import { minimatch } from "minimatch";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, displayPath, normalizeRelPath, PathGuard } from "./guard.js";
-import { hasSecretValue, redactSensitiveText } from "./redact.js";
+import { hasSecretValue, redactSensitiveText, redactSensitiveTextPreservingLines } from "./redact.js";
 
 export interface TreeOptions {
   path?: string;
@@ -167,6 +167,64 @@ function withLineNumbers(lines: string[], startLine: number): string {
   return lines.map((line, idx) => `${String(startLine + idx).padStart(width, " ")} | ${line}`).join("\n");
 }
 
+interface LoadedTextFile {
+  resolved: { absPath: string; relPath: string };
+  buffer: Buffer;
+  text: string;
+  allLines: string[];
+}
+
+async function loadTextFile(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  filePath: string,
+  options: { startLine?: number; endLine?: number; maxBytes?: number }
+): Promise<LoadedTextFile> {
+  const resolved = guard.resolve(workspace, filePath);
+  const maxBytes = Math.min(options.maxBytes ?? config.maxReadBytes, config.maxReadBytes);
+  const hasRange = options.startLine !== undefined || options.endLine !== undefined;
+  await guard.assertTextFile(resolved.absPath, hasRange ? textScanByteLimit(config) : maxBytes);
+  const buffer = await fsp.readFile(resolved.absPath);
+  const text = buffer.toString("utf8");
+  return { resolved, buffer, text, allLines: splitLines(text) };
+}
+
+function readFileWindow(
+  loaded: LoadedTextFile,
+  options: { startLine?: number; endLine?: number; maxBytes?: number },
+  lines = loaded.allLines,
+  budgetLines = loaded.allLines
+): ReadFileResult {
+  const maxBytes = options.maxBytes;
+  const hasRange = options.startLine !== undefined || options.endLine !== undefined;
+  const totalLines = loaded.allLines.length;
+  const startLine = Math.max(1, Math.floor(options.startLine ?? 1));
+  const endLine = Math.min(totalLines, Math.floor(options.endLine ?? totalLines));
+  if (endLine < startLine) {
+    throw new CodexProError(`end_line (${endLine}) must be >= start_line (${startLine}).`);
+  }
+  const selected = lines.slice(startLine - 1, endLine);
+  const numbered = withLineNumbers(selected, startLine);
+  // max_bytes is historically measured on the raw numbered range. Public
+  // source redaction may expand a line into a marker, but it must not change
+  // that range admission/budget representation.
+  const budgetNumbered = withLineNumbers(budgetLines.slice(startLine - 1, endLine), startLine);
+  if (hasRange && maxBytes !== undefined && Buffer.byteLength(budgetNumbered, "utf8") > maxBytes) {
+    throw new CodexProError(`Selected line range is too large. Limit: ${maxBytes} bytes.`);
+  }
+  return {
+    path: loaded.resolved.relPath,
+    text: numbered,
+    startLine,
+    endLine,
+    totalLines,
+    bytes: loaded.buffer.byteLength,
+    sha256: sha256(loaded.text),
+    truncated: startLine > 1 || endLine < totalLines
+  };
+}
+
 export function makeUnifiedDiff(oldText: string, newText: string, relPath: string, maxChars = 60_000): DiffResult {
   if (oldText === newText) {
     return { diff: `No changes in ${relPath}.`, additions: 0, deletions: 0, changed: false };
@@ -317,35 +375,28 @@ export async function readTextFile(
   filePath: string,
   options: { startLine?: number; endLine?: number; maxBytes?: number } = {}
 ): Promise<ReadFileResult> {
-  const resolved = guard.resolve(workspace, filePath);
+  const loaded = await loadTextFile(config, guard, workspace, filePath, options);
   const maxBytes = Math.min(options.maxBytes ?? config.maxReadBytes, config.maxReadBytes);
-  const hasRange = options.startLine !== undefined || options.endLine !== undefined;
-  await guard.assertTextFile(resolved.absPath, hasRange ? textScanByteLimit(config) : maxBytes);
-  const buffer = await fsp.readFile(resolved.absPath);
-  const text = buffer.toString("utf8");
-  const allLines = splitLines(text);
-  const totalLines = allLines.length;
-  const startLine = Math.max(1, Math.floor(options.startLine ?? 1));
-  const endLine = Math.min(totalLines, Math.floor(options.endLine ?? totalLines));
-  if (endLine < startLine) {
-    throw new CodexProError(`end_line (${endLine}) must be >= start_line (${startLine}).`);
-  }
-  const selected = allLines.slice(startLine - 1, endLine);
-  const numbered = withLineNumbers(selected, startLine);
-  if (hasRange && Buffer.byteLength(numbered, "utf8") > maxBytes) {
-    throw new CodexProError(`Selected line range is too large. Limit: ${maxBytes} bytes.`);
-  }
-  const truncated = startLine > 1 || endLine < totalLines;
-  return {
-    path: resolved.relPath,
-    text: numbered,
-    startLine,
-    endLine,
-    totalLines,
-    bytes: buffer.byteLength,
-    sha256: sha256(text),
-    truncated
-  };
+  return readFileWindow(loaded, { ...options, maxBytes });
+}
+
+/**
+ * Build the public read projection from one complete source snapshot. The
+ * raw readTextFile primitive remains unchanged for internal callers; public
+ * handlers use this variant so source-sensitive policy sees declarations and
+ * syntax outside the requested line range before framing the response.
+ */
+export async function readPublicTextFile(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  filePath: string,
+  options: { startLine?: number; endLine?: number; maxBytes?: number } = {}
+): Promise<ReadFileResult> {
+  const loaded = await loadTextFile(config, guard, workspace, filePath, options);
+  const maxBytes = Math.min(options.maxBytes ?? config.maxReadBytes, config.maxReadBytes);
+  const redactedLines = splitLines(redactSensitiveTextPreservingLines(loaded.text));
+  return readFileWindow(loaded, { ...options, maxBytes }, redactedLines, loaded.allLines);
 }
 
 export async function writeTextFile(

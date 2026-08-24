@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -101,6 +102,42 @@ function numbered(text, startLine = 1) {
   const lines = text.replace(/\r\n/g, '\n').split('\n');
   const width = String(startLine + lines.length - 1).length;
   return lines.map((line, index) => `${String(startLine + index).padStart(width, ' ')} | ${line}`).join('\n');
+}
+
+function sha256(text) {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
+function projectedRange(text, startLine = 1, endLine = undefined) {
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  const start = Math.max(1, Math.floor(startLine));
+  const end = Math.min(lines.length, Math.floor(endLine ?? lines.length));
+  return { text: numbered(lines.slice(start - 1, end).join('\n'), start), start, end, totalLines: lines.length };
+}
+
+function stripLineNumbers(text) {
+  return text.split('\n').map((line) => line.replace(/^\s*\d+\s\|\s?/u, '')).join('\n');
+}
+
+function assertReadMetadata(result, source, startLine, endLine, label) {
+  const expected = projectedRange(source, startLine, endLine);
+  const data = result.structuredContent;
+  assert.ok(data && typeof data === 'object', `${label} omitted structured read content`);
+  assert.equal(data.startLine, expected.start, `${label} changed the first physical line`);
+  assert.equal(data.endLine, expected.end, `${label} changed the last physical line`);
+  assert.equal(data.totalLines, expected.totalLines, `${label} changed total physical line count`);
+  assert.equal(data.bytes, Buffer.byteLength(source, 'utf8'), `${label} changed full-file byte metadata`);
+  assert.equal(data.sha256, sha256(source), `${label} changed full-file SHA-256 metadata`);
+  assert.equal(data.truncated, expected.start > 1 || expected.end < expected.totalLines, `${label} changed the truncation invariant`);
+  assert.ok(Object.prototype.hasOwnProperty.call(result, '_meta'), `${label} omitted the MCP metadata envelope`);
+  return expected;
+}
+
+function expectNoRawLiterals(value, literals, label) {
+  const serialized = JSON.stringify(value) ?? '';
+  for (const literal of literals) {
+    assert.equal(serialized.includes(literal), false, `${label} leaked ${literal} in its serialized response`);
+  }
 }
 
 function expectRedactedText(text, label) {
@@ -207,6 +244,149 @@ const safeConfig = [
   'const PASSWORD = settings.password;',
   ''
 ].join('\n');
+
+// These fixtures deliberately select interior lines without the enclosing
+// declaration/object/class syntax. The expected range text is derived from
+// the raw fixture, not from another MCP response, so a range cannot pass by
+// merely agreeing with a full-read redaction artifact.
+const rangedLawfulTs = [
+  'type Input = {',
+  '  token: Token<string>;',
+  '  password: PasswordType;',
+  '};',
+  'interface Credentials<T> {',
+  '  token: Token<T>;',
+  '  password: PasswordType;',
+  '}',
+  'const {',
+  '  hasSecretValue: policyHasSecretValue,',
+  '  apiToken: configuredToken,',
+  '} = policy;',
+  'function rangedFunction(',
+  '  token: Token<string>,',
+  '  password: PasswordType',
+  '): Token<string> {',
+  '  return token;',
+  '}',
+  'const rangedArrow = (',
+  '  token: Token<string>,',
+  '  password: PasswordType',
+  '): Token<string> => token;',
+  ''
+].join('\n');
+
+const rangedLawfulPy = [
+  'class Request:',
+  '    token: Token[str]',
+  '    password: PasswordType',
+  '',
+  'def ranged_function(',
+  '    token: Token[str],',
+  '    password: PasswordType',
+  ') -> Token[str]:',
+  '    return token',
+  ''
+].join('\n');
+
+const rangedHostileFixtures = {
+  'ranged-hostile.yaml': [
+    'credentials:',
+    '  token: QZ7',
+    '  password: ACTUAL_LITERAL_SECRET_7X9',
+    '  apiToken: client.actualSecret',
+    '  secret_call: client.getSecret()',
+    'safe: runtimeToken',
+    ''
+  ].join('\n'),
+  'ranged-hostile.env': [
+    'TOKEN=QZ7',
+    'PASSWORD=ACTUAL_LITERAL_SECRET_7X9',
+    'API_TOKEN=client.actualSecret',
+    'SECRET=client.getSecret()',
+    'SAFE=runtimeToken',
+    ''
+  ].join('\n'),
+  'ranged-hostile.json': [
+    '{',
+    '  "token": "ACTUAL_LITERAL_SECRET_7X9",',
+    '  "password": "QZ7",',
+    '  "apiToken": "client.actualSecret",',
+    '  "secret": "client.getSecret()",',
+    '  "safe": "runtimeToken"',
+    '}',
+    ''
+  ].join('\n'),
+  'ranged-hostile.ts': [
+    'const payload = {',
+    '  token: Token<ACTUAL_LITERAL_SECRET_7X9>,',
+    '  password: client.actualSecret,',
+    '  apiToken: client.getSecret(),',
+    '  nested_token: Wrapper<Token<client.actualSecret>>',
+    '};',
+    'const safeTail = runtimeToken;',
+    ''
+  ].join('\n')
+};
+
+const rangedHostileRedacted = {
+  'ranged-hostile.yaml': [
+    'credentials:',
+    '  token: [REDACTED_SECRET]',
+    '  password: [REDACTED_SECRET]',
+    '  apiToken: [REDACTED_SECRET]',
+    '  secret_call: [REDACTED_SECRET]',
+    'safe: runtimeToken',
+    ''
+  ].join('\n'),
+  'ranged-hostile.env': [
+    'TOKEN= [REDACTED_SECRET]',
+    'PASSWORD= [REDACTED_SECRET]',
+    'API_TOKEN= [REDACTED_SECRET]',
+    'SECRET= [REDACTED_SECRET]',
+    'SAFE=runtimeToken',
+    ''
+  ].join('\n'),
+  'ranged-hostile.json': [
+    '{',
+    '  "token": [REDACTED_SECRET],',
+    '  "password": [REDACTED_SECRET],',
+    '  "apiToken": [REDACTED_SECRET],',
+    '  "secret": [REDACTED_SECRET],',
+    '  "safe": "runtimeToken"',
+    '}',
+    ''
+  ].join('\n'),
+  'ranged-hostile.ts': [
+    'const payload = {',
+    '  token: [REDACTED_SECRET],',
+    '  password: [REDACTED_SECRET],',
+    '  apiToken: [REDACTED_SECRET],',
+    '  nested_token: [REDACTED_SECRET]',
+    '};',
+    'const safeTail = runtimeToken;',
+    ''
+  ].join('\n')
+};
+
+const rangedByteLimit = `const rangedByteLimit = ${JSON.stringify('x'.repeat(1_500))};\nconst rangedByteTail = true;\n`;
+
+const privateRangedFixture = [
+  'const rangedBefore = true;',
+  '-----BEGIN PRIVATE KEY-----',
+  'RANGED_PRIVATE_BODY_7X9',
+  '-----END PRIVATE KEY-----',
+  'const rangedAfter = true;',
+  ''
+].join('\n');
+
+const privateCrlfFixture = [
+  'const crlfBefore = true;',
+  '-----BEGIN PRIVATE KEY-----',
+  'CRLF_PRIVATE_BODY_7X9',
+  '-----END PRIVATE KEY-----',
+  'const crlfAfter = true;',
+  ''
+].join('\r\n');
 
 const relationshipSecretPath = 'ghp_01234567890123456789.ts';
 const relationshipSource = 'export const target = true;\n';
@@ -346,7 +526,8 @@ const directSafe = [
   'const { token: destructuredToken, password: destructuredPassword } = input;',
   'TOKEN: str = configuredToken',
   'def generic(token: Token[str]) -> Token[str]:',
-  'class GenericRequest:\n    token: Token[str]'
+  'class GenericRequest:\n    token: Token[str]',
+  'class Request:\n    token: Token[str]\n    password: PasswordType'
 ];
 for (const sample of directSafe) {
   assert.equal(redactSensitiveText(sample), sample, `policy changed lawful source: ${sample}`);
@@ -456,6 +637,12 @@ try {
   await writeFixture(tmp, 'source.ts', sourceTs);
   await writeFixture(tmp, 'source.py', sourcePy);
   await writeFixture(tmp, 'safe-config.js', safeConfig);
+  await writeFixture(tmp, 'ranged-lawful.ts', rangedLawfulTs);
+  await writeFixture(tmp, 'ranged-lawful.py', rangedLawfulPy);
+  for (const [relativePath, content] of Object.entries(rangedHostileFixtures)) await writeFixture(tmp, relativePath, content);
+  await writeFixture(tmp, 'ranged-byte-limit.ts', rangedByteLimit);
+  await writeFixture(tmp, 'private-ranged.txt', privateRangedFixture);
+  await writeFixture(tmp, 'private-crlf.txt', privateCrlfFixture);
   await writeFixture(tmp, 'binary-private.ts', binaryPrivateFixture);
   await writeFixture(tmp, 'mixed-private.ts', mixedPrivateFixture);
   await writeFixture(tmp, 'invalid-private.ts', invalidPrivateFixture);
@@ -501,6 +688,395 @@ try {
   assert.equal(sourcePyRead.structuredContent.text.includes('[REDACTED_SECRET]'), false, 'MCP read redacted lawful Python source');
   assert.equal(sourcePyRead.content?.[0]?.text.includes(numbered(sourcePy)), true, 'MCP Python read content envelope changed lawful source bytes');
   assert.equal(sourcePyRead.content?.[0]?.text.includes('[REDACTED_SECRET]'), false, 'MCP Python read content envelope redacted lawful source');
+
+  const lawfulRangeFixtures = [
+    {
+      path: 'ranged-lawful.ts',
+      source: rangedLawfulTs,
+      ranges: [
+        [2, 2, 'TypeScript type member'],
+        [6, 7, 'TypeScript interface body'],
+        [10, 11, 'TypeScript destructuring body'],
+        [14, 15, 'TypeScript function parameters'],
+        [20, 21, 'TypeScript arrow parameters']
+      ]
+    },
+    {
+      path: 'ranged-lawful.py',
+      source: rangedLawfulPy,
+      ranges: [
+        [2, 3, 'Python class body'],
+        [6, 7, 'Python function parameters']
+      ]
+    }
+  ];
+  for (const { path: relativePath, source, ranges } of lawfulRangeFixtures) {
+    const full = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: relativePath }
+    }), `lawful full read ${relativePath}`);
+    const fullExpected = assertReadMetadata(full, source, 1, undefined, `lawful full read ${relativePath}`);
+    assert.equal(full.structuredContent.text, fullExpected.text, `lawful full read ${relativePath} changed raw source projection`);
+    assert.equal(full.structuredContent.text.includes('[REDACTED_SECRET]'), false, `lawful full read ${relativePath} redacted source syntax`);
+    assert.equal(full.content?.[0]?.text.includes(fullExpected.text), true, `lawful full read ${relativePath} content envelope changed source projection`);
+    expectNoRawCredential(full, `lawful full read ${relativePath}`);
+
+    for (const [startLine, endLine, rangeLabel] of ranges) {
+      const ranged = assertToolSuccess(await client.request('tools/call', {
+        name: 'read',
+        arguments: { workspace_id: workspaceId, path: relativePath, start_line: startLine, end_line: endLine }
+      }), `${rangeLabel} read`);
+      const expected = assertReadMetadata(ranged, source, startLine, endLine, `${rangeLabel} read`);
+      assert.equal(ranged.structuredContent.text, expected.text, `${rangeLabel} read redacted or changed lawful interior lines`);
+      assert.equal(
+        ranged.structuredContent.text,
+        projectedRange(stripLineNumbers(full.structuredContent.text), startLine, endLine).text,
+        `${rangeLabel} read diverged from the independently observed full MCP projection`
+      );
+      assert.equal(ranged.structuredContent.text.includes('[REDACTED_SECRET]'), false, `${rangeLabel} read redacted lawful source syntax`);
+      assert.equal(ranged.content?.[0]?.text.includes(expected.text), true, `${rangeLabel} read content envelope changed lawful source projection`);
+      expectNoRawCredential(ranged, `${rangeLabel} read`);
+    }
+  }
+
+  const lawfulRangeBatchItems = [
+    { path: 'ranged-lawful.ts', start_line: 2, end_line: 3 },
+    { path: 'ranged-lawful.ts', start_line: 10, end_line: 11 },
+    { path: 'ranged-lawful.py', start_line: 2, end_line: 2 },
+    { path: 'ranged-lawful.py', start_line: 5, end_line: 6 }
+  ];
+  const lawfulRangeBatch = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: { workspace_id: workspaceId, items: lawfulRangeBatchItems }
+  }), 'lawful ranged read_many');
+  const lawfulRangeResults = lawfulRangeBatch.structuredContent.results ?? [];
+  assert.equal(lawfulRangeResults.length, lawfulRangeBatchItems.length, 'lawful ranged read_many changed item count');
+  for (const [index, item] of lawfulRangeBatchItems.entries()) {
+    const source = item.path.endsWith('.py') ? rangedLawfulPy : rangedLawfulTs;
+    const expected = projectedRange(source, item.start_line, item.end_line);
+    const actual = lawfulRangeResults[index];
+    assert.equal(actual.index, index, 'lawful ranged read_many changed item order');
+    assert.equal(actual.path, item.path, 'lawful ranged read_many changed item path');
+    assert.equal(actual.ok, true, `lawful ranged read_many rejected ${item.path}`);
+    assert.equal(actual.result.text, expected.text, `lawful ranged read_many changed ${item.path} projection`);
+    assert.equal(actual.result.startLine, expected.start, `lawful ranged read_many changed ${item.path} start line`);
+    assert.equal(actual.result.endLine, expected.end, `lawful ranged read_many changed ${item.path} end line`);
+    assert.equal(actual.result.totalLines, expected.totalLines, `lawful ranged read_many changed ${item.path} total lines`);
+    assert.equal(actual.result.bytes, Buffer.byteLength(source, 'utf8'), `lawful ranged read_many changed ${item.path} byte metadata`);
+    assert.equal(actual.result.sha256, sha256(source), `lawful ranged read_many changed ${item.path} SHA-256 metadata`);
+    assert.equal(actual.result.truncated, true, `lawful ranged read_many lost ${item.path} truncation metadata`);
+    expectNoRawCredential(actual, `lawful ranged read_many ${item.path}`);
+  }
+  expectNoRawLiterals(lawfulRangeBatch, ['[REDACTED_SECRET]'], 'lawful ranged read_many');
+
+  const hostileRangeLiterals = [
+    'QZ7',
+    'ACTUAL_LITERAL_SECRET_7X9',
+    'client.actualSecret',
+    'client.getSecret()',
+    'Token<ACTUAL_LITERAL_SECRET_7X9',
+    'Token<client.actualSecret',
+    'Password<client.getSecret()',
+    'Wrapper<Token<client.actualSecret>>'
+  ];
+  const hostileRangeFixtures = [
+    {
+      path: 'ranged-hostile.yaml',
+      source: rangedHostileFixtures['ranged-hostile.yaml'],
+      ranges: [[2, 2], [3, 4], [2, 5]]
+    },
+    {
+      path: 'ranged-hostile.env',
+      source: rangedHostileFixtures['ranged-hostile.env'],
+      ranges: [[1, 2], [3, 4], [2, 4]]
+    },
+    {
+      path: 'ranged-hostile.json',
+      source: rangedHostileFixtures['ranged-hostile.json'],
+      ranges: [[2, 2], [3, 4], [2, 5]]
+    },
+    {
+      path: 'ranged-hostile.ts',
+      source: rangedHostileFixtures['ranged-hostile.ts'],
+      ranges: [[2, 2], [3, 4], [2, 5]]
+    }
+  ];
+  for (const { path: relativePath, source, ranges } of hostileRangeFixtures) {
+    const redacted = rangedHostileRedacted[relativePath];
+    const full = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: relativePath }
+    }), `hostile full read ${relativePath}`);
+    assertReadMetadata(full, source, 1, undefined, `hostile full read ${relativePath}`);
+    assert.equal(full.structuredContent.text, numbered(redacted), `hostile full read ${relativePath} changed independently-derived sanitized projection`);
+    expectRedactedText(full.structuredContent.text, `hostile full read ${relativePath}`);
+    expectNoRawLiterals(full, hostileRangeLiterals, `hostile full read ${relativePath}`);
+    expectNoRawLiterals(full.content?.[0]?.text ?? '', hostileRangeLiterals, `hostile full read ${relativePath} content envelope`);
+    expectNoRawLiterals(full._meta, hostileRangeLiterals, `hostile full read ${relativePath} _meta`);
+
+    for (const [startLine, endLine] of ranges) {
+      const ranged = assertToolSuccess(await client.request('tools/call', {
+        name: 'read',
+        arguments: { workspace_id: workspaceId, path: relativePath, start_line: startLine, end_line: endLine }
+      }), `hostile range read ${relativePath} ${startLine}-${endLine}`);
+      assertReadMetadata(ranged, source, startLine, endLine, `hostile range read ${relativePath} ${startLine}-${endLine}`);
+      assert.equal(ranged.structuredContent.text, projectedRange(redacted, startLine, endLine).text, `hostile range read ${relativePath} ${startLine}-${endLine} diverged from independently-derived full sanitized projection`);
+      expectRedactedText(ranged.structuredContent.text, `hostile range read ${relativePath} ${startLine}-${endLine}`);
+      expectNoRawLiterals(ranged, hostileRangeLiterals, `hostile range read ${relativePath} ${startLine}-${endLine}`);
+      expectNoRawLiterals(ranged.content?.[0]?.text ?? '', hostileRangeLiterals, `hostile range read ${relativePath} ${startLine}-${endLine} content envelope`);
+      expectNoRawLiterals(ranged._meta, hostileRangeLiterals, `hostile range read ${relativePath} ${startLine}-${endLine} _meta`);
+    }
+  }
+
+  const hostileRangeBatchItems = [
+    { path: 'ranged-hostile.yaml', start_line: 2, end_line: 4 },
+    { path: 'ranged-hostile.env', start_line: 1, end_line: 2 },
+    { path: 'ranged-hostile.json', start_line: 3, end_line: 4 },
+    { path: 'ranged-hostile.ts', start_line: 2, end_line: 5 }
+  ];
+  const hostileRangeBatch = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: { workspace_id: workspaceId, items: hostileRangeBatchItems }
+  }), 'hostile ranged read_many');
+  const hostileRangeResults = hostileRangeBatch.structuredContent.results ?? [];
+  assert.equal(hostileRangeResults.length, hostileRangeBatchItems.length, 'hostile ranged read_many changed item count');
+  for (const [index, item] of hostileRangeBatchItems.entries()) {
+    const source = rangedHostileFixtures[item.path];
+    const redacted = rangedHostileRedacted[item.path];
+    const actual = hostileRangeResults[index];
+    assert.equal(actual.index, index, 'hostile ranged read_many changed item order');
+    assert.equal(actual.path, item.path, 'hostile ranged read_many changed item path');
+    assert.equal(actual.ok, true, `hostile ranged read_many rejected ${item.path}`);
+    const expected = projectedRange(redacted, item.start_line, item.end_line);
+    assert.equal(actual.result.text, expected.text, `hostile ranged read_many changed ${item.path} sanitized projection`);
+    assert.equal(actual.result.startLine, expected.start, `hostile ranged read_many changed ${item.path} start line`);
+    assert.equal(actual.result.endLine, expected.end, `hostile ranged read_many changed ${item.path} end line`);
+    assert.equal(actual.result.totalLines, expected.totalLines, `hostile ranged read_many changed ${item.path} total lines`);
+    assert.equal(actual.result.bytes, Buffer.byteLength(source, 'utf8'), `hostile ranged read_many changed ${item.path} byte metadata`);
+    assert.equal(actual.result.sha256, sha256(source), `hostile ranged read_many changed ${item.path} SHA-256 metadata`);
+    assert.equal(actual.result.truncated, true, `hostile ranged read_many lost ${item.path} truncation metadata`);
+    expectRedactedText(actual.result.text, `hostile ranged read_many ${item.path}`);
+    expectNoRawLiterals(actual, hostileRangeLiterals, `hostile ranged read_many ${item.path}`);
+  }
+  expectNoRawLiterals(hostileRangeBatch, hostileRangeLiterals, 'hostile ranged read_many complete response');
+  expectNoRawLiterals(hostileRangeBatch._meta, hostileRangeLiterals, 'hostile ranged read_many _meta');
+
+  const privateRangedSafeLines = [
+    'const rangedBefore = true;',
+    '[REDACTED_PRIVATE_KEY]',
+    '[REDACTED_PRIVATE_KEY]',
+    '[REDACTED_PRIVATE_KEY]',
+    'const rangedAfter = true;',
+    ''
+  ].join('\n');
+  const privateCrlfSafeLines = [
+    'const crlfBefore = true;',
+    '[REDACTED_PRIVATE_KEY]',
+    '[REDACTED_PRIVATE_KEY]',
+    '[REDACTED_PRIVATE_KEY]',
+    'const crlfAfter = true;',
+    ''
+  ].join('\n');
+  const duplicatePrivateSafeLines = [
+    'const duplicate = true;',
+    'const duplicate = true;',
+    '[REDACTED_PRIVATE_KEY]',
+    '[REDACTED_PRIVATE_KEY]',
+    '[REDACTED_PRIVATE_KEY]',
+    'const duplicate = true;',
+    'const duplicate = true;',
+    ''
+  ].join('\n');
+  const incompletePrivateSafeLines = ['[REDACTED_PRIVATE_KEY]', '[REDACTED_PRIVATE_KEY]', ''].join('\n');
+  const fragmentedPrivateSafeLines = ['[REDACTED_PRIVATE_KEY]', '[REDACTED_PRIVATE_KEY]', ''].join('\n');
+  const privateRangeCases = [
+    {
+      path: 'private-ranged.txt',
+      source: privateRangedFixture,
+      redacted: privateRangedSafeLines,
+      literals: ['RANGED_PRIVATE_BODY_7X9'],
+      ranges: [[1, 1], [3, 3], [2, 4], [5, 5]]
+    },
+    {
+      path: 'private-crlf.txt',
+      source: privateCrlfFixture,
+      redacted: privateCrlfSafeLines,
+      literals: ['CRLF_PRIVATE_BODY_7X9'],
+      ranges: [[1, 1], [3, 3], [2, 4], [5, 5]]
+    },
+    {
+      path: 'private-duplicate.txt',
+      source: privateSearchFixtures['private-duplicate.txt'],
+      redacted: duplicatePrivateSafeLines,
+      literals: ['-----BEGIN PRIVATE KEY-----', '-----END PRIVATE KEY-----'],
+      ranges: [[3, 5], [1, 7]]
+    },
+    {
+      path: 'private-incomplete.txt',
+      source: privateSearchFixtures['private-incomplete.txt'],
+      redacted: incompletePrivateSafeLines,
+      literals: ['INCOMPLETE_PRIVATE_BODY_7X9'],
+      ranges: [[2, 2], [1, 2]]
+    },
+    {
+      path: 'private-fragmented.txt',
+      source: privateSearchFixtures['private-fragmented.txt'],
+      redacted: fragmentedPrivateSafeLines,
+      literals: ['FRAGMENTED_PRIVATE_BODY_7X9'],
+      ranges: [[2, 2], [1, 2]]
+    }
+  ];
+  for (const { path: relativePath, source, redacted, literals, ranges } of privateRangeCases) {
+    const full = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: relativePath }
+    }), `private full read ${relativePath}`);
+    assertReadMetadata(full, source, 1, undefined, `private full read ${relativePath}`);
+    assert.equal(full.structuredContent.text, numbered(redacted), `private full read ${relativePath} changed physical redaction line mapping`);
+    expectNoRawLiterals(full, literals, `private full read ${relativePath}`);
+    for (const [startLine, endLine] of ranges) {
+      const ranged = assertToolSuccess(await client.request('tools/call', {
+        name: 'read',
+        arguments: { workspace_id: workspaceId, path: relativePath, start_line: startLine, end_line: endLine }
+      }), `private range read ${relativePath} ${startLine}-${endLine}`);
+      assertReadMetadata(ranged, source, startLine, endLine, `private range read ${relativePath} ${startLine}-${endLine}`);
+      const expected = projectedRange(redacted, startLine, endLine);
+      assert.equal(ranged.structuredContent.text, expected.text, `private range read ${relativePath} ${startLine}-${endLine} changed physical redaction line mapping`);
+      expectNoRawLiterals(ranged, literals, `private range read ${relativePath} ${startLine}-${endLine}`);
+      expectNoRawLiterals(ranged.content?.[0]?.text ?? '', literals, `private range read ${relativePath} ${startLine}-${endLine} content envelope`);
+    }
+  }
+
+  const privateRangeBatchItems = [
+    { path: 'private-ranged.txt', start_line: 3, end_line: 3 },
+    { path: 'private-duplicate.txt', start_line: 3, end_line: 5 },
+    { path: 'private-crlf.txt', start_line: 2, end_line: 4 }
+  ];
+  const privateRangeBatch = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: {
+      workspace_id: workspaceId,
+      items: privateRangeBatchItems
+    }
+  }), 'private ranged read_many');
+  const privateRangeResults = privateRangeBatch.structuredContent.results ?? [];
+  assert.equal(privateRangeResults.length, 3, 'private ranged read_many changed item count');
+  assert.deepEqual(privateRangeResults.map((item) => ({ index: item.index, path: item.path, ok: item.ok })), [
+    { index: 0, path: 'private-ranged.txt', ok: true },
+    { index: 1, path: 'private-duplicate.txt', ok: true },
+    { index: 2, path: 'private-crlf.txt', ok: true }
+  ], 'private ranged read_many changed order or item status');
+  for (const [index, item] of privateRangeBatchItems.entries()) {
+    const source = item.path === 'private-ranged.txt'
+      ? privateRangedFixture
+      : item.path === 'private-duplicate.txt'
+        ? privateSearchFixtures['private-duplicate.txt']
+        : privateCrlfFixture;
+    const expected = projectedRange(source, item.start_line, item.end_line);
+    const actual = privateRangeResults[index].result;
+    assert.equal(actual.startLine, expected.start, `private ranged read_many changed ${item.path} start line`);
+    assert.equal(actual.endLine, expected.end, `private ranged read_many changed ${item.path} end line`);
+    assert.equal(actual.totalLines, expected.totalLines, `private ranged read_many changed ${item.path} total lines`);
+    assert.equal(actual.bytes, Buffer.byteLength(source, 'utf8'), `private ranged read_many changed ${item.path} byte metadata`);
+    assert.equal(actual.sha256, sha256(source), `private ranged read_many changed ${item.path} SHA-256 metadata`);
+    assert.equal(actual.truncated, true, `private ranged read_many lost ${item.path} truncation metadata`);
+  }
+  assert.equal(privateRangeResults[0].result.text, projectedRange(privateRangedSafeLines, 3, 3).text, 'private ranged read_many lost inside-key mapping');
+  assert.equal(privateRangeResults[1].result.text, projectedRange(duplicatePrivateSafeLines, 3, 5).text, 'private duplicate read_many lost mapping');
+  assert.equal(privateRangeResults[2].result.text, projectedRange(privateCrlfSafeLines, 2, 4).text, 'private CRLF read_many lost mapping');
+  expectNoRawLiterals(privateRangeBatch, ['RANGED_PRIVATE_BODY_7X9', 'CRLF_PRIVATE_BODY_7X9', 'PRIVATE_KEY-----'], 'private ranged read_many complete response');
+
+  const fullByteLimited = assertToolError(await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: workspaceId, path: 'ranged-byte-limit.ts', max_bytes: 1_000 }
+  }), 'full read max_bytes limit');
+  assert.match(resultText(fullByteLimited), /too large|limit/i, 'full read max_bytes limit changed its bounded error');
+  expectNoRawLiterals(fullByteLimited, ['x'.repeat(128)], 'full read max_bytes error');
+
+  const rangedByteLimitedError = assertToolError(await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: workspaceId, path: 'ranged-byte-limit.ts', start_line: 1, end_line: 1, max_bytes: 1_000 }
+  }), 'ranged read selected max_bytes limit');
+  assert.match(resultText(rangedByteLimitedError), /Selected line range is too large/i, 'ranged read selected max_bytes limit changed its bounded error');
+  expectNoRawLiterals(rangedByteLimitedError, ['x'.repeat(128)], 'ranged read selected max_bytes error');
+
+  const rangedByteTail = assertToolSuccess(await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: workspaceId, path: 'ranged-byte-limit.ts', start_line: 2, end_line: 2, max_bytes: 1_000 }
+  }), 'ranged read max_bytes bounded success');
+  const rangedByteTailExpected = assertReadMetadata(rangedByteTail, rangedByteLimit, 2, 2, 'ranged read max_bytes bounded success');
+  assert.equal(rangedByteTail.structuredContent.text, rangedByteTailExpected.text, 'ranged read max_bytes bounded success changed selected source');
+  assert.equal(rangedByteTail.structuredContent.text, '2 | const rangedByteTail = true;', 'ranged read max_bytes bounded success changed line framing');
+
+  const byteLimitBatch = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: {
+      workspace_id: workspaceId,
+      items: [
+        { path: 'ranged-byte-limit.ts', max_bytes: 1_000 },
+        { path: 'ranged-lawful.ts', start_line: 2, end_line: 2 }
+      ]
+    }
+  }), 'read_many item max_bytes limit');
+  const byteLimitResults = byteLimitBatch.structuredContent.results ?? [];
+  assert.equal(byteLimitResults.length, 2, 'read_many item max_bytes limit changed item count');
+  assert.deepEqual(byteLimitResults.map((item) => ({ index: item.index, path: item.path, ok: item.ok })), [
+    { index: 0, path: 'ranged-byte-limit.ts', ok: false },
+    { index: 1, path: 'ranged-lawful.ts', ok: true }
+  ], 'read_many item max_bytes limit changed order or sibling status');
+  assert.match(byteLimitResults[0].error, /too large|limit/i, 'read_many item max_bytes limit changed its bounded error');
+  assert.equal(byteLimitResults[0].error.length <= 512, true, 'read_many item max_bytes error exceeded its bounded length');
+  expectNoRawLiterals(byteLimitBatch, ['x'.repeat(128)], 'read_many item max_bytes response');
+
+  const fourKilobyteBatch = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: {
+      workspace_id: workspaceId,
+      max_total_bytes: 4_000,
+      items: [{ path: 'ranged-lawful.ts', start_line: 2, end_line: 3 }]
+    }
+  }), 'read_many explicit 4000-byte budget');
+  assert.equal(fourKilobyteBatch.structuredContent.max_total_bytes, 4_000, 'read_many explicit budget was not reported');
+  assert.ok(Buffer.byteLength(JSON.stringify(fourKilobyteBatch), 'utf8') <= 4_000, 'read_many explicit 4000-byte budget was exceeded');
+
+  const aggregateOverflowBatch = assertToolError(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: {
+      workspace_id: workspaceId,
+      max_total_bytes: 4_000,
+      items: Array.from({ length: 32 }, () => ({ path: 'ranged-byte-limit.ts' }))
+    }
+  }), 'read_many aggregate byte limit');
+  assert.match(resultText(aggregateOverflowBatch), /aggregate response exceeds|max_total_bytes/i, 'read_many aggregate byte limit changed its bounded error');
+  expectNoRawLiterals(aggregateOverflowBatch, ['x'.repeat(128)], 'read_many aggregate byte-limit error');
+
+  const thirtyTwoItemBatch = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: {
+      workspace_id: workspaceId,
+      max_total_bytes: 100_000,
+      items: Array.from({ length: 32 }, () => ({ path: 'safe-config.js', start_line: 1, end_line: 1 }))
+    }
+  }), 'read_many maximum item count');
+  const thirtyTwoResults = thirtyTwoItemBatch.structuredContent.results ?? [];
+  assert.equal(thirtyTwoResults.length, 32, 'read_many maximum item count changed result count');
+  assert.ok(thirtyTwoResults.every((item, index) => item.index === index && item.path === 'safe-config.js' && item.ok === true), 'read_many maximum item count changed ordered lawful items');
+
+  const thirtyThreeItemBatch = assertToolError(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: {
+      workspace_id: workspaceId,
+      items: Array.from({ length: 33 }, () => ({ path: 'safe-config.js' }))
+    }
+  }), 'read_many item count limit');
+  assert.match(resultText(thirtyThreeItemBatch), /Invalid arguments for read_many/i, 'read_many item count limit changed its bounded error');
+  expectNoRawLiterals(thirtyThreeItemBatch, ['const API_TOKEN'], 'read_many item count error');
+
+  const overMaximumBatch = assertToolError(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: { workspace_id: workspaceId, max_total_bytes: 100_001, items: [{ path: 'safe-config.js' }] }
+  }), 'read_many maximum aggregate limit');
+  assert.match(resultText(overMaximumBatch), /Invalid arguments for read_many/i, 'read_many maximum aggregate limit changed its bounded error');
 
   const sourceSearchCases = [
     ['isCurrentTransition', sourceTs.split('\n')[0]],
@@ -866,7 +1442,7 @@ try {
   assert.match(resultText(privateWrite), /Secret-looking content is blocked/);
   await assert.rejects(fs.access(path.join(tmp, 'blocked-private-key.txt')), (error) => error?.code === 'ENOENT');
 
-  console.log(`source-redaction-smoke: PASS (real MCP read/search/read_many; ${negativePaths.length} negative fixtures; write/edit/apply_patch compatibility)`);
+  console.log(`source-redaction-smoke: PASS (real MCP read/search/read_many; ranged lawful/hostile/private and byte-limit coverage; ${negativePaths.length} negative fixtures; write/edit/apply_patch compatibility)`);
 } finally {
   client?.close();
   await fs.rm(tmp, { recursive: true, force: true });
