@@ -5,25 +5,48 @@ import * as policy from "../scripts/redaction-policy.mjs";
 
 const {
   hasSecretValue: policyHasSecretValue,
+  hasSecretValueInUnifiedDiff: policyHasSecretValueInUnifiedDiff,
   redactDiagnosticText: policyRedactDiagnosticText,
   redactSearchQuery: policyRedactSearchQuery,
   redactSensitiveText: policyRedactSensitiveText,
   redactSensitiveTextPreservingLines: policyRedactSensitiveTextPreservingLines,
+  redactUnifiedDiff: policyRedactUnifiedDiff,
+  sourceLanguageForPath: policySourceLanguageForPath,
   truncateUtf8: policyTruncateUtf8
 } = policy;
 
 export type RedactionContext = "source" | "diagnostic";
+export type SourceLanguage = "python";
+export type RedactionOptions = { context?: RedactionContext; language?: SourceLanguage };
 
-export function hasSecretValue(text: string, options: { context?: RedactionContext } | RedactionContext = {}): boolean {
+export function sourceLanguageForPath(filePath: string): SourceLanguage | undefined {
+  return policySourceLanguageForPath(filePath);
+}
+
+export function hasSecretValue(text: string, options: RedactionOptions | RedactionContext = {}): boolean {
   return policyHasSecretValue(text, options);
 }
 
-export function redactSensitiveText(text: string, options: { context?: RedactionContext } | RedactionContext = {}): string {
+export function hasSecretValueInUnifiedDiff(
+  text: string,
+  languageForPath?: (path: string | undefined) => SourceLanguage | undefined
+): boolean {
+  return policyHasSecretValueInUnifiedDiff(text, { languageForPath });
+}
+
+export function redactSensitiveText(text: string, options: RedactionOptions | RedactionContext = {}): string {
   return policyRedactSensitiveText(text, options);
 }
 
-export function redactSensitiveTextPreservingLines(text: string, options: { context?: RedactionContext } | RedactionContext = {}): string {
+export function redactSensitiveTextPreservingLines(text: string, options: RedactionOptions | RedactionContext = {}): string {
   return policyRedactSensitiveTextPreservingLines(text, options);
+}
+
+export function redactUnifiedDiff(
+  text: string,
+  languageForPath?: (path: string | undefined) => SourceLanguage | undefined
+): string {
+  return policyRedactUnifiedDiff(text, { languageForPath });
 }
 
 export function redactDiagnosticText(text: string): string {

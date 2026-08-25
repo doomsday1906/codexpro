@@ -6,7 +6,7 @@ import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, PathGuard } from "./guard.js";
 import { listFiles, textScanByteLimit } from "./fsOps.js";
-import { redactDiagnosticText, redactSearchQuery, redactSensitiveTextPreservingLines } from "./redact.js";
+import { redactDiagnosticText, redactSearchQuery, redactSensitiveTextPreservingLines, sourceLanguageForPath } from "./redact.js";
 import { searchWorkspaceStructured, type AnalysisSearchIntent, type StructuredSearchResult } from "./analysis/index.js";
 
 export interface SearchOptions {
@@ -57,10 +57,13 @@ function decodeSearchText(buffer: Buffer): string | null {
   }
 }
 
-function redactSearchBuffer(buffer: Buffer): RedactedSearchLines {
+function redactSearchBuffer(buffer: Buffer, relativePath?: string): RedactedSearchLines {
   const source = decodeSearchText(buffer);
   if (source === null) return null;
-  return redactSensitiveTextPreservingLines(source).split(/\r?\n/);
+  return redactSensitiveTextPreservingLines(source, {
+    context: "source",
+    language: sourceLanguageForPath(relativePath ?? "")
+  }).split(/\r?\n/);
 }
 
 async function readSearchBufferBounded(absPath: string, limit: number): Promise<Buffer | null> {
@@ -94,7 +97,7 @@ async function loadRedactedSearchLines(
   try {
     const resolved = guard.resolve(workspace, relativePath);
     const buffer = await readSearchBufferBounded(resolved.absPath, textScanByteLimit(config));
-    return buffer ? redactSearchBuffer(buffer) : null;
+    return buffer ? redactSearchBuffer(buffer, relativePath) : null;
   } catch {
     return null;
   }
@@ -200,7 +203,7 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
       const source = decodeSearchText(buffer);
       if (source === null) continue;
       const lines = source.split(/\r?\n/);
-      const redactedLines = redactSearchBuffer(buffer);
+      const redactedLines = redactSearchBuffer(buffer, rel);
       for (let i = 0; i < lines.length; i += 1) {
         const line = lines[i];
         const hit = line.includes(options.query);

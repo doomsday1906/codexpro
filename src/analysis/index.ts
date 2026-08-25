@@ -2,7 +2,7 @@ import type { CodexProConfig } from "../config.js";
 import fsp from "node:fs/promises";
 import { TextDecoder } from "node:util";
 import type { PathGuard, Workspace } from "../guard.js";
-import { redactSearchQuery, redactSensitiveTextPreservingLines } from "../redact.js";
+import { redactSearchQuery, redactSensitiveTextPreservingLines, sourceLanguageForPath } from "../redact.js";
 import { detectProjectTypes } from "./classify.js";
 import { getCachedWorkspaceAnalysis, invalidateWorkspaceAnalysis, setCachedWorkspaceAnalysis } from "./cache.js";
 import { extractWorkspaceFiles } from "./extract.js";
@@ -158,7 +158,12 @@ export async function searchWorkspaceStructured(
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index];
       if (!line.toLowerCase().includes(lowered)) continue;
-      if (contextAvailable) redactedLines ??= redactSensitiveTextPreservingLines(text).split(/\r?\n/);
+      if (contextAvailable) {
+        redactedLines ??= redactSensitiveTextPreservingLines(text, {
+          context: "source",
+          language: sourceLanguageForPath(file.path)
+        }).split(/\r?\n/);
+      }
       const symbol = definitions.get(index + 1);
       const isDefinition = Boolean(symbol && symbol.name.toLowerCase() === lowered);
       const group = groupForFile(analysis, file.path, isDefinition);

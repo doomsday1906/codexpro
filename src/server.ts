@@ -18,7 +18,7 @@ import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
 import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
-import { hasSecretValue, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactStructured, truncateUtf8 } from "./redact.js";
+import { hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactStructured, redactUnifiedDiff, sourceLanguageForPath, truncateUtf8 } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
@@ -858,6 +858,14 @@ function diffBlock(diff: string): string {
   return `\n\n\`\`\`diff\n${diff}\n\`\`\``;
 }
 
+function sourceDiffBlock(diff: string): readonly PublicTextSegment[] {
+  return [
+    { kind: "normal", text: "\n\n```diff\n" },
+    publicSourceBody(diff),
+    { kind: "normal", text: "\n```" }
+  ];
+}
+
 function diffStats(diff: string): { additions: number; deletions: number; changed: boolean } {
   let additions = 0;
   let deletions = 0;
@@ -983,9 +991,6 @@ async function applyWorkspacePatch(
   if (Buffer.byteLength(patch, "utf8") > config.maxWriteBytes) {
     throw new CodexProError(`Patch is too large. Limit: ${config.maxWriteBytes} bytes.`);
   }
-  if (hasSecretValue(patch)) {
-    throw new CodexProError("Secret-looking content is blocked from apply_patch. Use placeholders such as [REDACTED_SECRET].");
-  }
   if (patchHasSymlinkMode(patch)) {
     throw new CodexProError("Symlink patches are blocked from apply_patch.");
   }
@@ -993,9 +998,24 @@ async function applyWorkspacePatch(
   const paths = patchTouchedPaths(patch);
   if (!paths.length) throw new CodexProError("Patch must include at least one file path.");
   const absPaths: string[] = [];
+  const validatedLanguages = new Map<string, "python" | undefined>();
   for (const touchedPath of paths) {
-    absPaths.push(guard.resolve(workspace, touchedPath, { forWrite: true }).absPath);
+    const resolved = guard.resolve(workspace, touchedPath, { forWrite: true });
+    absPaths.push(resolved.absPath);
+    validatedLanguages.set(touchedPath, sourceLanguageForPath(resolved.relPath));
     assertWriteToolAllowed(config, touchedPath);
+  }
+
+  const languageForValidatedPath = (pathHint: string | undefined) => {
+    const normalized = String(pathHint ?? "").replaceAll("\\", "/").replace(/^(?:[ab])\//u, "");
+    return validatedLanguages.get(normalized);
+  };
+  // Target paths are now resolved and policy-checked. Only then may the
+  // source policy grant parser authority to Python hunks; every unknown or
+  // non-Python hunk remains generic/fail-closed. The check happens before any
+  // git apply so a mixed patch is rejected atomically.
+  if (hasSecretValueInUnifiedDiff(patch, languageForValidatedPath)) {
+    throw new CodexProError("Secret-looking content is blocked from apply_patch. Use placeholders such as [REDACTED_SECRET].");
   }
 
   return withFileWriteLocks(absPaths, () => {
@@ -1026,7 +1046,7 @@ async function applyWorkspacePatch(
       throw new CodexProError(redactDiagnosticText(applied.stderr?.trim() || applied.stdout?.trim() || applied.error?.message || "git apply failed"));
     }
 
-    const diff = redactSensitiveText(patch.trimEnd());
+    const diff = redactUnifiedDiff(patch.trimEnd(), languageForValidatedPath);
     const stats = diffStats(diff);
     return {
       paths,
@@ -2383,7 +2403,14 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         expectedSha256: args.expected_sha256
       });
       if (result.diff.changed) invalidateWorkspaceAnalysis(workspace.id);
-      const text = `# Write File\n\nPath: ${result.path}\nExisted before: ${result.existed}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}\nDiff stats: +${result.diff.additions} -${result.diff.deletions}${diffBlock(result.diff.diff)}`;
+      const diffBody = publicSourceBody(result.diff.diff);
+      const text: readonly PublicTextSegment[] = [
+        {
+          kind: "normal",
+          text: `# Write File\n\nPath: ${result.path}\nExisted before: ${result.existed}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}\nDiff stats: +${result.diff.additions} -${result.diff.deletions}`
+        },
+        ...sourceDiffBlock(result.diff.diff)
+      ];
       return textResult(text, {
         workspace_id: workspace.id,
         root: workspace.root,
@@ -2394,7 +2421,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         additions: result.diff.additions,
         deletions: result.diff.deletions,
         diff: result.diff.diff
-      });
+      }, {}, { sourceFields: [{ path: ["diff"], body: diffBody }] });
     }
   );
 
@@ -2431,7 +2458,14 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         expectedSha256: args.expected_sha256
       });
       if (result.diff.changed) invalidateWorkspaceAnalysis(workspace.id);
-      const text = `# Edit File\n\nPath: ${result.path}\nReplacements: ${result.replacements}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}\nDiff stats: +${result.diff.additions} -${result.diff.deletions}${diffBlock(result.diff.diff)}`;
+      const diffBody = publicSourceBody(result.diff.diff);
+      const text: readonly PublicTextSegment[] = [
+        {
+          kind: "normal",
+          text: `# Edit File\n\nPath: ${result.path}\nReplacements: ${result.replacements}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}\nDiff stats: +${result.diff.additions} -${result.diff.deletions}`
+        },
+        ...sourceDiffBlock(result.diff.diff)
+      ];
       return textResult(text, {
         workspace_id: workspace.id,
         root: workspace.root,
@@ -2442,7 +2476,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         additions: result.diff.additions,
         deletions: result.diff.deletions,
         diff: result.diff.diff
-      });
+      }, {}, { sourceFields: [{ path: ["diff"], body: diffBody }] });
     }
   );
 
@@ -2469,14 +2503,14 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const result = await applyWorkspacePatch(config, guard, workspace, String(args.patch ?? ""));
       if (result.changed) invalidateWorkspaceAnalysis(workspace.id);
-      const text = [
-        "# Apply Patch",
-        "",
-        `Paths: ${result.paths.join(", ")}`,
-        `Diff stats: +${result.additions} -${result.deletions}`,
-        result.stderr ? `stderr: ${result.stderr}` : "",
-        result.diff ? diffBlock(result.diff) : "No diff output."
-      ].filter(Boolean).join("\n");
+      const text: PublicTextSegment[] = [{
+        kind: "normal",
+        text: `# Apply Patch\n\nPaths: ${result.paths.join(", ")}\nDiff stats: +${result.additions} -${result.deletions}`
+      }];
+      if (result.stderr) text.push({ kind: "normal", text: `\nstderr: ${result.stderr}` });
+      const diffBody = result.diff ? publicSourceBody(result.diff) : undefined;
+      if (result.diff) text.push(...sourceDiffBlock(result.diff));
+      else text.push({ kind: "normal", text: "\n\nNo diff output." });
       return textResult(text, {
         workspace_id: workspace.id,
         root: workspace.root,
@@ -2487,7 +2521,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         deletions: result.deletions,
         changed: result.changed,
         diff: result.diff
-      });
+      }, {}, diffBody ? { sourceFields: [{ path: ["diff"], body: diffBody }] } : {});
     }
   );
 
@@ -2663,20 +2697,26 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       const diffError = rawDiff && looksLikeGitError(rawDiff) ? rawDiff : "";
       const stats = diffError ? { additions: 0, deletions: 0, changed: false } : diffStats(rawDiff);
       const includeDiff = parseBool(args.include_diff, true);
-      const text = diffError
+      const diffBody = !diffError && includeDiff ? publicSourceBody(rawDiff) : undefined;
+      const text: string | readonly PublicTextSegment[] = diffError
         ? diffError
         : includeDiff
-        ? rawDiff
+        ? [{ kind: "public-source-body", text: rawDiff }]
         : [
-            "# Git Diff",
-            "",
-            `Workspace: ${workspace.root}`,
-            `Path: ${args.path ?? "workspace diff"}`,
-            `Staged: ${parseBool(args.staged, false)}`,
-            `Diff stats: +${stats.additions} -${stats.deletions}`,
-            "",
-            "Raw diff omitted by include_diff=false."
-          ].join("\n");
+            {
+              kind: "normal",
+              text: [
+                "# Git Diff",
+                "",
+                `Workspace: ${workspace.root}`,
+                `Path: ${args.path ?? "workspace diff"}`,
+                `Staged: ${parseBool(args.staged, false)}`,
+                `Diff stats: +${stats.additions} -${stats.deletions}`,
+                "",
+                "Raw diff omitted by include_diff=false."
+              ].join("\n")
+            }
+          ];
       return textResult(text, {
         workspace_id: workspace.id,
         root: workspace.root,
@@ -2688,7 +2728,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         deletions: stats.deletions,
         changed: !diffError && stats.changed,
         diff: diffError || includeDiff ? rawDiff : ""
-      });
+      }, {}, diffBody ? { sourceFields: [{ path: ["diff"], body: diffBody }] } : {});
     }
   );
 
@@ -2786,7 +2826,17 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       const analysisText = analysis
         ? `\n\n## Analysis\n\nAffected areas: ${(analysis.affected_areas as string[]).join(", ") || "none"}\nRisks: ${((analysis.risk_signals as Array<{ label?: string }>) ?? []).map((risk) => risk.label).filter(Boolean).join(", ") || "none"}\nRelated tests: ${((analysis.related_tests as Array<{ path?: string }>) ?? []).map((file) => file.path).filter(Boolean).join(", ") || "none"}`
         : "";
-      const text = `# Show Changes\n\nWorkspace: ${workspace.root}\n\n## Changed\n\n${changedText}\n\n## Diff stats\n\n+${responseStats.additions} -${responseStats.deletions}${diffText}${analysisText}`;
+      const text: PublicTextSegment[] = [{
+        kind: "normal",
+        text: `# Show Changes\n\nWorkspace: ${workspace.root}\n\n## Changed\n\n${changedText}\n\n## Diff stats\n\n+${responseStats.additions} -${responseStats.deletions}`
+      }];
+      if (checkpointHit || !includeDiff || diffError || !diff) {
+        text.push({ kind: "normal", text: diffText });
+      } else {
+        text.push(...sourceDiffBlock(diff));
+      }
+      if (analysisText) text.push({ kind: "normal", text: analysisText });
+      const responseDiffBody = responseDiff ? publicSourceBody(responseDiff) : undefined;
       return textResult(text, {
         workspace_id: workspace.id,
         root: workspace.root,
@@ -2805,7 +2855,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         review_marked: checkpointWritten,
         review_checkpoint_hit: checkpointHit,
         ...(analysis ? { analysis } : {})
-      });
+      }, {}, responseDiffBody ? { sourceFields: [{ path: ["diff"], body: responseDiffBody }] } : {});
     }
   );
 

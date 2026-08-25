@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 const { hasSecretValue, redactDiagnosticText, redactSearchQuery, redactSensitiveText, redactSensitiveTextPreservingLines } = await import('../dist/redact.js');
+const pythonPolicy = { context: 'source', language: 'python' };
 
 class McpStdioClient {
   constructor(command, args, options) {
@@ -283,6 +284,7 @@ const sourcePy = [
   '    token: Token[str]',
   ''
 ].join('\n');
+const sourcePyRedacted = redactSensitiveText(sourcePy, pythonPolicy);
 
 function pythonBoundarySource(memberCount) {
   const members = Array.from({ length: memberCount }, (_, index) => `    field_${index}: str`);
@@ -451,16 +453,16 @@ for (const fixture of pythonLogicalFixtures.values()) {
   assert.ok(fixture.headerClassName, `${fixture.id} omitted a class declaration`);
   assertPythonAstAccepted(fixture.source, `Python logical ${fixture.id}`);
   assertPythonParserAccepted(fixture.source, `Python logical ${fixture.id}`);
-  assert.equal(redactSensitiveText(fixture.source), fixture.source, `Python logical ${fixture.id} changed lawful source bytes`);
-  assert.equal(hasSecretValue(fixture.source), false, `Python logical ${fixture.id} was classified as hostile`);
+  assert.equal(redactSensitiveText(fixture.source, pythonPolicy), fixture.source, `Python logical ${fixture.id} changed lawful source bytes`);
+  assert.equal(hasSecretValue(fixture.source, pythonPolicy), false, `Python logical ${fixture.id} was classified as hostile`);
 }
 
 for (const [memberCount, source] of pythonBoundarySources) {
   const label = `Python direct class annotation after ${memberCount} members`;
   assertPythonAstAccepted(source, label);
   assertPythonParserAccepted(source, label);
-  assert.equal(redactSensitiveText(source), source, `${label} changed source bytes`);
-  assert.equal(hasSecretValue(source), false, `${label} was classified as hostile`);
+  assert.equal(redactSensitiveText(source, pythonPolicy), source, `${label} changed source bytes`);
+  assert.equal(hasSecretValue(source, pythonPolicy), false, `${label} was classified as hostile`);
 }
 
 // These Python fixtures separate lawful class/type provenance from nested
@@ -530,6 +532,133 @@ const pythonProvenanceHostileRedacted = [
 
 assertPythonParserAccepted(pythonProvenanceLawful, 'Python provenance lawful fixture');
 assertPythonParserAccepted(pythonProvenanceHostile, 'Python provenance hostile fixture');
+
+const python312Lawful = [
+  'type password = PasswordType',
+  'type Box[T] = list[T]',
+  'type multiline_password = (',
+  '    PasswordType',
+  ')',
+  'class AliasRequest(',
+  '    Base,',
+  '):',
+  '    password: PasswordType',
+  '    token: (',
+  '        Token[',
+  '            str',
+  '        ]',
+  '    )',
+  '    quoted: "PasswordType"',
+  '    quoted_password: "PasswordType" = configuredToken',
+  '    generic_quoted_password: list["PasswordType"]',
+  '    class Nested:',
+  '        password: PasswordType',
+  '',
+  'def annotated(password: (PasswordType), quoted_password: list["PasswordType"]):',
+  '    return password',
+  ''
+].join('\n');
+
+const python312Hostile = [
+  'class HostileSyntax:',
+  '    dict_payload = {"token": ACTUAL_LITERAL_SECRET_7X9}',
+  '    list_payload = [{"token": ACTUAL_LITERAL_SECRET_7X9}]',
+  '    tuple_payload = ({"password": ACTUAL_LITERAL_SECRET_7X9},)',
+  '    call_payload = make_call(token=ACTUAL_LITERAL_SECRET_7X9,)',
+  '    assignment_payload = token = ACTUAL_LITERAL_SECRET_7X9',
+  '    def method(self):',
+  '        token = ACTUAL_LITERAL_SECRET_7X9',
+  '    if enabled:',
+  '        token = ACTUAL_LITERAL_SECRET_7X9',
+  '        type nested_password = PasswordType',
+  '    for item in items:',
+  '        token = ACTUAL_LITERAL_SECRET_7X9',
+  '    while enabled:',
+  '        token = ACTUAL_LITERAL_SECRET_7X9',
+  '    with context_manager:',
+  '        token = ACTUAL_LITERAL_SECRET_7X9',
+  '    try:',
+  '        token = ACTUAL_LITERAL_SECRET_7X9',
+  '    except Exception:',
+  '        pass',
+  '    nested = {"outer": {"token": ACTUAL_LITERAL_SECRET_7X9}}',
+  '',
+  'top_level_payload = {token: client.actualSecret}',
+  'call_payload = make_call(password=client.getSecret())',
+  ''
+].join('\n');
+
+const python312HostileRedacted = [
+  'class HostileSyntax:',
+  '    dict_payload = {"token": [REDACTED_SECRET]}',
+  '    list_payload = [{"token": [REDACTED_SECRET]}]',
+  '    tuple_payload = ({"password": [REDACTED_SECRET]},)',
+  '    call_payload = make_call(token= [REDACTED_SECRET],)',
+  '    assignment_payload = token= [REDACTED_SECRET]',
+  '    def method(self):',
+  '        token= [REDACTED_SECRET]',
+  '    if enabled:',
+  '        token= [REDACTED_SECRET]',
+  '        type nested_password= [REDACTED_SECRET]',
+  '    for item in items:',
+  '        token= [REDACTED_SECRET]',
+  '    while enabled:',
+  '        token= [REDACTED_SECRET]',
+  '    with context_manager:',
+  '        token= [REDACTED_SECRET]',
+  '    try:',
+  '        token= [REDACTED_SECRET]',
+  '    except Exception:',
+  '        pass',
+  '    nested = {"outer": {"token": [REDACTED_SECRET]}}',
+  '',
+  'top_level_payload = {token: [REDACTED_SECRET]}',
+  'call_payload = make_call(password= [REDACTED_SECRET])',
+  ''
+].join('\n');
+
+assertPythonParserAccepted(python312Lawful, 'Python 3.12 lawful alias/annotation fixture');
+assertPythonParserAccepted(python312Hostile, 'Python 3.12 hostile ownership fixture');
+assert.equal(redactSensitiveText(python312Lawful, pythonPolicy), python312Lawful, 'Python 3.12 lawful aliases/annotations changed source bytes');
+assert.equal(hasSecretValue(python312Lawful, pythonPolicy), false, 'Python 3.12 lawful aliases/annotations were classified as hostile');
+assert.equal(redactSensitiveText(python312Hostile, pythonPolicy), python312HostileRedacted, 'Python 3.12 hostile ownership projection changed');
+assert.equal(hasSecretValue(python312Hostile, pythonPolicy), true, 'Python 3.12 hostile ownership fixture was not classified as hostile');
+
+const multilineHostileAliasDiff = [
+  'diff --git a/multiline.py b/multiline.py',
+  '--- a/multiline.py',
+  '+++ b/multiline.py',
+  '@@ -1,2 +1,4 @@',
+  ' class R:',
+  '+    payload = {password: ACTUAL_LITERAL_SECRET_7X9}',
+  ''
+].join('\n');
+const multilineHostileAliasDiffRedacted = [
+  'diff --git a/multiline.py b/multiline.py',
+  '--- a/multiline.py',
+  '+++ b/multiline.py',
+  '@@ -1,2 +1,4 @@',
+  ' class R:',
+  '+    payload = {password: [REDACTED_SECRET]}',
+  ''
+].join('\n');
+const multilineHostileAnnotationDiff = multilineHostileAliasDiff
+  .replaceAll('password: ACTUAL_LITERAL_SECRET_7X9', 'password: client.getSecret()')
+  .replaceAll('multiline.py', 'multiline-annotation.py');
+const multilineHostileAnnotationDiffRedacted = multilineHostileAliasDiffRedacted
+  .replaceAll('password: [REDACTED_SECRET]', 'password: [REDACTED_SECRET]')
+  .replaceAll('multiline.py', 'multiline-annotation.py');
+for (const [label, source, expected] of [
+  ['multiline hostile alias diff', multilineHostileAliasDiff, multilineHostileAliasDiffRedacted],
+  ['multiline hostile annotation diff', multilineHostileAnnotationDiff, multilineHostileAnnotationDiffRedacted]
+]) {
+  assert.equal(hasSecretValue(source, pythonPolicy), true, `${label} was not classified as hostile`);
+  assert.equal(redactSensitiveText(source, pythonPolicy), expected, `${label} changed framing or line count`);
+  assert.equal(redactSensitiveText(source, pythonPolicy).includes('ACTUAL_LITERAL_SECRET_7X9'), false, `${label} leaked continuation content`);
+  const diagnosticRedacted = redactDiagnosticText(source);
+  assert.equal(diagnosticRedacted.includes('ACTUAL_LITERAL_SECRET_7X9'), false, `${label} diagnostic leaked continuation content`);
+  assert.equal(diagnosticRedacted.split(/\r?\n/u).length, source.split(/\r?\n/u).length, `${label} diagnostic changed line count`);
+}
 
 // This fixture keeps a lawful direct class annotation at tab+space column 12,
 // then exercises the parseable mixed-indentation dictionary/block shapes that
@@ -675,14 +804,14 @@ const pythonContinuationHostileLiterals = [
 ];
 
 assertPythonParserAccepted(pythonContinuationProvenance, 'Python continuation provenance fixture');
-assert.equal(hasSecretValue(pythonContinuationProvenance), true, 'Python continuation provenance fixture was not classified as hostile');
+assert.equal(hasSecretValue(pythonContinuationProvenance, pythonPolicy), true, 'Python continuation provenance fixture was not classified as hostile');
 assert.equal(
-  redactSensitiveText(pythonContinuationProvenance),
+  redactSensitiveText(pythonContinuationProvenance, pythonPolicy),
   pythonContinuationProvenanceRedacted,
   'Python continuation provenance direct policy changed the independently expected projection'
 );
 assert.equal(
-  redactSensitiveText(pythonContinuationProvenance).includes('ACTUAL_LITERAL_SECRET_7X9'),
+  redactSensitiveText(pythonContinuationProvenance, pythonPolicy).includes('ACTUAL_LITERAL_SECRET_7X9'),
   false,
   'Python continuation provenance direct policy leaked the raw literal'
 );
@@ -711,8 +840,8 @@ const pythonContinuationLawfulFixtures = [
 ];
 for (const [source, label] of pythonContinuationLawfulFixtures) {
   assertPythonParserAccepted(source, label);
-  assert.equal(redactSensitiveText(source), source, `${label} changed source bytes`);
-  assert.equal(hasSecretValue(source), false, `${label} was classified as hostile`);
+  assert.equal(redactSensitiveText(source, pythonPolicy), source, `${label} changed source bytes`);
+  assert.equal(hasSecretValue(source, pythonPolicy), false, `${label} was classified as hostile`);
 }
 
 const collisionPath = '2 |   token: Token<string>;';
@@ -921,7 +1050,7 @@ const privateSearchFixtures = {
 const negativeFixtures = {
   'literal.ts': 'const TOKEN = "ACTUAL_LITERAL_SECRET_7X9";\nconst x = { token: "ACTUAL_LITERAL_SECRET_7X9" };\nconst source = "TOKEN=QZ7";\n',
   'typed-literal.ts': 'const API_KEY: string = "ACTUAL_LITERAL_SECRET_7X9";\nconst TOKEN: { token: Token<string>; password: string } = "QZ7";\n',
-  'typed-literal.py': 'TOKEN: str = "ACTUAL_LITERAL_SECRET_7X9"\nPASSWORD: str = "QZ7"\n',
+  'typed-literal.txt': 'TOKEN: str = "ACTUAL_LITERAL_SECRET_7X9"\nPASSWORD: str = "QZ7"\n',
   'config.env': 'TOKEN=QZ7\nPASSWORD=ACTUAL_LITERAL_SECRET_7X9\n',
   'secrets.yaml': 'token: QZ7\npassword: ACTUAL_LITERAL_SECRET_7X9\n',
   'secrets.json': '{\n  "token": "ACTUAL_LITERAL_SECRET_7X9",\n  "password": "QZ7"\n}\n',
@@ -974,6 +1103,79 @@ const negativeFixtures = {
   ].join('\n')
 };
 
+const looksPythonHostile = 'class R:\n    token: Token[ACTUAL_LITERAL_SECRET_7X9]\n';
+const looksPythonHostileRedacted = redactSensitiveText(looksPythonHostile);
+const looksPythonHostileFixtures = {
+  'looks-python.yaml': looksPythonHostile,
+  'looks-python.txt': looksPythonHostile,
+  'looks-python.js': looksPythonHostile,
+  'looks-python.ts': looksPythonHostile,
+  'looks-python.config': looksPythonHostile
+};
+const looksPythonLongMembers = Array.from({ length: 100 }, (_, index) => `    field_${index}: str`);
+const looksPythonLawful = [
+  'from typing import Annotated',
+  '',
+  'token: Token[ACTUAL_LITERAL_SECRET_7X9]',
+  'token_call: Token[str] = client.getSecret()',
+  'password_quoted: Token[str] = "ACTUAL_LITERAL_SECRET_7X9"',
+  'password_parenthesized: Token[str] = (ACTUAL_LITERAL_SECRET_7X9)',
+  'password_quoted_annotation: "Token[ACTUAL_LITERAL_SECRET_7X9]"',
+  'password_parenthesized_annotation: (Token[ACTUAL_LITERAL_SECRET_7X9])',
+  'password_union: Token[ACTUAL_LITERAL_SECRET_7X9] | None',
+  'password_annotated: Annotated[Token[ACTUAL_LITERAL_SECRET_7X9], "metadata"]',
+  'password_multiline: (',
+  '    Token[',
+  '        ACTUAL_LITERAL_SECRET_7X9',
+  '    ]',
+  ')',
+  '',
+  'def annotated_function(token: Token[ACTUAL_LITERAL_SECRET_7X9], password_quoted: "ACTUAL_LITERAL_SECRET_7X9") -> Token[ACTUAL_LITERAL_SECRET_7X9]:',
+  '    return token',
+  '',
+  'type password_call_alias = client.getSecret()',
+  'type password_quoted_alias = "ACTUAL_LITERAL_SECRET_7X9"',
+  'type password_parenthesized_alias = (Token[ACTUAL_LITERAL_SECRET_7X9])',
+  'type password_union_alias = Token[ACTUAL_LITERAL_SECRET_7X9] | None',
+  'type password_annotated_alias = Annotated[Token[ACTUAL_LITERAL_SECRET_7X9], "metadata"]',
+  'type password_multiline_alias = (',
+  '    Token[',
+  '        ACTUAL_LITERAL_SECRET_7X9',
+  '    ]',
+  ')',
+  '',
+  'class R:',
+  '    token: Token[ACTUAL_LITERAL_SECRET_7X9]',
+  '    token_call: Token[str] = client.getSecret()',
+  '    type password_nested = Token[ACTUAL_LITERAL_SECRET_7X9]',
+  '    type password_nested_box[T] = list[Token[ACTUAL_LITERAL_SECRET_7X9]]',
+  '',
+  'class LongR:',
+  ...looksPythonLongMembers,
+  '    token: Token[ACTUAL_LITERAL_SECRET_7X9]',
+  ''
+].join('\n');
+
+assertPythonAstAccepted(looksPythonLawful, 'looks-Python lawful canary');
+assertPythonParserAccepted(looksPythonLawful, 'looks-Python lawful canary');
+assert.equal(redactSensitiveText(looksPythonLawful, pythonPolicy), looksPythonLawful, 'looks-Python lawful direct policy changed exact source');
+assert.equal(hasSecretValue(looksPythonLawful, pythonPolicy), false, 'looks-Python lawful direct policy was classified as hostile');
+for (const [relativePath, source] of Object.entries(looksPythonHostileFixtures)) {
+  assert.equal(redactSensitiveText(source), looksPythonHostileRedacted, `${relativePath} direct policy changed generic projection`);
+  assert.equal(hasSecretValue(source), true, `${relativePath} direct policy was not failed closed`);
+  assert.notEqual(redactSensitiveText(source), source, `${relativePath} unexpectedly received Python provenance`);
+}
+assert.equal(redactSensitiveText(looksPythonHostile, pythonPolicy), looksPythonHostile, 'explicit Python source hint did not grant lawful AST ownership');
+assert.equal(hasSecretValue(looksPythonHostile, pythonPolicy), false, 'explicit Python source hint did not grant lawful AST ownership');
+assert.equal(redactSensitiveText(looksPythonHostile), looksPythonHostileRedacted, 'Python-looking text without a language hint was not failed closed');
+assert.equal(redactSensitiveText(looksPythonHostile, { context: 'diagnostic', language: 'python' }), looksPythonHostileRedacted, 'diagnostic text incorrectly received Python parser authority');
+assert.equal(hasSecretValue(looksPythonHostile, { context: 'diagnostic', language: 'python' }), true, 'diagnostic text incorrectly received Python parser authority');
+const pythonNoHintCall = 'token: Token[str] = client.getSecret()';
+assert.equal(hasSecretValue(pythonNoHintCall), true, 'Python-looking typed call without a language hint was not failed closed');
+assert.equal(redactSensitiveText(pythonNoHintCall).includes('client.getSecret()'), false, 'Python-looking typed call without a language hint leaked');
+assert.equal(hasSecretValue(pythonNoHintCall, pythonPolicy), false, 'explicit Python hint rejected a lawful typed call');
+assert.equal(redactSensitiveText(pythonNoHintCall, pythonPolicy), pythonNoHintCall, 'explicit Python hint changed a lawful typed call');
+
 const directSafe = [
   'const isCurrentTransition = (token: PlayerSessionTransitionToken): boolean => true;',
   'const { hasSecretValue: policyHasSecretValue, apiToken: configuredToken } = policy;',
@@ -1006,15 +1208,22 @@ const directSafe = [
   'const arrowFn = (token: Token<string>): Token<string> => token;',
   'const { token: destructuredToken, password: destructuredPassword } = input;',
   'TOKEN: str = configuredToken',
-  'def generic(token: Token[str]) -> Token[str]:',
+  'def generic(token: Token[str]) -> Token[str]:\n    return token',
   'class GenericRequest:\n    token: Token[str]',
   'class Request:\n    token: Token[str]\n    password: PasswordType',
   'class SquareRequest:\n    token: Token[str]',
-  'def square_parameter(token: Token[str]) -> Token[str]:\n    return token'
+  'def square_parameter(token: Token[str]) -> Token[str]:\n    return token',
+  'type password = PasswordType',
+  'type password[T] = list[T]',
+  'type multiline_password = (\n    PasswordType\n)',
+  'class AliasRequest:\n    type password = PasswordType\n    parenthesized: (\n        Token[\n            str\n        ]\n    )\n    quoted: \'PasswordType\'',
+  'def annotated(password: (PasswordType), quoted: \'PasswordType\') -> Token[str]:\n    return password'
 ];
 for (const sample of directSafe) {
-  assert.equal(redactSensitiveText(sample), sample, `policy changed lawful source: ${sample}`);
-  assert.equal(hasSecretValue(sample), false, `policy classified lawful source as secret: ${sample}`);
+  const python = /^(?:def\s+[A-Za-z_][A-Za-z0-9_]*\s*\(|class\s+[A-Za-z_][A-Za-z0-9_]*(?:\([^\n]*\))?:|type\s+[A-Za-z_][A-Za-z0-9_]*(?:\[[^\n]*\])?\s*=)|^TOKEN:\s/mu.test(sample) && !sample.includes('{');
+  const options = python ? pythonPolicy : {};
+  assert.equal(redactSensitiveText(sample, options), sample, `policy changed lawful source: ${sample}`);
+  assert.equal(hasSecretValue(sample, options), false, `policy classified lawful source as secret: ${sample}`);
 }
 
 const directUnsafe = [
@@ -1048,9 +1257,33 @@ const directUnsafe = [
   '// token: client.actualSecret',
   'token: client.actualSecret',
   'token: client.getSecret()',
+  '(TOKEN, other) = (ACTUAL_LITERAL_SECRET_7X9, value)',
+  'password: (ACTUAL_LITERAL_SECRET_7X9)',
+  'password: (client.getSecret())',
+  'type password = (ACTUAL_LITERAL_SECRET_7X9)',
+  'password: (\n    Token[ACTUAL_LITERAL_SECRET_7X9]\n)',
+  'token: str = {"token": ACTUAL_LITERAL_SECRET_7X9, "password": client.getSecret()}',
+  'token: str = make_call(token=ACTUAL_LITERAL_SECRET_7X9)',
+  'type password = make_call(token=ACTUAL_LITERAL_SECRET_7X9)',
   'const API_KEY: string = "ACTUAL_LITERAL_SECRET_7X9";',
   'const API_KEY: { token: Token<string>; password: string } = "QZ7";',
-  'TOKEN: str = "ACTUAL_LITERAL_SECRET_7X9"'
+  'TOKEN: str = "ACTUAL_LITERAL_SECRET_7X9"',
+  'type password = "ACTUAL_LITERAL_SECRET_7X9"',
+  'type password[T] = call(ACTUAL_LITERAL_SECRET_7X9)',
+  'def malformed(password: PasswordType):',
+  'class C:\n    list_payload = [{"token": ACTUAL_LITERAL_SECRET_7X9}]',
+  'class C:\n    tuple_payload = ({"password": ACTUAL_LITERAL_SECRET_7X9},)',
+  'class C:\n    call_payload = some_call(token=ACTUAL_LITERAL_SECRET_7X9)',
+  'class C:\n    token = ACTUAL_LITERAL_SECRET_7X9',
+  'class C:\n    def method(self):\n        token = ACTUAL_LITERAL_SECRET_7X9',
+  'class C:\n    if enabled:\n        token = ACTUAL_LITERAL_SECRET_7X9',
+  'class C:\n    for item in items:\n        token = ACTUAL_LITERAL_SECRET_7X9',
+  'class C:\n    while enabled:\n        token = ACTUAL_LITERAL_SECRET_7X9',
+  'class C:\n    with context:\n        token = ACTUAL_LITERAL_SECRET_7X9',
+  'class C:\n    try:\n        token = ACTUAL_LITERAL_SECRET_7X9\n    except Exception:\n        pass',
+  'class C:\n    nested = {outer: {token: client.actualSecret}}',
+  'token: client.actualSecret',
+  'token: client.getSecret()'
 ];
 for (const sample of directUnsafe) {
   const redacted = redactSensitiveText(sample);
@@ -1069,6 +1302,9 @@ assert.equal(
   'token: [REDACTED_SECRET]\nconst lawful = runtimeToken;',
   'malformed generic tail stopped before its rejected payload'
 );
+const overLimitPython = `class OverLimit:\n    password: PasswordType\n${'x'.repeat(2_000_001)}`;
+assert.equal(hasSecretValue(overLimitPython, pythonPolicy), true, 'over-limit Python source was not failed closed');
+assert.equal(redactSensitiveText(overLimitPython, pythonPolicy).includes('password: PasswordType'), false, 'over-limit Python source preserved ambiguous credential provenance');
 
 const squareTailCases = [
   ['token: Token[ACTUAL_LITERAL_SECRET_7X9]', 'token: [REDACTED_SECRET]'],
@@ -1096,8 +1332,8 @@ for (const sample of [
   'class SquareTailLawful:\n    token: Token[str]',
   'def squareTailFunction(token: Token[str]) -> Token[str]:\n    return token'
 ]) {
-  assert.equal(redactSensitiveText(sample), sample, `lawful square generic source changed: ${sample}`);
-  assert.equal(hasSecretValue(sample), false, `lawful square generic source classified as secret: ${sample}`);
+  assert.equal(redactSensitiveText(sample, pythonPolicy), sample, `lawful square generic source changed: ${sample}`);
+  assert.equal(hasSecretValue(sample, pythonPolicy), false, `lawful square generic source classified as secret: ${sample}`);
 }
 
 for (const [query, safeMatchTexts, expected] of [
@@ -1150,8 +1386,12 @@ let client;
 try {
   await writeFixture(tmp, 'source.ts', sourceTs);
   await writeFixture(tmp, 'source.py', sourcePy);
+  await writeFixture(tmp, 'looks-python.py', looksPythonLawful);
+  for (const [relativePath, source] of Object.entries(looksPythonHostileFixtures)) await writeFixture(tmp, relativePath, source);
   await writeFixture(tmp, 'python-provenance-lawful.py', pythonProvenanceLawful);
   await writeFixture(tmp, 'python-provenance-hostile.py', pythonProvenanceHostile);
+  await writeFixture(tmp, 'python-312-lawful.py', python312Lawful);
+  await writeFixture(tmp, 'python-312-hostile.py', python312Hostile);
   await writeFixture(tmp, 'python-mixed-provenance.py', pythonMixedProvenance);
   await writeFixture(tmp, 'python-continuation-provenance.py', pythonContinuationProvenance);
   await writeFixture(tmp, 'python-boundary-96.py', pythonBoundarySources.get(96));
@@ -1200,6 +1440,188 @@ try {
   const workspaceId = opened.structuredContent.workspace_id;
   assert.ok(workspaceId, 'open_current_workspace omitted workspace id');
 
+  // These names intentionally look like Python only in their contents. The
+  // path, not text resemblance, is the sole authority for parser provenance.
+  const looksPythonRead = assertToolSuccess(await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: workspaceId, path: 'looks-python.py' }
+  }), 'looks-Python lawful full read');
+  assertReadMetadata(looksPythonRead, looksPythonLawful, 1, undefined, 'looks-Python lawful full read');
+  assert.equal(looksPythonRead.structuredContent.text, numbered(looksPythonLawful), 'looks-Python lawful read changed exact source bytes');
+  assert.equal(resultText(looksPythonRead).includes(numbered(looksPythonLawful)), true, 'looks-Python lawful read content envelope changed exact source bytes');
+  assert.equal(JSON.stringify(looksPythonRead).includes('ACTUAL_LITERAL_SECRET_7X9'), true, 'looks-Python lawful read was unexpectedly redacted');
+  await writeRawArtifact(rawArtifactDir, 'looks-python-lawful-read', looksPythonRead);
+
+  const looksPythonLines = looksPythonLawful.split('\n');
+  const looksPythonRange = assertToolSuccess(await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: workspaceId, path: 'looks-python.py', start_line: 3, end_line: 16 }
+  }), 'looks-Python lawful ranged read');
+  assertReadMetadata(looksPythonRange, looksPythonLawful, 3, 16, 'looks-Python lawful ranged read');
+  assert.equal(looksPythonRange.structuredContent.text, projectedRange(looksPythonLawful, 3, 16).text, 'looks-Python lawful ranged read changed source projection');
+  assert.equal(looksPythonLines.slice(2, 16).some((line) => line.includes('ACTUAL_LITERAL_SECRET_7X9')), true, 'looks-Python lawful ranged read omitted its source marker');
+
+  const looksPythonReadManyPaths = ['looks-python.py', ...Object.keys(looksPythonHostileFixtures)];
+  const looksPythonReadMany = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: { workspace_id: workspaceId, items: looksPythonReadManyPaths.map((path) => ({ path })) }
+  }), 'looks-Python canary read_many');
+  for (const [index, relativePath] of looksPythonReadManyPaths.entries()) {
+    const source = relativePath === 'looks-python.py' ? looksPythonLawful : looksPythonHostileFixtures[relativePath];
+    const projection = relativePath === 'looks-python.py' ? source : looksPythonHostileRedacted;
+    const item = looksPythonReadMany.structuredContent.results?.[index];
+    assert.equal(item?.index, index, `looks-Python canary read_many changed item ${index} order`);
+    assert.equal(item?.path, relativePath, `looks-Python canary read_many changed item ${index} path`);
+    assert.equal(item?.ok, true, `looks-Python canary read_many failed item ${index}`);
+    assert.equal(item?.result?.text, numbered(projection), `looks-Python canary read_many changed item ${index} source projection`);
+    if (relativePath === 'looks-python.py') {
+      assert.equal(JSON.stringify(item).includes('client.getSecret()'), true, `looks-Python lawful read_many item ${index} unexpectedly redacted source`);
+    } else expectNoHostileResponseFields(item, ['ACTUAL_LITERAL_SECRET_7X9'], `looks-Python hostile read_many item ${index}`);
+  }
+  assert.equal(resultText(looksPythonReadMany).includes(numbered(looksPythonLawful)), true, 'looks-Python canary read_many omitted lawful source body');
+  for (const relativePath of Object.keys(looksPythonHostileFixtures)) {
+    const source = looksPythonHostileFixtures[relativePath];
+    const read = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: relativePath }
+    }), `looks-Python hostile ${relativePath} full read`);
+    assertReadMetadata(read, source, 1, undefined, `looks-Python hostile ${relativePath} full read`);
+    assert.equal(read.structuredContent.text, numbered(looksPythonHostileRedacted), `looks-Python hostile ${relativePath} full read changed redacted projection`);
+    expectNoHostileResponseFields(read, ['ACTUAL_LITERAL_SECRET_7X9'], `looks-Python hostile ${relativePath} full read`);
+    const ranged = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: relativePath, start_line: 2, end_line: 2 }
+    }), `looks-Python hostile ${relativePath} ranged read`);
+    assert.equal(ranged.structuredContent.text, projectedRange(looksPythonHostileRedacted, 2, 2).text, `looks-Python hostile ${relativePath} ranged read changed projection`);
+    expectNoHostileResponseFields(ranged, ['ACTUAL_LITERAL_SECRET_7X9'], `looks-Python hostile ${relativePath} ranged read`);
+    if (relativePath === 'looks-python.txt') await writeRawArtifact(rawArtifactDir, 'looks-python-hostile-read', read);
+  }
+
+  const looksPythonSearchCases = [
+    ['looks-python.py', 'Token[', 'Token', false],
+    ...Object.keys(looksPythonHostileFixtures).map((relativePath) => [relativePath, 'ACTUAL_LITERAL_SECRET_7X9', 'ACTUAL_LITERAL_SECRET_7X9', true])
+  ];
+  for (const [relativePath, query, regexQuery, hostile] of looksPythonSearchCases) {
+    const source = hostile ? looksPythonHostileFixtures[relativePath] : looksPythonLawful;
+    const expectedLineNumbers = source.split('\n').map((line, index) => line.includes(hostile ? 'ACTUAL_LITERAL_SECRET_7X9' : 'Token[') ? index + 1 : 0).filter(Boolean);
+    for (const [variantName, variantArgs, searchQuery] of [
+      ['plain', {}, query],
+      ['regex', { regex: true }, regexQuery],
+      ['structured', { intent: 'text' }, query],
+      ['structured-regex', { intent: 'text', regex: true }, regexQuery]
+    ]) {
+      const searched = assertToolSuccess(await client.request('tools/call', {
+        name: 'search',
+        arguments: { workspace_id: workspaceId, query: searchQuery, path: relativePath, max_results: 50, ...variantArgs }
+      }), `looks-Python ${relativePath} ${variantName} search`);
+      assert.equal(searched.structuredContent.matches?.length, expectedLineNumbers.length, `looks-Python ${relativePath} ${variantName} search changed match count`);
+      for (const [index, lineNumber] of expectedLineNumbers.entries()) {
+        const expectedLine = source.split('\n')[lineNumber - 1];
+        const match = searched.structuredContent.matches[index];
+        assert.equal(match.line, lineNumber, `looks-Python ${relativePath} ${variantName} search changed line ${index}`);
+        assert.equal(match.text, hostile ? looksPythonHostileRedacted.split('\n')[lineNumber - 1] : expectedLine, `looks-Python ${relativePath} ${variantName} search changed match text ${index}`);
+      }
+      if (hostile) {
+        expectNoHostileResponseFields(searched, ['ACTUAL_LITERAL_SECRET_7X9'], `looks-Python hostile ${variantName} search`);
+        assert.equal(searched.structuredContent.analysis?.query ?? '[REDACTED_SECRET]', '[REDACTED_SECRET]', `looks-Python hostile ${variantName} search did not redact analysis.query`);
+        assert.equal(resultText(searched).includes('[REDACTED_SECRET]'), true, `looks-Python hostile ${variantName} search omitted marker`);
+      } else {
+        assert.equal(JSON.stringify(searched).includes('ACTUAL_LITERAL_SECRET_7X9'), true, `looks-Python lawful ${variantName} search unexpectedly redacted source`);
+        if (variantArgs.intent === 'text') assert.equal(searched.structuredContent.analysis?.query, searchQuery, `looks-Python lawful ${variantName} search changed analysis.query`);
+      }
+    }
+  }
+
+  const looksPythonWritePath = 'looks-python-write.py';
+  const looksPythonWrite = assertToolSuccess(await client.request('tools/call', {
+    name: 'write',
+    arguments: { workspace_id: workspaceId, path: looksPythonWritePath, content: looksPythonLawful }
+  }), 'looks-Python lawful write');
+  assert.equal(await fs.readFile(path.join(tmp, looksPythonWritePath), 'utf8'), looksPythonLawful, 'looks-Python lawful write changed source bytes');
+  assert.ok(looksPythonWrite.structuredContent, 'looks-Python lawful write omitted structured output');
+  assert.equal(looksPythonWrite.structuredContent.diff.includes('ACTUAL_LITERAL_SECRET_7X9'), true, 'looks-Python lawful write diff was re-redacted after path-aware policy');
+  assert.equal(resultText(looksPythonWrite).includes('ACTUAL_LITERAL_SECRET_7X9'), true, 'looks-Python lawful write content diff was re-redacted after path-aware policy');
+  const looksPythonEdited = looksPythonLawful.replaceAll('token: Token[ACTUAL_LITERAL_SECRET_7X9]', 'token: Token[ACTUAL_LITERAL_SECRET_8Y9]');
+  const looksPythonEdit = assertToolSuccess(await client.request('tools/call', {
+    name: 'edit',
+    arguments: {
+      workspace_id: workspaceId,
+      path: looksPythonWritePath,
+      old_text: 'token: Token[ACTUAL_LITERAL_SECRET_7X9]',
+      new_text: 'token: Token[ACTUAL_LITERAL_SECRET_8Y9]',
+      replace_all: true,
+      expected_replacements: 4
+    }
+  }), 'looks-Python lawful edit');
+  assert.equal(await fs.readFile(path.join(tmp, looksPythonWritePath), 'utf8'), looksPythonEdited, 'looks-Python lawful edit changed source bytes');
+  assert.ok(looksPythonEdit.structuredContent, 'looks-Python lawful edit omitted structured output');
+  assert.equal(looksPythonEdit.structuredContent.diff.includes('ACTUAL_LITERAL_SECRET_8Y9'), true, 'looks-Python lawful edit diff was re-redacted after path-aware policy');
+
+  for (const [relativePath, source] of Object.entries(looksPythonHostileFixtures)) {
+    const before = await fs.readFile(path.join(tmp, relativePath), 'utf8');
+    const blockedWrite = assertToolError(await client.request('tools/call', {
+      name: 'write',
+      arguments: { workspace_id: workspaceId, path: relativePath, content: source }
+    }), `looks-Python hostile ${relativePath} write`);
+    assert.match(resultText(blockedWrite), /Secret-looking content is blocked/);
+    assert.equal(await fs.readFile(path.join(tmp, relativePath), 'utf8'), before, `looks-Python hostile ${relativePath} write mutated the file`);
+    const blockedEdit = assertToolError(await client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: workspaceId,
+        path: relativePath,
+        old_text: 'token: Token[ACTUAL_LITERAL_SECRET_7X9]',
+        new_text: 'token: Token[QZ7]',
+        expected_replacements: 1
+      }
+    }), `looks-Python hostile ${relativePath} edit`);
+    assert.match(resultText(blockedEdit), /Secret-looking content is blocked/);
+    assert.equal(await fs.readFile(path.join(tmp, relativePath), 'utf8'), before, `looks-Python hostile ${relativePath} edit mutated the file`);
+  }
+
+  const lawfulPatchPath = 'looks-python-patch.py';
+  const mixedPatchTextPath = 'looks-python-patch.txt';
+  await writeFixture(tmp, lawfulPatchPath, 'class Patch:\n');
+  await writeFixture(tmp, mixedPatchTextPath, 'class Patch:\n');
+  const lawfulPythonPatch = [
+    `diff --git a/${lawfulPatchPath} b/${lawfulPatchPath}`,
+    `--- a/${lawfulPatchPath}`,
+    `+++ b/${lawfulPatchPath}`,
+    '@@ -1,1 +1,2 @@',
+    ' class Patch:',
+    '+    token: Token[ACTUAL_LITERAL_SECRET_7X9]',
+    ''
+  ].join('\n');
+  const lawfulPatchResult = assertToolSuccess(await client.request('tools/call', {
+    name: 'apply_patch',
+    arguments: { workspace_id: workspaceId, patch: lawfulPythonPatch }
+  }), 'looks-Python lawful apply_patch');
+  assert.equal(await fs.readFile(path.join(tmp, lawfulPatchPath), 'utf8'), 'class Patch:\n    token: Token[ACTUAL_LITERAL_SECRET_7X9]\n', 'looks-Python lawful apply_patch changed source bytes');
+  assert.equal(lawfulPatchResult.structuredContent.diff.includes('ACTUAL_LITERAL_SECRET_7X9'), true, 'looks-Python lawful apply_patch diff was re-redacted after path-aware policy');
+  assert.equal(resultText(lawfulPatchResult).includes('ACTUAL_LITERAL_SECRET_7X9'), true, 'looks-Python lawful apply_patch content diff was re-redacted after path-aware policy');
+  await writeRawArtifact(rawArtifactDir, 'looks-python-lawful-apply-patch', lawfulPatchResult);
+  const mixedPatch = [
+    lawfulPythonPatch.trimEnd(),
+    `diff --git a/${mixedPatchTextPath} b/${mixedPatchTextPath}`,
+    `--- a/${mixedPatchTextPath}`,
+    `+++ b/${mixedPatchTextPath}`,
+    '@@ -1,1 +1,2 @@',
+    ' class Patch:',
+    '+    token: Token[ACTUAL_LITERAL_SECRET_7X9]',
+    ''
+  ].join('\n');
+  const mixedBeforePython = await fs.readFile(path.join(tmp, lawfulPatchPath), 'utf8');
+  const mixedBeforeText = await fs.readFile(path.join(tmp, mixedPatchTextPath), 'utf8');
+  const mixedBlocked = assertToolError(await client.request('tools/call', {
+    name: 'apply_patch',
+    arguments: { workspace_id: workspaceId, patch: mixedPatch }
+  }), 'looks-Python mixed-language apply_patch');
+  assert.match(resultText(mixedBlocked), /Secret-looking content is blocked/);
+  assert.equal(resultText(mixedBlocked).includes('ACTUAL_LITERAL_SECRET_7X9'), false, 'looks-Python mixed-language rejection leaked its hostile hunk');
+  assert.equal(await fs.readFile(path.join(tmp, lawfulPatchPath), 'utf8'), mixedBeforePython, 'looks-Python mixed-language rejection partially mutated Python file');
+  assert.equal(await fs.readFile(path.join(tmp, mixedPatchTextPath), 'utf8'), mixedBeforeText, 'looks-Python mixed-language rejection mutated non-Python file');
+  await writeRawArtifact(rawArtifactDir, 'looks-python-mixed-apply-patch-rejected', mixedBlocked);
+
   const sourceRead = assertToolSuccess(await client.request('tools/call', { name: 'read', arguments: { workspace_id: workspaceId, path: 'source.ts' } }), 'source read');
   assert.equal(sourceRead.structuredContent.path, 'source.ts', 'source read hid its path');
   assert.equal(sourceRead.structuredContent.text, numbered(sourceTs), 'MCP read changed lawful source bytes or line framing');
@@ -1208,10 +1630,10 @@ try {
   assert.equal(sourceRead.content?.[0]?.text.includes('[REDACTED_SECRET]'), false, 'MCP read content envelope redacted lawful source');
 
   const sourcePyRead = assertToolSuccess(await client.request('tools/call', { name: 'read', arguments: { workspace_id: workspaceId, path: 'source.py' } }), 'Python source read');
-  assert.equal(sourcePyRead.structuredContent.text, numbered(sourcePy), 'MCP read changed lawful Python source bytes or line framing');
-  assert.equal(sourcePyRead.structuredContent.text.includes('[REDACTED_SECRET]'), false, 'MCP read redacted lawful Python source');
-  assert.equal(sourcePyRead.content?.[0]?.text.includes(numbered(sourcePy)), true, 'MCP Python read content envelope changed lawful source bytes');
-  assert.equal(sourcePyRead.content?.[0]?.text.includes('[REDACTED_SECRET]'), false, 'MCP Python read content envelope redacted lawful source');
+  assert.equal(sourcePyRead.structuredContent.text, numbered(sourcePyRedacted), 'MCP read changed Python source bytes or line framing');
+  assert.equal(sourcePyRead.structuredContent.text.includes('[REDACTED_SECRET]'), true, 'MCP read omitted hostile Python redaction');
+  assert.equal(sourcePyRead.content?.[0]?.text.includes(numbered(sourcePyRedacted)), true, 'MCP Python read content envelope changed source bytes');
+  assert.equal(sourcePyRead.content?.[0]?.text.includes('[REDACTED_SECRET]'), true, 'MCP Python read content envelope omitted hostile redaction');
 
   // The filename is deliberately identical to a later ranged source body.
   // Metadata must take the ordinary policy path while the typed source slot
@@ -1533,6 +1955,128 @@ try {
       if (query === 'ACTUAL_LITERAL_SECRET_7X9' && variantName === 'structured-regex') {
         await writeRawArtifact(rawArtifactDir, 'python-provenance-hostile-structured-regex-search', searched);
       }
+    }
+  }
+
+  const python312LawfulRead = assertToolSuccess(await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: workspaceId, path: 'python-312-lawful.py' }
+  }), 'Python 3.12 lawful alias/annotation full read');
+  assertReadMetadata(python312LawfulRead, python312Lawful, 1, undefined, 'Python 3.12 lawful alias/annotation full read');
+  assert.equal(python312LawfulRead.structuredContent.text, numbered(python312Lawful), 'Python 3.12 lawful full read changed exact source output');
+  assert.equal(python312LawfulRead.structuredContent.text.includes('[REDACTED_SECRET]'), false, 'Python 3.12 lawful full read redacted syntax');
+  expectNoHostileResponseFields(python312LawfulRead, ['ACTUAL_LITERAL_SECRET_7X9', 'client.actualSecret', 'client.getSecret()'], 'Python 3.12 lawful full read');
+
+  const python312LawfulRanges = [[1, 5], [6, 17], [19, 20]];
+  for (const [startLine, endLine] of python312LawfulRanges) {
+    const ranged = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: 'python-312-lawful.py', start_line: startLine, end_line: endLine }
+    }), `Python 3.12 lawful range ${startLine}-${endLine}`);
+    assertReadMetadata(ranged, python312Lawful, startLine, endLine, `Python 3.12 lawful range ${startLine}-${endLine}`);
+    assert.equal(ranged.structuredContent.text, projectedRange(python312Lawful, startLine, endLine).text, `Python 3.12 lawful range ${startLine}-${endLine} changed exact source output`);
+    assert.equal(ranged.structuredContent.text.includes('[REDACTED_SECRET]'), false, `Python 3.12 lawful range ${startLine}-${endLine} redacted syntax`);
+  }
+
+  const python312LawfulBatchItems = python312LawfulRanges.map(([start_line, end_line]) => ({
+    path: 'python-312-lawful.py',
+    start_line,
+    end_line
+  }));
+  const python312LawfulBatch = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: { workspace_id: workspaceId, items: python312LawfulBatchItems }
+  }), 'Python 3.12 lawful alias/annotation read_many');
+  for (const [index, item] of python312LawfulBatchItems.entries()) {
+    const actual = python312LawfulBatch.structuredContent.results?.[index];
+    assert.deepEqual(
+      { index: actual.index, path: actual.path, ok: actual.ok, text: actual.result?.text },
+      { index, path: item.path, ok: true, text: projectedRange(python312Lawful, item.start_line, item.end_line).text },
+      `Python 3.12 lawful read_many item ${index} changed source projection`
+    );
+    expectNoHostileResponseFields(actual, ['ACTUAL_LITERAL_SECRET_7X9', 'client.actualSecret', 'client.getSecret()'], `Python 3.12 lawful read_many item ${index}`);
+  }
+
+  const python312LawfulSearchCases = [
+    { query: 'PasswordType', regexQuery: 'PasswordType', expectedLines: python312Lawful.split('\n').map((line, index) => line.includes('PasswordType') ? index + 1 : 0).filter(Boolean) },
+    { query: 'Token[', regexQuery: 'Token\\[', expectedLines: python312Lawful.split('\n').map((line, index) => line.includes('Token[') ? index + 1 : 0).filter(Boolean) }
+  ];
+  for (const { query, regexQuery, expectedLines } of python312LawfulSearchCases) {
+    for (const [variantName, variantArgs, searchQuery] of [
+      ['plain', {}, query],
+      ['structured', { intent: 'text' }, query],
+      ['regex', { regex: true }, regexQuery],
+      ['structured-regex', { intent: 'text', regex: true }, regexQuery]
+    ]) {
+      const searched = assertToolSuccess(await client.request('tools/call', {
+        name: 'search',
+        arguments: { workspace_id: workspaceId, query: searchQuery, path: 'python-312-lawful.py', max_results: 20, ...variantArgs }
+      }), `Python 3.12 lawful ${variantName} search ${query}`);
+      assert.deepEqual(searched.structuredContent.matches?.map((match) => match.line), expectedLines, `Python 3.12 lawful ${variantName} search ${query} changed lines`);
+      for (const [index, expectedLine] of expectedLines.entries()) assert.equal(searched.structuredContent.matches[index].text, python312Lawful.split('\n')[expectedLine - 1], `Python 3.12 lawful ${variantName} search ${query} changed match ${index}`);
+      assert.equal(resultText(searched).includes('[REDACTED_SECRET]'), false, `Python 3.12 lawful ${variantName} search ${query} redacted syntax`);
+      expectNoHostileResponseFields(searched, ['ACTUAL_LITERAL_SECRET_7X9', 'client.actualSecret', 'client.getSecret()'], `Python 3.12 lawful ${variantName} search ${query}`);
+    }
+  }
+
+  const python312HostileLiterals = ['ACTUAL_LITERAL_SECRET_7X9', 'client.actualSecret', 'client.getSecret()'];
+  const python312HostileRead = assertToolSuccess(await client.request('tools/call', {
+    name: 'read',
+    arguments: { workspace_id: workspaceId, path: 'python-312-hostile.py' }
+  }), 'Python 3.12 hostile ownership full read');
+  assertReadMetadata(python312HostileRead, python312Hostile, 1, undefined, 'Python 3.12 hostile ownership full read');
+  assert.equal(python312HostileRead.structuredContent.text, numbered(python312HostileRedacted), 'Python 3.12 hostile full read changed sanitized projection');
+  expectRedactedText(python312HostileRead.structuredContent.text, 'Python 3.12 hostile ownership full read');
+  expectNoHostileResponseFields(python312HostileRead, python312HostileLiterals, 'Python 3.12 hostile ownership full read');
+
+  const python312HostileRanges = [[2, 5], [6, 19], [22, 26]];
+  for (const [startLine, endLine] of python312HostileRanges) {
+    const ranged = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: 'python-312-hostile.py', start_line: startLine, end_line: endLine }
+    }), `Python 3.12 hostile range ${startLine}-${endLine}`);
+    assertReadMetadata(ranged, python312Hostile, startLine, endLine, `Python 3.12 hostile range ${startLine}-${endLine}`);
+    assert.equal(ranged.structuredContent.text, projectedRange(python312HostileRedacted, startLine, endLine).text, `Python 3.12 hostile range ${startLine}-${endLine} changed sanitized projection`);
+    expectRedactedText(ranged.structuredContent.text, `Python 3.12 hostile range ${startLine}-${endLine}`);
+    expectNoHostileResponseFields(ranged, python312HostileLiterals, `Python 3.12 hostile range ${startLine}-${endLine}`);
+  }
+
+  const python312HostileBatchItems = python312HostileRanges.map(([start_line, end_line]) => ({
+    path: 'python-312-hostile.py',
+    start_line,
+    end_line
+  }));
+  const python312HostileBatch = assertToolSuccess(await client.request('tools/call', {
+    name: 'read_many',
+    arguments: { workspace_id: workspaceId, items: python312HostileBatchItems }
+  }), 'Python 3.12 hostile ownership read_many');
+  for (const [index, item] of python312HostileBatchItems.entries()) {
+    const actual = python312HostileBatch.structuredContent.results?.[index];
+    assert.equal(actual.result?.text, projectedRange(python312HostileRedacted, item.start_line, item.end_line).text, `Python 3.12 hostile read_many item ${index} changed sanitized projection`);
+    expectRedactedText(actual.result?.text ?? '', `Python 3.12 hostile read_many item ${index}`);
+    expectNoHostileResponseFields(actual, python312HostileLiterals, `Python 3.12 hostile read_many item ${index}`);
+  }
+
+  for (const [query, regexQuery] of [
+    ['ACTUAL_LITERAL_SECRET_7X9', 'ACTUAL_LITERAL_SECRET_7X9'],
+    ['client.actualSecret', 'client\\.actualSecret'],
+    ['client.getSecret()', 'client\\.getSecret\\(\\)']
+  ]) {
+    const expectedLines = python312Hostile.split('\n').map((line, index) => line.includes(query) ? index + 1 : 0).filter(Boolean);
+    for (const [variantName, variantArgs, searchQuery] of [
+      ['plain', {}, query],
+      ['structured', { intent: 'text' }, query],
+      ['regex', { regex: true }, regexQuery],
+      ['structured-regex', { intent: 'text', regex: true }, regexQuery]
+    ]) {
+      const searched = assertToolSuccess(await client.request('tools/call', {
+        name: 'search',
+        arguments: { workspace_id: workspaceId, query: searchQuery, path: 'python-312-hostile.py', max_results: 20, ...variantArgs }
+      }), `Python 3.12 hostile ${variantName} search ${query}`);
+      assert.deepEqual(searched.structuredContent.matches?.map((match) => match.line), expectedLines, `Python 3.12 hostile ${variantName} search ${query} changed lines`);
+      for (const match of searched.structuredContent.matches ?? []) expectRedactedText(match.text, `Python 3.12 hostile ${variantName} search ${query} match`);
+      if (searched.structuredContent.analysis && Object.prototype.hasOwnProperty.call(searched.structuredContent.analysis, 'query')) assert.equal(searched.structuredContent.analysis.query, '[REDACTED_SECRET]', `Python 3.12 hostile ${variantName} search ${query} did not redact analysis.query`);
+      expectNoHostileResponseFields(searched, python312HostileLiterals, `Python 3.12 hostile ${variantName} search ${query}`);
     }
   }
 
@@ -2526,7 +3070,7 @@ try {
     ['arrowFn', sourceTs.split('\n').find((line) => line.includes('const arrowFn'))],
     ['destructuredToken', sourceTs.split('\n').find((line) => line.includes('destructuredToken'))],
     ['PasswordType', sourcePy.split('\n')[3]],
-    ['options = {apiToken', sourcePy.split('\n')[9]],
+    ['options = {apiToken', sourcePyRedacted.split('\n')[9]],
     ['TOKEN: str', sourcePy.split('\n')[10]],
     ['def generic', sourcePy.split('\n').find((line) => line.startsWith('def generic')), 'source.py'],
     ['GenericRequest', sourcePy.split('\n').find((line) => line.startsWith('class GenericRequest')), 'source.py']
@@ -2541,7 +3085,11 @@ try {
       assert.equal(searched.structuredContent.matches[index].path, searchPath, `source search ${query} hid its path`);
       assert.equal(resultText(searched).includes(expectedLine), true, `source search ${query} content envelope changed lawful source text`);
     }
-    assert.equal(resultText(searched).includes('[REDACTED_SECRET]'), false, `source search ${query} content envelope redacted lawful source`);
+    assert.equal(
+      resultText(searched).includes('[REDACTED_SECRET]'),
+      expectedLines.some((line) => line.includes('[REDACTED_SECRET]')),
+      `source search ${query} content envelope changed redaction state`
+    );
   }
 
   const lawfulQueryCases = [
@@ -2711,15 +3259,16 @@ try {
   assert.equal(lawfulBatchResults.length, lawfulBatchPaths.length, 'lawful read_many changed item count');
   for (const [index, relativePath] of lawfulBatchPaths.entries()) {
     const expected = await fs.readFile(path.join(tmp, relativePath), 'utf8');
+    const expectedProjection = relativePath === 'source.py' ? sourcePyRedacted : expected;
     const item = lawfulBatchResults[index];
     assert.equal(item.index, index, 'lawful read_many changed item order');
     assert.equal(item.path, relativePath, 'lawful read_many hid a source path');
     assert.equal(item.ok, true, `lawful read_many rejected ${relativePath}`);
-    assert.equal(item.result.text, numbered(expected), `lawful read_many changed ${relativePath}`);
-    assert.equal(item.result.text.includes('[REDACTED_SECRET]'), false, `lawful read_many redacted ${relativePath}`);
-    assert.equal(lawfulBatch.content?.[0]?.text.includes(numbered(expected)), true, `lawful read_many content envelope changed ${relativePath}`);
-    assert.equal(lawfulBatch.content?.[0]?.text.includes('[REDACTED_SECRET]'), false, `lawful read_many content envelope redacted ${relativePath}`);
+    assert.equal(item.result.text, numbered(expectedProjection), `lawful read_many changed ${relativePath}`);
+    assert.equal(item.result.text.includes('[REDACTED_SECRET]'), expectedProjection.includes('[REDACTED_SECRET]'), `lawful read_many changed redaction state for ${relativePath}`);
+    assert.equal(lawfulBatch.content?.[0]?.text.includes(numbered(expectedProjection)), true, `lawful read_many content envelope changed ${relativePath}`);
   }
+  assert.equal(lawfulBatch.content?.[0]?.text.includes('[REDACTED_SECRET]'), sourcePyRedacted.includes('[REDACTED_SECRET]'), 'lawful read_many content envelope changed aggregate redaction state');
 
   const negativePaths = Object.keys(negativeFixtures);
   for (const relativePath of negativePaths) {
@@ -2792,7 +3341,8 @@ try {
   const compatibility = {
     'compat.js': 'const API_TOKEN = getToken();\nconst options = { token: runtimeToken };\n',
     'compat.ts': 'interface Compat { token: string; }\nconst PASSWORD = credentials.getPassword();\n',
-    'compat.py': 'TOKEN = os.getenv("TOKEN")\nPASSWORD = getpass.getpass()\n',
+    'compat.py': 'class Compat:\n    token: Token[str]\n    password: PasswordType\n',
+    'compat.txt': 'TOKEN = os.getenv("TOKEN")\nPASSWORD = getpass.getpass()\n',
     'compat.rb': 'token = credentials.fetch(:token)\npassword = ENV.fetch("PASSWORD")\n'
   };
   for (const [relativePath, content] of Object.entries(compatibility)) {
@@ -2804,7 +3354,8 @@ try {
   const edits = {
     'compat.js': ['const API_TOKEN = getToken();', 'const API_TOKEN = config.apiToken;'],
     'compat.ts': ['interface Compat { token: string; }', 'interface Compat { token: string; password: string; }'],
-    'compat.py': ['TOKEN = os.getenv("TOKEN")', 'TOKEN = os.environ.get("TOKEN")'],
+    'compat.py': ['token: Token[str]', 'token: Token[bytes]'],
+    'compat.txt': ['TOKEN = os.getenv("TOKEN")', 'TOKEN = os.environ.get("TOKEN")'],
     'compat.rb': ['token = credentials.fetch(:token)', 'token = credentials.fetch(:token_name)']
   };
   for (const [relativePath, [oldText, newText]] of Object.entries(edits)) {
@@ -2829,6 +3380,54 @@ try {
   assertToolSuccess(await client.request('tools/call', { name: 'apply_patch', arguments: { workspace_id: workspaceId, patch } }), 'source apply_patch Ruby');
   assert.equal((await fs.readFile(path.join(tmp, 'compat.rb'), 'utf8')).includes('credentials.fetch(:runtime_token)'), true, 'source apply_patch changed Ruby source unexpectedly');
 
+  const multilineLawfulPath = 'python-multiline-lawful-patch.py';
+  await assertToolSuccess(await client.request('tools/call', {
+    name: 'write',
+    arguments: { workspace_id: workspaceId, path: multilineLawfulPath, content: 'class R:\n' }
+  }), 'Python multiline lawful patch seed write');
+  const multilineLawfulPatch = [
+    `diff --git a/${multilineLawfulPath} b/${multilineLawfulPath}`,
+    `--- a/${multilineLawfulPath}`,
+    `+++ b/${multilineLawfulPath}`,
+    '@@ -1,1 +1,7 @@',
+    ' class R:',
+    '+    type password = (',
+    '+        PasswordType',
+    '+    )',
+    '+    token: (',
+    '+        Token[str]',
+    '+    )',
+    ''
+  ].join('\n');
+  await assertToolSuccess(await client.request('tools/call', {
+    name: 'apply_patch',
+    arguments: { workspace_id: workspaceId, patch: multilineLawfulPatch }
+  }), 'Python multiline lawful alias/annotation apply_patch');
+  assert.equal(
+    await fs.readFile(path.join(tmp, multilineLawfulPath), 'utf8'),
+    'class R:\n    type password = (\n        PasswordType\n    )\n    token: (\n        Token[str]\n    )\n',
+    'Python multiline lawful patch changed source bytes'
+  );
+
+  for (const [label, pathName, diff] of [
+    ['alias', 'python-multiline-hostile-alias.py', multilineHostileAliasDiff],
+    ['annotation', 'python-multiline-hostile-annotation.py', multilineHostileAnnotationDiff]
+  ]) {
+    await assertToolSuccess(await client.request('tools/call', {
+      name: 'write',
+      arguments: { workspace_id: workspaceId, path: pathName, content: 'class R:\n' }
+    }), `Python multiline hostile ${label} patch seed write`);
+    const hostileDiff = diff.replaceAll('multiline.py', pathName);
+    const before = await fs.readFile(path.join(tmp, pathName), 'utf8');
+    const blocked = assertToolError(await client.request('tools/call', {
+      name: 'apply_patch',
+      arguments: { workspace_id: workspaceId, patch: hostileDiff }
+    }), `Python multiline hostile ${label} apply_patch`);
+    assert.match(resultText(blocked), /Secret-looking content is blocked/);
+    assert.equal(resultText(blocked).includes('ACTUAL_LITERAL_SECRET_7X9'), false, `Python multiline hostile ${label} apply_patch leaked continuation content`);
+    assert.equal(await fs.readFile(path.join(tmp, pathName), 'utf8'), before, `Python multiline hostile ${label} apply_patch mutated source`);
+  }
+
   const literalWritePath = 'blocked-literal.txt';
   const literalWrite = assertToolError(await client.request('tools/call', {
     name: 'write',
@@ -2845,11 +3444,11 @@ try {
   assert.match(resultText(literalEdit), /Secret-looking content is blocked/);
   assert.equal(await fs.readFile(path.join(tmp, 'compat.ts'), 'utf8'), compatTsBeforeBlockedEdit, 'literal edit changed source despite rejection');
 
-  const compatPyBeforeBlockedPatch = await fs.readFile(path.join(tmp, 'compat.py'), 'utf8');
+  const compatPyBeforeBlockedPatch = await fs.readFile(path.join(tmp, 'compat.txt'), 'utf8');
   const literalPatch = [
-    'diff --git a/compat.py b/compat.py',
-    '--- a/compat.py',
-    '+++ b/compat.py',
+    'diff --git a/compat.txt b/compat.txt',
+    '--- a/compat.txt',
+    '+++ b/compat.txt',
     '@@ -1,2 +1,2 @@',
     '-TOKEN = os.environ.get("TOKEN")',
     '+TOKEN = "QZ7"',
@@ -2857,7 +3456,45 @@ try {
   ].join('\n') + '\n';
   const blockedPatch = assertToolError(await client.request('tools/call', { name: 'apply_patch', arguments: { workspace_id: workspaceId, patch: literalPatch } }), 'literal credential apply_patch');
   assert.match(resultText(blockedPatch), /Secret-looking content is blocked/);
-  assert.equal(await fs.readFile(path.join(tmp, 'compat.py'), 'utf8'), compatPyBeforeBlockedPatch, 'literal patch changed source despite rejection');
+  assert.equal(await fs.readFile(path.join(tmp, 'compat.txt'), 'utf8'), compatPyBeforeBlockedPatch, 'literal patch changed source despite rejection');
+
+  // Exercise actual git diff/show_changes producers with a mixed tracked
+  // result. The Python hunk keeps its parser-lawful source bytes while the
+  // same-looking non-Python hunk is redacted from each per-header block.
+  const trackedPythonBefore = await fs.readFile(path.join(tmp, 'looks-python.py'), 'utf8');
+  const trackedTextBefore = await fs.readFile(path.join(tmp, 'looks-python.txt'), 'utf8');
+  await fs.writeFile(path.join(tmp, 'looks-python.py'), `${trackedPythonBefore}class GitDiffLawful:\n    token: Token[ACTUAL_LITERAL_SECRET_7X9]\n`, 'utf8');
+  await fs.writeFile(path.join(tmp, 'looks-python.txt'), `${trackedTextBefore}class R:\n    token: Token[ACTUAL_LITERAL_SECRET_7X9]\n`, 'utf8');
+  const scopedGitDiff = assertToolSuccess(await client.request('tools/call', {
+    name: 'git_diff',
+    arguments: { workspace_id: workspaceId, path: 'looks-python.py', include_diff: true }
+  }), 'scoped Python git_diff');
+  assert.equal(scopedGitDiff.structuredContent.diff.includes('ACTUAL_LITERAL_SECRET_7X9'), true, 'scoped Python git_diff lost lawful source bytes');
+  assert.equal(resultText(scopedGitDiff).includes('ACTUAL_LITERAL_SECRET_7X9'), true, 'scoped Python git_diff content diff was re-redacted');
+  const mixedGitDiff = assertToolSuccess(await client.request('tools/call', {
+    name: 'git_diff',
+    arguments: { workspace_id: workspaceId, include_diff: true }
+  }), 'mixed repo-wide git_diff');
+  const mixedGitText = resultText(mixedGitDiff);
+  assert.equal(mixedGitText.includes('+++ b/looks-python.py'), true, 'repo-wide git_diff omitted Python header');
+  assert.equal(mixedGitText.includes('+++ b/looks-python.txt'), true, 'repo-wide git_diff omitted non-Python header');
+  assert.match(mixedGitText, /\+    token: Token\[ACTUAL_LITERAL_SECRET_7X9\]/u, 'repo-wide git_diff changed lawful Python hunk');
+  const mixedTextHeader = mixedGitText.indexOf('+++ b/looks-python.txt');
+  const mixedTextEnd = mixedGitText.indexOf('diff --git ', mixedTextHeader + 1);
+  const mixedTextBlock = mixedGitText.slice(mixedTextHeader, mixedTextEnd < 0 ? undefined : mixedTextEnd);
+  assert.equal(mixedTextBlock.includes('ACTUAL_LITERAL_SECRET_7X9'), false, 'repo-wide git_diff leaked non-Python hunk');
+  assert.equal(mixedTextBlock.includes('[REDACTED_SECRET]'), true, 'repo-wide git_diff omitted non-Python redaction marker');
+  const shownChanges = assertToolSuccess(await client.request('tools/call', {
+    name: 'show_changes',
+    arguments: { workspace_id: workspaceId, include_diff: true, since: 'workspace', mark_reviewed: false }
+  }), 'mixed repo-wide show_changes');
+  const shownText = resultText(shownChanges);
+  assert.match(shownText, /\+    token: Token\[ACTUAL_LITERAL_SECRET_7X9\]/u, 'show_changes changed lawful Python hunk');
+  const shownTextHeader = shownText.indexOf('+++ b/looks-python.txt');
+  const shownTextEnd = shownText.indexOf('diff --git ', shownTextHeader + 1);
+  const shownTextBlock = shownText.slice(shownTextHeader, shownTextEnd < 0 ? undefined : shownTextEnd);
+  assert.equal(shownTextBlock.includes('ACTUAL_LITERAL_SECRET_7X9'), false, 'show_changes leaked non-Python hunk');
+  assert.equal(shownTextBlock.includes('[REDACTED_SECRET]'), true, 'show_changes omitted non-Python redaction marker');
 
   const privateWrite = assertToolError(await client.request('tools/call', {
     name: 'write',

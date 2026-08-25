@@ -2,9 +2,9 @@ import { spawnSync } from "node:child_process";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, PathGuard } from "./guard.js";
-import { redactDiagnosticText, redactSensitiveText } from "./redact.js";
+import { redactDiagnosticText, redactSensitiveText, redactUnifiedDiff, sourceLanguageForPath } from "./redact.js";
 
-function runGit(workspace: Workspace, args: string[], maxOutputBytes: number): string {
+function runGit(workspace: Workspace, args: string[], maxOutputBytes: number, scopedSourcePath?: string): string {
   const result = spawnSync("git", args, {
     cwd: workspace.root,
     encoding: "utf8",
@@ -19,7 +19,13 @@ function runGit(workspace: Workspace, args: string[], maxOutputBytes: number): s
     const stdout = result.stdout?.trim() || "";
     return redactDiagnosticText(stderr || stdout || `git exited with status ${result.status}`);
   }
-  return redactSensitiveText(result.stdout.trim() || "(no output)");
+  const output = result.stdout.trim() || "(no output)";
+  if (args[0] === "diff") {
+    return redactUnifiedDiff(output, scopedSourcePath
+      ? () => sourceLanguageForPath(scopedSourcePath)
+      : undefined);
+  }
+  return redactSensitiveText(output);
 }
 
 function isGitFailure(output: string): boolean {
@@ -51,11 +57,13 @@ export function gitStatus(config: CodexProConfig, workspace: Workspace, guard?: 
 export function gitDiff(config: CodexProConfig, guard: PathGuard, workspace: Workspace, filePath?: string, staged = false): string {
   const args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv"];
   if (staged) args.push("--staged");
+  let scopedSourcePath: string | undefined;
   if (filePath?.trim()) {
     const resolved = guard.resolve(workspace, filePath);
     args.push("--", resolved.relPath);
+    scopedSourcePath = resolved.relPath;
   }
-  return runGit(workspace, args, config.maxOutputBytes);
+  return runGit(workspace, args, config.maxOutputBytes, scopedSourcePath);
 }
 
 export function gitDiffStatus(config: CodexProConfig, guard: PathGuard, workspace: Workspace, filePath?: string, staged = false): string {

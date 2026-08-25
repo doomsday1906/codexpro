@@ -1,5 +1,24 @@
+import {
+  createPythonProvenance,
+  ownsPythonCredential
+} from './python-provenance.mjs';
+
 const REDACTED_SECRET = '[REDACTED_SECRET]';
 export const PRIVATE_KEY_REDACTION_MARKER = '[REDACTED_PRIVATE_KEY]';
+
+// A path hint is trusted only after the caller has resolved/validated the
+// target path. Text itself never selects a parser or language.
+export function sourceLanguageForPath(filePath) {
+  const value = String(filePath ?? '').replaceAll('\\', '/');
+  return /\.(?:py|pyi|pyw)$/iu.test(value) ? 'python' : undefined;
+}
+
+function normalizeOptions(options, defaultContext = 'source') {
+  if (typeof options === 'string') return { context: options, language: undefined };
+  const context = options?.context ?? defaultContext;
+  const language = context === 'source' && options?.language === 'python' ? 'python' : undefined;
+  return { context, language };
+}
 
 const PRIVATE_KEY_LABELS = [
   'PRIVATE KEY',
@@ -14,10 +33,18 @@ const PRIVATE_KEY_LABEL_PATTERN = PRIVATE_KEY_LABELS.map((label) => label.replac
 const PRIVATE_BEGIN_PATTERN = new RegExp(`-----BEGIN\\s+(?:${PRIVATE_KEY_LABEL_PATTERN})-----`, 'gi');
 const PRIVATE_PARTIAL_PATTERN = new RegExp(`-----BEGIN\\s+(?:${PRIVATE_KEY_LABEL_PATTERN})-*(?:\\r?\\n|$)`, 'i');
 
-const REFERENCE_CALL = '[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*\\s*\\([^;\\r\\n]*\\)';
+const REFERENCE_CALL = '[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*\\s*\\([^;()=\\r\\n]*\\)';
 const CREDENTIAL_LABEL = '[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}';
-const CREDENTIAL_VALUE = `(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|\\x60[^\\x60\\r\\n]*\\x60|(?:${REFERENCE_CALL})(?=[\\s,;}\\]]|$)|[^\\s"'\\x60<>\\[\\]{},;]+)`;
+const CREDENTIAL_LABEL_PATTERN = new RegExp(`^${CREDENTIAL_LABEL}$`, 'i');
+const CREDENTIAL_PARENTHESIZED_VALUE = `\\((?:${REFERENCE_CALL}|[^()=]{1,1024})\\)`;
+const CREDENTIAL_VALUE = `(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|\\x60[^\\x60\\r\\n]*\\x60|${CREDENTIAL_PARENTHESIZED_VALUE}|(?:${REFERENCE_CALL})(?=[\\s,;})\\]]|$)|[^\\s"'\\x60<>\\[\\]{},;()]+(?![A-Za-z0-9_$])(?!(?:[ \\t]*\\()))`;
 const CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(`\\b(${CREDENTIAL_LABEL}\\s*=\\s*)(${CREDENTIAL_VALUE})`, 'gi');
+// Generic bracketed targets/PEP695 aliases are anchored to a statement start.
+// Without that boundary, `Token[str] = ...` inside an annotated declaration
+// is mistaken for a second assignment and can override the real AST owner.
+const CREDENTIAL_ALIAS_ASSIGNMENT_PATTERN = new RegExp(`((?:^|[;\\n])\\s*(?:type\\s+)?${CREDENTIAL_LABEL}\\s*\\[[^\\]\\r\\n]{1,256}\\]\\s*=\\s*)(${CREDENTIAL_VALUE})`, 'gim');
+const CREDENTIAL_SUBSCRIPT_ASSIGNMENT_PATTERN = new RegExp(`([\\[(,]\\s*${CREDENTIAL_LABEL}\\s*]\\s*=\\s*)(${CREDENTIAL_VALUE})`, 'gi');
+const CREDENTIAL_DESTRUCTURED_ASSIGNMENT_PATTERN = new RegExp(`((?:^|[\\[(,])\\s*\\*?${CREDENTIAL_LABEL}\\s*(?:[,\\]])[^=\\r\\n]{0,256}=\\s*(?:[([{]\\s*)?)(${CREDENTIAL_VALUE})`, 'gim');
 const CREDENTIAL_FIELD_PATTERN = new RegExp(`(["']?${CREDENTIAL_LABEL}["']?\\s*:\\s*)(${CREDENTIAL_VALUE})`, 'gi');
 // A typed declaration keeps the credential label and its annotation in one
 // prefix, so the initializer can be redacted without treating the annotation
@@ -282,6 +309,44 @@ function genericTailInfo(code, end) {
   };
 }
 
+function hasMalformedGenericTail(code) {
+  const text = String(code ?? '');
+  const masked = maskSourceTrivia(text);
+  for (const match of masked.matchAll(/[<[]/gu)) {
+    const tail = genericTailInfo(masked, match.index);
+    if (tail && !tail.balanced) return true;
+  }
+  return false;
+}
+
+function unmatchedCredentialParenthesisStart(text) {
+  const source = String(text ?? '');
+  const masked = maskSourceTrivia(source);
+  const candidatePattern = new RegExp(`\\b${CREDENTIAL_LABEL}\\s*(?::|=)[^\\r\\n]{0,512}\\(`, 'gi');
+  let match;
+  while ((match = candidatePattern.exec(masked)) !== null) {
+    const opening = masked.indexOf('(', match.index);
+    if (opening < 0) continue;
+    let depth = 0;
+    for (let index = opening; index < masked.length; index += 1) {
+      if (masked[index] === '(') depth += 1;
+      else if (masked[index] === ')') {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+    if (depth !== 0) return opening;
+  }
+  return -1;
+}
+
+function redactMalformedCredentialParentheses(text) {
+  const source = String(text ?? '');
+  const start = unmatchedCredentialParenthesisStart(source);
+  if (start < 0) return source;
+  return `${source.slice(0, start)}${REDACTED_SECRET}${source.slice(start).replace(/[^\r\n]/gu, '')}`;
+}
+
 function credentialValueSpanEnd(text, valueEnd) {
   const genericTail = genericTailInfo(String(text ?? ''), valueEnd);
   return genericTail ? genericTail.end : valueEnd;
@@ -305,6 +370,10 @@ function hasTypedVariableAnnotationAnchor(code, syntax, offset, assignment = '',
     if (/(?:^|[\n;{}])\s*(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*:\s*$/u.test(prefix)
       && /^\s*=/u.test(suffix)) return true;
   }
+  // A credential-looking assignment nested in a call/parenthesized expression
+  // is a keyword/value, not the enclosing declaration's initializer. Keep the
+  // declaration anchor line-local and let the nested assignment be redacted.
+  if (findEnclosingPair(syntax, '(', ')', offset)) return false;
 
   const line = sourceLineBounds(code, valueStart);
   const linePrefix = code.slice(line.start, valueStart).trim()
@@ -371,367 +440,30 @@ function hasParameterAnchor(code, syntax, offset) {
   if (!arrow && !declaration) return false;
   if (arrow) return true;
   const prefix = sourceAnchorPrefix(code, parens.open);
-  return /(?:^|[\n;{}])\s*(?:(?:export\s+)?(?:async\s+)?function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*<[^>\n]*>)?)?|(?:async\s+)?def\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*[\[<][^>\]\n]*[\]>])?|(?:async\s+)?[A-Za-z_$][A-Za-z0-9_$]*(?:\s*<[^>\n]*>)?)\s*$/u.test(prefix);
+  return /(?:^|[\n;{}])\s*(?:(?:export\s+)?(?:async\s+)?function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*<[^>\n]*>)?)?|(?:async\s+)?[A-Za-z_$][A-Za-z0-9_$]*(?:\s*<[^>\n]*>)?)\s*$/u.test(prefix);
 }
 
-function pythonIndentationColumn(line) {
-  let column = 0;
-  for (const character of line) {
-    if (character === ' ') {
-      column += 1;
-      continue;
-    }
-    if (character === '\t') {
-      column += 8 - (column % 8);
-      continue;
-    }
-    // Python's other leading control/Unicode whitespace forms have semantics
-    // that this bounded source classifier does not model. Fail closed instead
-    // of inventing an indentation ordering for them.
-    if (/\s/u.test(character)) return null;
-    return column;
-  }
-  return column;
-}
 
-function pythonLayoutLine(source, start, end) {
-  const raw = source.slice(start, end);
-  let contentStart = start;
-  // Public reads add a `N | ` prefix to every physical line. It is framing,
-  // not Python syntax, so strip it from the layout while retaining raw source
-  // offsets for candidate provenance checks.
-  const numbered = raw.match(/^\s*\d+\s*\|\s?/u);
-  if (numbered) contentStart += numbered[0].length;
-  return { start, end, contentStart, raw };
-}
-
-function pythonLayoutDiffLine(source, line) {
-  const raw = source.slice(line.start, line.end);
-  if (/^(?:diff --git\s|@@\s|---\s|\+\+\+\s|index\s|new file mode\s|old file mode\s|deleted file mode\s|similarity index\s|rename from\s|rename to\s|copy from\s|copy to\s|Binary files\s)/u.test(raw)) {
-    return { kind: 'metadata' };
-  }
-  if (/^\\(?: No newline at end of file)?\s*$/u.test(raw)) return { kind: 'metadata' };
-  if (!/^[ +\-]/u.test(raw)) return { kind: 'outside-hunk' };
-  return { kind: 'payload', start: line.start + 1 };
-}
-
-function pythonLayoutLooksLikeSuiteHeader(code) {
-  // A physical backslash continuation is layout trivia once the logical
-  // statement is assembled. Keep the scanner conservative, but permit it in
-  // otherwise parser-valid class/ suite headers.
-  const trimmed = String(code ?? '').replace(/\\[ \t]*/gu, '').trim();
-  // Keep the bounded recognizer on Python's identifier alphabet. `$` is a
-  // JavaScript identifier character but cannot begin a Python class name;
-  // accepting it here would let invalid source establish a class parent.
-  if (/^class\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*\[[\s\S]*\])?(?:\s*\([\s\S]*\))?$/u.test(trimmed)) return 'class-header';
-  if (/^(?:(?:async\s+)?def|if|for|while|try|with|match|case|else|elif|except|finally)\b[\s\S]*$/u.test(trimmed)) return 'suite-header';
-  return null;
-}
-
-function pythonLayoutStatementKind(code, suiteColon) {
-  if (suiteColon < 0) return 'statement';
-  const beforeColon = String(code ?? '').slice(0, suiteColon);
-  return pythonLayoutLooksLikeSuiteHeader(beforeColon) ?? 'statement';
-}
-
-const PYTHON_SUITE_FIRST_WORDS = new Set([
-  'async',
-  'case',
-  'class',
-  'def',
-  'elif',
-  'else',
-  'except',
-  'finally',
-  'for',
-  'if',
-  'match',
-  'try',
-  'while',
-  'with'
-]);
-
-function buildPythonSourceLayout(source) {
-  const text = String(source ?? '');
-  const statements = [];
-  const suiteStack = [];
-
-  // A layout scan is deliberately a small lexical envelope, not a Python
-  // parser. Diff mode is recognized once, then only hunk payload lines are
-  // admitted. File/hunk metadata cannot become suite parents.
-  // Unified diffs begin with one of these metadata records. Checking only the
-  // prefix keeps mode selection constant-time; the scanner still validates
-  // every subsequent hunk/file line before admitting payload.
-  const diffMode = text.startsWith('diff --git ') || text.startsWith('--- ') || text.startsWith('@@ ');
-  let inHunk = !diffMode;
-  let current = null;
-  let stringState = null;
-  let delimiterStack = [];
-  let lineLastSignificant = '';
-  let layoutUncertain = false;
-
-  const resetSuiteState = () => {
-    suiteStack.length = 0;
-    current = null;
-    stringState = null;
-    delimiterStack = [];
-    lineLastSignificant = '';
-    layoutUncertain = false;
-  };
-
-  const beginStatement = (start, indentColumn, valid = true) => {
-    current = {
-      start,
-      end: start,
-      firstCodeOffset: -1,
-      indentColumn,
-      valid: valid && indentColumn !== null && !layoutUncertain,
-      code: [],
-      suiteColon: -1,
-      firstWord: '',
-      firstWordDone: false
-    };
-  };
-
-  const appendBlank = (count = 1) => {
-    if (!current) return;
-    for (let index = 0; index < count; index += 1) current.code.push(' ');
-  };
-
-  const appendCode = (character, offset) => {
-    if (!current) return;
-    if (current.firstCodeOffset < 0 && !/[ \t\r\n]/u.test(character)) current.firstCodeOffset = offset;
-    current.code.push(character);
-    if (!current.firstWordDone) {
-      if (/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(character)) current.firstWord += character;
-      else if (current.firstWord) current.firstWordDone = true;
-      else if (!/[ \t]/u.test(character)) current.firstWordDone = true;
-    }
-    if (!/[ \t\r\n]/u.test(character)) lineLastSignificant = character;
-  };
-
-  const nearestParent = (indentColumn) => {
-    if (indentColumn === null) return null;
-    while (suiteStack.length > 0 && indentColumn <= suiteStack[suiteStack.length - 1].indentColumn) suiteStack.pop();
-    return suiteStack[suiteStack.length - 1] ?? null;
-  };
-
-  const finishStatement = (forcedInvalid = false, endOverride = undefined) => {
-    if (!current) return null;
-    const statement = current;
-    current = null;
-    if (statement.firstCodeOffset < 0) return null;
-    const code = statement.code.join('');
-    const kind = pythonLayoutStatementKind(code, statement.suiteColon);
-    const valid = statement.valid && !forcedInvalid && delimiterStack.length === 0 && !stringState;
-    if (statement.indentColumn === null) {
-      // An unsupported leading whitespace form makes parent ordering unknown;
-      // do not let a later statement inherit a class suite through it.
-      suiteStack.length = 0;
-      layoutUncertain = true;
-    }
-    const parent = valid ? nearestParent(statement.indentColumn) : null;
-    const record = {
-      start: statement.start,
-      end: endOverride ?? statement.end,
-      firstCodeOffset: statement.firstCodeOffset,
-      indentColumn: statement.indentColumn,
-      parent,
-      parentKind: parent?.kind ?? null,
-      kind,
-      classHeaderKind: kind === 'class-header' ? 'class-header' : null,
-      valid
-    };
-    statements.push(record);
-    if (valid && (kind === 'class-header' || kind === 'suite-header')) suiteStack.push(record);
-    return record;
-  };
-
-  const startInlineStatement = (offset, indentColumn) => {
-    beginStatement(offset, indentColumn, true);
-    lineLastSignificant = '';
-  };
-
-  const processBoundary = () => {
-    if (!current) return;
-    current.end = current.end || current.start;
-    const continued = Boolean(stringState || delimiterStack.length > 0 || lineLastSignificant === '\\');
-    if (!continued) finishStatement(false, current.end);
-    else appendBlank();
-  };
-
-  // Discover each physical line boundary as the scanner reaches it. This
-  // keeps the layout construction to one bounded left-to-right pass rather
-  // than materializing a second full source representation first.
-  let lineStart = 0;
-  while (lineStart <= text.length) {
-    let lineEnd = lineStart;
-    while (lineEnd < text.length && text[lineEnd] !== '\n' && text[lineEnd] !== '\r') lineEnd += 1;
-    const next = lineEnd < text.length
-      ? (text[lineEnd] === '\r' && text[lineEnd + 1] === '\n' ? lineEnd + 2 : lineEnd + 1)
-      : text.length;
-    const line = { start: lineStart, end: lineEnd };
-    const diffInfo = diffMode ? pythonLayoutDiffLine(text, line) : { kind: 'payload', start: line.start };
-    if (diffMode && diffInfo.kind === 'metadata') {
-      const raw = text.slice(line.start, line.end);
-      if (/^@@\s/u.test(raw)) inHunk = true;
-      else if (/^(?:diff --git\s|---\s|\+\+\+\s)/u.test(raw)) inHunk = false;
-      resetSuiteState();
-      if (lineEnd >= text.length) break;
-      lineStart = next;
-      continue;
-    }
-    if (diffMode && (!inHunk || diffInfo.kind !== 'payload')) {
-      resetSuiteState();
-      if (lineEnd >= text.length) break;
-      lineStart = next;
-      continue;
-    }
-
-    const layoutLine = pythonLayoutLine(text, line.start, line.end);
-    const payloadStart = diffMode ? Math.min(line.end, diffInfo.start) : layoutLine.contentStart;
-    const contentStart = diffMode
-      ? pythonLayoutLine(text, payloadStart, line.end).contentStart
-      : layoutLine.contentStart;
-    const content = text.slice(contentStart, line.end);
-    const indentColumn = current ? current.indentColumn : pythonIndentationColumn(content);
-    if (!current) beginStatement(contentStart, indentColumn, true);
-    current.end = line.end;
-    lineLastSignificant = '';
-    let inlineIndentColumn = null;
-    let inComment = false;
-
-    for (let index = contentStart; index < line.end; index += 1) {
-      const character = text[index];
-      if (!current && character !== '#' && !/[ \t]/u.test(character)) {
-        startInlineStatement(index, inlineIndentColumn ?? (indentColumn === null ? null : indentColumn + 1));
-      }
-      if (inComment) {
-        appendBlank();
-        continue;
-      }
-
-      if (stringState) {
-        if (stringState.escaped) {
-          appendBlank();
-          stringState.escaped = false;
-          continue;
-        }
-        if (character === '\\') {
-          appendBlank();
-          stringState.escaped = true;
-          continue;
-        }
-        const delimiter = stringState.triple ? stringState.quote.repeat(3) : stringState.quote;
-        if (text.startsWith(delimiter, index)) {
-          appendBlank(delimiter.length);
-          index += delimiter.length - 1;
-          stringState = null;
-          continue;
-        }
-        appendBlank();
-        continue;
-      }
-
-      if (character === '#') {
-        appendBlank();
-        inComment = true;
-        continue;
-      }
-      if (character === '"' || character === "'") {
-        const triple = text.startsWith(character.repeat(3), index);
-        appendBlank(triple ? 3 : 1);
-        if (triple) index += 2;
-        stringState = { quote: character, triple, escaped: false };
-        continue;
-      }
-
-      if (character === '(' || character === '[' || character === '{') {
-        delimiterStack.push(character);
-        appendCode(character, index);
-        continue;
-      }
-      if (character === ')' || character === ']' || character === '}') {
-        const expected = character === ')' ? '(' : character === ']' ? '[' : '{';
-        if (delimiterStack.length === 0 || delimiterStack[delimiterStack.length - 1] !== expected) current.valid = false;
-        else delimiterStack.pop();
-        appendCode(character, index);
-        continue;
-      }
-
-      if (character === ':' && delimiterStack.length === 0 && current.suiteColon < 0) {
-        const inlineCompound = inlineIndentColumn !== null;
-        const suiteKind = PYTHON_SUITE_FIRST_WORDS.has(current.firstWord)
-          ? pythonLayoutLooksLikeSuiteHeader(current.code.join(''))
-          : null;
-        appendCode(character, index);
-        if (suiteKind) {
-          current.suiteColon = current.code.length - 1;
-          finishStatement(false, index + 1);
-          // A compound suite cannot legally follow the simple suite body on
-          // the same physical line. Keep that malformed route fail-closed so
-          // its following credential-looking statement cannot inherit the
-          // enclosing class merely from virtual inline indentation.
-          inlineIndentColumn = inlineCompound
-            ? indentColumn
-            : (indentColumn === null ? null : indentColumn + 1);
-        }
-        continue;
-      }
-      if (character === ';' && delimiterStack.length === 0) {
-        const statementIndent = current.indentColumn;
-        appendCode(character, index);
-        finishStatement(false, index + 1);
-        startInlineStatement(index + 1, statementIndent ?? inlineIndentColumn ?? indentColumn);
-        continue;
-      }
-      appendCode(character, index);
-      // Keep an invalid state for control characters that are not supported
-      // by this bounded lexical envelope; ordinary spaces/tabs remain valid.
-      if (current && character !== ' ' && character !== '\t' && character.charCodeAt(0) < 0x20) current.valid = false;
-    }
-    if (current) current.end = line.end;
-    processBoundary();
-    if (stringState || delimiterStack.length > 0 || lineLastSignificant === '\\') appendBlank();
-    if (lineEnd >= text.length) break;
-    lineStart = next;
-  }
-
-  if (current) finishStatement(true, current.end);
-  return { statements, uncertain: layoutUncertain, diffMode };
-}
-
-function findPythonLayoutStatement(layout, offset) {
-  const statements = layout?.statements ?? [];
-  let low = 0;
-  let high = statements.length - 1;
-  while (low <= high) {
-    const middle = low + Math.floor((high - low) / 2);
-    const statement = statements[middle];
-    if (offset < statement.start) high = middle - 1;
-    else if (offset >= statement.end) low = middle + 1;
-    else return statement;
-  }
-  return null;
-}
-
-function hasPythonClassAnchor(syntax, offset) {
-  const statement = findPythonLayoutStatement(syntax?.pythonLayout, offset);
-  if (!statement || !statement.valid) return false;
-  // The candidate must itself be the first code/member occurrence. This
-  // rejects labels nested in assignments, containers, calls, and suites.
-  return statement.firstCodeOffset === offset && statement.parent?.kind === 'class-header';
-}
 
 function hasBalancedGenericTail(code, end) {
   const tail = genericTailInfo(code, end);
   return !tail || tail.balanced;
 }
 
-function createSourceSyntax(text) {
+function createSourceSyntax(text, language) {
   const source = String(text ?? '');
   const code = maskSourceTrivia(source);
-  return { code, pairs: buildDelimiterPairs(code), pythonLayout: buildPythonSourceLayout(source) };
+  return {
+    code,
+    pairs: buildDelimiterPairs(code),
+    language,
+    // Parser authority is opt-in from a trusted path-derived language hint.
+    // Diagnostics, URLs, config, and generic text deliberately carry no
+    // provenance object, even when their bytes resemble Python.
+    pythonProvenance: language === 'python'
+      ? createPythonProvenance(source, { language })
+      : undefined
+  };
 }
 
 function isCredibleSourceReference(value, text, offset, assignment = '', syntax = undefined) {
@@ -741,6 +473,18 @@ function isCredibleSourceReference(value, text, offset, assignment = '', syntax 
   const valueStart = offset + assignment.length;
   const valueEnd = valueStart + raw.length;
   const original = String(text ?? '');
+  if (hasMalformedGenericTail(assignment)) return false;
+  // Parser ownership is authoritative only for an explicitly trusted Python
+  // source hint. A Python-looking string passed without that hint remains
+  // generic/fail-closed rather than silently selecting a parser.
+  if (syntax.language === 'python') {
+    // AST ownership grants the Python source-fidelity exception for supported
+    // declaration roles. Parser-unowned reference assignments still use the
+    // language-neutral envelope below (for example `TOKEN = os.getenv(...)`);
+    // literal/value-shaped occurrences continue through the generic checks and
+    // therefore remain fail-closed.
+    if (ownsPythonCredential({ provenance: syntax.pythonProvenance, offset, valueStart })) return true;
+  }
   // Only the matched occurrence's code boundary must survive trivia masking.
   // Calls such as os.getenv("TOKEN") legitimately contain masked string bytes
   // inside the outer source expression, so comparing the complete slice would
@@ -752,19 +496,16 @@ function isCredibleSourceReference(value, text, offset, assignment = '', syntax 
   const typedAnnotation = hasTypedVariableAnnotationAnchor(syntax.code, syntax, offset, assignment, raw);
   const typeLikeBody = hasTypeLikeBodyAnchor(syntax.code, syntax, offset);
   const parameter = hasParameterAnchor(syntax.code, syntax, offset);
-  const pythonClass = hasPythonClassAnchor(syntax, offset);
   const destructuring = hasDestructuringAnchor(syntax.code, syntax, offset);
-  // The credential value matcher intentionally remains language-neutral and
-  // may capture a physical backslash before a continued class annotation's
-  // real type name. The layout has already proved this is the first direct
-  // class member, so preserve that continuation instead of redacting the
-  // separator and leaving the type tail behind.
-  if (raw === '\\' && pythonClass) return true;
   const initializerGeneric = Boolean(genericTail && /=\s*$/u.test(assignment));
+  // An unhinted `name: Type = value` is Python-looking source, not a lawful
+  // generic source reference. Only an explicit Python language hint may grant
+  // its AST declaration ownership; TS/JS declarations retain their keyword.
+  if (syntax.language !== 'python' && isPythonLikeTypedAssignment(assignment)) return false;
   // A generic tail is source syntax only when a surrounding type, parameter,
   // annotation, or destructuring anchor proves that it is not a value. In an
   // object/config expression it remains part of the credential-looking value.
-  if (genericTail && (initializerGeneric || !(typedAnnotation || typeLikeBody || parameter || pythonClass || destructuring))) return false;
+  if (genericTail && (initializerGeneric || !(typedAnnotation || typeLikeBody || parameter || destructuring))) return false;
   const expressionReference = isReferenceExpression(raw, { allowAnyRoot: true });
   if (!reference && !expressionReference) return typedAnnotation && !/=\s*$/u.test(assignment);
   const memberExpression = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/u.test(raw);
@@ -781,9 +522,13 @@ function isCredibleSourceReference(value, text, offset, assignment = '', syntax 
     || typedAnnotation
     || destructuring
     || typeLikeBody
-    || objectExpression
-    || parameter
-    || pythonClass;
+    // A parser-unowned Python occurrence inside a dict/object remains a
+    // value-shaped hostile case even when its value happens to look like a
+    // generic reference. The language-neutral object envelope remains
+    // available for non-Python source, while ordinary Python reference
+    // assignments (outside the container) use the branches above.
+    || (objectExpression && syntax.language !== 'python')
+    || parameter;
 }
 
 function isSourceDeclaration(text, offset, assignment = '', context = 'source') {
@@ -794,6 +539,11 @@ function isSourceDeclaration(text, offset, assignment = '', context = 'source') 
     ? '(?:\\[[^\\]\\r\\n]{1,64}\\]\\s*)?'
     : '(?:(?:\\d+\\s*\\|\\s*)|(?:[+-]\\s*))?';
   return new RegExp(`^\\s*${structuralPrefix}(?:export\\s+)?(?:const|let|var)\\s+[A-Za-z_$][A-Za-z0-9_$]*\\s*=\\s*$`, 'u').test(linePrefix.slice(statementStart));
+}
+
+function isPythonLikeTypedAssignment(assignment) {
+  const normalized = String(assignment ?? '').trim();
+  return /^[A-Za-z_$][A-Za-z0-9_$]*\s*:\s*[^=\r\n]{1,512}?=\s*$/u.test(normalized);
 }
 
 function safeCredentialReference(value, text, offset, context, assignment = '', syntax = undefined) {
@@ -995,25 +745,30 @@ function redactCredentialAssignment(match, prefix, value, wholeText, offset, con
   const valueEnd = offset + prefix.length + value.length;
   const genericTail = genericTailInfo(wholeText, valueEnd);
   const initializerGeneric = Boolean(genericTail && /=\s*$/u.test(prefix));
+  if (hasMalformedGenericTail(prefix)) {
+    const colon = prefix.lastIndexOf(':');
+    const equals = prefix.lastIndexOf('=');
+    if (colon >= 0 && colon < equals) return `${prefix.slice(0, colon + 1).trimEnd()} ${REDACTED_SECRET}`;
+  }
   if (context === 'source' && syntax && !initializerGeneric && (!genericTail || genericTail.balanced) && hasTypedVariableAnnotationAnchor(syntax.code, syntax, offset, prefix, value)) {
     if (!/=\s*$/u.test(prefix)) return match;
     return `${prefix}${REDACTED_SECRET}`;
   }
   const equals = prefix.lastIndexOf('=');
+  const preservedValueLineBreaks = value.replace(/[^\r\n]/gu, '');
   if (equals >= 0) {
     const beforeEquals = prefix.slice(0, equals).trimEnd();
     // Keep a separator for typed declarations so the follow-up field pass
     // cannot absorb the assignment operator into the annotation value.
     const typedSeparator = beforeEquals.includes(':') ? ' ' : '';
-    return `${beforeEquals}${typedSeparator}= ${REDACTED_SECRET}`;
+    return `${beforeEquals}${typedSeparator}= ${REDACTED_SECRET}${preservedValueLineBreaks}`;
   }
-  return `${prefix}${REDACTED_SECRET}`;
+  return `${prefix}${REDACTED_SECRET}${preservedValueLineBreaks}`;
 }
 
-function replaceCredentialMatches(text, pattern, context, syntax) {
+function collectCredentialMatches(text, pattern, context, syntax, priority) {
   pattern.lastIndex = 0;
-  let cursor = 0;
-  let output = '';
+  const matches = [];
   let match;
   while ((match = pattern.exec(text)) !== null) {
     const prefix = match[1] ?? '';
@@ -1021,22 +776,37 @@ function replaceCredentialMatches(text, pattern, context, syntax) {
     const replacement = redactCredentialAssignment(match[0], prefix, value, text, match.index, context, syntax);
     const valueEnd = match.index + prefix.length + value.length;
     const end = replacement === match[0] ? match.index + match[0].length : credentialValueSpanEnd(text, valueEnd);
-    output += text.slice(cursor, match.index) + replacement;
-    cursor = Math.max(cursor, end);
-    if (end > match.index + match[0].length) pattern.lastIndex = end;
+    matches.push({ start: match.index, end, replacement, priority });
   }
-  return output + text.slice(cursor);
+  return matches;
 }
 
-function applyCredentialPatterns(text, context) {
-  let output = text;
-  const typedSyntax = context === 'source' ? createSourceSyntax(output) : undefined;
-  output = replaceCredentialMatches(output, TYPED_DECLARATION_ASSIGNMENT_PATTERN, context, typedSyntax);
-  const assignmentSyntax = context === 'source' ? createSourceSyntax(output) : undefined;
-  output = replaceCredentialMatches(output, CREDENTIAL_ASSIGNMENT_PATTERN, context, assignmentSyntax);
-  const fieldSyntax = context === 'source' ? createSourceSyntax(output) : undefined;
-  output = replaceCredentialMatches(output, CREDENTIAL_FIELD_PATTERN, context, fieldSyntax);
-  return output;
+function applyCredentialPatterns(text, context, language) {
+  const syntax = context === 'source' ? createSourceSyntax(text, language) : undefined;
+  const candidates = [
+    [TYPED_DECLARATION_ASSIGNMENT_PATTERN, 0],
+    [CREDENTIAL_ASSIGNMENT_PATTERN, 2],
+    [CREDENTIAL_ALIAS_ASSIGNMENT_PATTERN, 2],
+    [CREDENTIAL_SUBSCRIPT_ASSIGNMENT_PATTERN, 2],
+    [CREDENTIAL_DESTRUCTURED_ASSIGNMENT_PATTERN, 2],
+    [CREDENTIAL_FIELD_PATTERN, 3]
+  ].flatMap(([pattern, priority]) => collectCredentialMatches(text, pattern, context, syntax, priority));
+  candidates.sort((left, right) => left.start - right.start || left.priority - right.priority || right.end - left.end);
+
+  const selected = [];
+  let coveredUntil = 0;
+  for (const candidate of candidates) {
+    if (candidate.start < coveredUntil) continue;
+    selected.push(candidate);
+    coveredUntil = candidate.end;
+  }
+  let cursor = 0;
+  let output = '';
+  for (const candidate of selected) {
+    output += text.slice(cursor, candidate.start) + candidate.replacement;
+    cursor = candidate.end;
+  }
+  return output + text.slice(cursor);
 }
 
 function applyDirectPatterns(text) {
@@ -1051,13 +821,13 @@ function applyDirectPatterns(text) {
 }
 
 export function redactSensitiveText(text, options = {}) {
-  const context = typeof options === 'string' ? options : options?.context ?? 'source';
+  const { context, language } = normalizeOptions(options);
   const privateSafe = redactPrivateKeys(String(text ?? ''));
   // Protect transport-shaped credentials before generic assignment handling;
   // otherwise `?codexpro_token=value` becomes `?codexpro_token= [REDACTED_SECRET]`
   // and the displayed URL no longer retains a valid query shape.
   const directSafe = applyDirectPatterns(privateSafe);
-  return applyCredentialPatterns(directSafe, context);
+  return redactMalformedCredentialParentheses(applyCredentialPatterns(directSafe, context, language));
 }
 
 export function redactSensitiveTextPreservingLines(text, options = {}) {
@@ -1114,11 +884,15 @@ function hasUnsafeCredentialMatch(text, pattern, context, syntax = undefined) {
 
 export function hasSecretValue(text, options = {}) {
   const source = String(text ?? '');
-  const context = typeof options === 'string' ? options : options?.context ?? 'source';
-  const syntax = context === 'source' ? createSourceSyntax(source) : undefined;
+  const { context, language } = normalizeOptions(options);
+  const syntax = context === 'source' ? createSourceSyntax(source, language) : undefined;
   PRIVATE_BEGIN_PATTERN.lastIndex = 0;
   if (PRIVATE_BEGIN_PATTERN.test(source) || PRIVATE_PARTIAL_PATTERN.test(source)) return true;
+  if (unmatchedCredentialParenthesisStart(source) >= 0) return true;
   if (hasUnsafeCredentialMatch(source, TYPED_DECLARATION_ASSIGNMENT_PATTERN, context, syntax)) return true;
+  if (hasUnsafeCredentialMatch(source, CREDENTIAL_ALIAS_ASSIGNMENT_PATTERN, context, syntax)) return true;
+  if (hasUnsafeCredentialMatch(source, CREDENTIAL_SUBSCRIPT_ASSIGNMENT_PATTERN, context, syntax)) return true;
+  if (hasUnsafeCredentialMatch(source, CREDENTIAL_DESTRUCTURED_ASSIGNMENT_PATTERN, context, syntax)) return true;
   if (hasUnsafeCredentialMatch(source, CREDENTIAL_ASSIGNMENT_PATTERN, context, syntax)) return true;
   if (hasUnsafeCredentialMatch(source, CREDENTIAL_FIELD_PATTERN, context, syntax)) return true;
 
@@ -1141,6 +915,88 @@ export function hasSecretValue(text, options = {}) {
     }
   }
   return false;
+}
+
+function diffPathFromBlock(block) {
+  const lines = String(block ?? '').split(/\r?\n/u);
+  const candidates = [
+    lines.find((line) => line.startsWith('+++ ')),
+    lines.find((line) => line.startsWith('--- '))
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    let value = candidate.slice(4).split('\t')[0].trim();
+    if (value.startsWith('"') && value.endsWith('"')) {
+      const encoded = value.slice(1, -1);
+      let decoded = '';
+      const octets = [];
+      const flushOctets = () => {
+        if (!octets.length) return;
+        decoded += Buffer.from(octets).toString('utf8');
+        octets.length = 0;
+      };
+      for (let index = 0; index < encoded.length; index += 1) {
+        if (encoded[index] !== '\\') {
+          flushOctets();
+          decoded += encoded[index];
+          continue;
+        }
+        const escaped = encoded[++index];
+        if (escaped === undefined) break;
+        if (/[0-7]/u.test(escaped)) {
+          let octal = escaped;
+          for (let count = 0; count < 2 && /[0-7]/u.test(encoded[index + 1] ?? ''); count += 1) octal += encoded[++index];
+          octets.push(Number.parseInt(octal, 8));
+        } else {
+          flushOctets();
+          decoded += ({ a: '\x07', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v' }[escaped] ?? escaped);
+        }
+      }
+      flushOctets();
+      value = decoded;
+    }
+    if (value === '/dev/null') continue;
+    value = value.replace(/^(?:[ab])\//u, '');
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function diffBlocks(text) {
+  const source = String(text ?? '');
+  if (/^diff --git\s/mu.test(source)) {
+    return source.split(/(?=^diff --git\s)/mu).filter((block) => block.length > 0);
+  }
+  // Some callers provide a minimal unified patch without `diff --git`
+  // records. Split each `---`/`+++` pair so a later non-Python file cannot
+  // inherit the first file's parser authority.
+  if (/^---\s/mu.test(source) && /^\+\+\+\s/mu.test(source)) {
+    return source.split(/(?=^---\s)/mu).filter((block) => block.length > 0);
+  }
+  return [source];
+}
+
+// Unified diff output is a collection of per-file target routes. The caller
+// may provide a validated-path callback; unknown paths intentionally receive
+// no parser authority and therefore use the generic fail-closed policy.
+export function redactUnifiedDiff(text, options = {}) {
+  const languageForPath = typeof options?.languageForPath === 'function'
+    ? options.languageForPath
+    : sourceLanguageForPath;
+  return diffBlocks(text).map((block) => {
+    const language = languageForPath(diffPathFromBlock(block));
+    return redactSensitiveText(block, { context: 'source', language: language === 'python' ? 'python' : undefined });
+  }).join('');
+}
+
+export function hasSecretValueInUnifiedDiff(text, options = {}) {
+  const languageForPath = typeof options?.languageForPath === 'function'
+    ? options.languageForPath
+    : sourceLanguageForPath;
+  return diffBlocks(text).some((block) => {
+    const language = languageForPath(diffPathFromBlock(block));
+    return hasSecretValue(block, { context: 'source', language: language === 'python' ? 'python' : undefined });
+  });
 }
 
 function utf8PrefixLength(buffer, limit) {
