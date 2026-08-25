@@ -431,13 +431,11 @@ function hasPythonClassParent(code, offset) {
   // meaningful line at a strictly smaller indentation is the only provenance
   // boundary that can establish a direct class annotation.
   let previousEnd = currentBounds.start;
-  let inspected = 0;
-  while (previousEnd > 0 && inspected < 96) {
+  while (previousEnd > 0) {
     while (previousEnd > 0 && (code[previousEnd - 1] === '\n' || code[previousEnd - 1] === '\r')) previousEnd -= 1;
     const previousStart = code.lastIndexOf('\n', previousEnd - 1) + 1;
     const previousLine = code.slice(previousStart, previousEnd).replace(/^\s*\d+\s*\|\s?/u, '');
     previousEnd = previousStart;
-    inspected += 1;
     if (!previousLine.trim()) continue;
     const previousIndent = pythonIndentationColumn(previousLine);
     if (previousIndent === null) return false;

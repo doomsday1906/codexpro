@@ -214,6 +214,19 @@ function assertPythonParserAccepted(source, label) {
   assert.equal(result.status, 0, `${label} was not accepted by Python: ${result.stderr || result.stdout}`);
 }
 
+function assertPythonAstAccepted(source, label) {
+  const parserScript = [
+    'import ast, sys',
+    'ast.parse(sys.stdin.read(), filename="fixture.py", mode="exec")'
+  ].join('\n');
+  const result = spawnSync(
+    'python3',
+    ['-c', parserScript],
+    { input: source, encoding: 'utf8' }
+  );
+  assert.equal(result.status, 0, `${label} was not accepted by ast.parse: ${result.stderr || result.stdout}`);
+}
+
 const sourceTs = [
   'const isCurrentTransition = (token: PlayerSessionTransitionToken): boolean => true;',
   'const { hasSecretValue: policyHasSecretValue, apiToken: configuredToken } = policy;',
@@ -270,6 +283,26 @@ const sourcePy = [
   '    token: Token[str]',
   ''
 ].join('\n');
+
+function pythonBoundarySource(memberCount) {
+  const members = Array.from({ length: memberCount }, (_, index) => `    field_${index}: str`);
+  return [`class Boundary${memberCount}:`, ...members, '    token: Token[str]', ''].join('\n');
+}
+
+const pythonBoundaryMemberCounts = [0, 1, 95, 96, 97, 128, 256];
+const pythonBoundaryLongMemberCount = 512;
+const pythonBoundarySources = new Map(
+  [...pythonBoundaryMemberCounts, pythonBoundaryLongMemberCount]
+    .map((memberCount) => [memberCount, pythonBoundarySource(memberCount)])
+);
+
+for (const [memberCount, source] of pythonBoundarySources) {
+  const label = `Python direct class annotation after ${memberCount} members`;
+  assertPythonAstAccepted(source, label);
+  assertPythonParserAccepted(source, label);
+  assert.equal(redactSensitiveText(source), source, `${label} changed source bytes`);
+  assert.equal(hasSecretValue(source), false, `${label} was classified as hostile`);
+}
 
 // These Python fixtures separate lawful class/type provenance from nested
 // dictionary and block values. The expected lawful result is the exact source
@@ -957,6 +990,8 @@ try {
   await writeFixture(tmp, 'python-provenance-hostile.py', pythonProvenanceHostile);
   await writeFixture(tmp, 'python-mixed-provenance.py', pythonMixedProvenance);
   await writeFixture(tmp, 'python-continuation-provenance.py', pythonContinuationProvenance);
+  await writeFixture(tmp, 'python-boundary-96.py', pythonBoundarySources.get(96));
+  await writeFixture(tmp, `python-boundary-${pythonBoundaryLongMemberCount}.py`, pythonBoundarySources.get(pythonBoundaryLongMemberCount));
   await writeFixture(tmp, collisionPath, collisionSource);
   await writeFixture(tmp, 'identical-source-a.ts', identicalSourceBody);
   await writeFixture(tmp, 'identical-source-b.ts', identicalSourceBody);
@@ -1685,6 +1720,139 @@ try {
         }
       }
     }
+  }
+
+  const pythonBoundaryMcpFixtures = [
+    {
+      memberCount: 96,
+      path: 'python-boundary-96.py',
+      source: pythonBoundarySources.get(96)
+    },
+    {
+      memberCount: pythonBoundaryLongMemberCount,
+      path: `python-boundary-${pythonBoundaryLongMemberCount}.py`,
+      source: pythonBoundarySources.get(pythonBoundaryLongMemberCount)
+    }
+  ];
+  for (const fixture of pythonBoundaryMcpFixtures) {
+    const label = `Python ${fixture.memberCount}-member boundary`;
+    const targetLine = fixture.memberCount + 2;
+    const multiLineStart = targetLine - 1;
+    const multiLineEnd = targetLine + 1;
+    const full = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: fixture.path }
+    }), `${label} full read`);
+    const fullExpected = assertReadMetadata(full, fixture.source, 1, undefined, `${label} full read`);
+    assert.equal(full.structuredContent.text, fullExpected.text, `${label} full read changed lawful source bytes`);
+    assert.equal(full.structuredContent.text.includes('[REDACTED_SECRET]'), false, `${label} full read redacted lawful source`);
+    assert.equal(full.content?.[0]?.text.includes(fullExpected.text), true, `${label} full read content envelope changed lawful source bytes`);
+    expectNoRawCredential(full, `${label} full read`);
+
+    for (const [startLine, endLine, rangeLabel] of [
+      [targetLine, targetLine, 'one-line Token[str]'],
+      [multiLineStart, multiLineEnd, 'multi-line surrounding range']
+    ]) {
+      const ranged = assertToolSuccess(await client.request('tools/call', {
+        name: 'read',
+        arguments: { workspace_id: workspaceId, path: fixture.path, start_line: startLine, end_line: endLine }
+      }), `${label} ${rangeLabel} read`);
+      const expected = assertReadMetadata(ranged, fixture.source, startLine, endLine, `${label} ${rangeLabel} read`);
+      assert.equal(ranged.structuredContent.text, expected.text, `${label} ${rangeLabel} read changed lawful source bytes`);
+      assert.equal(ranged.structuredContent.text.includes('[REDACTED_SECRET]'), false, `${label} ${rangeLabel} read redacted lawful source`);
+      assert.equal(ranged.content?.[0]?.text.includes(expected.text), true, `${label} ${rangeLabel} read content envelope changed lawful source bytes`);
+      expectNoRawCredential(ranged, `${label} ${rangeLabel} read`);
+    }
+
+    const boundaryBatchItems = [
+      { path: fixture.path, start_line: targetLine, end_line: targetLine },
+      { path: fixture.path, start_line: multiLineStart, end_line: multiLineEnd }
+    ];
+    const boundaryBatch = assertToolSuccess(await client.request('tools/call', {
+      name: 'read_many',
+      arguments: { workspace_id: workspaceId, items: boundaryBatchItems }
+    }), `${label} read_many`);
+    const boundaryResults = boundaryBatch.structuredContent.results ?? [];
+    assert.equal(boundaryResults.length, boundaryBatchItems.length, `${label} read_many changed item count`);
+    for (const [index, item] of boundaryBatchItems.entries()) {
+      const expected = projectedRange(fixture.source, item.start_line, item.end_line);
+      const actual = boundaryResults[index];
+      assert.deepEqual(
+        { index: actual.index, path: actual.path, ok: actual.ok, text: actual.result?.text },
+        { index, path: fixture.path, ok: true, text: expected.text },
+        `${label} read_many changed item ${index}`
+      );
+      expectNoRawCredential(actual, `${label} read_many item ${index}`);
+    }
+    expectNoRawLiterals(boundaryBatch, ['[REDACTED_SECRET]'], `${label} read_many`);
+
+    for (const [variantName, variantArgs, searchQuery] of [
+      ['plain', {}, 'Token[str]'],
+      ['structured', { intent: 'text' }, 'Token[str]'],
+      // Keep the regex query itself a lawful literal so the MCP analysis
+      // field can prove it remains visible rather than being replaced by a
+      // policy marker; the exact match assertion still checks Token[str].
+      ['regex', { regex: true }, 'Token'],
+      ['structured-regex', { intent: 'text', regex: true }, 'Token']
+    ]) {
+      const searched = assertToolSuccess(await client.request('tools/call', {
+        name: 'search',
+        arguments: { workspace_id: workspaceId, query: searchQuery, path: fixture.path, max_results: 20, ...variantArgs }
+      }), `${label} ${variantName} search`);
+      const matches = searched.structuredContent.matches ?? [];
+      assert.deepEqual(matches.map((match) => match.line), [targetLine], `${label} ${variantName} search changed exact match line`);
+      assert.equal(matches.length, 1, `${label} ${variantName} search changed exact match count`);
+      assert.equal(matches[0].path, fixture.path, `${label} ${variantName} search changed match path`);
+      assert.equal(matches[0].text, '    token: Token[str]', `${label} ${variantName} search changed exact match text`);
+      const analysis = searched.structuredContent.analysis;
+      if (analysis && Object.prototype.hasOwnProperty.call(analysis, 'query')) {
+        assert.notEqual(analysis.query, '[REDACTED_SECRET]', `${label} ${variantName} search redacted lawful analysis.query`);
+      }
+      assert.equal(resultText(searched).includes('[REDACTED_SECRET]'), false, `${label} ${variantName} search redacted lawful content`);
+      expectNoRawCredential(searched, `${label} ${variantName} search`);
+    }
+  }
+
+  for (const fixture of pythonBoundaryMcpFixtures) {
+    const writePath = `python-boundary-${fixture.memberCount}-write.py`;
+    const written = assertToolSuccess(await client.request('tools/call', {
+      name: 'write',
+      arguments: { workspace_id: workspaceId, path: writePath, content: fixture.source }
+    }), `Python ${fixture.memberCount}-member lawful write`);
+    assert.ok(written.structuredContent, `Python ${fixture.memberCount}-member lawful write omitted structured output`);
+    assert.equal(await fs.readFile(path.join(tmp, writePath), 'utf8'), fixture.source, `Python ${fixture.memberCount}-member lawful write changed source`);
+
+    const edited = assertToolSuccess(await client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: workspaceId,
+        path: writePath,
+        old_text: '    field_0: str',
+        new_text: '    field_0: int',
+        expected_replacements: 1
+      }
+    }), `Python ${fixture.memberCount}-member lawful edit`);
+    assert.ok(edited.structuredContent, `Python ${fixture.memberCount}-member lawful edit omitted structured output`);
+    const afterEdit = fixture.source.replace('    field_0: str', '    field_0: int');
+    assert.equal(await fs.readFile(path.join(tmp, writePath), 'utf8'), afterEdit, `Python ${fixture.memberCount}-member lawful edit changed source`);
+
+    const patch = [
+      `diff --git a/${writePath} b/${writePath}`,
+      `--- a/${writePath}`,
+      `+++ b/${writePath}`,
+      '@@ -1,4 +1,4 @@',
+      ` class Boundary${fixture.memberCount}:`,
+      '     field_0: int',
+      '-    field_1: str',
+      '+    field_1: int',
+      '     field_2: str'
+    ].join('\n') + '\n';
+    assertToolSuccess(await client.request('tools/call', {
+      name: 'apply_patch',
+      arguments: { workspace_id: workspaceId, patch }
+    }), `Python ${fixture.memberCount}-member lawful apply_patch`);
+    const afterPatch = afterEdit.replace('    field_1: str', '    field_1: int');
+    assert.equal(await fs.readFile(path.join(tmp, writePath), 'utf8'), afterPatch, `Python ${fixture.memberCount}-member lawful apply_patch changed source`);
   }
 
   const lawfulRangeBatchItems = [
