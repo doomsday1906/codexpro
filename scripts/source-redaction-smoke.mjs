@@ -296,6 +296,165 @@ const pythonBoundarySources = new Map(
     .map((memberCount) => [memberCount, pythonBoundarySource(memberCount)])
 );
 
+function pythonLogicalClassSource({ header, bodyIndent = '    ', memberCount = 0 }) {
+  const members = Array.from({ length: memberCount }, (_, index) => `${bodyIndent}field_${index}: str`);
+  return [...header, ...members, `${bodyIndent}token: Token[str]`, ''].join('\n');
+}
+
+const pythonLogicalFixtureSpecs = [
+  {
+    id: 'simple-multiline-base',
+    header: ['class SimpleMultiline(', '    Base,', '):'],
+    memberCount: 0
+  },
+  {
+    id: 'multiple-bases',
+    header: ['class MultipleBases(', '    FirstBase,', '    SecondBase,', '):'],
+    memberCount: 0
+  },
+  {
+    id: 'metaclass-header',
+    header: ['class WithMetaclass(', '    Base,', '    metaclass=Meta,', '):'],
+    memberCount: 0
+  },
+  {
+    id: 'nested-multiline-class',
+    header: ['class Outer:', '    class NestedMultiline(', '        Base,', '    ):'],
+    bodyIndent: '        ',
+    memberCount: 0
+  },
+  {
+    id: 'decorated-multiline-class',
+    header: [
+      '@decorator(',
+      '    "decorator trivia: []",',
+      ')',
+      'class DecoratedMultiline(',
+      '    Base,',
+      '):'
+    ],
+    memberCount: 0
+  },
+  {
+    id: 'comments-trivia-header',
+    header: [
+      'class CommentTrivia(',
+      '    # fake class Fake[Base]:',
+      '    Base,  # trailing fake ]: [',
+      '):'
+    ],
+    memberCount: 0
+  },
+  {
+    id: 'header-strings-fake-delimiters',
+    header: [
+      'class HeaderStrings(',
+      '    Base["fake brackets ] : [ and colon:"],',
+      '):'
+    ],
+    memberCount: 0
+  },
+  {
+    id: 'triple-quoted-fake-class',
+    header: [
+      'class TripleQuotedHeader(',
+      '    Base(',
+      '        """fake class Fake(',
+      '            FakeBase,',
+      '        ):',
+      '            fake: str',
+      '        """',
+      '    ),',
+      '):'
+    ],
+    memberCount: 0
+  },
+  {
+    id: 'mixed-tabs-spaces-header',
+    header: ['class MixedTabsSpaces(', '    Base,', '):'],
+    bodyIndent: '\t',
+    memberCount: 0
+  },
+  {
+    id: 'multiline-base-96-members',
+    header: ['class MultilineBase96(', '    Base,', '):'],
+    memberCount: 96
+  },
+  {
+    id: 'multiline-base-512-members',
+    header: ['class MultilineBase512(', '    Base,', '):'],
+    memberCount: 512
+  }
+];
+
+const pythonLogicalFixtures = new Map(
+  pythonLogicalFixtureSpecs.map((spec) => [spec.id, {
+    ...spec,
+    source: pythonLogicalClassSource(spec),
+    path: `python-logical-${spec.id}.py`
+  }])
+);
+
+const pythonHostileResponseLiterals = [
+  'QZ7',
+  'ACTUAL_LITERAL_SECRET_7X9',
+  'client.actualSecret',
+  'client.getSecret()',
+  'Token<ACTUAL_LITERAL_SECRET_7X9',
+  'Token<client.actualSecret',
+  'Password<client.getSecret()'
+];
+
+function pythonTokenLine(source) {
+  const lines = source.split('\n');
+  const line = lines.findIndex((candidate) => /token:\s*Token\[str\]/u.test(candidate));
+  assert.notEqual(line, -1, 'Python logical fixture omitted its direct Token[str] member');
+  return line + 1;
+}
+
+function pythonHeaderStartLine(source, fixture) {
+  const lines = source.split('\n');
+  const classIndex = lines.findLastIndex((line) => line.trim().startsWith(`class ${fixture.headerClassName}`));
+  assert.notEqual(classIndex, -1, `${fixture.id} omitted its class header`);
+  let start = classIndex;
+  while (start > 0 && lines[start - 1].trim() && !lines[start - 1].trim().startsWith('class ')) start -= 1;
+  return start + 1;
+}
+
+function pythonLogicalPatch(relativePath, source, startLine, targetLine, replacement, { add = false } = {}) {
+  const lines = source.replace(/\r\n/g, '\n').split('\n');
+  const target = lines[targetLine - 1];
+  assert.ok(target, `Python logical patch target line ${targetLine} was missing`);
+  const segment = lines.slice(startLine - 1, targetLine);
+  const context = segment.slice(0, -1).map((line) => ` ${line}`);
+  const trailingContext = targetLine < lines.length - 1
+    ? lines.slice(targetLine, targetLine + 1).map((line) => ` ${line}`)
+    : [];
+  const changeLines = add
+    ? [`+${replacement}`, ` ${target}`]
+    : [`-${target}`, `+${replacement}`];
+  const oldCount = segment.length + trailingContext.length;
+  const newCount = oldCount + (add ? 1 : 0);
+  return [
+    `diff --git a/${relativePath} b/${relativePath}`,
+    `--- a/${relativePath}`,
+    `+++ b/${relativePath}`,
+    `@@ -${startLine},${oldCount} +${startLine},${newCount} @@`,
+    ...context,
+    ...changeLines,
+    ...trailingContext
+  ].join('\n') + '\n';
+}
+
+for (const fixture of pythonLogicalFixtures.values()) {
+  fixture.headerClassName = fixture.header.find((line) => /^class\s+/u.test(line.trim()))?.trim().match(/^class\s+([A-Za-z_$][A-Za-z0-9_$]*)/u)?.[1];
+  assert.ok(fixture.headerClassName, `${fixture.id} omitted a class declaration`);
+  assertPythonAstAccepted(fixture.source, `Python logical ${fixture.id}`);
+  assertPythonParserAccepted(fixture.source, `Python logical ${fixture.id}`);
+  assert.equal(redactSensitiveText(fixture.source), fixture.source, `Python logical ${fixture.id} changed lawful source bytes`);
+  assert.equal(hasSecretValue(fixture.source), false, `Python logical ${fixture.id} was classified as hostile`);
+}
+
 for (const [memberCount, source] of pythonBoundarySources) {
   const label = `Python direct class annotation after ${memberCount} members`;
   assertPythonAstAccepted(source, label);
@@ -369,6 +528,9 @@ const pythonProvenanceHostileRedacted = [
   ''
 ].join('\n');
 
+assertPythonParserAccepted(pythonProvenanceLawful, 'Python provenance lawful fixture');
+assertPythonParserAccepted(pythonProvenanceHostile, 'Python provenance hostile fixture');
+
 // This fixture keeps a lawful direct class annotation at tab+space column 12,
 // then exercises the parseable mixed-indentation dictionary/block shapes that
 // must not inherit provenance from the surrounding class. The exact first
@@ -393,7 +555,7 @@ const pythonMixedProvenance = [
   '\t        return nested',
   '',
   '        if enabled:',
-  '\t    nested_token = Token[ACTUAL_LITERAL_SECRET_7X9]',
+  '\t        nested_token = Token[ACTUAL_LITERAL_SECRET_7X9]',
   '',
   '        deeply_nested = {',
   '\t    outer: {token: Token[ACTUAL_LITERAL_SECRET_7X9]}',
@@ -423,7 +585,7 @@ const pythonMixedProvenanceRedacted = [
   '\t        return nested',
   '',
   '        if enabled:',
-  '\t    nested_token= [REDACTED_SECRET]',
+  '\t        nested_token= [REDACTED_SECRET]',
   '',
   '        deeply_nested = {',
   '\t    outer: {token: [REDACTED_SECRET]}',
@@ -432,6 +594,8 @@ const pythonMixedProvenanceRedacted = [
   'TOP_LEVEL = {token: [REDACTED_SECRET]}',
   ''
 ].join('\n');
+
+assertPythonParserAccepted(pythonMixedProvenance, 'Python mixed-indentation provenance fixture');
 
 const pythonContinuationExplicitBackslash = '    backslash_payload = { ' + '\\';
 const pythonContinuationExplicitBackslashOnly = '    explicit_only_payload = ' + '\\';
@@ -992,6 +1156,7 @@ try {
   await writeFixture(tmp, 'python-continuation-provenance.py', pythonContinuationProvenance);
   await writeFixture(tmp, 'python-boundary-96.py', pythonBoundarySources.get(96));
   await writeFixture(tmp, `python-boundary-${pythonBoundaryLongMemberCount}.py`, pythonBoundarySources.get(pythonBoundaryLongMemberCount));
+  for (const fixture of pythonLogicalFixtures.values()) await writeFixture(tmp, fixture.path, fixture.source);
   await writeFixture(tmp, collisionPath, collisionSource);
   await writeFixture(tmp, 'identical-source-a.ts', identicalSourceBody);
   await writeFixture(tmp, 'identical-source-b.ts', identicalSourceBody);
@@ -1734,6 +1899,153 @@ try {
       source: pythonBoundarySources.get(pythonBoundaryLongMemberCount)
     }
   ];
+  for (const fixture of pythonLogicalFixtures.values()) {
+    const label = `Python logical ${fixture.id}`;
+    const tokenLine = pythonTokenLine(fixture.source);
+    const headerStartLine = pythonHeaderStartLine(fixture.source, fixture);
+    const full = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: fixture.path }
+    }), `${label} full read`);
+    const fullExpected = assertReadMetadata(full, fixture.source, 1, undefined, `${label} full read`);
+    assert.equal(full.structuredContent.text, fullExpected.text, `${label} full read changed lawful source bytes`);
+    assert.equal(full.structuredContent.text.includes('[REDACTED_SECRET]'), false, `${label} full read redacted lawful source`);
+    assert.equal(full.content?.[0]?.text.includes(fullExpected.text), true, `${label} full read content envelope changed lawful source`);
+    expectNoHostileResponseFields(full, pythonHostileResponseLiterals, `${label} full read`);
+
+    const ranges = [
+      [tokenLine, tokenLine, 'one-line Token[str]'],
+      [headerStartLine, tokenLine, 'multiline header-to-member']
+    ];
+    for (const [startLine, endLine, rangeLabel] of ranges) {
+      const ranged = assertToolSuccess(await client.request('tools/call', {
+        name: 'read',
+        arguments: { workspace_id: workspaceId, path: fixture.path, start_line: startLine, end_line: endLine }
+      }), `${label} ${rangeLabel} read`);
+      const expected = assertReadMetadata(ranged, fixture.source, startLine, endLine, `${label} ${rangeLabel} read`);
+      assert.equal(ranged.structuredContent.text, expected.text, `${label} ${rangeLabel} read changed lawful source bytes`);
+      assert.equal(ranged.structuredContent.text, projectedRange(fixture.source, startLine, endLine).text, `${label} ${rangeLabel} read diverged from raw fixture projection`);
+      assert.equal(ranged.structuredContent.text.includes('[REDACTED_SECRET]'), false, `${label} ${rangeLabel} read redacted lawful source`);
+      assert.equal(ranged.content?.[0]?.text.includes(expected.text), true, `${label} ${rangeLabel} read content envelope changed lawful source`);
+      expectNoHostileResponseFields(ranged, pythonHostileResponseLiterals, `${label} ${rangeLabel} read`);
+    }
+
+    const batchItems = ranges.map(([start_line, end_line]) => ({ path: fixture.path, start_line, end_line }));
+    const batch = assertToolSuccess(await client.request('tools/call', {
+      name: 'read_many',
+      arguments: { workspace_id: workspaceId, items: batchItems }
+    }), `${label} read_many`);
+    const batchResults = batch.structuredContent.results ?? [];
+    assert.equal(batchResults.length, batchItems.length, `${label} read_many changed item count`);
+    for (const [index, item] of batchItems.entries()) {
+      const expected = projectedRange(fixture.source, item.start_line, item.end_line);
+      const actual = batchResults[index];
+      assert.deepEqual(
+        { index: actual.index, path: actual.path, ok: actual.ok, text: actual.result?.text },
+        { index, path: fixture.path, ok: true, text: expected.text },
+        `${label} read_many changed item ${index}`
+      );
+      assert.equal(actual.result.startLine, expected.start, `${label} read_many changed item ${index} start line`);
+      assert.equal(actual.result.endLine, expected.end, `${label} read_many changed item ${index} end line`);
+      expectNoHostileResponseFields(actual, pythonHostileResponseLiterals, `${label} read_many item ${index}`);
+    }
+    expectNoHostileResponseFields(batch, pythonHostileResponseLiterals, `${label} read_many`);
+
+    for (const [variantName, variantArgs, searchQuery] of [
+      ['plain', {}, 'Token[str]'],
+      ['structured', { intent: 'text' }, 'Token[str]'],
+      ['regex', { regex: true }, 'Token\\[str\\]'],
+      ['structured-regex', { intent: 'text', regex: true }, 'Token\\[str\\]']
+    ]) {
+      const searched = assertToolSuccess(await client.request('tools/call', {
+        name: 'search',
+        arguments: { workspace_id: workspaceId, query: searchQuery, path: fixture.path, max_results: 20, ...variantArgs }
+      }), `${label} ${variantName} search`);
+      const matches = searched.structuredContent.matches ?? [];
+      assert.deepEqual(matches.map((match) => match.line), [tokenLine], `${label} ${variantName} search changed exact match line`);
+      assert.equal(matches.length, 1, `${label} ${variantName} search changed exact match count`);
+      assert.equal(matches[0].path, fixture.path, `${label} ${variantName} search changed match path`);
+      assert.equal(matches[0].text, fixture.source.split('\n')[tokenLine - 1], `${label} ${variantName} search changed exact match text`);
+      const analysis = searched.structuredContent.analysis;
+      if (variantName === 'structured') {
+        assert.ok(analysis && Object.prototype.hasOwnProperty.call(analysis, 'query'), `${label} ${variantName} search omitted analysis.query`);
+        assert.equal(analysis.query, 'Token[str]', `${label} ${variantName} search changed analysis.query`);
+      }
+      assert.equal(resultText(searched).includes('[REDACTED_SECRET]'), false, `${label} ${variantName} search redacted lawful content`);
+      expectNoHostileResponseFields(searched, pythonHostileResponseLiterals, `${label} ${variantName} search`);
+    }
+  }
+
+  const pythonLogicalMutationIds = new Set([
+    'simple-multiline-base',
+    'nested-multiline-class',
+    'multiline-base-96-members',
+    'multiline-base-512-members'
+  ]);
+  for (const fixture of [...pythonLogicalFixtures.values()].filter(({ id }) => pythonLogicalMutationIds.has(id))) {
+    const label = `Python logical ${fixture.id}`;
+    const writePath = `python-logical-${fixture.id}-write.py`;
+    const written = assertToolSuccess(await client.request('tools/call', {
+      name: 'write',
+      arguments: { workspace_id: workspaceId, path: writePath, content: fixture.source }
+    }), `${label} lawful write`);
+    assert.ok(written.structuredContent, `${label} lawful write omitted structured output`);
+    assert.equal(await fs.readFile(path.join(tmp, writePath), 'utf8'), fixture.source, `${label} lawful write changed source`);
+    assertPythonAstAccepted(fixture.source, `${label} lawful write target`);
+
+    const tokenLine = pythonTokenLine(fixture.source);
+    const headerStartLine = pythonHeaderStartLine(fixture.source, fixture);
+    const tokenIndent = fixture.source.split('\n')[tokenLine - 1].match(/^\s*/u)?.[0] ?? '    ';
+    const lawfulEdit = assertToolSuccess(await client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: workspaceId,
+        path: writePath,
+        old_text: `${tokenIndent}token: Token[str]`,
+        new_text: `${tokenIndent}token: Token[bytes]`,
+        expected_replacements: 1
+      }
+    }), `${label} lawful edit`);
+    assert.ok(lawfulEdit.structuredContent, `${label} lawful edit omitted structured output`);
+    const afterEdit = fixture.source.replace(`${tokenIndent}token: Token[str]`, `${tokenIndent}token: Token[bytes]`);
+    assert.equal(await fs.readFile(path.join(tmp, writePath), 'utf8'), afterEdit, `${label} lawful edit changed source`);
+    assertPythonAstAccepted(afterEdit, `${label} lawful edit target`);
+
+    const addedMember = `${tokenIndent}added: Token[str]`;
+    const addPatch = pythonLogicalPatch(writePath, afterEdit, headerStartLine, tokenLine, addedMember, { add: true });
+    const added = assertToolSuccess(await client.request('tools/call', {
+      name: 'apply_patch',
+      arguments: { workspace_id: workspaceId, patch: addPatch }
+    }), `${label} lawful added-member apply_patch`);
+    assert.ok(added.structuredContent, `${label} lawful added-member apply_patch omitted structured output`);
+    const afterAdd = afterEdit.replace(`${tokenIndent}token: Token[bytes]`, `${addedMember}\n${tokenIndent}token: Token[bytes]`);
+    assert.equal(await fs.readFile(path.join(tmp, writePath), 'utf8'), afterAdd, `${label} lawful added-member apply_patch changed source`);
+    assertPythonAstAccepted(afterAdd, `${label} lawful added-member patch target`);
+
+    const replacedMember = `${tokenIndent}replaced: Token[str]`;
+    const replacePatch = pythonLogicalPatch(writePath, afterAdd, headerStartLine, tokenLine, replacedMember);
+    const replaced = assertToolSuccess(await client.request('tools/call', {
+      name: 'apply_patch',
+      arguments: { workspace_id: workspaceId, patch: replacePatch }
+    }), `${label} lawful replaced-member apply_patch`);
+    assert.ok(replaced.structuredContent, `${label} lawful replaced-member apply_patch omitted structured output`);
+    const afterReplace = afterAdd.replace(addedMember, replacedMember);
+    assert.equal(await fs.readFile(path.join(tmp, writePath), 'utf8'), afterReplace, `${label} lawful replaced-member apply_patch changed source`);
+    assertPythonAstAccepted(afterReplace, `${label} lawful replaced-member patch target`);
+
+    const hostileMember = `${tokenIndent}token = "QZ7"`;
+    const hostilePatch = pythonLogicalPatch(writePath, afterReplace, headerStartLine, tokenLine, hostileMember);
+    const beforeHostilePatch = await fs.readFile(path.join(tmp, writePath), 'utf8');
+    const blocked = assertToolError(await client.request('tools/call', {
+      name: 'apply_patch',
+      arguments: { workspace_id: workspaceId, patch: hostilePatch }
+    }), `${label} hostile apply_patch`);
+    assert.match(resultText(blocked), /Secret-looking content is blocked/);
+    assert.equal(await fs.readFile(path.join(tmp, writePath), 'utf8'), beforeHostilePatch, `${label} hostile apply_patch mutated source despite rejection`);
+    assertPythonAstAccepted(beforeHostilePatch, `${label} hostile patch atomicity target`);
+    expectNoHostileResponseFields(blocked, pythonHostileResponseLiterals, `${label} hostile apply_patch`);
+  }
+
   for (const fixture of pythonBoundaryMcpFixtures) {
     const label = `Python ${fixture.memberCount}-member boundary`;
     const targetLine = fixture.memberCount + 2;

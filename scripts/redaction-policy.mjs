@@ -394,74 +394,333 @@ function pythonIndentationColumn(line) {
   return column;
 }
 
-function hasPythonDelimiterContinuation(code, syntax, offset) {
-  const currentBounds = sourceLineBounds(code, offset);
-  // A class-looking annotation on a line inside a delimiter continuation is
-  // an expression/value, not a direct class member. Track every opener (not
-  // only braces/parentheses used by the source-anchor helpers) so same-column
-  // dictionary, list, tuple, and call continuations fail closed.
-  for (const opener of syntax?.pairs?.openers ?? []) {
-    if (opener >= currentBounds.start) continue;
-    const close = syntax.pairs.openToClose.get(opener);
-    if (close === undefined || close > offset) return true;
-  }
-
-  // Explicit backslash continuation has no delimiter pair to anchor. Only
-  // the immediately preceding physical line can continue into this one;
-  // strings/comments are already blanked by maskSourceTrivia.
-  if (currentBounds.start > 0) {
-    let previousEnd = currentBounds.start - 1;
-    if (code[previousEnd] === '\n') previousEnd -= 1;
-    if (code[previousEnd] === '\r') previousEnd -= 1;
-    const previousStart = code.lastIndexOf('\n', previousEnd - 1) + 1;
-    if (/\\[ \t]*$/u.test(code.slice(previousStart, previousEnd + 1))) return true;
-  }
-
-  return false;
+function pythonLayoutLine(source, start, end) {
+  const raw = source.slice(start, end);
+  let contentStart = start;
+  // Public reads add a `N | ` prefix to every physical line. It is framing,
+  // not Python syntax, so strip it from the layout while retaining raw source
+  // offsets for candidate provenance checks.
+  const numbered = raw.match(/^\s*\d+\s*\|\s?/u);
+  if (numbered) contentStart += numbered[0].length;
+  return { start, end, contentStart, raw };
 }
 
-function hasPythonClassParent(code, offset) {
-  const currentBounds = sourceLineBounds(code, offset);
-  const currentLine = code.slice(currentBounds.start, currentBounds.end).replace(/^\s*\d+\s*\|\s?/u, '');
-  const currentIndent = pythonIndentationColumn(currentLine);
-  if (currentIndent === null) return false;
-
-  // Walk complete preceding physical lines. Same- or deeper-indentation
-  // members belong to the current suite and may be skipped; the first
-  // meaningful line at a strictly smaller indentation is the only provenance
-  // boundary that can establish a direct class annotation.
-  let previousEnd = currentBounds.start;
-  while (previousEnd > 0) {
-    while (previousEnd > 0 && (code[previousEnd - 1] === '\n' || code[previousEnd - 1] === '\r')) previousEnd -= 1;
-    const previousStart = code.lastIndexOf('\n', previousEnd - 1) + 1;
-    const previousLine = code.slice(previousStart, previousEnd).replace(/^\s*\d+\s*\|\s?/u, '');
-    previousEnd = previousStart;
-    if (!previousLine.trim()) continue;
-    const previousIndent = pythonIndentationColumn(previousLine);
-    if (previousIndent === null) return false;
-    if (previousIndent >= currentIndent) continue;
-    return /^class\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*(?:\([^\n]*\)|\[[^\n]*\]|<[^>\n]*>))?\s*:/u.test(previousLine.trim());
+function pythonLayoutDiffLine(source, line) {
+  const raw = source.slice(line.start, line.end);
+  if (/^(?:diff --git\s|@@\s|---\s|\+\+\+\s|index\s|new file mode\s|old file mode\s|deleted file mode\s|similarity index\s|rename from\s|rename to\s|copy from\s|copy to\s|Binary files\s)/u.test(raw)) {
+    return { kind: 'metadata' };
   }
-  return false;
+  if (/^\\(?: No newline at end of file)?\s*$/u.test(raw)) return { kind: 'metadata' };
+  if (!/^[ +\-]/u.test(raw)) return { kind: 'outside-hunk' };
+  return { kind: 'payload', start: line.start + 1 };
 }
 
-function hasPythonClassAnchor(code, syntax, offset) {
-  const currentBounds = sourceLineBounds(code, offset);
-  const rawCurrentLine = code.slice(currentBounds.start, currentBounds.end);
-  const currentLine = rawCurrentLine.replace(/^\s*\d+\s*\|\s?/u, '');
-  const currentIndent = pythonIndentationColumn(currentLine);
-  if (currentIndent === null) return false;
-  if (hasPythonDelimiterContinuation(code, syntax, offset)) return false;
+function pythonLayoutLooksLikeSuiteHeader(code) {
+  // A physical backslash continuation is layout trivia once the logical
+  // statement is assembled. Keep the scanner conservative, but permit it in
+  // otherwise parser-valid class/ suite headers.
+  const trimmed = String(code ?? '').replace(/\\[ \t]*/gu, '').trim();
+  // Keep the bounded recognizer on Python's identifier alphabet. `$` is a
+  // JavaScript identifier character but cannot begin a Python class name;
+  // accepting it here would let invalid source establish a class parent.
+  if (/^class\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*\[[\s\S]*\])?(?:\s*\([\s\S]*\))?$/u.test(trimmed)) return 'class-header';
+  if (/^(?:(?:async\s+)?def|if|for|while|try|with|match|case|else|elif|except|finally)\b[\s\S]*$/u.test(trimmed)) return 'suite-header';
+  return null;
+}
 
-  // A direct class-suite annotation starts at the physical line's indentation.
-  // Anything already written on that line is a nested expression/statement,
-  // not a class member, even when the line is inside a class suite.
-  const linePrefixLength = rawCurrentLine.length - currentLine.length;
-  const currentOffsetInLine = Math.max(0, offset - currentBounds.start - linePrefixLength);
-  const currentPrefix = currentLine.slice(0, currentOffsetInLine).trim();
-  if (currentPrefix) return false;
+function pythonLayoutStatementKind(code, suiteColon) {
+  if (suiteColon < 0) return 'statement';
+  const beforeColon = String(code ?? '').slice(0, suiteColon);
+  return pythonLayoutLooksLikeSuiteHeader(beforeColon) ?? 'statement';
+}
 
-  return hasPythonClassParent(code, offset);
+const PYTHON_SUITE_FIRST_WORDS = new Set([
+  'async',
+  'case',
+  'class',
+  'def',
+  'elif',
+  'else',
+  'except',
+  'finally',
+  'for',
+  'if',
+  'match',
+  'try',
+  'while',
+  'with'
+]);
+
+function buildPythonSourceLayout(source) {
+  const text = String(source ?? '');
+  const statements = [];
+  const suiteStack = [];
+
+  // A layout scan is deliberately a small lexical envelope, not a Python
+  // parser. Diff mode is recognized once, then only hunk payload lines are
+  // admitted. File/hunk metadata cannot become suite parents.
+  // Unified diffs begin with one of these metadata records. Checking only the
+  // prefix keeps mode selection constant-time; the scanner still validates
+  // every subsequent hunk/file line before admitting payload.
+  const diffMode = text.startsWith('diff --git ') || text.startsWith('--- ') || text.startsWith('@@ ');
+  let inHunk = !diffMode;
+  let current = null;
+  let stringState = null;
+  let delimiterStack = [];
+  let lineLastSignificant = '';
+  let layoutUncertain = false;
+
+  const resetSuiteState = () => {
+    suiteStack.length = 0;
+    current = null;
+    stringState = null;
+    delimiterStack = [];
+    lineLastSignificant = '';
+    layoutUncertain = false;
+  };
+
+  const beginStatement = (start, indentColumn, valid = true) => {
+    current = {
+      start,
+      end: start,
+      firstCodeOffset: -1,
+      indentColumn,
+      valid: valid && indentColumn !== null && !layoutUncertain,
+      code: [],
+      suiteColon: -1,
+      firstWord: '',
+      firstWordDone: false
+    };
+  };
+
+  const appendBlank = (count = 1) => {
+    if (!current) return;
+    for (let index = 0; index < count; index += 1) current.code.push(' ');
+  };
+
+  const appendCode = (character, offset) => {
+    if (!current) return;
+    if (current.firstCodeOffset < 0 && !/[ \t\r\n]/u.test(character)) current.firstCodeOffset = offset;
+    current.code.push(character);
+    if (!current.firstWordDone) {
+      if (/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(character)) current.firstWord += character;
+      else if (current.firstWord) current.firstWordDone = true;
+      else if (!/[ \t]/u.test(character)) current.firstWordDone = true;
+    }
+    if (!/[ \t\r\n]/u.test(character)) lineLastSignificant = character;
+  };
+
+  const nearestParent = (indentColumn) => {
+    if (indentColumn === null) return null;
+    while (suiteStack.length > 0 && indentColumn <= suiteStack[suiteStack.length - 1].indentColumn) suiteStack.pop();
+    return suiteStack[suiteStack.length - 1] ?? null;
+  };
+
+  const finishStatement = (forcedInvalid = false, endOverride = undefined) => {
+    if (!current) return null;
+    const statement = current;
+    current = null;
+    if (statement.firstCodeOffset < 0) return null;
+    const code = statement.code.join('');
+    const kind = pythonLayoutStatementKind(code, statement.suiteColon);
+    const valid = statement.valid && !forcedInvalid && delimiterStack.length === 0 && !stringState;
+    if (statement.indentColumn === null) {
+      // An unsupported leading whitespace form makes parent ordering unknown;
+      // do not let a later statement inherit a class suite through it.
+      suiteStack.length = 0;
+      layoutUncertain = true;
+    }
+    const parent = valid ? nearestParent(statement.indentColumn) : null;
+    const record = {
+      start: statement.start,
+      end: endOverride ?? statement.end,
+      firstCodeOffset: statement.firstCodeOffset,
+      indentColumn: statement.indentColumn,
+      parent,
+      parentKind: parent?.kind ?? null,
+      kind,
+      classHeaderKind: kind === 'class-header' ? 'class-header' : null,
+      valid
+    };
+    statements.push(record);
+    if (valid && (kind === 'class-header' || kind === 'suite-header')) suiteStack.push(record);
+    return record;
+  };
+
+  const startInlineStatement = (offset, indentColumn) => {
+    beginStatement(offset, indentColumn, true);
+    lineLastSignificant = '';
+  };
+
+  const processBoundary = () => {
+    if (!current) return;
+    current.end = current.end || current.start;
+    const continued = Boolean(stringState || delimiterStack.length > 0 || lineLastSignificant === '\\');
+    if (!continued) finishStatement(false, current.end);
+    else appendBlank();
+  };
+
+  // Discover each physical line boundary as the scanner reaches it. This
+  // keeps the layout construction to one bounded left-to-right pass rather
+  // than materializing a second full source representation first.
+  let lineStart = 0;
+  while (lineStart <= text.length) {
+    let lineEnd = lineStart;
+    while (lineEnd < text.length && text[lineEnd] !== '\n' && text[lineEnd] !== '\r') lineEnd += 1;
+    const next = lineEnd < text.length
+      ? (text[lineEnd] === '\r' && text[lineEnd + 1] === '\n' ? lineEnd + 2 : lineEnd + 1)
+      : text.length;
+    const line = { start: lineStart, end: lineEnd };
+    const diffInfo = diffMode ? pythonLayoutDiffLine(text, line) : { kind: 'payload', start: line.start };
+    if (diffMode && diffInfo.kind === 'metadata') {
+      const raw = text.slice(line.start, line.end);
+      if (/^@@\s/u.test(raw)) inHunk = true;
+      else if (/^(?:diff --git\s|---\s|\+\+\+\s)/u.test(raw)) inHunk = false;
+      resetSuiteState();
+      if (lineEnd >= text.length) break;
+      lineStart = next;
+      continue;
+    }
+    if (diffMode && (!inHunk || diffInfo.kind !== 'payload')) {
+      resetSuiteState();
+      if (lineEnd >= text.length) break;
+      lineStart = next;
+      continue;
+    }
+
+    const layoutLine = pythonLayoutLine(text, line.start, line.end);
+    const payloadStart = diffMode ? Math.min(line.end, diffInfo.start) : layoutLine.contentStart;
+    const contentStart = diffMode
+      ? pythonLayoutLine(text, payloadStart, line.end).contentStart
+      : layoutLine.contentStart;
+    const content = text.slice(contentStart, line.end);
+    const indentColumn = current ? current.indentColumn : pythonIndentationColumn(content);
+    if (!current) beginStatement(contentStart, indentColumn, true);
+    current.end = line.end;
+    lineLastSignificant = '';
+    let inlineIndentColumn = null;
+    let inComment = false;
+
+    for (let index = contentStart; index < line.end; index += 1) {
+      const character = text[index];
+      if (!current && character !== '#' && !/[ \t]/u.test(character)) {
+        startInlineStatement(index, inlineIndentColumn ?? (indentColumn === null ? null : indentColumn + 1));
+      }
+      if (inComment) {
+        appendBlank();
+        continue;
+      }
+
+      if (stringState) {
+        if (stringState.escaped) {
+          appendBlank();
+          stringState.escaped = false;
+          continue;
+        }
+        if (character === '\\') {
+          appendBlank();
+          stringState.escaped = true;
+          continue;
+        }
+        const delimiter = stringState.triple ? stringState.quote.repeat(3) : stringState.quote;
+        if (text.startsWith(delimiter, index)) {
+          appendBlank(delimiter.length);
+          index += delimiter.length - 1;
+          stringState = null;
+          continue;
+        }
+        appendBlank();
+        continue;
+      }
+
+      if (character === '#') {
+        appendBlank();
+        inComment = true;
+        continue;
+      }
+      if (character === '"' || character === "'") {
+        const triple = text.startsWith(character.repeat(3), index);
+        appendBlank(triple ? 3 : 1);
+        if (triple) index += 2;
+        stringState = { quote: character, triple, escaped: false };
+        continue;
+      }
+
+      if (character === '(' || character === '[' || character === '{') {
+        delimiterStack.push(character);
+        appendCode(character, index);
+        continue;
+      }
+      if (character === ')' || character === ']' || character === '}') {
+        const expected = character === ')' ? '(' : character === ']' ? '[' : '{';
+        if (delimiterStack.length === 0 || delimiterStack[delimiterStack.length - 1] !== expected) current.valid = false;
+        else delimiterStack.pop();
+        appendCode(character, index);
+        continue;
+      }
+
+      if (character === ':' && delimiterStack.length === 0 && current.suiteColon < 0) {
+        const inlineCompound = inlineIndentColumn !== null;
+        const suiteKind = PYTHON_SUITE_FIRST_WORDS.has(current.firstWord)
+          ? pythonLayoutLooksLikeSuiteHeader(current.code.join(''))
+          : null;
+        appendCode(character, index);
+        if (suiteKind) {
+          current.suiteColon = current.code.length - 1;
+          finishStatement(false, index + 1);
+          // A compound suite cannot legally follow the simple suite body on
+          // the same physical line. Keep that malformed route fail-closed so
+          // its following credential-looking statement cannot inherit the
+          // enclosing class merely from virtual inline indentation.
+          inlineIndentColumn = inlineCompound
+            ? indentColumn
+            : (indentColumn === null ? null : indentColumn + 1);
+        }
+        continue;
+      }
+      if (character === ';' && delimiterStack.length === 0) {
+        const statementIndent = current.indentColumn;
+        appendCode(character, index);
+        finishStatement(false, index + 1);
+        startInlineStatement(index + 1, statementIndent ?? inlineIndentColumn ?? indentColumn);
+        continue;
+      }
+      appendCode(character, index);
+      // Keep an invalid state for control characters that are not supported
+      // by this bounded lexical envelope; ordinary spaces/tabs remain valid.
+      if (current && character !== ' ' && character !== '\t' && character.charCodeAt(0) < 0x20) current.valid = false;
+    }
+    if (current) current.end = line.end;
+    processBoundary();
+    if (stringState || delimiterStack.length > 0 || lineLastSignificant === '\\') appendBlank();
+    if (lineEnd >= text.length) break;
+    lineStart = next;
+  }
+
+  if (current) finishStatement(true, current.end);
+  return { statements, uncertain: layoutUncertain, diffMode };
+}
+
+function findPythonLayoutStatement(layout, offset) {
+  const statements = layout?.statements ?? [];
+  let low = 0;
+  let high = statements.length - 1;
+  while (low <= high) {
+    const middle = low + Math.floor((high - low) / 2);
+    const statement = statements[middle];
+    if (offset < statement.start) high = middle - 1;
+    else if (offset >= statement.end) low = middle + 1;
+    else return statement;
+  }
+  return null;
+}
+
+function hasPythonClassAnchor(syntax, offset) {
+  const statement = findPythonLayoutStatement(syntax?.pythonLayout, offset);
+  if (!statement || !statement.valid) return false;
+  // The candidate must itself be the first code/member occurrence. This
+  // rejects labels nested in assignments, containers, calls, and suites.
+  return statement.firstCodeOffset === offset && statement.parent?.kind === 'class-header';
 }
 
 function hasBalancedGenericTail(code, end) {
@@ -470,8 +729,9 @@ function hasBalancedGenericTail(code, end) {
 }
 
 function createSourceSyntax(text) {
-  const code = maskSourceTrivia(text);
-  return { code, pairs: buildDelimiterPairs(code) };
+  const source = String(text ?? '');
+  const code = maskSourceTrivia(source);
+  return { code, pairs: buildDelimiterPairs(code), pythonLayout: buildPythonSourceLayout(source) };
 }
 
 function isCredibleSourceReference(value, text, offset, assignment = '', syntax = undefined) {
@@ -492,8 +752,14 @@ function isCredibleSourceReference(value, text, offset, assignment = '', syntax 
   const typedAnnotation = hasTypedVariableAnnotationAnchor(syntax.code, syntax, offset, assignment, raw);
   const typeLikeBody = hasTypeLikeBodyAnchor(syntax.code, syntax, offset);
   const parameter = hasParameterAnchor(syntax.code, syntax, offset);
-  const pythonClass = hasPythonClassAnchor(syntax.code, syntax, offset);
+  const pythonClass = hasPythonClassAnchor(syntax, offset);
   const destructuring = hasDestructuringAnchor(syntax.code, syntax, offset);
+  // The credential value matcher intentionally remains language-neutral and
+  // may capture a physical backslash before a continued class annotation's
+  // real type name. The layout has already proved this is the first direct
+  // class member, so preserve that continuation instead of redacting the
+  // separator and leaving the type tail behind.
+  if (raw === '\\' && pythonClass) return true;
   const initializerGeneric = Boolean(genericTail && /=\s*$/u.test(assignment));
   // A generic tail is source syntax only when a surrounding type, parameter,
   // annotation, or destructuring anchor proves that it is not a value. In an
