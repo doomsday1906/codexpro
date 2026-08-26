@@ -15,6 +15,7 @@ const {
   redactSensitiveTextPreservingLines,
   redactUnifiedDiff
 } = await import('../dist/redact.js');
+const { createPythonProvenance } = await import('../scripts/python-provenance.mjs');
 const pythonPolicy = { context: 'source', language: 'python' };
 
 class McpStdioClient {
@@ -1443,6 +1444,18 @@ const sideRoutingDelete = [
   '-    token: Token[SIDE_DELETED_LITERAL]',
   ''
 ].join('\n');
+const sideRoutingCopyTxtToPy = sideRoutingTxtToPy
+  .replaceAll('rename from', 'copy from')
+  .replaceAll('rename to', 'copy to');
+const sideRoutingCopyPyToTxt = sideRoutingPyToTxt
+  .replaceAll('rename from', 'copy from')
+  .replaceAll('rename to', 'copy to');
+const sideRoutingCreateTxt = sideRoutingCreate
+  .replaceAll('side-created.py', 'side-created.txt')
+  .replaceAll('SIDE_CREATED_LITERAL', 'SIDE_CREATED_TEXT_LITERAL');
+const sideRoutingDeleteTxt = sideRoutingDelete
+  .replaceAll('side-deleted.py', 'side-deleted.txt')
+  .replaceAll('SIDE_DELETED_LITERAL', 'SIDE_DELETED_TEXT_LITERAL');
 for (const [label, source, oldExpected, newExpected, hasRaw] of [
   ['txt-to-py', sideRoutingTxtToPy, false, true, true],
   ['py-to-txt', sideRoutingPyToTxt, true, false, true],
@@ -1457,6 +1470,33 @@ for (const [label, source, oldExpected, newExpected, hasRaw] of [
   assert.equal(newContainsLiteral, newExpected, `${label} changed new-side source fidelity`);
   assert.equal(hasSecretValueInUnifiedDiff(source), hasRaw, `${label} changed raw-sensitive classification`);
 }
+function diffSideLanguages(source) {
+  const provenance = createPythonProvenance(source, { language: 'python' });
+  return {
+    available: provenance.available,
+    languages: provenance.segments.flatMap((segment) => (segment.sides ?? []).map((side) => side.language))
+  };
+}
+
+function assertValidDiffSideAuthority(label, source, expectedPaths, expectedLanguages, expectedAvailable) {
+  const blocks = extractDiffFileBlocks(source);
+  assert.equal(blocks.length, 1, `${label} changed canonical block count`);
+  assert.equal(blocks[0].pathDiscoveryValid, true, `${label} lost valid block authority`);
+  assert.deepEqual(blocks[0].paths, expectedPaths, `${label} changed canonical paths`);
+  assert.deepEqual(diffSideLanguages(source), {
+    available: expectedAvailable,
+    languages: expectedLanguages
+  }, `${label} changed side-specific Python provenance`);
+}
+
+assertValidDiffSideAuthority('txt-to-py mirror', sideRoutingTxtToPy, ['side-old.txt', 'side-new.py'], [undefined, 'python'], true);
+assertValidDiffSideAuthority('py-to-txt mirror', sideRoutingPyToTxt, ['side-old.py', 'side-new.txt'], ['python', undefined], true);
+assertValidDiffSideAuthority('copy txt-to-py', sideRoutingCopyTxtToPy, ['side-old.txt', 'side-new.py'], [undefined, 'python'], true);
+assertValidDiffSideAuthority('copy py-to-txt', sideRoutingCopyPyToTxt, ['side-old.py', 'side-new.txt'], ['python', undefined], true);
+assertValidDiffSideAuthority('dev-null to new.py', sideRoutingCreate, ['side-created.py'], [undefined, 'python'], true);
+assertValidDiffSideAuthority('old.py to dev-null', sideRoutingDelete, ['side-deleted.py'], ['python', undefined], true);
+assertValidDiffSideAuthority('dev-null to new.txt', sideRoutingCreateTxt, ['side-created.txt'], [undefined, undefined], false);
+assertValidDiffSideAuthority('old.txt to dev-null', sideRoutingDeleteTxt, ['side-deleted.txt'], [undefined, undefined], false);
 const sideRoutingMixed = `${sideRoutingTxtToPy}${sideRoutingPyToTxt}`;
 const sideRoutingMixedOutput = redactUnifiedDiff(sideRoutingMixed);
 const mixedPythonBytesPresent = sideRoutingMixedOutput.includes('+    token: Token[SIDE_NEW_LITERAL]')
@@ -1465,6 +1505,7 @@ const mixedTextBytesMasked = sideRoutingMixedOutput.includes('+    token: [REDAC
   && sideRoutingMixedOutput.includes('-    token: [REDACTED_SECRET]');
 assert.equal(mixedPythonBytesPresent, true, 'mixed side routing lost lawful Python-side bytes');
 assert.equal(mixedTextBytesMasked, true, 'mixed side routing preserved non-Python-side bytes');
+
 const consultedDiffPaths = [];
 redactUnifiedDiff(sideRoutingTxtToPy, (pathHint) => {
   consultedDiffPaths.push(pathHint);
@@ -1484,7 +1525,36 @@ const contradictoryOutput = redactUnifiedDiff(contradictorySideMetadata);
 const contradictoryOldBytesPresent = contradictoryOutput.includes('-    token: Token[SIDE_OLD_LITERAL]');
 const contradictoryNewBytesPresent = contradictoryOutput.includes('+    token: Token[SIDE_NEW_LITERAL]');
 assert.equal(contradictoryOldBytesPresent, false, 'contradictory old-side metadata donated parser provenance');
-assert.equal(contradictoryNewBytesPresent, true, 'contradictory old-side metadata disabled the unaffected new side');
+assert.equal(contradictoryNewBytesPresent, false, 'contradictory old-side metadata left block-level new-side parser provenance enabled');
+assert.deepEqual(diffSideLanguages(contradictorySideMetadata), {
+  available: false,
+  languages: [undefined, undefined]
+}, 'contradictory old-side metadata retained Python provenance on one side');
+
+const mixedInvalidBlock = contradictorySideMetadata
+  .replaceAll('SIDE_OLD_LITERAL', 'MIXED_INVALID_OLD_LITERAL')
+  .replaceAll('SIDE_NEW_LITERAL', 'MIXED_INVALID_NEW_LITERAL');
+const mixedValidBlock = sideRoutingPyToTxt
+  .replaceAll('SIDE_OLD_LITERAL', 'MIXED_VALID_OLD_LITERAL')
+  .replaceAll('SIDE_NEW_LITERAL', 'MIXED_VALID_NEW_LITERAL');
+const mixedInvalidAndValid = `${mixedInvalidBlock}${mixedValidBlock}`;
+const mixedInvalidAndValidBlocks = extractDiffFileBlocks(mixedInvalidAndValid);
+assert.equal(mixedInvalidAndValidBlocks.length, 2, 'mixed invalid/valid patch changed canonical block count');
+assert.equal(mixedInvalidAndValidBlocks[0].pathDiscoveryValid, false, 'mixed invalid block granted path authority');
+assert.deepEqual(mixedInvalidAndValidBlocks[0].paths, [], 'mixed invalid block exposed paths');
+assert.equal(mixedInvalidAndValidBlocks[1].pathDiscoveryValid, true, 'mixed valid block lost independent path authority');
+assert.deepEqual(mixedInvalidAndValidBlocks[1].paths, ['side-old.py', 'side-new.txt'], 'mixed valid block changed lawful paths');
+const mixedInvalidAndValidProvenance = createPythonProvenance(mixedInvalidAndValid, { language: 'python' });
+assert.deepEqual(mixedInvalidAndValidProvenance.segments.map((segment) => (segment.sides ?? []).map((side) => side.language)), [
+  [undefined, undefined],
+  ['python', undefined]
+], 'mixed invalid/valid provenance did not isolate block-level authority');
+const mixedInvalidAndValidOutput = redactUnifiedDiff(mixedInvalidAndValid);
+assert.equal(mixedInvalidAndValidOutput.includes('MIXED_INVALID_OLD_LITERAL'), false, 'mixed invalid old side leaked parser-sensitive bytes');
+assert.equal(mixedInvalidAndValidOutput.includes('MIXED_INVALID_NEW_LITERAL'), false, 'mixed invalid new side leaked parser-sensitive bytes');
+assert.equal(mixedInvalidAndValidOutput.includes('MIXED_VALID_OLD_LITERAL'), true, 'mixed valid Python old side lost lawful source fidelity');
+assert.equal(mixedInvalidAndValidOutput.includes('MIXED_VALID_NEW_LITERAL'), false, 'mixed valid non-Python new side omitted generic redaction');
+assert.equal(hasSecretValueInUnifiedDiff(mixedInvalidAndValid), true, 'mixed invalid/valid classification lost sensitive material');
 
 const unfinishedHunk = [
   'diff --git a/bad.py b/bad.py',
@@ -1511,6 +1581,64 @@ const ambiguousPythonOutput = redactUnifiedDiff(ambiguousPythonPayload);
 assert.equal(hasSecretValueInUnifiedDiff(ambiguousPythonPayload), true, 'ambiguous Python-looking hunk lost fail-closed classification');
 assert.equal(ambiguousPythonOutput.includes('AMBIGUOUS_LITERAL'), false, 'ambiguous Python-looking hunk preserved a raw secret-looking token');
 assert.equal(ambiguousPythonOutput.includes('[REDACTED_SECRET]'), true, 'ambiguous Python-looking hunk omitted generic redaction');
+
+function syntheticDiff({
+  metadata = [],
+  oldHeaders = ['--- a/matrix-old.py'],
+  newHeaders = ['+++ b/matrix-new.py'],
+  headerOrder,
+  hunkHeader = '@@ -1,2 +1,2 @@',
+  hunkLines = [
+    '-class Matrix:',
+    '-    token: Token[MATRIX_LITERAL]',
+    '+class Matrix:',
+    '+    token: Token[MATRIX_LITERAL]'
+  ]
+} = {}) {
+  const headers = headerOrder ?? [...oldHeaders, ...newHeaders];
+  return [
+    'diff --git a/matrix-old.py b/matrix-new.py',
+    ...metadata,
+    ...headers,
+    hunkHeader,
+    ...hunkLines,
+    ''
+  ].join('\n');
+}
+
+function assertInvalidDiffAuthority(label, source, literal) {
+  const blocks = extractDiffFileBlocks(source);
+  assert.equal(blocks.length, 1, `${label} changed canonical block count`);
+  assert.equal(blocks[0].pathDiscoveryValid, false, `${label} granted block-level path authority`);
+  assert.deepEqual(blocks[0].paths, [], `${label} exposed paths despite invalid block authority`);
+  const provenance = createPythonProvenance(source, { language: 'python' });
+  const sideRecords = provenance.segments.flatMap((segment) => segment.sides ?? []);
+  assert.equal(provenance.available, false, `${label} exposed Python provenance availability`);
+  assert.equal(sideRecords.length >= 2, true, `${label} omitted old/new provenance sides`);
+  assert.equal(sideRecords.every((side) => side.language === undefined && side.parse === undefined), true, `${label} retained parser authority on an invalid side`);
+  const redacted = redactUnifiedDiff(source);
+  assert.equal(redacted.includes(literal), false, `${label} preserved synthetic sensitive material`);
+  assert.equal(redacted.includes('[REDACTED_SECRET]'), true, `${label} omitted generic redaction marker`);
+  assert.equal(hasSecretValueInUnifiedDiff(source), true, `${label} lost generic sensitive classification`);
+}
+
+const invalidDiffCases = [
+  ['conflicting rename-from', syntheticDiff({ metadata: ['rename from matrix-other.py', 'rename to matrix-new.py'] })],
+  ['conflicting rename-to', syntheticDiff({ metadata: ['rename from matrix-old.py', 'rename to matrix-other.py'] })],
+  ['conflicting copy-from', syntheticDiff({ metadata: ['copy from matrix-other.py', 'copy to matrix-new.py'] })],
+  ['conflicting copy-to', syntheticDiff({ metadata: ['copy from matrix-old.py', 'copy to matrix-other.py'] })],
+  ['duplicate --- headers', syntheticDiff({ oldHeaders: ['--- a/matrix-old.py', '--- a/duplicate-old.py'] })],
+  ['duplicate +++ headers', syntheticDiff({ newHeaders: ['+++ b/matrix-new.py', '+++ b/duplicate-new.py'] })],
+  ['reversed header ordering', syntheticDiff({ headerOrder: ['+++ b/matrix-new.py', '--- a/matrix-old.py'] })],
+  ['malformed quoted old path', syntheticDiff({ oldHeaders: ['--- "a/matrix-old.py'] })],
+  ['malformed quoted new path', syntheticDiff({ newHeaders: ['+++ "b/matrix-new.py'] })],
+  ['unfinished hunk', syntheticDiff({ hunkLines: ['-class Matrix:', '-    token: Token[MATRIX_LITERAL]', '+class Matrix:'] })],
+  ['malformed hunk counts', syntheticDiff({ hunkHeader: '@@ -1,2 +1,not-a-count @@' })],
+  ['already-supported structural ambiguity', ambiguousPythonPayload, 'AMBIGUOUS_LITERAL']
+];
+for (const [label, source, literal = 'MATRIX_LITERAL'] of invalidDiffCases) {
+  assertInvalidDiffAuthority(label, source, literal);
+}
 
 const mcpRouteTxtSource = [
   'class McpRoute:',
@@ -3772,6 +3900,38 @@ try {
   assert.equal(applyRenamePyToTxtAtomic, true, 'MCP .py-to-.txt apply_patch rename was not atomically rejected');
   expectNoHostileResponseFields(blockedApplyRenamePyToTxt, applyRenameHostileLiterals, 'MCP .py-to-.txt apply_patch rename');
   await writeRawArtifact(rawArtifactDir, 'apply-rename-py-to-txt-rejected', blockedApplyRenamePyToTxt);
+
+  const mixedAtomicTxtBefore = await fs.readFile(path.join(tmp, 'apply-rename-old.txt'), 'utf8');
+  const mixedAtomicPyBefore = await fs.readFile(path.join(tmp, 'apply-rename-old.py'), 'utf8');
+  const mixedAtomicPatch = [
+    'diff --git a/apply-rename-old.txt b/apply-rename-old.txt',
+    'rename from contradictory.txt',
+    'rename to apply-rename-old.txt',
+    '--- a/apply-rename-old.txt',
+    '+++ b/apply-rename-old.txt',
+    '@@ -1,2 +1,2 @@',
+    '-class ApplyRenameOldTxt:',
+    '-    token: Token[APPLY_RENAME_OLD_LITERAL]',
+    '+class ApplyRenameOldTxt:',
+    '+    token: Token[MIXED_INVALID_LITERAL]',
+    'diff --git a/apply-rename-old.py b/apply-rename-old.py',
+    '--- a/apply-rename-old.py',
+    '+++ b/apply-rename-old.py',
+    '@@ -1,2 +1,2 @@',
+    '-class ApplyRenameOldPy:',
+    '+class ApplyRenameNewPy:',
+    '     token: Token[str]',
+    ''
+  ].join('\n');
+  const blockedMixedAtomicPatch = assertToolError(await client.request('tools/call', {
+    name: 'apply_patch',
+    arguments: { workspace_id: workspaceId, patch: mixedAtomicPatch }
+  }), 'mixed invalid/valid apply_patch atomicity');
+  assert.match(resultText(blockedMixedAtomicPatch), /unambiguous file paths/);
+  assert.equal(resultText(blockedMixedAtomicPatch).includes('MIXED_INVALID_LITERAL'), false, 'mixed invalid/valid apply_patch leaked rejected payload');
+  assert.equal(await fs.readFile(path.join(tmp, 'apply-rename-old.txt'), 'utf8'), mixedAtomicTxtBefore, 'mixed invalid/valid apply_patch mutated invalid-block file');
+  assert.equal(await fs.readFile(path.join(tmp, 'apply-rename-old.py'), 'utf8'), mixedAtomicPyBefore, 'mixed invalid/valid apply_patch mutated valid-block file');
+  await writeRawArtifact(rawArtifactDir, 'mixed-invalid-valid-apply-patch-rejected', blockedMixedAtomicPatch);
 
   // A real Git hunk can contain payload lines whose first characters look
   // exactly like unified-diff file headers. Those payload bytes must not alter

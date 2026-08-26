@@ -938,7 +938,11 @@ export function hasSecretValue(text, options = {}) {
   return false;
 }
 
-function trustedDiffLanguage(languageForPath, path, valid, present, structurallyValid = true) {
+function trustedDiffLanguage(languageForPath, path, present, pathDiscoveryValid) {
+  // A file block has one metadata/hunk authority. Do not let a side-specific
+  // path or the absence of a parser error donate provenance after that
+  // authority has failed.
+  if (!pathDiscoveryValid) return undefined;
   let candidate;
   try {
     // Consult both sides independently, including an undefined absent or
@@ -947,20 +951,20 @@ function trustedDiffLanguage(languageForPath, path, valid, present, structurally
   } catch {
     candidate = undefined;
   }
-  return structurallyValid && valid && present && candidate === 'python' ? 'python' : undefined;
+  return present && candidate === 'python' ? 'python' : undefined;
 }
 
-// Unified diff output is a collection of per-file target routes. Each side
-// receives its own validated language; no scoped path may donate provenance to
-// the other side, and contradictory rename/copy metadata disables that side.
+// Unified diff output is a collection of per-file target routes. A block must
+// first pass the canonical pathDiscoveryValid authority: invalid metadata or
+// hunks disable both sides, while valid blocks retain independent old/new path
+// language routing.
 export function redactUnifiedDiff(text, options = {}) {
   const languageForPath = typeof options?.languageForPath === 'function'
     ? options.languageForPath
     : sourceLanguageForPath;
   return extractDiffFileBlocks(text).map((block) => {
-    const structurallyValid = !block.ambiguous;
-    const oldLanguage = trustedDiffLanguage(languageForPath, block.oldPath, block.oldValid, block.oldPresent, structurallyValid);
-    const newLanguage = trustedDiffLanguage(languageForPath, block.newPath, block.newValid, block.newPresent, structurallyValid);
+    const oldLanguage = trustedDiffLanguage(languageForPath, block.oldPath, block.oldPresent, block.pathDiscoveryValid);
+    const newLanguage = trustedDiffLanguage(languageForPath, block.newPath, block.newPresent, block.pathDiscoveryValid);
     return redactSensitiveText(block.source, { context: 'source', oldLanguage, newLanguage });
   }).join('');
 }
@@ -970,9 +974,8 @@ export function hasSecretValueInUnifiedDiff(text, options = {}) {
     ? options.languageForPath
     : sourceLanguageForPath;
   return extractDiffFileBlocks(text).some((block) => {
-    const structurallyValid = !block.ambiguous;
-    const oldLanguage = trustedDiffLanguage(languageForPath, block.oldPath, block.oldValid, block.oldPresent, structurallyValid);
-    const newLanguage = trustedDiffLanguage(languageForPath, block.newPath, block.newValid, block.newPresent, structurallyValid);
+    const oldLanguage = trustedDiffLanguage(languageForPath, block.oldPath, block.oldPresent, block.pathDiscoveryValid);
+    const newLanguage = trustedDiffLanguage(languageForPath, block.newPath, block.newPresent, block.pathDiscoveryValid);
     return hasSecretValue(block.source, { context: 'source', oldLanguage, newLanguage });
   });
 }

@@ -576,10 +576,15 @@ export function createPythonProvenance(source, options = {}) {
     const blocks = extractDiffFileBlocks(text);
     const callback = typeof options?.languageForPath === 'function' ? options.languageForPath : undefined;
     const defaultLanguageForPath = (filePath) => /\.(?:py|pyi|pyw)$/iu.test(String(filePath ?? '')) ? 'python' : undefined;
-    const resolveLanguage = (side, path, valid, present, structurallyValid = true) => {
+    const resolveLanguage = (side, path, present, pathDiscoveryValid) => {
+      // `pathDiscoveryValid` is the single block-level authority. A side
+      // cannot retain parser provenance when any metadata or hunk in the
+      // containing block is contradictory, even if that side looks valid in
+      // isolation.
+      if (!pathDiscoveryValid) return undefined;
       const optionName = side === 'old' ? 'oldLanguage' : 'newLanguage';
       if (Object.prototype.hasOwnProperty.call(options, optionName)) {
-        return options[optionName] === 'python' && structurallyValid && valid && present ? 'python' : undefined;
+        return options[optionName] === 'python' && present ? 'python' : undefined;
       }
       if (callback) {
         let candidate;
@@ -588,19 +593,18 @@ export function createPythonProvenance(source, options = {}) {
         } catch {
           candidate = undefined;
         }
-        return candidate === 'python' && structurallyValid && valid && present ? 'python' : undefined;
+        return candidate === 'python' && present ? 'python' : undefined;
       }
       if (options?.language === 'python') {
-        return structurallyValid && valid && present ? defaultLanguageForPath(path) : undefined;
+        return present ? defaultLanguageForPath(path) : undefined;
       }
       return undefined;
     };
     const segments = [];
     let hasPythonSide = false;
     for (const block of blocks) {
-      const structurallyValid = !block.ambiguous;
-      const oldLanguage = resolveLanguage('old', block.oldPath, block.oldValid, block.oldPresent, structurallyValid);
-      const newLanguage = resolveLanguage('new', block.newPath, block.newValid, block.newPresent, structurallyValid);
+      const oldLanguage = resolveLanguage('old', block.oldPath, block.oldPresent, block.pathDiscoveryValid);
+      const newLanguage = resolveLanguage('new', block.newPath, block.newPresent, block.pathDiscoveryValid);
       if (oldLanguage === 'python' || newLanguage === 'python') hasPythonSide = true;
       segments.push(...buildDiffSegments(text, { oldLanguage, newLanguage }, block.start, block.end));
     }
