@@ -19,7 +19,7 @@ export type RedactionContext = "source" | "diagnostic";
 export type SourceLanguage = "python";
 export type RedactionOptions = { context?: RedactionContext; language?: SourceLanguage };
 
-export function sourceLanguageForPath(filePath: string): SourceLanguage | undefined {
+export function sourceLanguageForPath(filePath: string | undefined): SourceLanguage | undefined {
   return policySourceLanguageForPath(filePath);
 }
 

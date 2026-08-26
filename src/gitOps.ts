@@ -2,9 +2,14 @@ import { spawnSync } from "node:child_process";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, PathGuard } from "./guard.js";
-import { redactDiagnosticText, redactSensitiveText, redactUnifiedDiff, sourceLanguageForPath } from "./redact.js";
+import { redactDiagnosticText, redactSensitiveText, redactUnifiedDiff, sourceLanguageForPath, type SourceLanguage } from "./redact.js";
 
-function runGit(workspace: Workspace, args: string[], maxOutputBytes: number, scopedSourcePath?: string): string {
+function runGit(
+  workspace: Workspace,
+  args: string[],
+  maxOutputBytes: number,
+  languageForPath?: (path: string | undefined) => SourceLanguage | undefined
+): string {
   const result = spawnSync("git", args, {
     cwd: workspace.root,
     encoding: "utf8",
@@ -21,9 +26,7 @@ function runGit(workspace: Workspace, args: string[], maxOutputBytes: number, sc
   }
   const output = result.stdout.trim() || "(no output)";
   if (args[0] === "diff") {
-    return redactUnifiedDiff(output, scopedSourcePath
-      ? () => sourceLanguageForPath(scopedSourcePath)
-      : undefined);
+    return redactUnifiedDiff(output, languageForPath ?? sourceLanguageForPath);
   }
   return redactSensitiveText(output);
 }
@@ -57,13 +60,14 @@ export function gitStatus(config: CodexProConfig, workspace: Workspace, guard?: 
 export function gitDiff(config: CodexProConfig, guard: PathGuard, workspace: Workspace, filePath?: string, staged = false): string {
   const args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv"];
   if (staged) args.push("--staged");
-  let scopedSourcePath: string | undefined;
   if (filePath?.trim()) {
     const resolved = guard.resolve(workspace, filePath);
     args.push("--", resolved.relPath);
-    scopedSourcePath = resolved.relPath;
   }
-  return runGit(workspace, args, config.maxOutputBytes, scopedSourcePath);
+  // The redaction policy consults the actual ---/+++ side path from Git's
+  // output. A scoped query only constrains which diff Git emits; it must never
+  // donate its one path language to a renamed/copied opposite side.
+  return runGit(workspace, args, config.maxOutputBytes, sourceLanguageForPath);
 }
 
 export function gitDiffStatus(config: CodexProConfig, guard: PathGuard, workspace: Workspace, filePath?: string, staged = false): string {

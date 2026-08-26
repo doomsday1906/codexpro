@@ -1,5 +1,6 @@
 import {
   createPythonProvenance,
+  extractDiffSidePaths,
   ownsPythonCredential
 } from './python-provenance.mjs';
 
@@ -14,10 +15,21 @@ export function sourceLanguageForPath(filePath) {
 }
 
 function normalizeOptions(options, defaultContext = 'source') {
-  if (typeof options === 'string') return { context: options, language: undefined };
+  if (typeof options === 'string') return {
+    context: options,
+    language: undefined,
+    oldLanguage: undefined,
+    newLanguage: undefined,
+    languageForPath: undefined
+  };
   const context = options?.context ?? defaultContext;
   const language = context === 'source' && options?.language === 'python' ? 'python' : undefined;
-  return { context, language };
+  const oldLanguage = context === 'source' && options?.oldLanguage === 'python' ? 'python' : undefined;
+  const newLanguage = context === 'source' && options?.newLanguage === 'python' ? 'python' : undefined;
+  const languageForPath = context === 'source' && typeof options?.languageForPath === 'function'
+    ? options.languageForPath
+    : undefined;
+  return { context, language, oldLanguage, newLanguage, languageForPath };
 }
 
 const PRIVATE_KEY_LABELS = [
@@ -450,9 +462,14 @@ function hasBalancedGenericTail(code, end) {
   return !tail || tail.balanced;
 }
 
-function createSourceSyntax(text, language) {
+function createSourceSyntax(text, options = {}) {
   const source = String(text ?? '');
+  const { language, oldLanguage, newLanguage, languageForPath } = normalizeOptions(options);
   const code = maskSourceTrivia(source);
+  const provenanceOptions = { language };
+  if (oldLanguage !== undefined) provenanceOptions.oldLanguage = oldLanguage;
+  if (newLanguage !== undefined) provenanceOptions.newLanguage = newLanguage;
+  if (languageForPath !== undefined) provenanceOptions.languageForPath = languageForPath;
   return {
     code,
     pairs: buildDelimiterPairs(code),
@@ -460,8 +477,8 @@ function createSourceSyntax(text, language) {
     // Parser authority is opt-in from a trusted path-derived language hint.
     // Diagnostics, URLs, config, and generic text deliberately carry no
     // provenance object, even when their bytes resemble Python.
-    pythonProvenance: language === 'python'
-      ? createPythonProvenance(source, { language })
+    pythonProvenance: language === 'python' || oldLanguage === 'python' || newLanguage === 'python'
+      ? createPythonProvenance(source, provenanceOptions)
       : undefined
   };
 }
@@ -477,7 +494,7 @@ function isCredibleSourceReference(value, text, offset, assignment = '', syntax 
   // Parser ownership is authoritative only for an explicitly trusted Python
   // source hint. A Python-looking string passed without that hint remains
   // generic/fail-closed rather than silently selecting a parser.
-  if (syntax.language === 'python') {
+  if (syntax.language === 'python' || syntax.pythonProvenance?.available) {
     // AST ownership grants the Python source-fidelity exception for supported
     // declaration roles. Parser-unowned reference assignments still use the
     // language-neutral envelope below (for example `TOKEN = os.getenv(...)`);
@@ -781,8 +798,8 @@ function collectCredentialMatches(text, pattern, context, syntax, priority) {
   return matches;
 }
 
-function applyCredentialPatterns(text, context, language) {
-  const syntax = context === 'source' ? createSourceSyntax(text, language) : undefined;
+function applyCredentialPatterns(text, context, languageOptions) {
+  const syntax = context === 'source' ? createSourceSyntax(text, languageOptions) : undefined;
   const candidates = [
     [TYPED_DECLARATION_ASSIGNMENT_PATTERN, 0],
     [CREDENTIAL_ASSIGNMENT_PATTERN, 2],
@@ -821,13 +838,14 @@ function applyDirectPatterns(text) {
 }
 
 export function redactSensitiveText(text, options = {}) {
-  const { context, language } = normalizeOptions(options);
+  const normalized = normalizeOptions(options);
+  const { context } = normalized;
   const privateSafe = redactPrivateKeys(String(text ?? ''));
   // Protect transport-shaped credentials before generic assignment handling;
   // otherwise `?codexpro_token=value` becomes `?codexpro_token= [REDACTED_SECRET]`
   // and the displayed URL no longer retains a valid query shape.
   const directSafe = applyDirectPatterns(privateSafe);
-  return redactMalformedCredentialParentheses(applyCredentialPatterns(directSafe, context, language));
+  return redactMalformedCredentialParentheses(applyCredentialPatterns(directSafe, context, normalized));
 }
 
 export function redactSensitiveTextPreservingLines(text, options = {}) {
@@ -884,8 +902,9 @@ function hasUnsafeCredentialMatch(text, pattern, context, syntax = undefined) {
 
 export function hasSecretValue(text, options = {}) {
   const source = String(text ?? '');
-  const { context, language } = normalizeOptions(options);
-  const syntax = context === 'source' ? createSourceSyntax(source, language) : undefined;
+  const normalized = normalizeOptions(options);
+  const { context } = normalized;
+  const syntax = context === 'source' ? createSourceSyntax(source, normalized) : undefined;
   PRIVATE_BEGIN_PATTERN.lastIndex = 0;
   if (PRIVATE_BEGIN_PATTERN.test(source) || PRIVATE_PARTIAL_PATTERN.test(source)) return true;
   if (unmatchedCredentialParenthesisStart(source) >= 0) return true;
@@ -917,51 +936,6 @@ export function hasSecretValue(text, options = {}) {
   return false;
 }
 
-function diffPathFromBlock(block) {
-  const lines = String(block ?? '').split(/\r?\n/u);
-  const candidates = [
-    lines.find((line) => line.startsWith('+++ ')),
-    lines.find((line) => line.startsWith('--- '))
-  ];
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    let value = candidate.slice(4).split('\t')[0].trim();
-    if (value.startsWith('"') && value.endsWith('"')) {
-      const encoded = value.slice(1, -1);
-      let decoded = '';
-      const octets = [];
-      const flushOctets = () => {
-        if (!octets.length) return;
-        decoded += Buffer.from(octets).toString('utf8');
-        octets.length = 0;
-      };
-      for (let index = 0; index < encoded.length; index += 1) {
-        if (encoded[index] !== '\\') {
-          flushOctets();
-          decoded += encoded[index];
-          continue;
-        }
-        const escaped = encoded[++index];
-        if (escaped === undefined) break;
-        if (/[0-7]/u.test(escaped)) {
-          let octal = escaped;
-          for (let count = 0; count < 2 && /[0-7]/u.test(encoded[index + 1] ?? ''); count += 1) octal += encoded[++index];
-          octets.push(Number.parseInt(octal, 8));
-        } else {
-          flushOctets();
-          decoded += ({ a: '\x07', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v' }[escaped] ?? escaped);
-        }
-      }
-      flushOctets();
-      value = decoded;
-    }
-    if (value === '/dev/null') continue;
-    value = value.replace(/^(?:[ab])\//u, '');
-    if (value) return value;
-  }
-  return undefined;
-}
-
 function diffBlocks(text) {
   const source = String(text ?? '');
   if (/^diff --git\s/mu.test(source)) {
@@ -976,16 +950,30 @@ function diffBlocks(text) {
   return [source];
 }
 
-// Unified diff output is a collection of per-file target routes. The caller
-// may provide a validated-path callback; unknown paths intentionally receive
-// no parser authority and therefore use the generic fail-closed policy.
+function trustedDiffLanguage(languageForPath, path, valid, present) {
+  let candidate;
+  try {
+    // Consult both sides independently, including an undefined absent or
+    // unknown path. The result is ignored for an invalid/absent side.
+    candidate = languageForPath(path);
+  } catch {
+    candidate = undefined;
+  }
+  return valid && present && candidate === 'python' ? 'python' : undefined;
+}
+
+// Unified diff output is a collection of per-file target routes. Each side
+// receives its own validated language; no scoped path may donate provenance to
+// the other side, and contradictory rename/copy metadata disables that side.
 export function redactUnifiedDiff(text, options = {}) {
   const languageForPath = typeof options?.languageForPath === 'function'
     ? options.languageForPath
     : sourceLanguageForPath;
   return diffBlocks(text).map((block) => {
-    const language = languageForPath(diffPathFromBlock(block));
-    return redactSensitiveText(block, { context: 'source', language: language === 'python' ? 'python' : undefined });
+    const paths = extractDiffSidePaths(block);
+    const oldLanguage = trustedDiffLanguage(languageForPath, paths.oldPath, paths.oldValid, paths.oldPresent);
+    const newLanguage = trustedDiffLanguage(languageForPath, paths.newPath, paths.newValid, paths.newPresent);
+    return redactSensitiveText(block, { context: 'source', oldLanguage, newLanguage });
   }).join('');
 }
 
@@ -994,8 +982,10 @@ export function hasSecretValueInUnifiedDiff(text, options = {}) {
     ? options.languageForPath
     : sourceLanguageForPath;
   return diffBlocks(text).some((block) => {
-    const language = languageForPath(diffPathFromBlock(block));
-    return hasSecretValue(block, { context: 'source', language: language === 'python' ? 'python' : undefined });
+    const paths = extractDiffSidePaths(block);
+    const oldLanguage = trustedDiffLanguage(languageForPath, paths.oldPath, paths.oldValid, paths.oldPresent);
+    const newLanguage = trustedDiffLanguage(languageForPath, paths.newPath, paths.newValid, paths.newPresent);
+    return hasSecretValue(block, { context: 'source', oldLanguage, newLanguage });
   });
 }
 

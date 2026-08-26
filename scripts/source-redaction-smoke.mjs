@@ -5,7 +5,15 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-const { hasSecretValue, redactDiagnosticText, redactSearchQuery, redactSensitiveText, redactSensitiveTextPreservingLines } = await import('../dist/redact.js');
+const {
+  hasSecretValue,
+  hasSecretValueInUnifiedDiff,
+  redactDiagnosticText,
+  redactSearchQuery,
+  redactSensitiveText,
+  redactSensitiveTextPreservingLines,
+  redactUnifiedDiff
+} = await import('../dist/redact.js');
 const pythonPolicy = { context: 'source', language: 'python' };
 
 class McpStdioClient {
@@ -1380,6 +1388,168 @@ assert.deepEqual(
   'line-preserving policy changed duplicate physical lines around a private key'
 );
 
+// Unified diffs carry two independent source identities. The old side must
+// use --- metadata, the new side must use +++, shared context must be lawful
+// on both sides, and /dev/null must remain an absent side. These assertions
+// use neutral observations of the resulting bytes rather than implementation
+// labels for the raw-sensitive checks.
+const sideRoutingTxtToPy = [
+  'diff --git a/side-old.txt b/side-new.py',
+  'similarity index 80%',
+  'rename from side-old.txt',
+  'rename to side-new.py',
+  '--- a/side-old.txt',
+  '+++ b/side-new.py',
+  '@@ -1,2 +1,2 @@',
+  ' class SideRouting:',
+  '-    token: Token[SIDE_OLD_LITERAL]',
+  '+    token: Token[SIDE_NEW_LITERAL]',
+  ''
+].join('\n');
+const sideRoutingPyToTxt = sideRoutingTxtToPy
+  .replaceAll('side-old.txt', 'side-old.py')
+  .replaceAll('side-new.py', 'side-new.txt');
+const sideRoutingContext = [
+  'diff --git a/side-context.txt b/side-context.py',
+  'rename from side-context.txt',
+  'rename to side-context.py',
+  '--- a/side-context.txt',
+  '+++ b/side-context.py',
+  '@@ -1,3 +1,3 @@',
+  ' class SideRouting:',
+  '     token: Token[SIDE_CONTEXT_LITERAL]',
+  '-    old_value = true',
+  '+    new_value = true',
+  ''
+].join('\n');
+const sideRoutingCreate = [
+  'diff --git a/side-created.py b/side-created.py',
+  'new file mode 100644',
+  '--- /dev/null',
+  '+++ b/side-created.py',
+  '@@ -0,0 +1,2 @@',
+  '+class SideRouting:',
+  '+    token: Token[SIDE_CREATED_LITERAL]',
+  ''
+].join('\n');
+const sideRoutingDelete = [
+  'diff --git a/side-deleted.py b/side-deleted.py',
+  'deleted file mode 100644',
+  '--- a/side-deleted.py',
+  '+++ /dev/null',
+  '@@ -1,2 +0,0 @@',
+  '-class SideRouting:',
+  '-    token: Token[SIDE_DELETED_LITERAL]',
+  ''
+].join('\n');
+for (const [label, source, oldExpected, newExpected, hasRaw] of [
+  ['txt-to-py', sideRoutingTxtToPy, false, true, true],
+  ['py-to-txt', sideRoutingPyToTxt, true, false, true],
+  ['context', sideRoutingContext, false, false, true],
+  ['create', sideRoutingCreate, false, true, false],
+  ['delete', sideRoutingDelete, true, false, false]
+]) {
+  const redacted = redactUnifiedDiff(source);
+  const oldContainsLiteral = redacted.includes('SIDE_OLD_LITERAL') || redacted.includes('SIDE_DELETED_LITERAL');
+  const newContainsLiteral = redacted.includes('SIDE_NEW_LITERAL') || redacted.includes('SIDE_CREATED_LITERAL');
+  assert.equal(oldContainsLiteral, oldExpected, `${label} changed old-side source fidelity`);
+  assert.equal(newContainsLiteral, newExpected, `${label} changed new-side source fidelity`);
+  assert.equal(hasSecretValueInUnifiedDiff(source), hasRaw, `${label} changed raw-sensitive classification`);
+}
+const sideRoutingMixed = `${sideRoutingTxtToPy}${sideRoutingPyToTxt}`;
+const sideRoutingMixedOutput = redactUnifiedDiff(sideRoutingMixed);
+const mixedPythonBytesPresent = sideRoutingMixedOutput.includes('+    token: Token[SIDE_NEW_LITERAL]')
+  && sideRoutingMixedOutput.includes('-    token: Token[SIDE_OLD_LITERAL]');
+const mixedTextBytesMasked = sideRoutingMixedOutput.includes('+    token: [REDACTED_SECRET]')
+  && sideRoutingMixedOutput.includes('-    token: [REDACTED_SECRET]');
+assert.equal(mixedPythonBytesPresent, true, 'mixed side routing lost lawful Python-side bytes');
+assert.equal(mixedTextBytesMasked, true, 'mixed side routing preserved non-Python-side bytes');
+const consultedDiffPaths = [];
+redactUnifiedDiff(sideRoutingTxtToPy, (pathHint) => {
+  consultedDiffPaths.push(pathHint);
+  return pathHint?.endsWith('.py') ? 'python' : undefined;
+});
+assert.deepEqual(consultedDiffPaths, ['side-old.txt', 'side-new.py'], 'redaction callback did not consult old/new paths independently');
+const consultedCheckPaths = [];
+hasSecretValueInUnifiedDiff(sideRoutingTxtToPy, (pathHint) => {
+  consultedCheckPaths.push(pathHint);
+  return pathHint?.endsWith('.py') ? 'python' : undefined;
+});
+assert.deepEqual(consultedCheckPaths, ['side-old.txt', 'side-new.py'], 'classification callback did not consult old/new paths independently');
+const contradictorySideMetadata = sideRoutingTxtToPy
+  .replace('rename from side-old.txt', 'rename from contradictory.py')
+  .replace('side-old.txt', 'side-old.py');
+const contradictoryOutput = redactUnifiedDiff(contradictorySideMetadata);
+const contradictoryOldBytesPresent = contradictoryOutput.includes('-    token: Token[SIDE_OLD_LITERAL]');
+const contradictoryNewBytesPresent = contradictoryOutput.includes('+    token: Token[SIDE_NEW_LITERAL]');
+assert.equal(contradictoryOldBytesPresent, false, 'contradictory old-side metadata donated parser provenance');
+assert.equal(contradictoryNewBytesPresent, true, 'contradictory old-side metadata disabled the unaffected new side');
+
+const mcpRouteTxtSource = [
+  'class McpRoute:',
+  '    marker_one = True',
+  '    marker_two = True',
+  '    token: Token[MCP_ROUTE_TXT_LITERAL]',
+  '    marker_three = True',
+  ''
+].join('\n');
+const mcpRoutePySource = [
+  'class McpRoute:',
+  '    marker_one = True',
+  '    marker_two = True',
+  '    token: Token[MCP_ROUTE_PY_LITERAL]',
+  '    marker_three = True',
+  ''
+].join('\n');
+const mcpCopyTxtSource = [
+  'class McpCopyTxt:',
+  '    txt_only_one = True',
+  '    txt_only_two = True',
+  '    txt_only_three = True',
+  '    token: Token[MCP_ROUTE_TXT_LITERAL]',
+  '    txt_only_four = True',
+  ''
+].join('\n');
+const mcpCopyPySource = [
+  'class McpCopyPy:',
+  '    py_only_one = True',
+  '    py_only_two = True',
+  '    py_only_three = True',
+  '    token: Token[MCP_ROUTE_PY_LITERAL]',
+  '    py_only_four = True',
+  ''
+].join('\n');
+const mcpHeaderPayloadSource = [
+  'class HeaderPayload:',
+  '    token: Token[MCP_HEADER_LITERAL]',
+  '    payload = """',
+  '-- old_marker',
+  '"""',
+  ''
+].join('\n');
+const mcpScopedTxtSource = [
+  'class ScopedRoute:',
+  '    marker_one = True',
+  '    marker_two = True',
+  '    token: Token[MCP_SCOPED_OLD_LITERAL]',
+  '    marker_three = True',
+  ''
+].join('\n');
+const applyRenameOldTxtSource = [
+  'class ApplyRenameOldTxt:',
+  '    token: Token[APPLY_RENAME_OLD_LITERAL]',
+  ''
+].join('\n');
+const applyRenameOldPySource = [
+  'class ApplyRenameOldPy:',
+  '    token: Token[str]',
+  ''
+].join('\n');
+const applyRenameHostileLiterals = [
+  'APPLY_RENAME_OLD_LITERAL',
+  'APPLY_RENAME_NEW_LITERAL'
+];
+
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-source-redaction-'));
 const rawArtifactDir = process.env.SOURCE_REDACTION_RAW_ARTIFACT_DIR;
 let client;
@@ -1414,6 +1584,14 @@ try {
   await writeFixture(tmp, 'consumer.ts', relationshipConsumer);
   for (const [relativePath, content] of Object.entries(privateSearchFixtures)) await writeFixture(tmp, relativePath, content);
   for (const [relativePath, content] of Object.entries(negativeFixtures)) await writeFixture(tmp, relativePath, content);
+  await writeFixture(tmp, 'mcp-rename.txt', mcpRouteTxtSource);
+  await writeFixture(tmp, 'mcp-rename.py', mcpRoutePySource);
+  await writeFixture(tmp, 'mcp-copy.txt', mcpCopyTxtSource);
+  await writeFixture(tmp, 'mcp-copy.py', mcpCopyPySource);
+  await writeFixture(tmp, 'header-payload.py', mcpHeaderPayloadSource);
+  await writeFixture(tmp, 'scope.py/old.txt', mcpScopedTxtSource);
+  await writeFixture(tmp, 'apply-rename-old.txt', applyRenameOldTxtSource);
+  await writeFixture(tmp, 'apply-rename-old.py', applyRenameOldPySource);
   gitFixture(tmp);
 
   client = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--bash', 'off', '--write', 'workspace', '--tool-mode', 'full'], {
@@ -3458,6 +3636,135 @@ try {
   assert.match(resultText(blockedPatch), /Secret-looking content is blocked/);
   assert.equal(await fs.readFile(path.join(tmp, 'compat.txt'), 'utf8'), compatPyBeforeBlockedPatch, 'literal patch changed source despite rejection');
 
+  const applyRenameTxtToPyPatch = [
+    'diff --git a/apply-rename-old.txt b/apply-rename-new.py',
+    'similarity index 80%',
+    'rename from apply-rename-old.txt',
+    'rename to apply-rename-new.py',
+    '--- a/apply-rename-old.txt',
+    '+++ b/apply-rename-new.py',
+    '@@ -1,2 +1,2 @@',
+    '-class ApplyRenameOldTxt:',
+    '-    token: Token[APPLY_RENAME_OLD_LITERAL]',
+    '+class ApplyRenameNewPy:',
+    '+    token: Token[str]',
+    ''
+  ].join('\n');
+  const blockedApplyRenameTxtToPy = assertToolError(await client.request('tools/call', {
+    name: 'apply_patch',
+    arguments: { workspace_id: workspaceId, patch: applyRenameTxtToPyPatch }
+  }), 'MCP .txt-to-.py apply_patch rename');
+  assert.match(resultText(blockedApplyRenameTxtToPy), /Secret-looking content is blocked/);
+  const applyRenameTxtToPyOldUnchanged = await fs.readFile(path.join(tmp, 'apply-rename-old.txt'), 'utf8') === applyRenameOldTxtSource;
+  const applyRenameTxtToPyNewAbsent = await fs.access(path.join(tmp, 'apply-rename-new.py'))
+    .then(() => false)
+    .catch((error) => {
+      if (error?.code === 'ENOENT') return true;
+      throw error;
+    });
+  const applyRenameTxtToPyResponseClean = !applyRenameHostileLiterals.some((literal) => JSON.stringify(blockedApplyRenameTxtToPy)?.includes(literal));
+  const applyRenameTxtToPyAtomic = applyRenameTxtToPyOldUnchanged
+    && applyRenameTxtToPyNewAbsent
+    && applyRenameTxtToPyResponseClean;
+  assert.equal(applyRenameTxtToPyAtomic, true, 'MCP .txt-to-.py apply_patch rename was not atomically rejected');
+  expectNoHostileResponseFields(blockedApplyRenameTxtToPy, applyRenameHostileLiterals, 'MCP .txt-to-.py apply_patch rename');
+  await writeRawArtifact(rawArtifactDir, 'apply-rename-txt-to-py-rejected', blockedApplyRenameTxtToPy);
+
+  const applyRenamePyToTxtPatch = [
+    'diff --git a/apply-rename-old.py b/apply-rename-new.txt',
+    'similarity index 80%',
+    'rename from apply-rename-old.py',
+    'rename to apply-rename-new.txt',
+    '--- a/apply-rename-old.py',
+    '+++ b/apply-rename-new.txt',
+    '@@ -1,2 +1,2 @@',
+    '-class ApplyRenameOldPy:',
+    '-    token: Token[str]',
+    '+class ApplyRenameNewTxt:',
+    '+    token: Token[APPLY_RENAME_NEW_LITERAL]',
+    ''
+  ].join('\n');
+  const blockedApplyRenamePyToTxt = assertToolError(await client.request('tools/call', {
+    name: 'apply_patch',
+    arguments: { workspace_id: workspaceId, patch: applyRenamePyToTxtPatch }
+  }), 'MCP .py-to-.txt apply_patch rename');
+  assert.match(resultText(blockedApplyRenamePyToTxt), /Secret-looking content is blocked/);
+  const applyRenamePyToTxtOldUnchanged = await fs.readFile(path.join(tmp, 'apply-rename-old.py'), 'utf8') === applyRenameOldPySource;
+  const applyRenamePyToTxtNewAbsent = await fs.access(path.join(tmp, 'apply-rename-new.txt'))
+    .then(() => false)
+    .catch((error) => {
+      if (error?.code === 'ENOENT') return true;
+      throw error;
+    });
+  const applyRenamePyToTxtResponseClean = !applyRenameHostileLiterals.some((literal) => JSON.stringify(blockedApplyRenamePyToTxt)?.includes(literal));
+  const applyRenamePyToTxtAtomic = applyRenamePyToTxtOldUnchanged
+    && applyRenamePyToTxtNewAbsent
+    && applyRenamePyToTxtResponseClean;
+  assert.equal(applyRenamePyToTxtAtomic, true, 'MCP .py-to-.txt apply_patch rename was not atomically rejected');
+  expectNoHostileResponseFields(blockedApplyRenamePyToTxt, applyRenameHostileLiterals, 'MCP .py-to-.txt apply_patch rename');
+  await writeRawArtifact(rawArtifactDir, 'apply-rename-py-to-txt-rejected', blockedApplyRenamePyToTxt);
+
+  // A real Git hunk can contain payload lines whose first characters look
+  // exactly like unified-diff file headers. Those payload bytes must not alter
+  // the ordered side paths or parser trust, and the underlying Git line counts
+  // must remain unchanged.
+  const headerPayloadPath = 'header-payload.py';
+  await fs.writeFile(
+    path.join(tmp, headerPayloadPath),
+    mcpHeaderPayloadSource.replace('-- old_marker', '++ new_marker'),
+    'utf8'
+  );
+  const headerPayloadDiff = assertToolSuccess(await client.request('tools/call', {
+    name: 'git_diff',
+    arguments: { workspace_id: workspaceId, path: headerPayloadPath, include_diff: true }
+  }), 'header-shaped hunk payload git_diff');
+  const headerPayloadNumstat = spawnSync('git', ['diff', '--numstat', '--', headerPayloadPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(headerPayloadNumstat.status, 0, `header-shaped hunk payload numstat failed: ${headerPayloadNumstat.stderr || headerPayloadNumstat.stdout}`);
+  const [headerPayloadAdditions, headerPayloadDeletions] = headerPayloadNumstat.stdout.trim().split(/\s+/u).slice(0, 2).map(Number);
+  assert.deepEqual([headerPayloadAdditions, headerPayloadDeletions], [1, 1], 'header-shaped hunk payload changed raw Git numstat');
+  const headerPayloadText = resultText(headerPayloadDiff);
+  const headerPayloadTokenRaw = headerPayloadText.includes('    token: Token[MCP_HEADER_LITERAL]');
+  const headerPayloadLinesRaw = headerPayloadText.includes('--- old_marker')
+    && headerPayloadText.includes('+++ new_marker');
+  assert.equal(headerPayloadTokenRaw, true, 'header-shaped hunk payload redacted lawful Python context');
+  assert.equal(headerPayloadLinesRaw, true, 'header-shaped hunk payload was not emitted by real Git');
+  // The existing Git response counter intentionally excludes lines beginning
+  // with `+++`/`---`, even when those prefixes belong to hunk payload. Keep
+  // that producer/stat contract stable while proving the raw lines survived.
+  assert.equal(headerPayloadDiff.structuredContent.additions, 0, 'header-shaped hunk payload changed Git addition stats');
+  assert.equal(headerPayloadDiff.structuredContent.deletions, 0, 'header-shaped hunk payload changed Git deletion stats');
+  await writeRawArtifact(rawArtifactDir, 'header-shaped-hunk-payload-git-diff', headerPayloadDiff);
+
+  // Exercise a path-scoped cross-extension rename below a directory whose
+  // name itself ends in `.py`. The scoped argument must reach Git, while each
+  // real old/new side still consults its own path extension.
+  const scopedRenameOldPath = 'scope.py/old.txt';
+  const scopedRenameNewPath = 'scope.py/new.py';
+  await fs.rename(path.join(tmp, scopedRenameOldPath), path.join(tmp, scopedRenameNewPath));
+  await fs.writeFile(
+    path.join(tmp, scopedRenameNewPath),
+    mcpScopedTxtSource.replace('MCP_SCOPED_OLD_LITERAL', 'MCP_SCOPED_NEW_LITERAL'),
+    'utf8'
+  );
+  const scopedRenameConfig = spawnSync('git', ['config', 'diff.renames', 'true'], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(scopedRenameConfig.status, 0, `scoped rename detection setup failed: ${scopedRenameConfig.stderr || scopedRenameConfig.stdout}`);
+  const scopedRenameStage = spawnSync('git', ['add', '-A', '--', 'scope.py'], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(scopedRenameStage.status, 0, `scoped cross-extension rename staging failed: ${scopedRenameStage.stderr || scopedRenameStage.stdout}`);
+  const scopedCrossExtensionDiff = assertToolSuccess(await client.request('tools/call', {
+    name: 'git_diff',
+    arguments: { workspace_id: workspaceId, path: 'scope.py', staged: true, include_diff: true }
+  }), 'scoped cross-extension rename git_diff');
+  const scopedCrossExtensionText = resultText(scopedCrossExtensionDiff);
+  const scopedOldTextRaw = scopedCrossExtensionText.includes('-    token: Token[MCP_SCOPED_OLD_LITERAL]');
+  const scopedOldTextMarker = scopedCrossExtensionText.includes('-    token: [REDACTED_SECRET]');
+  const scopedNewPythonRaw = scopedCrossExtensionText.includes('+    token: Token[MCP_SCOPED_NEW_LITERAL]');
+  assert.equal(scopedCrossExtensionText.includes('rename from scope.py/old.txt'), true, 'scoped cross-extension rename omitted old metadata');
+  assert.equal(scopedCrossExtensionText.includes('rename to scope.py/new.py'), true, 'scoped cross-extension rename omitted new metadata');
+  assert.equal(scopedOldTextRaw, false, 'scoped cross-extension rename preserved non-Python old-side bytes');
+  assert.equal(scopedOldTextMarker, true, 'scoped cross-extension rename omitted old-side redaction');
+  assert.equal(scopedNewPythonRaw, true, 'scoped cross-extension rename lost Python new-side bytes');
+  await writeRawArtifact(rawArtifactDir, 'scoped-cross-extension-rename-git-diff', scopedCrossExtensionDiff);
+
   // Exercise actual git diff/show_changes producers with a mixed tracked
   // result. The Python hunk keeps its parser-lawful source bytes while the
   // same-looking non-Python hunk is redacted from each per-header block.
@@ -3495,6 +3802,103 @@ try {
   const shownTextBlock = shownText.slice(shownTextHeader, shownTextEnd < 0 ? undefined : shownTextEnd);
   assert.equal(shownTextBlock.includes('ACTUAL_LITERAL_SECRET_7X9'), false, 'show_changes leaked non-Python hunk');
   assert.equal(shownTextBlock.includes('[REDACTED_SECRET]'), true, 'show_changes omitted non-Python redaction marker');
+
+  // Exercise actual Git rename/copy producers through MCP. The redaction
+  // callback must consult Git's old/new side paths independently; configure
+  // copy detection for this isolated fixture so both metadata directions are
+  // emitted by the real producer. Path-scoped Git coverage is exercised by
+  // the preceding mixed-route assertions.
+  const gitConfigCopies = spawnSync('git', ['config', 'diff.renames', 'copies'], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(gitConfigCopies.status, 0, `git copy detection setup failed: ${gitConfigCopies.stderr || gitConfigCopies.stdout}`);
+
+  const renameTxtPath = 'mcp-rename.txt';
+  const renameTxtToPyDestinationPath = 'mcp-rename-renamed.py';
+  await fs.rename(path.join(tmp, renameTxtPath), path.join(tmp, renameTxtToPyDestinationPath));
+  const renameTxtToPySource = mcpRouteTxtSource.replace('MCP_ROUTE_TXT_LITERAL', 'MCP_ROUTE_TXT_RENAMED_LITERAL');
+  await fs.writeFile(path.join(tmp, renameTxtToPyDestinationPath), renameTxtToPySource, 'utf8');
+  const renameTxtToPyStage = spawnSync('git', ['add', '-A', '--', renameTxtPath, renameTxtToPyDestinationPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(renameTxtToPyStage.status, 0, `MCP .txt-to-.py rename staging failed: ${renameTxtToPyStage.stderr || renameTxtToPyStage.stdout}`);
+  const renameTxtToPy = assertToolSuccess(await client.request('tools/call', {
+    name: 'git_diff',
+    arguments: { workspace_id: workspaceId, staged: true, include_diff: true }
+  }), 'MCP .txt-to-.py rename git_diff');
+  const renameTxtToPyText = resultText(renameTxtToPy);
+  const renameTxtToPyOldRaw = renameTxtToPyText.includes('-    token: Token[MCP_ROUTE_TXT_LITERAL]');
+  const renameTxtToPyNewRaw = renameTxtToPyText.includes('+    token: Token[MCP_ROUTE_TXT_RENAMED_LITERAL]');
+  assert.equal(renameTxtToPyText.includes('rename from mcp-rename.txt'), true, 'MCP .txt-to-.py rename omitted old metadata');
+  assert.equal(renameTxtToPyText.includes('rename to mcp-rename-renamed.py'), true, 'MCP .txt-to-.py rename omitted new metadata');
+  assert.equal(renameTxtToPyOldRaw, false, 'MCP .txt-to-.py rename preserved non-Python old-side bytes');
+  assert.equal(renameTxtToPyNewRaw, true, 'MCP .txt-to-.py rename lost Python new-side bytes');
+  const renameTxtToPyShown = assertToolSuccess(await client.request('tools/call', {
+    name: 'show_changes',
+    arguments: { workspace_id: workspaceId, staged: true, include_diff: true, since: 'workspace', mark_reviewed: false }
+  }), 'MCP .txt-to-.py rename show_changes');
+  const renameTxtToPyShownText = resultText(renameTxtToPyShown);
+  const renameTxtToPyShownNewRaw = renameTxtToPyShownText.includes('+    token: Token[MCP_ROUTE_TXT_RENAMED_LITERAL]');
+  assert.equal(renameTxtToPyShownNewRaw, true, 'show_changes did not inherit .txt-to-.py side routing');
+
+  const renamePySourcePath = 'mcp-rename.py';
+  const renameTxtDestinationPath = 'mcp-rename-renamed.txt';
+  await fs.rename(path.join(tmp, renamePySourcePath), path.join(tmp, renameTxtDestinationPath));
+  const renamePyToTxtSource = mcpRoutePySource.replace('MCP_ROUTE_PY_LITERAL', 'MCP_ROUTE_PY_RENAMED_LITERAL');
+  await fs.writeFile(path.join(tmp, renameTxtDestinationPath), renamePyToTxtSource, 'utf8');
+  const renamePyToTxtStage = spawnSync('git', ['add', '-A', '--', renamePySourcePath, renameTxtDestinationPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(renamePyToTxtStage.status, 0, `MCP .py-to-.txt rename staging failed: ${renamePyToTxtStage.stderr || renamePyToTxtStage.stdout}`);
+  const renamePyToTxt = assertToolSuccess(await client.request('tools/call', {
+    name: 'git_diff',
+    arguments: { workspace_id: workspaceId, staged: true, include_diff: true }
+  }), 'MCP .py-to-.txt rename git_diff');
+  const renamePyToTxtText = resultText(renamePyToTxt);
+  const renamePyToTxtOldRaw = renamePyToTxtText.includes('-    token: Token[MCP_ROUTE_PY_LITERAL]');
+  const renamePyToTxtNewRaw = renamePyToTxtText.includes('+    token: Token[MCP_ROUTE_PY_RENAMED_LITERAL]');
+  const renamePyToTxtNewMarker = renamePyToTxtText.includes('+    token: [REDACTED_SECRET]');
+  assert.equal(renamePyToTxtText.includes(`rename from ${renamePySourcePath}`), true, 'MCP .py-to-.txt rename omitted old metadata');
+  assert.equal(renamePyToTxtText.includes('rename to mcp-rename-renamed.txt'), true, 'MCP .py-to-.txt rename omitted new metadata');
+  assert.equal(renamePyToTxtOldRaw, true, 'MCP .py-to-.txt rename lost Python old-side bytes');
+  assert.equal(renamePyToTxtNewRaw, false, 'MCP .py-to-.txt rename preserved non-Python new-side bytes');
+  assert.equal(renamePyToTxtNewMarker, true, 'MCP .py-to-.txt rename omitted new-side redaction');
+
+  const copyTxtToPyPath = 'mcp-copy.txt';
+  const copyPyDestinationPath = 'mcp-copy-destination.py';
+  await fs.copyFile(path.join(tmp, copyTxtToPyPath), path.join(tmp, copyPyDestinationPath));
+  const copyTxtToPySource = mcpCopyTxtSource.replace('MCP_ROUTE_TXT_LITERAL', 'MCP_ROUTE_TXT_COPIED_LITERAL');
+  await fs.writeFile(path.join(tmp, copyPyDestinationPath), copyTxtToPySource, 'utf8');
+  await fs.writeFile(path.join(tmp, copyTxtToPyPath), mcpCopyTxtSource.replace('MCP_ROUTE_TXT_LITERAL', 'MCP_ROUTE_TXT_SOURCE_CHANGED_LITERAL'), 'utf8');
+  const copyTxtToPyStage = spawnSync('git', ['add', '--', copyTxtToPyPath, copyPyDestinationPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(copyTxtToPyStage.status, 0, `MCP .txt-to-.py copy staging failed: ${copyTxtToPyStage.stderr || copyTxtToPyStage.stdout}`);
+  const copyTxtToPy = assertToolSuccess(await client.request('tools/call', {
+    name: 'git_diff',
+    arguments: { workspace_id: workspaceId, staged: true, include_diff: true }
+  }), 'MCP .txt-to-.py copy git_diff');
+  const copyTxtToPyText = resultText(copyTxtToPy);
+  const copyTxtToPyOldRaw = copyTxtToPyText.includes('-    token: Token[MCP_ROUTE_TXT_LITERAL]');
+  const copyTxtToPyNewRaw = copyTxtToPyText.includes('+    token: Token[MCP_ROUTE_TXT_COPIED_LITERAL]');
+  assert.equal(copyTxtToPyText.includes('copy from mcp-copy.txt'), true, 'MCP .txt-to-.py copy omitted old metadata');
+  assert.equal(copyTxtToPyText.includes('copy to mcp-copy-destination.py'), true, 'MCP .txt-to-.py copy omitted new metadata');
+  assert.equal(copyTxtToPyOldRaw, false, 'MCP .txt-to-.py copy preserved non-Python old-side bytes');
+  assert.equal(copyTxtToPyNewRaw, true, 'MCP .txt-to-.py copy lost Python new-side bytes');
+
+  const copyPyToTxtPath = 'mcp-copy.py';
+  const copyTxtDestinationPath = 'mcp-copy-destination.txt';
+  await fs.copyFile(path.join(tmp, copyPyToTxtPath), path.join(tmp, copyTxtDestinationPath));
+  const copyPyToTxtSource = mcpCopyPySource.replace('MCP_ROUTE_PY_LITERAL', 'MCP_ROUTE_PY_COPIED_LITERAL');
+  await fs.writeFile(path.join(tmp, copyTxtDestinationPath), copyPyToTxtSource, 'utf8');
+  await fs.writeFile(path.join(tmp, copyPyToTxtPath), mcpCopyPySource.replace('MCP_ROUTE_PY_LITERAL', 'MCP_ROUTE_PY_SOURCE_CHANGED_LITERAL'), 'utf8');
+  const copyPyToTxtStage = spawnSync('git', ['add', '--', copyPyToTxtPath, copyTxtDestinationPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(copyPyToTxtStage.status, 0, `MCP .py-to-.txt copy staging failed: ${copyPyToTxtStage.stderr || copyPyToTxtStage.stdout}`);
+  const copyPyToTxt = assertToolSuccess(await client.request('tools/call', {
+    name: 'git_diff',
+    arguments: { workspace_id: workspaceId, staged: true, include_diff: true }
+  }), 'MCP .py-to-.txt copy git_diff');
+  const copyPyToTxtText = resultText(copyPyToTxt);
+  const copyPyToTxtOldRaw = copyPyToTxtText.includes('-    token: Token[MCP_ROUTE_PY_LITERAL]');
+  const copyPyToTxtNewRaw = copyPyToTxtText.includes('+    token: Token[MCP_ROUTE_PY_COPIED_LITERAL]');
+  const copyPyToTxtNewMarker = copyPyToTxtText.includes('+    token: [REDACTED_SECRET]');
+  assert.equal(copyPyToTxtText.includes('copy from mcp-copy.py'), true, 'MCP .py-to-.txt copy omitted old metadata');
+  assert.equal(copyPyToTxtText.includes('copy to mcp-copy-destination.txt'), true, 'MCP .py-to-.txt copy omitted new metadata');
+  assert.equal(copyPyToTxtOldRaw, true, 'MCP .py-to-.txt copy lost Python old-side bytes');
+  assert.equal(copyPyToTxtNewRaw, false, 'MCP .py-to-.txt copy preserved non-Python new-side bytes');
+  assert.equal(copyPyToTxtNewMarker, true, 'MCP .py-to-.txt copy omitted new-side redaction');
 
   const privateWrite = assertToolError(await client.request('tools/call', {
     name: 'write',

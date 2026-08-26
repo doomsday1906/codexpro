@@ -201,11 +201,133 @@ function splitPhysicalLines(source) {
   return lines;
 }
 
+function decodeGitQuotedPath(encoded) {
+  let decoded = '';
+  const octets = [];
+  const flushOctets = () => {
+    if (!octets.length) return;
+    decoded += Buffer.from(octets).toString('utf8');
+    octets.length = 0;
+  };
+  for (let index = 0; index < encoded.length; index += 1) {
+    if (encoded[index] !== '\\') {
+      flushOctets();
+      decoded += encoded[index];
+      continue;
+    }
+    const escaped = encoded[++index];
+    if (escaped === undefined) return undefined;
+    if (/[0-7]/u.test(escaped)) {
+      let octal = escaped;
+      for (let count = 0; count < 2 && /[0-7]/u.test(encoded[index + 1] ?? ''); count += 1) {
+        octal += encoded[++index];
+      }
+      octets.push(Number.parseInt(octal, 8));
+      continue;
+    }
+    flushOctets();
+    decoded += ({ a: '\x07', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v' }[escaped] ?? escaped);
+  }
+  flushOctets();
+  return decoded;
+}
+
+function parseDiffPathLine(rawPath, stripPrefix = false) {
+  let value = String(rawPath ?? '').split('\t')[0]?.trim() ?? '';
+  if (!value) return { valid: false, known: true, present: false, path: undefined };
+  if (value === '/dev/null') return { valid: true, known: true, present: false, path: undefined };
+  if (value.startsWith('"')) {
+    if (!value.endsWith('"') || value.length < 2) return { valid: false, known: true, present: false, path: undefined };
+    value = decodeGitQuotedPath(value.slice(1, -1));
+    if (value === undefined) return { valid: false, known: true, present: false, path: undefined };
+  }
+  value = value.replaceAll('\\', '/');
+  if (stripPrefix) value = value.replace(/^(?:[ab])\//u, '');
+  return value
+    ? { valid: true, known: true, present: true, path: value }
+    : { valid: false, known: true, present: false, path: undefined };
+}
+
+function sideMetadata(lines, side) {
+  const values = [];
+  let invalid = false;
+  for (const line of lines) {
+    const match = line.match(new RegExp(`^(?:rename|copy) ${side === 'old' ? 'from' : 'to'}\\s(.*)$`, 'u'));
+    if (!match) continue;
+    const parsed = parseDiffPathLine(match[1]);
+    if (!parsed.valid) invalid = true;
+    else values.push(parsed);
+  }
+  return { values, invalid };
+}
+
+function resolveDiffSide(header, metadata) {
+  const metadataPaths = new Set(metadata.values.filter((entry) => entry.present).map((entry) => entry.path));
+  const metadataAbsent = metadata.values.some((entry) => !entry.present);
+  let valid = !metadata.invalid && metadataPaths.size <= 1 && !(metadataAbsent && metadataPaths.size > 0);
+  if (header) {
+    if (!header.valid) valid = false;
+    if (header.present !== (metadata.values.length === 0 ? header.present : !metadataAbsent)) valid = false;
+    if (header.present && metadataPaths.size > 0 && !metadataPaths.has(header.path)) valid = false;
+    return {
+      valid,
+      known: true,
+      present: header.present,
+      path: valid && header.present ? header.path : undefined
+    };
+  }
+  if (metadata.values.length === 0) return { valid: true, known: false, present: false, path: undefined };
+  const first = metadata.values[0];
+  return {
+    valid,
+    known: true,
+    present: first.present,
+    path: valid && first.present ? first.path : undefined
+  };
+}
+
+// Resolve both sides from the actual unified-diff headers. Rename/copy
+// records corroborate those headers (or provide a bounded fallback when a
+// header is absent); a contradiction disables only the affected side.
+export function extractDiffSidePaths(source) {
+  const lines = String(source ?? '').split(/\r?\n/u);
+  const firstHunk = lines.findIndex((line) => /^@@\s/u.test(line));
+  // Only the pre-hunk file-header region can establish side identity. A
+  // Python payload may itself begin with `--- ` or `+++ `; those lines must
+  // never become extra headers or contradict the actual ordered pair.
+  const headerRegion = lines.slice(0, firstHunk >= 0 ? firstHunk : lines.length);
+  const oldHeaderEntries = headerRegion
+    .flatMap((line, index) => line.startsWith('--- ') ? [{ index, parsed: parseDiffPathLine(line.slice(4), true) }] : []);
+  const newHeaderEntries = headerRegion
+    .flatMap((line, index) => line.startsWith('+++ ') ? [{ index, parsed: parseDiffPathLine(line.slice(4), true) }] : []);
+  const oldHeader = oldHeaderEntries.length === 1 ? oldHeaderEntries[0].parsed : undefined;
+  const newHeader = newHeaderEntries.length === 1 ? newHeaderEntries[0].parsed : undefined;
+  const headerOrderContradiction = oldHeaderEntries.length === 1
+    && newHeaderEntries.length === 1
+    && oldHeaderEntries[0].index >= newHeaderEntries[0].index;
+  const oldHeaderContradiction = oldHeaderEntries.length > 1 || headerOrderContradiction;
+  const newHeaderContradiction = newHeaderEntries.length > 1 || headerOrderContradiction;
+  const oldMetadata = sideMetadata(headerRegion, 'old');
+  const newMetadata = sideMetadata(headerRegion, 'new');
+  const old = resolveDiffSide(oldHeaderContradiction ? { valid: false, known: true, present: false, path: undefined } : oldHeader, oldMetadata);
+  const next = resolveDiffSide(newHeaderContradiction ? { valid: false, known: true, present: false, path: undefined } : newHeader, newMetadata);
+  return {
+    oldPath: old.path,
+    newPath: next.path,
+    oldValid: old.valid,
+    newValid: next.valid,
+    oldKnown: old.known,
+    newKnown: next.known,
+    oldPresent: old.present,
+    newPresent: next.present
+  };
+}
+
 function isDiffHeader(line) {
   return /^(?:diff --git\s|---\s|\+\+\+\s|index\s|new file mode\s|old file mode\s|deleted file mode\s|similarity index\s|rename from\s|rename to\s|copy from\s|copy to\s|Binary files\s)/u.test(line);
 }
 
-function createDiffSide(source, lineRecords, side) {
+function createDiffSide(source, lineRecords, side, language) {
   const chars = [];
   const originalOffsets = [];
   const originalToVirtual = new Map();
@@ -226,11 +348,15 @@ function createDiffSide(source, lineRecords, side) {
     source: chars.join(''),
     originalOffsets,
     originalToVirtual,
-    parse: undefined
+    language,
+    // Non-Python and absent/ambiguous sides deliberately never reach the
+    // parser. Their offsets remain available so every mapped side must still
+    // agree before a credential receives Python source fidelity.
+    parse: language === 'python' ? parsePythonSegment(chars.join('')) : undefined
   };
 }
 
-function buildDiffSegments(source) {
+function buildDiffSegments(source, options = {}) {
   const lines = splitPhysicalLines(source);
   const segments = [];
   let hunkLines = [];
@@ -238,10 +364,8 @@ function buildDiffSegments(source) {
 
   const flush = () => {
     if (hunkLines.length === 0) return;
-    const oldSide = createDiffSide(source, hunkLines, 'old');
-    const newSide = createDiffSide(source, hunkLines, 'new');
-    oldSide.parse = parsePythonSegment(oldSide.source);
-    newSide.parse = parsePythonSegment(newSide.source);
+    const oldSide = createDiffSide(source, hunkLines, 'old', options.oldLanguage);
+    const newSide = createDiffSide(source, hunkLines, 'new', options.newLanguage);
     segments.push({ lines: hunkLines, sides: [oldSide, newSide] });
     hunkLines = [];
   };
@@ -253,13 +377,19 @@ function buildDiffSegments(source) {
       inHunk = true;
       continue;
     }
+    // Once a hunk is active, every line with a unified-diff marker is payload,
+    // even when its content begins with `--- ` or `+++ `. Only a non-payload
+    // line can terminate the hunk and establish the next file block.
+    if (inHunk && /^[ +\-]/u.test(line)) {
+      hunkLines.push(record);
+      continue;
+    }
     if (isDiffHeader(line)) {
       flush();
       inHunk = false;
       continue;
     }
     if (!inHunk) continue;
-    if (/^[ +\-]/u.test(line)) hunkLines.push(record);
   }
   flush();
   return segments;
@@ -281,16 +411,45 @@ function identitySegment(source) {
 }
 
 export function createPythonProvenance(source, options = {}) {
-  if (options?.language !== 'python') {
-    return { available: false, reason: 'untrusted-language', segments: [] };
-  }
   const text = String(source ?? '');
   if (Buffer.byteLength(text, 'utf8') > PYTHON_PROVENANCE_MAX_BYTES) {
     return { available: false, reason: 'over-limit', segments: [] };
   }
   if (isUnifiedDiff(text)) {
-    const segments = buildDiffSegments(text);
-    return { available: segments.length > 0, reason: segments.length > 0 ? undefined : 'no-hunks', segments };
+    const paths = extractDiffSidePaths(text);
+    const callback = typeof options?.languageForPath === 'function' ? options.languageForPath : undefined;
+    const defaultLanguageForPath = (filePath) => /\.(?:py|pyi|pyw)$/iu.test(String(filePath ?? '')) ? 'python' : undefined;
+    const resolveLanguage = (side, path, valid, present) => {
+      const optionName = side === 'old' ? 'oldLanguage' : 'newLanguage';
+      if (Object.prototype.hasOwnProperty.call(options, optionName)) {
+        return options[optionName] === 'python' && valid && present ? 'python' : undefined;
+      }
+      if (callback) {
+        let candidate;
+        try {
+          candidate = callback(path);
+        } catch {
+          candidate = undefined;
+        }
+        return candidate === 'python' && valid && present ? 'python' : undefined;
+      }
+      if (options?.language === 'python') {
+        return valid && present ? defaultLanguageForPath(path) : undefined;
+      }
+      return undefined;
+    };
+    const oldLanguage = resolveLanguage('old', paths.oldPath, paths.oldValid, paths.oldPresent);
+    const newLanguage = resolveLanguage('new', paths.newPath, paths.newValid, paths.newPresent);
+    const segments = buildDiffSegments(text, { oldLanguage, newLanguage });
+    const hasPythonSide = oldLanguage === 'python' || newLanguage === 'python';
+    return {
+      available: segments.length > 0 && hasPythonSide,
+      reason: segments.length === 0 ? 'no-hunks' : hasPythonSide ? undefined : 'untrusted-language',
+      segments
+    };
+  }
+  if (options?.language !== 'python') {
+    return { available: false, reason: 'untrusted-language', segments: [] };
   }
   return { available: true, reason: undefined, segments: [identitySegment(text)] };
 }
