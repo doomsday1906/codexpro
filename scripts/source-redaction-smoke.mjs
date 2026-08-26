@@ -8,6 +8,7 @@ import path from 'node:path';
 const {
   hasSecretValue,
   hasSecretValueInUnifiedDiff,
+  extractDiffFileBlocks,
   redactDiagnosticText,
   redactSearchQuery,
   redactSensitiveText,
@@ -636,7 +637,7 @@ const multilineHostileAliasDiff = [
   'diff --git a/multiline.py b/multiline.py',
   '--- a/multiline.py',
   '+++ b/multiline.py',
-  '@@ -1,2 +1,4 @@',
+  '@@ -1,1 +1,2 @@',
   ' class R:',
   '+    payload = {password: ACTUAL_LITERAL_SECRET_7X9}',
   ''
@@ -645,7 +646,7 @@ const multilineHostileAliasDiffRedacted = [
   'diff --git a/multiline.py b/multiline.py',
   '--- a/multiline.py',
   '+++ b/multiline.py',
-  '@@ -1,2 +1,4 @@',
+  '@@ -1,1 +1,2 @@',
   ' class R:',
   '+    payload = {password: [REDACTED_SECRET]}',
   ''
@@ -1485,6 +1486,32 @@ const contradictoryNewBytesPresent = contradictoryOutput.includes('+    token: T
 assert.equal(contradictoryOldBytesPresent, false, 'contradictory old-side metadata donated parser provenance');
 assert.equal(contradictoryNewBytesPresent, true, 'contradictory old-side metadata disabled the unaffected new side');
 
+const unfinishedHunk = [
+  'diff --git a/bad.py b/bad.py',
+  '--- a/bad.py',
+  '+++ b/bad.py',
+  '@@ -1,2 +1,2 @@',
+  '-one',
+  ''
+].join('\n');
+const unfinishedHunkBlock = extractDiffFileBlocks(unfinishedHunk);
+assert.equal(unfinishedHunkBlock.length, 1, 'unfinished EOF hunk changed block count');
+assert.equal(unfinishedHunkBlock[0].ambiguous, true, 'unfinished EOF hunk was not marked ambiguous');
+assert.equal(unfinishedHunkBlock[0].pathDiscoveryValid, false, 'unfinished EOF hunk granted path discovery');
+assert.deepEqual(unfinishedHunkBlock[0].paths, [], 'unfinished EOF hunk exposed a touched path');
+const ambiguousPythonPayload = [
+  'diff --git a/ambiguous.py b/ambiguous.py',
+  '--- a/ambiguous.py',
+  '+++ b/ambiguous.py',
+  '@@ -1,2 +1,2 @@',
+  '+    token: Token[AMBIGUOUS_LITERAL]',
+  ''
+].join('\n');
+const ambiguousPythonOutput = redactUnifiedDiff(ambiguousPythonPayload);
+assert.equal(hasSecretValueInUnifiedDiff(ambiguousPythonPayload), true, 'ambiguous Python-looking hunk lost fail-closed classification');
+assert.equal(ambiguousPythonOutput.includes('AMBIGUOUS_LITERAL'), false, 'ambiguous Python-looking hunk preserved a raw secret-looking token');
+assert.equal(ambiguousPythonOutput.includes('[REDACTED_SECRET]'), true, 'ambiguous Python-looking hunk omitted generic redaction');
+
 const mcpRouteTxtSource = [
   'class McpRoute:',
   '    marker_one = True',
@@ -1527,6 +1554,45 @@ const mcpHeaderPayloadSource = [
   '"""',
   ''
 ].join('\n');
+const mcpHeaderPayloadMirrorSource = [
+  'class HeaderPayloadMirror:',
+  '    payload = """',
+  '-- header-looking.txt',
+  '"""',
+  ''
+].join('\n');
+const mcpHeaderPayloadVariantFixtures = [
+  {
+    path: 'header-payload-relative.py',
+    payload: 'relative-looking-text',
+    source: ['class HeaderPayloadRelative:', '    payload = """', '-- relative-looking-text', '"""', ''].join('\n')
+  },
+  {
+    path: 'header-payload-absolute.py',
+    payload: '/absolute-looking/synthetic/path',
+    source: ['class HeaderPayloadAbsolute:', '    payload = """', '-- /absolute-looking/synthetic/path', '"""', ''].join('\n')
+  },
+  {
+    path: 'header-payload-suffix.py',
+    payload: 'header-looking.py',
+    source: ['class HeaderPayloadSuffixPy:', '    payload = """', '-- header-looking.py', '"""', ''].join('\n')
+  },
+  {
+    path: 'header-payload-suffix.txt',
+    payload: 'header-looking.txt',
+    source: ['class HeaderPayloadSuffixTxt:', '    payload = """', '-- header-looking.txt', '"""', ''].join('\n')
+  }
+];
+const customPrefixOldPath = 'a/custom-prefix.py';
+const customPrefixNewPath = 'b/custom-prefix.py';
+const customPrefixOldSource = [
+  'class CustomPrefix:',
+  '    marker_one = True',
+  '    token: Token[CUSTOM_PREFIX_OLD_LITERAL]',
+  '    marker_two = True',
+  ''
+].join('\n');
+const customPrefixNewSource = customPrefixOldSource.replace('CUSTOM_PREFIX_OLD_LITERAL', 'CUSTOM_PREFIX_NEW_LITERAL');
 const mcpScopedTxtSource = [
   'class ScopedRoute:',
   '    marker_one = True',
@@ -1589,6 +1655,9 @@ try {
   await writeFixture(tmp, 'mcp-copy.txt', mcpCopyTxtSource);
   await writeFixture(tmp, 'mcp-copy.py', mcpCopyPySource);
   await writeFixture(tmp, 'header-payload.py', mcpHeaderPayloadSource);
+  await writeFixture(tmp, 'header-payload-mirror.txt', mcpHeaderPayloadMirrorSource);
+  for (const fixture of mcpHeaderPayloadVariantFixtures) await writeFixture(tmp, fixture.path, fixture.source);
+  await writeFixture(tmp, customPrefixOldPath, customPrefixOldSource);
   await writeFixture(tmp, 'scope.py/old.txt', mcpScopedTxtSource);
   await writeFixture(tmp, 'apply-rename-old.txt', applyRenameOldTxtSource);
   await writeFixture(tmp, 'apply-rename-old.py', applyRenameOldPySource);
@@ -3734,6 +3803,143 @@ try {
   assert.equal(headerPayloadDiff.structuredContent.additions, 0, 'header-shaped hunk payload changed Git addition stats');
   assert.equal(headerPayloadDiff.structuredContent.deletions, 0, 'header-shaped hunk payload changed Git deletion stats');
   await writeRawArtifact(rawArtifactDir, 'header-shaped-hunk-payload-git-diff', headerPayloadDiff);
+
+  // Feed that exact Git-produced patch back through the real MCP apply_patch
+  // route. The file is restored only to make the captured diff applicable;
+  // Git remains the target patch producer and MCP remains the target route.
+  const headerPayloadRawPatchResult = spawnSync('git', ['diff', '--', headerPayloadPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(headerPayloadRawPatchResult.status, 0, `header-shaped raw Git patch failed: ${headerPayloadRawPatchResult.stderr || headerPayloadRawPatchResult.stdout}`);
+  const headerPayloadRawPatch = headerPayloadRawPatchResult.stdout;
+  assert.equal(headerPayloadRawPatch, `${headerPayloadDiff.structuredContent.diff}\n`, 'MCP Git diff did not preserve the real Git patch bytes');
+  await fs.writeFile(path.join(tmp, headerPayloadPath), mcpHeaderPayloadSource, 'utf8');
+  const headerPayloadSentinelPath = 'source.ts';
+  const headerPayloadSentinelBefore = await fs.readFile(path.join(tmp, headerPayloadSentinelPath), 'utf8');
+  const headerPayloadSentinelHash = sha256(headerPayloadSentinelBefore);
+  const headerPayloadEntriesBefore = (await fs.readdir(tmp)).sort();
+  const headerPayloadDerivedFiles = [
+    'old_marker',
+    'new_marker',
+    'relative-looking-text',
+    'header-looking.py',
+    'header-looking.txt',
+    'absolute-looking'
+  ];
+  const headerPayloadApply = assertToolSuccess(await client.request('tools/call', {
+    name: 'apply_patch',
+    arguments: { workspace_id: workspaceId, patch: headerPayloadRawPatch }
+  }), 'header-shaped hunk payload MCP apply_patch');
+  assert.deepEqual(headerPayloadApply.structuredContent.paths, [headerPayloadPath], 'header-shaped MCP apply_patch returned payload-looking paths');
+  assert.equal(await fs.readFile(path.join(tmp, headerPayloadPath), 'utf8'), mcpHeaderPayloadSource
+    .replace('-- old_marker', '++ new_marker'), 'header-shaped MCP apply_patch changed bytes unexpectedly');
+  const headerPayloadSentinelAfter = await fs.readFile(path.join(tmp, headerPayloadSentinelPath), 'utf8');
+  assert.equal(headerPayloadSentinelAfter, headerPayloadSentinelBefore, 'header-shaped MCP apply_patch changed unrelated sentinel bytes');
+  assert.equal(sha256(headerPayloadSentinelAfter), headerPayloadSentinelHash, 'header-shaped MCP apply_patch changed unrelated sentinel hash');
+  assert.deepEqual((await fs.readdir(tmp)).sort(), headerPayloadEntriesBefore, 'header-shaped MCP apply_patch created or removed unrelated entries');
+  for (const derivedFile of headerPayloadDerivedFiles) {
+    const derivedPath = path.join(tmp, derivedFile);
+    const absent = await fs.access(derivedPath).then(() => false).catch((error) => {
+      if (error?.code === 'ENOENT') return true;
+      throw error;
+    });
+    assert.equal(absent, true, `header-shaped MCP apply_patch created payload-derived file ${derivedFile}`);
+  }
+  await writeRawArtifact(rawArtifactDir, 'header-shaped-hunk-payload-mcp-apply', headerPayloadApply);
+
+  for (const fixture of mcpHeaderPayloadVariantFixtures) {
+    const { path: variantPath, payload: expectedPayload, source: variantSource } = fixture;
+    const variantChanged = variantSource.replace('-- ', '++ ');
+    await fs.writeFile(path.join(tmp, variantPath), variantChanged, 'utf8');
+    const variantDiffResult = spawnSync('git', ['diff', '--', variantPath], { cwd: tmp, encoding: 'utf8' });
+    assert.equal(variantDiffResult.status, 0, `${variantPath} real Git diff failed: ${variantDiffResult.stderr || variantDiffResult.stdout}`);
+    const variantPatch = variantDiffResult.stdout;
+    assert.equal(variantPatch.includes(`--- ${expectedPayload}`), true, `${variantPath} real Git diff omitted exact header-shaped deletion payload`);
+    assert.equal(variantPatch.includes(`+++ ${expectedPayload}`), true, `${variantPath} real Git diff omitted exact header-shaped addition payload`);
+    const variantBlocks = extractDiffFileBlocks(variantPatch);
+    assert.deepEqual(variantBlocks.map((block) => block.paths), [[variantPath]], `${variantPath} canonical metadata admitted payload-looking path`);
+    await fs.writeFile(path.join(tmp, variantPath), variantSource, 'utf8');
+    const variantApply = assertToolSuccess(await client.request('tools/call', {
+      name: 'apply_patch',
+      arguments: { workspace_id: workspaceId, patch: variantPatch }
+    }), `${variantPath} header-shaped MCP apply_patch`);
+    assert.deepEqual(variantApply.structuredContent.paths, [variantPath], `${variantPath} MCP apply_patch returned payload-looking paths`);
+    assert.equal(await fs.readFile(path.join(tmp, variantPath), 'utf8'), variantChanged, `${variantPath} MCP apply_patch changed bytes unexpectedly`);
+  }
+
+  // A real Git multi-file diff must be split per file, with the Python and
+  // mirror paths independently routed and the MCP result deterministically
+  // deduped in producer order.
+  const headerPayloadMirrorPath = 'header-payload-mirror.txt';
+  const headerPayloadMirrorChanged = mcpHeaderPayloadMirrorSource.replace('-- header-looking.txt', '++ header-looking.txt');
+  await fs.writeFile(path.join(tmp, headerPayloadPath), mcpHeaderPayloadSource, 'utf8');
+  await fs.writeFile(path.join(tmp, headerPayloadMirrorPath), mcpHeaderPayloadMirrorSource, 'utf8');
+  await fs.writeFile(path.join(tmp, headerPayloadPath), mcpHeaderPayloadSource.replace('-- old_marker', '++ new_marker'), 'utf8');
+  await fs.writeFile(path.join(tmp, headerPayloadMirrorPath), headerPayloadMirrorChanged, 'utf8');
+  const multiHeaderPayloadPatchResult = spawnSync('git', ['diff', '--', headerPayloadPath, headerPayloadMirrorPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(multiHeaderPayloadPatchResult.status, 0, `multi-file header-shaped Git diff failed: ${multiHeaderPayloadPatchResult.stderr || multiHeaderPayloadPatchResult.stdout}`);
+  const multiHeaderPayloadPatch = multiHeaderPayloadPatchResult.stdout;
+  assert.equal(multiHeaderPayloadPatch.includes('--- header-looking.txt'), true, 'multi-file Git diff omitted .txt header-shaped deletion payload');
+  assert.equal(multiHeaderPayloadPatch.includes('+++ header-looking.txt'), true, 'multi-file Git diff omitted .txt header-shaped addition payload');
+  await writeRawArtifact(rawArtifactDir, 'header-shaped-hunk-payload-multi-file-git-diff', { patch: multiHeaderPayloadPatch });
+  const multiHeaderPayloadBlocks = extractDiffFileBlocks(multiHeaderPayloadPatch);
+  assert.deepEqual(multiHeaderPayloadBlocks.map((block) => block.paths), [[headerPayloadMirrorPath], [headerPayloadPath]], 'multi-file canonical blocks changed producer-ordered paths');
+  assert.equal(multiHeaderPayloadBlocks.every((block) => block.pathDiscoveryValid), true, 'multi-file canonical blocks were not unambiguous');
+  await fs.writeFile(path.join(tmp, headerPayloadPath), mcpHeaderPayloadSource, 'utf8');
+  await fs.writeFile(path.join(tmp, headerPayloadMirrorPath), mcpHeaderPayloadMirrorSource, 'utf8');
+  const multiHeaderPayloadApply = assertToolSuccess(await client.request('tools/call', {
+    name: 'apply_patch',
+    arguments: { workspace_id: workspaceId, patch: multiHeaderPayloadPatch }
+  }), 'multi-file header-shaped MCP apply_patch');
+  assert.deepEqual(multiHeaderPayloadApply.structuredContent.paths, [headerPayloadMirrorPath, headerPayloadPath], 'multi-file MCP apply_patch changed returned path order or dedupe');
+  assert.equal(await fs.readFile(path.join(tmp, headerPayloadPath), 'utf8'), mcpHeaderPayloadSource
+    .replace('-- old_marker', '++ new_marker'), 'multi-file MCP apply_patch changed Python bytes unexpectedly');
+  assert.equal(await fs.readFile(path.join(tmp, headerPayloadMirrorPath), 'utf8'), headerPayloadMirrorChanged, 'multi-file MCP apply_patch changed mirror bytes unexpectedly');
+  await writeRawArtifact(rawArtifactDir, 'header-shaped-hunk-payload-multi-file-mcp-apply', multiHeaderPayloadApply);
+
+  // Git's default -p1 strips one component from ordinary unified headers even
+  // when the producer uses prefixes other than `a/` and `b/`. Keep actual
+  // Python files beneath top-level `a/` and `b/` to prove the canonical path
+  // is the post-strip target consumed by PathGuard, language routing, and Git.
+  await fs.mkdir(path.join(tmp, 'b'), { recursive: true });
+  await fs.rename(path.join(tmp, customPrefixOldPath), path.join(tmp, customPrefixNewPath));
+  await fs.writeFile(path.join(tmp, customPrefixNewPath), customPrefixNewSource, 'utf8');
+  const customPrefixStage = spawnSync('git', ['add', '-A', '--', customPrefixOldPath, customPrefixNewPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(customPrefixStage.status, 0, `custom-prefix rename staging failed: ${customPrefixStage.stderr || customPrefixStage.stdout}`);
+  const customPrefixPatchResult = spawnSync('git', [
+    '-c', 'diff.renames=true',
+    'diff', '--cached', '--find-renames=50%',
+    '--src-prefix=old/', '--dst-prefix=new/',
+    '--', customPrefixOldPath, customPrefixNewPath
+  ], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(customPrefixPatchResult.status, 0, `custom-prefix real Git diff failed: ${customPrefixPatchResult.stderr || customPrefixPatchResult.stdout}`);
+  const customPrefixPatch = customPrefixPatchResult.stdout;
+  assert.equal(customPrefixPatch.includes(`--- old/${customPrefixOldPath}`), true, 'custom-prefix Git diff omitted old non-a/b header');
+  assert.equal(customPrefixPatch.includes(`+++ new/${customPrefixNewPath}`), true, 'custom-prefix Git diff omitted new non-a/b header');
+  assert.equal(customPrefixPatch.includes(`rename from ${customPrefixOldPath}`), true, 'custom-prefix Git diff omitted old rename metadata');
+  assert.equal(customPrefixPatch.includes(`rename to ${customPrefixNewPath}`), true, 'custom-prefix Git diff omitted new rename metadata');
+  const customPrefixBlocks = extractDiffFileBlocks(customPrefixPatch);
+  assert.deepEqual(customPrefixBlocks.map((block) => block.paths), [[customPrefixOldPath, customPrefixNewPath]], 'custom-prefix canonical paths did not match Git -p1 targets');
+  assert.equal(customPrefixBlocks[0].oldPath, customPrefixOldPath, 'custom-prefix old canonical path was not post-strip');
+  assert.equal(customPrefixBlocks[0].newPath, customPrefixNewPath, 'custom-prefix new canonical path was not post-strip');
+  assert.equal(customPrefixBlocks[0].pathDiscoveryValid, true, 'custom-prefix canonical block was not valid');
+  const customPrefixReset = spawnSync('git', ['reset', 'HEAD', '--', customPrefixOldPath, customPrefixNewPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(customPrefixReset.status, 0, `custom-prefix rename unstaging failed: ${customPrefixReset.stderr || customPrefixReset.stdout}`);
+  await fs.rename(path.join(tmp, customPrefixNewPath), path.join(tmp, customPrefixOldPath));
+  await fs.writeFile(path.join(tmp, customPrefixOldPath), customPrefixOldSource, 'utf8');
+  const customPrefixApply = assertToolSuccess(await client.request('tools/call', {
+    name: 'apply_patch',
+    arguments: { workspace_id: workspaceId, patch: customPrefixPatch }
+  }), 'custom-prefix Python rename MCP apply_patch');
+  assert.deepEqual(customPrefixApply.structuredContent.paths, [customPrefixOldPath, customPrefixNewPath], 'custom-prefix MCP apply_patch returned non-canonical or payload-derived paths');
+  assert.equal(await fs.readFile(path.join(tmp, customPrefixNewPath), 'utf8'), customPrefixNewSource, 'custom-prefix MCP apply_patch changed new Python bytes unexpectedly');
+  const customPrefixOldAbsent = await fs.access(path.join(tmp, customPrefixOldPath)).then(() => false).catch((error) => {
+    if (error?.code === 'ENOENT') return true;
+    throw error;
+  });
+  assert.equal(customPrefixOldAbsent, true, 'custom-prefix MCP apply_patch left the old Python path behind');
+  assert.equal(resultText(customPrefixApply).includes('CUSTOM_PREFIX_NEW_LITERAL'), true, 'custom-prefix MCP apply_patch did not preserve trusted Python response bytes');
+  const customPrefixPostApplyReset = spawnSync('git', ['reset', 'HEAD', '--', customPrefixOldPath, customPrefixNewPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(customPrefixPostApplyReset.status, 0, `custom-prefix post-apply unstaging failed: ${customPrefixPostApplyReset.stderr || customPrefixPostApplyReset.stdout}`);
+  await writeRawArtifact(rawArtifactDir, 'custom-prefix-python-rename-mcp-apply', customPrefixApply);
 
   // Exercise a path-scoped cross-extension rename below a directory whose
   // name itself ends in `.py`. The scoped argument must reach Git, while each

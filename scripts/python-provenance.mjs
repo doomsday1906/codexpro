@@ -201,6 +201,111 @@ function splitPhysicalLines(source) {
   return lines;
 }
 
+function parseHunkHeader(line) {
+  const match = String(line ?? '').match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/u);
+  if (!match) return undefined;
+  return {
+    oldRemaining: Number(match[2] ?? 1),
+    newRemaining: Number(match[4] ?? 1)
+  };
+}
+
+function consumeHunkLine(state, line) {
+  if (!state) return undefined;
+  // Git emits this note without consuming either side of the hunk.
+  if (/^\\ No newline at end of file$/u.test(line)) return state;
+  // A malformed hunk remains opaque until a non-payload line appears. This
+  // keeps header-shaped payload from becoming path metadata while allowing
+  // the caller to fail closed for the ambiguous block.
+  if (state.invalid) return /^[ +\-]/u.test(line) ? state : undefined;
+  const marker = line[0];
+  if (marker !== ' ' && marker !== '-' && marker !== '+') return undefined;
+  const next = {
+    oldRemaining: state.oldRemaining - (marker === '+' ? 0 : 1),
+    newRemaining: state.newRemaining - (marker === '-' ? 0 : 1)
+  };
+  if (next.oldRemaining < 0 || next.newRemaining < 0) return { invalid: true };
+  return next.oldRemaining === 0 && next.newRemaining === 0 ? undefined : next;
+}
+
+function splitDiffFileRanges(source) {
+  const text = String(source ?? '');
+  const records = splitPhysicalLines(text);
+  if (!records.length) return [{ start: 0, end: text.length, ambiguous: false }];
+
+  const ranges = [];
+  let blockStart = 0;
+  let blockAmbiguous = false;
+  let hunkState;
+  let sawHunk = false;
+  let completedHunk = false;
+  let sawOldHeader = false;
+  let sawNewHeader = false;
+
+  const resetBlock = (start) => {
+    blockStart = start;
+    blockAmbiguous = false;
+    hunkState = undefined;
+    sawHunk = false;
+    completedHunk = false;
+    sawOldHeader = false;
+    sawNewHeader = false;
+  };
+  const pushBlock = (end) => {
+    ranges.push({ start: blockStart, end, ambiguous: blockAmbiguous || Boolean(hunkState) });
+  };
+
+  for (const record of records) {
+    const line = text.slice(record.start, record.end);
+
+    // A payload line is always prefixed by a hunk marker, so an unprefixed
+    // `diff --git` line is a safe block boundary even when hunk counts are
+    // malformed. Any unfinished hunk makes the preceding block ambiguous.
+    if (/^diff --git\s/u.test(line)) {
+      if (record.start > blockStart) pushBlock(record.start);
+      resetBlock(record.start);
+      continue;
+    }
+
+    if (hunkState) {
+      const next = consumeHunkLine(hunkState, line);
+      if (next !== undefined || /^[ +\-]/u.test(line) || /^\\ No newline at end of file$/u.test(line)) {
+        if (next?.invalid) blockAmbiguous = true;
+        hunkState = next;
+        if (!hunkState) completedHunk = true;
+        continue;
+      }
+      if (hunkState.invalid || hunkState.oldRemaining !== 0 || hunkState.newRemaining !== 0) blockAmbiguous = true;
+      hunkState = undefined;
+      completedHunk = true;
+    }
+
+    if (/^@@\s/u.test(line)) {
+      sawHunk = true;
+      hunkState = parseHunkHeader(line) ?? { invalid: true };
+      if (hunkState.invalid) blockAmbiguous = true;
+      completedHunk = false;
+      continue;
+    }
+
+    // Minimal unified diffs have no `diff --git` sentinel. Once a complete
+    // hunk has ended, a fresh `---` header starts the next file block. Before
+    // the first hunk, require an already-seen header pair so repeated or
+    // contradictory metadata stays in one block and fails closed.
+    if (line.startsWith('--- ')
+      && record.start > blockStart
+      && (completedHunk || (sawOldHeader && sawNewHeader && !sawHunk))) {
+      pushBlock(record.start);
+      resetBlock(record.start);
+    }
+    if (line.startsWith('--- ')) sawOldHeader = true;
+    if (line.startsWith('+++ ')) sawNewHeader = true;
+  }
+
+  pushBlock(text.length);
+  return ranges;
+}
+
 function decodeGitQuotedPath(encoded) {
   let decoded = '';
   const octets = [];
@@ -242,7 +347,14 @@ function parseDiffPathLine(rawPath, stripPrefix = false) {
     if (value === undefined) return { valid: false, known: true, present: false, path: undefined };
   }
   value = value.replaceAll('\\', '/');
-  if (stripPrefix) value = value.replace(/^(?:[ab])\//u, '');
+  // Unified headers are consumed by Git with its default -p1 behavior. Strip
+  // exactly one relative component regardless of its name (a/, b/, old/,
+  // new/, etc.), but never reinterpret absolute POSIX or Windows paths.
+  const absolute = value.startsWith('/') || value.startsWith('//') || /^[A-Za-z]:\//u.test(value);
+  if (stripPrefix && !absolute) {
+    const slash = value.indexOf('/');
+    if (slash >= 0) value = value.slice(slash + 1);
+  }
   return value
     ? { valid: true, known: true, present: true, path: value }
     : { valid: false, known: true, present: false, path: undefined };
@@ -323,6 +435,50 @@ export function extractDiffSidePaths(source) {
   };
 }
 
+function orderedUniquePaths(paths) {
+  const seen = new Set();
+  const output = [];
+  for (const value of paths) {
+    if (typeof value !== 'string' || !value || seen.has(value)) continue;
+    seen.add(value);
+    output.push(value);
+  }
+  return output;
+}
+
+// Canonical hunk-aware unified-diff records. `source` is an exact contiguous
+// slice of the input; `paths` contains only both-side-validated, present
+// paths, in old/new order, with deterministic dedupe. A block with missing,
+// contradictory, or ambiguous metadata exposes no discovery paths.
+export function extractDiffFileBlocks(source) {
+  const text = String(source ?? '');
+  return splitDiffFileRanges(text).map((range) => {
+    const block = text.slice(range.start, range.end);
+    const sidePaths = extractDiffSidePaths(block);
+    const pathDiscoveryValid = !range.ambiguous
+      && sidePaths.oldKnown
+      && sidePaths.newKnown
+      && sidePaths.oldValid
+      && sidePaths.newValid
+      && (sidePaths.oldPresent || sidePaths.newPresent);
+    const paths = pathDiscoveryValid
+      ? orderedUniquePaths([
+        sidePaths.oldPresent ? sidePaths.oldPath : undefined,
+        sidePaths.newPresent ? sidePaths.newPath : undefined
+      ])
+      : [];
+    return {
+      source: block,
+      start: range.start,
+      end: range.end,
+      ambiguous: range.ambiguous,
+      ...sidePaths,
+      pathDiscoveryValid,
+      paths
+    };
+  });
+}
+
 function isDiffHeader(line) {
   return /^(?:diff --git\s|---\s|\+\+\+\s|index\s|new file mode\s|old file mode\s|deleted file mode\s|similarity index\s|rename from\s|rename to\s|copy from\s|copy to\s|Binary files\s)/u.test(line);
 }
@@ -356,8 +512,9 @@ function createDiffSide(source, lineRecords, side, language) {
   };
 }
 
-function buildDiffSegments(source, options = {}) {
-  const lines = splitPhysicalLines(source);
+function buildDiffSegments(source, options = {}, rangeStart = 0, rangeEnd = source.length) {
+  const lines = splitPhysicalLines(source)
+    .filter((record) => record.start >= rangeStart && record.start < rangeEnd);
   const segments = [];
   let hunkLines = [];
   let inHunk = false;
@@ -416,13 +573,13 @@ export function createPythonProvenance(source, options = {}) {
     return { available: false, reason: 'over-limit', segments: [] };
   }
   if (isUnifiedDiff(text)) {
-    const paths = extractDiffSidePaths(text);
+    const blocks = extractDiffFileBlocks(text);
     const callback = typeof options?.languageForPath === 'function' ? options.languageForPath : undefined;
     const defaultLanguageForPath = (filePath) => /\.(?:py|pyi|pyw)$/iu.test(String(filePath ?? '')) ? 'python' : undefined;
-    const resolveLanguage = (side, path, valid, present) => {
+    const resolveLanguage = (side, path, valid, present, structurallyValid = true) => {
       const optionName = side === 'old' ? 'oldLanguage' : 'newLanguage';
       if (Object.prototype.hasOwnProperty.call(options, optionName)) {
-        return options[optionName] === 'python' && valid && present ? 'python' : undefined;
+        return options[optionName] === 'python' && structurallyValid && valid && present ? 'python' : undefined;
       }
       if (callback) {
         let candidate;
@@ -431,17 +588,22 @@ export function createPythonProvenance(source, options = {}) {
         } catch {
           candidate = undefined;
         }
-        return candidate === 'python' && valid && present ? 'python' : undefined;
+        return candidate === 'python' && structurallyValid && valid && present ? 'python' : undefined;
       }
       if (options?.language === 'python') {
-        return valid && present ? defaultLanguageForPath(path) : undefined;
+        return structurallyValid && valid && present ? defaultLanguageForPath(path) : undefined;
       }
       return undefined;
     };
-    const oldLanguage = resolveLanguage('old', paths.oldPath, paths.oldValid, paths.oldPresent);
-    const newLanguage = resolveLanguage('new', paths.newPath, paths.newValid, paths.newPresent);
-    const segments = buildDiffSegments(text, { oldLanguage, newLanguage });
-    const hasPythonSide = oldLanguage === 'python' || newLanguage === 'python';
+    const segments = [];
+    let hasPythonSide = false;
+    for (const block of blocks) {
+      const structurallyValid = !block.ambiguous;
+      const oldLanguage = resolveLanguage('old', block.oldPath, block.oldValid, block.oldPresent, structurallyValid);
+      const newLanguage = resolveLanguage('new', block.newPath, block.newValid, block.newPresent, structurallyValid);
+      if (oldLanguage === 'python' || newLanguage === 'python') hasPythonSide = true;
+      segments.push(...buildDiffSegments(text, { oldLanguage, newLanguage }, block.start, block.end));
+    }
     return {
       available: segments.length > 0 && hasPythonSide,
       reason: segments.length === 0 ? 'no-hunks' : hasPythonSide ? undefined : 'untrusted-language',

@@ -1,8 +1,10 @@
 import {
   createPythonProvenance,
-  extractDiffSidePaths,
+  extractDiffFileBlocks,
   ownsPythonCredential
 } from './python-provenance.mjs';
+
+export { extractDiffFileBlocks };
 
 const REDACTED_SECRET = '[REDACTED_SECRET]';
 export const PRIVATE_KEY_REDACTION_MARKER = '[REDACTED_PRIVATE_KEY]';
@@ -936,21 +938,7 @@ export function hasSecretValue(text, options = {}) {
   return false;
 }
 
-function diffBlocks(text) {
-  const source = String(text ?? '');
-  if (/^diff --git\s/mu.test(source)) {
-    return source.split(/(?=^diff --git\s)/mu).filter((block) => block.length > 0);
-  }
-  // Some callers provide a minimal unified patch without `diff --git`
-  // records. Split each `---`/`+++` pair so a later non-Python file cannot
-  // inherit the first file's parser authority.
-  if (/^---\s/mu.test(source) && /^\+\+\+\s/mu.test(source)) {
-    return source.split(/(?=^---\s)/mu).filter((block) => block.length > 0);
-  }
-  return [source];
-}
-
-function trustedDiffLanguage(languageForPath, path, valid, present) {
+function trustedDiffLanguage(languageForPath, path, valid, present, structurallyValid = true) {
   let candidate;
   try {
     // Consult both sides independently, including an undefined absent or
@@ -959,7 +947,7 @@ function trustedDiffLanguage(languageForPath, path, valid, present) {
   } catch {
     candidate = undefined;
   }
-  return valid && present && candidate === 'python' ? 'python' : undefined;
+  return structurallyValid && valid && present && candidate === 'python' ? 'python' : undefined;
 }
 
 // Unified diff output is a collection of per-file target routes. Each side
@@ -969,11 +957,11 @@ export function redactUnifiedDiff(text, options = {}) {
   const languageForPath = typeof options?.languageForPath === 'function'
     ? options.languageForPath
     : sourceLanguageForPath;
-  return diffBlocks(text).map((block) => {
-    const paths = extractDiffSidePaths(block);
-    const oldLanguage = trustedDiffLanguage(languageForPath, paths.oldPath, paths.oldValid, paths.oldPresent);
-    const newLanguage = trustedDiffLanguage(languageForPath, paths.newPath, paths.newValid, paths.newPresent);
-    return redactSensitiveText(block, { context: 'source', oldLanguage, newLanguage });
+  return extractDiffFileBlocks(text).map((block) => {
+    const structurallyValid = !block.ambiguous;
+    const oldLanguage = trustedDiffLanguage(languageForPath, block.oldPath, block.oldValid, block.oldPresent, structurallyValid);
+    const newLanguage = trustedDiffLanguage(languageForPath, block.newPath, block.newValid, block.newPresent, structurallyValid);
+    return redactSensitiveText(block.source, { context: 'source', oldLanguage, newLanguage });
   }).join('');
 }
 
@@ -981,11 +969,11 @@ export function hasSecretValueInUnifiedDiff(text, options = {}) {
   const languageForPath = typeof options?.languageForPath === 'function'
     ? options.languageForPath
     : sourceLanguageForPath;
-  return diffBlocks(text).some((block) => {
-    const paths = extractDiffSidePaths(block);
-    const oldLanguage = trustedDiffLanguage(languageForPath, paths.oldPath, paths.oldValid, paths.oldPresent);
-    const newLanguage = trustedDiffLanguage(languageForPath, paths.newPath, paths.newValid, paths.newPresent);
-    return hasSecretValue(block, { context: 'source', oldLanguage, newLanguage });
+  return extractDiffFileBlocks(text).some((block) => {
+    const structurallyValid = !block.ambiguous;
+    const oldLanguage = trustedDiffLanguage(languageForPath, block.oldPath, block.oldValid, block.oldPresent, structurallyValid);
+    const newLanguage = trustedDiffLanguage(languageForPath, block.newPath, block.newValid, block.newPresent, structurallyValid);
+    return hasSecretValue(block.source, { context: 'source', oldLanguage, newLanguage });
   });
 }
 

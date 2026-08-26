@@ -18,7 +18,7 @@ import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
 import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
-import { hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactStructured, redactUnifiedDiff, sourceLanguageForPath, truncateUtf8 } from "./redact.js";
+import { extractDiffFileBlocks, hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactStructured, redactUnifiedDiff, sourceLanguageForPath, truncateUtf8 } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
@@ -945,40 +945,8 @@ function decodeGitQuotedPath(pathText: string): string {
   return decoded;
 }
 
-function stripPatchPathComponents(filePath: string, stripComponents: number): string {
-  if (path.isAbsolute(filePath) || path.win32.isAbsolute(filePath)) return filePath;
-  let stripped = filePath;
-  for (let i = 0; i < stripComponents; i += 1) {
-    const slash = stripped.indexOf("/");
-    if (slash < 0) return stripped;
-    stripped = stripped.slice(slash + 1);
-  }
-  return stripped;
-}
-
-function normalizePatchPath(rawPath: string, stripComponents = 1): string | undefined {
-  const raw = rawPath.trim().split("\t")[0]?.trim();
-  if (!raw || raw === "/dev/null") return undefined;
-  const unquoted = raw.startsWith('"') && raw.endsWith('"') ? decodeGitQuotedPath(raw.slice(1, -1)) : raw;
-  return stripPatchPathComponents(unquoted, stripComponents);
-}
-
 function patchHasSymlinkMode(patch: string): boolean {
   return patch.split(/\r?\n/).some((line) => /^(?:new|old|deleted) file mode 120000\s*$/.test(line) || /^new mode 120000\s*$/.test(line) || /^old mode 120000\s*$/.test(line));
-}
-
-function patchTouchedPaths(patch: string): string[] {
-  const paths = new Set<string>();
-  for (const line of patch.split(/\r?\n/)) {
-    if (line.startsWith("--- ") || line.startsWith("+++ ")) {
-      const normalized = normalizePatchPath(line.slice(4));
-      if (normalized) paths.add(normalized);
-    } else if (line.startsWith("rename from ") || line.startsWith("rename to ") || line.startsWith("copy from ") || line.startsWith("copy to ")) {
-      const normalized = normalizePatchPath(line.replace(/^(?:rename|copy) (?:from|to) /, ""), 0);
-      if (normalized) paths.add(normalized);
-    }
-  }
-  return [...paths];
 }
 
 async function applyWorkspacePatch(
@@ -995,19 +963,34 @@ async function applyWorkspacePatch(
     throw new CodexProError("Symlink patches are blocked from apply_patch.");
   }
 
-  const paths = patchTouchedPaths(patch);
+  const fileBlocks = extractDiffFileBlocks(patch);
+  if (fileBlocks.some((block) => !block.pathDiscoveryValid)) {
+    throw new CodexProError("Patch must include unambiguous file paths in every file block.");
+  }
+  const paths: string[] = [];
+  const seenPaths = new Set<string>();
+  for (const block of fileBlocks) {
+    for (const touchedPath of block.paths) {
+      if (seenPaths.has(touchedPath)) continue;
+      seenPaths.add(touchedPath);
+      paths.push(touchedPath);
+    }
+  }
   if (!paths.length) throw new CodexProError("Patch must include at least one file path.");
-  const absPaths: string[] = [];
-  const validatedLanguages = new Map<string, "python" | undefined>();
+  const validatedPathRecords: Array<{ touchedPath: string; absPath: string; relPath: string }> = [];
   for (const touchedPath of paths) {
     const resolved = guard.resolve(workspace, touchedPath, { forWrite: true });
-    absPaths.push(resolved.absPath);
-    validatedLanguages.set(touchedPath, sourceLanguageForPath(resolved.relPath));
     assertWriteToolAllowed(config, touchedPath);
+    validatedPathRecords.push({ touchedPath, absPath: resolved.absPath, relPath: resolved.relPath });
+  }
+  const absPaths = validatedPathRecords.map(({ absPath }) => absPath);
+  const validatedLanguages = new Map<string, "python" | undefined>();
+  for (const { touchedPath, relPath } of validatedPathRecords) {
+    validatedLanguages.set(touchedPath, sourceLanguageForPath(relPath));
   }
 
   const languageForValidatedPath = (pathHint: string | undefined) => {
-    const normalized = String(pathHint ?? "").replaceAll("\\", "/").replace(/^(?:[ab])\//u, "");
+    const normalized = String(pathHint ?? "").replaceAll("\\", "/");
     return validatedLanguages.get(normalized);
   };
   // Target paths are now resolved and policy-checked. Only then may the

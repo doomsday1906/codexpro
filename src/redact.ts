@@ -11,6 +11,7 @@ const {
   redactSensitiveText: policyRedactSensitiveText,
   redactSensitiveTextPreservingLines: policyRedactSensitiveTextPreservingLines,
   redactUnifiedDiff: policyRedactUnifiedDiff,
+  extractDiffFileBlocks: policyExtractDiffFileBlocks,
   sourceLanguageForPath: policySourceLanguageForPath,
   truncateUtf8: policyTruncateUtf8
 } = policy;
@@ -18,6 +19,27 @@ const {
 export type RedactionContext = "source" | "diagnostic";
 export type SourceLanguage = "python";
 export type RedactionOptions = { context?: RedactionContext; language?: SourceLanguage };
+
+export type DiffFileBlock = {
+  readonly source: string;
+  readonly start: number;
+  readonly end: number;
+  readonly ambiguous: boolean;
+  readonly oldPath?: string;
+  readonly newPath?: string;
+  readonly oldValid: boolean;
+  readonly newValid: boolean;
+  readonly oldKnown: boolean;
+  readonly newKnown: boolean;
+  readonly oldPresent: boolean;
+  readonly newPresent: boolean;
+  readonly pathDiscoveryValid: boolean;
+  readonly paths: readonly string[];
+};
+
+export function extractDiffFileBlocks(text: string): readonly DiffFileBlock[] {
+  return policyExtractDiffFileBlocks(text) as readonly DiffFileBlock[];
+}
 
 export function sourceLanguageForPath(filePath: string | undefined): SourceLanguage | undefined {
   return policySourceLanguageForPath(filePath);
