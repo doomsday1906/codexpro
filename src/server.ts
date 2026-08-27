@@ -1,4 +1,5 @@
 import fsp from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -18,7 +19,7 @@ import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
 import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
-import { extractDiffFileBlocks, hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactStructured, redactUnifiedDiff, sourceLanguageForPath, truncateUtf8 } from "./redact.js";
+import { hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactStructured, redactUnifiedDiff, sourceLanguageForPath, truncateUtf8 } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
@@ -910,6 +911,30 @@ function normalizeGitOutput(output: string): string {
   return output.trim() === "(no output)" ? "" : output;
 }
 
+type GitApplyNumstat = { additions: string; deletions: string; path: string };
+type GitApplyPathPair = {
+  additions: string;
+  deletions: string;
+  oldPath: string;
+  newPath: string;
+};
+type GitApplyPreflight = {
+  numstat: GitApplyNumstat[];
+  reverseNumstat: GitApplyNumstat[];
+  pairs: GitApplyPathPair[];
+  verbose: Buffer;
+};
+type ValidatedPatchPath = { gitPath: string; absPath: string; relPath: string };
+type GitCommandResult = { status: number | null; error?: Error; stdout?: Buffer; stderr?: Buffer };
+type SimulatedPatch = {
+  rawDiff: string;
+  numstat: GitApplyNumstat[];
+  additions: number;
+  deletions: number;
+  changed: boolean;
+};
+type ValidatedSimulation = SimulatedPatch & { diff: string };
+
 function decodeGitQuotedPath(pathText: string): string {
   const input = pathText.startsWith('"') && pathText.endsWith('"') ? pathText.slice(1, -1) : pathText;
   let decoded = "";
@@ -945,8 +970,365 @@ function decodeGitQuotedPath(pathText: string): string {
   return decoded;
 }
 
-function patchHasSymlinkMode(patch: string): boolean {
-  return patch.split(/\r?\n/).some((line) => /^(?:new|old|deleted) file mode 120000\s*$/.test(line) || /^new mode 120000\s*$/.test(line) || /^old mode 120000\s*$/.test(line));
+function gitMachineBytes(output: Buffer | string): Buffer {
+  return Buffer.isBuffer(output) ? Buffer.from(output) : Buffer.from(output, "utf8");
+}
+
+function decodeGitMachineUtf8(output: Buffer | string): string {
+  const bytes = gitMachineBytes(output);
+  const value = bytes.toString("utf8");
+  if (!Buffer.from(value, "utf8").equals(bytes)) {
+    throw new CodexProError("Git returned non-lossless UTF-8 machine output.");
+  }
+  return value;
+}
+
+function parseGitNumstat(output: Buffer | string): GitApplyNumstat[] {
+  const text = decodeGitMachineUtf8(output);
+  if (!text) return [];
+  if (!text.endsWith("\0")) throw new CodexProError("Git returned malformed apply numstat output.");
+  const entries = text.slice(0, -1).split("\0");
+  const records: GitApplyNumstat[] = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (!entry) throw new CodexProError("Git returned malformed apply numstat output.");
+    const firstTab = entry.indexOf("\t");
+    const secondTab = firstTab < 0 ? -1 : entry.indexOf("\t", firstTab + 1);
+    if (firstTab <= 0 || secondTab <= firstTab + 1) {
+      throw new CodexProError("Git returned malformed apply numstat output.");
+    }
+    const additions = entry.slice(0, firstTab);
+    const deletions = entry.slice(firstTab + 1, secondTab);
+    const pathValue = entry.slice(secondTab + 1);
+    if (!/^\d+$/.test(additions) && additions !== "-") throw new CodexProError("Git returned malformed apply numstat output.");
+    if (!/^\d+$/.test(deletions) && deletions !== "-") throw new CodexProError("Git returned malformed apply numstat output.");
+    if (pathValue) {
+      // `-z` deliberately returns path bytes without Git's quote-and-escape
+      // display layer. Preserve every backslash and quote as a filename byte.
+      records.push({ additions, deletions, path: pathValue });
+      continue;
+    }
+    // Git's `diff --numstat -z` represents a detected rename/copy as an
+    // empty path field followed by old and new paths in two NUL records.
+    const oldPath = entries[index + 1];
+    const newPath = entries[index + 2];
+    if (!oldPath || !newPath) throw new CodexProError("Git returned malformed apply numstat output.");
+    records.push({ additions, deletions, path: newPath });
+    index += 2;
+  }
+  return records;
+}
+
+function pairGitApplyNumstat(forward: GitApplyNumstat[], reverse: GitApplyNumstat[]): GitApplyPathPair[] {
+  if (!forward.length || forward.length !== reverse.length) {
+    throw new CodexProError("Git apply preflight returned mismatched path/count output.");
+  }
+  const reverseInApplyOrder = [...reverse].reverse();
+  return forward.map((entry, index) => {
+    const reverseEntry = reverseInApplyOrder[index];
+    if (
+      entry.additions !== reverseEntry.deletions ||
+      entry.deletions !== reverseEntry.additions
+    ) {
+      throw new CodexProError("Git apply preflight returned mismatched path/count output.");
+    }
+    return {
+      additions: entry.additions,
+      deletions: entry.deletions,
+      oldPath: reverseEntry.path,
+      newPath: entry.path
+    };
+  });
+}
+
+function applyReportPaths(report: GitApplyPreflight): string[] {
+  const paths: string[] = [];
+  const add = (value: string | undefined) => {
+    if (value && !paths.includes(value)) paths.push(value);
+  };
+  // Forward numstat names the effective destination. Reverse numstat names
+  // the source for a rename/copy; its records are paired in reverse order.
+  // Preserve that producer identity order without normalizing any path text.
+  for (const entry of report.pairs) {
+    if (entry.oldPath !== entry.newPath) add(entry.oldPath);
+    add(entry.newPath);
+  }
+  return paths;
+}
+
+function applyGitEnvironment(isolated = false): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = { ...process.env, LC_ALL: "C", LANG: "C", NO_COLOR: "1" };
+  // Apply-related Git calls must remain rooted at their explicit cwd. Remove
+  // inherited repository/index/attribute routing and config injection keys
+  // for both real and disposable repositories.
+  for (const key of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_ATTR_SOURCE",
+    "GIT_PREFIX",
+    "GIT_CONFIG"
+  ]) delete environment[key];
+  for (const key of Object.keys(environment)) {
+    if (/^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS)$/.test(key)) delete environment[key];
+  }
+  if (isolated) {
+    const nullConfigPath = process.platform === "win32" ? "NUL" : "/dev/null";
+    environment.GIT_CONFIG_NOSYSTEM = "1";
+    environment.GIT_CONFIG_SYSTEM = nullConfigPath;
+    environment.GIT_CONFIG_GLOBAL = nullConfigPath;
+  }
+  return environment;
+}
+
+function runApplyGit(cwd: string, args: string[], input: string | undefined, maxOutputBytes: number, isolated = false): GitCommandResult {
+  return spawnSync("git", args, {
+    cwd,
+    input,
+    encoding: null,
+    maxBuffer: maxOutputBytes,
+    env: applyGitEnvironment(isolated)
+  }) as unknown as GitCommandResult;
+}
+
+function gitOutputText(output: Buffer | string | undefined): string {
+  if (output === undefined) return "";
+  return Buffer.isBuffer(output) ? output.toString("utf8") : output;
+}
+
+function gitCommandFailure(result: GitCommandResult, fallback: string): string {
+  const detail = gitOutputText(result.stderr).trim() || gitOutputText(result.stdout).trim() || result.error?.message || fallback;
+  return redactDiagnosticText(detail).slice(0, 4_096);
+}
+
+function assertApplyGitSuccess(result: GitCommandResult, fallback: string): void {
+  if (result.error || result.status !== 0) throw new CodexProError(gitCommandFailure(result, fallback));
+}
+
+function runApplyPreflight(config: CodexProConfig, workspace: Workspace, patch: string): GitApplyPreflight {
+  const result = runApplyGit(
+    workspace.root,
+    ["apply", "--check", "--numstat", "-z", "--verbose", "--whitespace=nowarn"],
+    patch,
+    config.maxOutputBytes
+  );
+  if (result.error || result.status !== 0) {
+    throw new CodexProError(gitCommandFailure(result, "git apply preflight failed"));
+  }
+  const verbose = gitMachineBytes(result.stderr ?? Buffer.alloc(0));
+  const reverseResult = runApplyGit(
+    workspace.root,
+    ["apply", "--numstat", "-z", "--reverse", "--whitespace=nowarn"],
+    patch,
+    config.maxOutputBytes
+  );
+  if (reverseResult.error || reverseResult.status !== 0) {
+    throw new CodexProError(gitCommandFailure(reverseResult, "git apply reverse preflight failed"));
+  }
+  try {
+    const numstat = parseGitNumstat(result.stdout ?? Buffer.alloc(0));
+    const reverseNumstat = parseGitNumstat(reverseResult.stdout ?? Buffer.alloc(0));
+    const pairs = pairGitApplyNumstat(numstat, reverseNumstat);
+    return { numstat, reverseNumstat, pairs, verbose };
+  } catch (error) {
+    throw new CodexProError("Git apply preflight returned malformed path/count output.");
+  }
+}
+
+function sameApplyPreflight(left: GitApplyPreflight, right: GitApplyPreflight): boolean {
+  return (
+    JSON.stringify({ numstat: left.numstat, reverseNumstat: left.reverseNumstat, pairs: left.pairs }) ===
+      JSON.stringify({ numstat: right.numstat, reverseNumstat: right.reverseNumstat, pairs: right.pairs }) &&
+    left.verbose.equals(right.verbose)
+  );
+}
+
+function validateApplyPaths(config: CodexProConfig, guard: PathGuard, workspace: Workspace, report: GitApplyPreflight): ValidatedPatchPath[] {
+  const paths = applyReportPaths(report);
+  if (!paths.length) throw new CodexProError("Patch must include at least one Git-identified file path.");
+  return paths.map((gitPath) => {
+    const resolved = guard.resolve(workspace, gitPath, { forWrite: true });
+    assertWriteToolAllowed(config, resolved.relPath);
+    return { gitPath, absPath: resolved.absPath, relPath: resolved.relPath };
+  });
+}
+
+function sameValidatedApplyPaths(left: ValidatedPatchPath[], right: ValidatedPatchPath[]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function policyPathMatches(recordPath: string, policyPath: string): boolean {
+  if (recordPath === policyPath) return true;
+  // The existing source-policy diff reader historically treats a quoted
+  // backslash as a separator while extracting a header. Match that lossy
+  // representation only here, after the real Git path has passed PathGuard;
+  // this is never used to resolve, block, or lock a filesystem path.
+  const backslash = String.fromCharCode(92);
+  let recordIndex = 0;
+  let usedCompatibilityAlias = false;
+  for (const policyCharacter of policyPath) {
+    const recordCharacter = recordPath[recordIndex];
+    if (policyCharacter === "/" && recordCharacter === backslash) {
+      recordIndex += 1;
+      usedCompatibilityAlias = true;
+      continue;
+    }
+    if (recordCharacter !== policyCharacter) return false;
+    recordIndex += 1;
+  }
+  return usedCompatibilityAlias && recordIndex === recordPath.length;
+}
+
+function languageForValidatedPaths(records: ValidatedPatchPath[]): (pathHint: string | undefined) => "python" | undefined {
+  return (pathHint: string | undefined) => {
+    if (typeof pathHint !== "string") return undefined;
+    const matches = records.filter((record) => policyPathMatches(record.gitPath, pathHint) || policyPathMatches(record.relPath, pathHint));
+    if (matches.length !== 1) return undefined;
+    return sourceLanguageForPath(matches[0].relPath);
+  };
+}
+
+function simulationPath(root: string, gitPath: string): string {
+  const parts = gitPath.split("/");
+  if (!parts.length || parts.some((part) => !part || part === "." || part === "..")) {
+    throw new CodexProError("Git returned an unsafe apply path.");
+  }
+  const candidate = path.join(root, ...parts);
+  const relative = path.relative(root, candidate);
+  if (path.isAbsolute(relative) || relative.startsWith(`..${path.sep}`) || relative === "..") {
+    throw new CodexProError("Git returned an unsafe apply path.");
+  }
+  return candidate;
+}
+
+async function populateSimulation(root: string, records: ValidatedPatchPath[]): Promise<void> {
+  const destinations = new Map<string, string>();
+  for (const record of records) {
+    let stat;
+    try {
+      stat = await fsp.lstat(record.absPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) throw new CodexProError("Symlink patches are blocked from apply_patch.");
+    if (!stat.isFile()) continue;
+
+    const destination = simulationPath(root, record.gitPath);
+    const prior = destinations.get(destination);
+    if (prior && prior !== record.absPath) throw new CodexProError("Git apply paths resolve ambiguously.");
+    destinations.set(destination, record.absPath);
+    await fsp.mkdir(path.dirname(destination), { recursive: true });
+    await fsp.copyFile(record.absPath, destination);
+    await fsp.chmod(destination, stat.mode & 0o7777);
+  }
+}
+
+function numstatCount(value: string): number {
+  return value === "-" ? 0 : Number(value);
+}
+
+function summarizeNumstat(numstat: GitApplyNumstat[]): { additions: number; deletions: number } {
+  return numstat.reduce(
+    (summary, entry) => ({
+      additions: summary.additions + numstatCount(entry.additions),
+      deletions: summary.deletions + numstatCount(entry.deletions)
+    }),
+    { additions: 0, deletions: 0 }
+  );
+}
+
+function assertNoSimulatedSymlinkIndex(output: Buffer | string): void {
+  const bytes = gitMachineBytes(output);
+  if (!bytes.length) return;
+  let start = 0;
+  while (start < bytes.length) {
+    const end = bytes.indexOf(0, start);
+    if (end < 0 || end === start) throw new CodexProError("Git simulation returned malformed index output.");
+    const record = bytes.subarray(start, end);
+    if (record.length < 7 || record[6] !== 0x20) {
+      throw new CodexProError("Git simulation returned malformed index output.");
+    }
+    const mode = record.subarray(0, 6).toString("ascii");
+    if (!/^\d{6}$/.test(mode)) throw new CodexProError("Git simulation returned malformed index output.");
+    if (mode === "120000") throw new CodexProError("Symlink patches are blocked from apply_patch.");
+    start = end + 1;
+  }
+}
+
+async function simulateWorkspacePatch(config: CodexProConfig, records: ValidatedPatchPath[], patch: string): Promise<SimulatedPatch> {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "codexpro-apply-"));
+  try {
+    await populateSimulation(root, records);
+    assertApplyGitSuccess(runApplyGit(root, ["init", "-q"], undefined, config.maxOutputBytes, true), "git simulation init failed");
+    assertApplyGitSuccess(runApplyGit(root, ["-c", "core.autocrlf=false", "-c", "core.filemode=true", "add", "--all", "--force"], undefined, config.maxOutputBytes, true), "git simulation baseline staging failed");
+    assertApplyGitSuccess(
+      runApplyGit(root, ["-c", "core.autocrlf=false", "-c", "core.filemode=true", "-c", "user.name=CodexPro", "-c", "user.email=codexpro@invalid", "commit", "--allow-empty", "--no-verify", "-m", "CodexPro apply_patch baseline"], undefined, config.maxOutputBytes, true),
+      "git simulation baseline commit failed"
+    );
+    assertApplyGitSuccess(
+      runApplyGit(root, ["-c", "core.autocrlf=false", "-c", "core.filemode=true", "-c", "core.symlinks=false", "apply", "--index", "--whitespace=nowarn"], patch, config.maxOutputBytes, true),
+      "git simulation apply failed"
+    );
+    const indexResult = runApplyGit(
+      root,
+      ["ls-files", "--stage", "-z"],
+      undefined,
+      config.maxOutputBytes,
+      true
+    );
+    assertApplyGitSuccess(indexResult, "git simulation index inspection failed");
+    assertNoSimulatedSymlinkIndex(indexResult.stdout ?? Buffer.alloc(0));
+
+    const diffResult = runApplyGit(
+      root,
+      ["-c", "core.autocrlf=false", "-c", "core.filemode=true", "-c", "core.quotepath=true", "diff", "--cached", "--no-color", "--no-ext-diff", "--no-textconv", "--full-index", "--binary", "--src-prefix=a/", "--dst-prefix=b/", "--find-renames", "--find-copies", "--find-copies-harder"],
+      undefined,
+      config.maxOutputBytes,
+      true
+    );
+    assertApplyGitSuccess(diffResult, "git simulation canonical diff failed");
+    const numstatResult = runApplyGit(
+      root,
+      ["-c", "core.autocrlf=false", "-c", "core.filemode=true", "-c", "core.quotepath=true", "diff", "--cached", "--numstat", "-z", "--no-ext-diff", "--no-textconv", "--find-renames", "--find-copies", "--find-copies-harder"],
+      undefined,
+      config.maxOutputBytes,
+      true
+    );
+    assertApplyGitSuccess(numstatResult, "git simulation canonical numstat failed");
+    const numstat = parseGitNumstat(numstatResult.stdout ?? "");
+    const summary = summarizeNumstat(numstat);
+    const rawDiff = gitOutputText(diffResult.stdout);
+    return {
+      rawDiff,
+      numstat,
+      additions: summary.additions,
+      deletions: summary.deletions,
+      changed: Boolean(rawDiff.trim())
+    };
+  } catch (error) {
+    if (error instanceof CodexProError) throw error;
+    throw new CodexProError("Git apply simulation failed.");
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+function validateSimulatedSource(simulated: SimulatedPatch, records: ValidatedPatchPath[]): ValidatedSimulation {
+  const languageForPath = languageForValidatedPaths(records);
+  try {
+    if (hasSecretValueInUnifiedDiff(simulated.rawDiff, languageForPath)) {
+      throw new CodexProError("Secret-looking content is blocked from apply_patch. Use placeholders such as [REDACTED_SECRET].");
+    }
+    return { ...simulated, diff: redactUnifiedDiff(simulated.rawDiff, languageForPath) };
+  } catch (error) {
+    if (error instanceof CodexProError) throw error;
+    throw new CodexProError("Canonical Git diff source validation failed.");
+  }
 }
 
 async function applyWorkspacePatch(
@@ -959,86 +1341,42 @@ async function applyWorkspacePatch(
   if (Buffer.byteLength(patch, "utf8") > config.maxWriteBytes) {
     throw new CodexProError(`Patch is too large. Limit: ${config.maxWriteBytes} bytes.`);
   }
-  if (patchHasSymlinkMode(patch)) {
-    throw new CodexProError("Symlink patches are blocked from apply_patch.");
-  }
 
-  const fileBlocks = extractDiffFileBlocks(patch);
-  if (fileBlocks.some((block) => !block.pathDiscoveryValid)) {
-    throw new CodexProError("Patch must include unambiguous file paths in every file block.");
-  }
-  const paths: string[] = [];
-  const seenPaths = new Set<string>();
-  for (const block of fileBlocks) {
-    for (const touchedPath of block.paths) {
-      if (seenPaths.has(touchedPath)) continue;
-      seenPaths.add(touchedPath);
-      paths.push(touchedPath);
+  // Git is the first path/count authority. Do not classify source bytes or
+  // inspect patch grammar until this read-only preflight has succeeded.
+  const firstPreflight = runApplyPreflight(config, workspace, patch);
+  const firstRecords = validateApplyPaths(config, guard, workspace, firstPreflight);
+
+  return withFileWriteLocks(firstRecords.map((record) => record.absPath), async () => {
+    let lockedPreflight: GitApplyPreflight;
+    try {
+      lockedPreflight = runApplyPreflight(config, workspace, patch);
+    } catch {
+      throw new CodexProError("Patch preflight changed while waiting for its write locks; retry.");
     }
-  }
-  if (!paths.length) throw new CodexProError("Patch must include at least one file path.");
-  const validatedPathRecords: Array<{ touchedPath: string; absPath: string; relPath: string }> = [];
-  for (const touchedPath of paths) {
-    const resolved = guard.resolve(workspace, touchedPath, { forWrite: true });
-    assertWriteToolAllowed(config, touchedPath);
-    validatedPathRecords.push({ touchedPath, absPath: resolved.absPath, relPath: resolved.relPath });
-  }
-  const absPaths = validatedPathRecords.map(({ absPath }) => absPath);
-  const validatedLanguages = new Map<string, "python" | undefined>();
-  for (const { touchedPath, relPath } of validatedPathRecords) {
-    validatedLanguages.set(touchedPath, sourceLanguageForPath(relPath));
-  }
-
-  const languageForValidatedPath = (pathHint: string | undefined) => {
-    const normalized = String(pathHint ?? "").replaceAll("\\", "/");
-    return validatedLanguages.get(normalized);
-  };
-  // Target paths are now resolved and policy-checked. Only then may the
-  // source policy grant parser authority to Python hunks; every unknown or
-  // non-Python hunk remains generic/fail-closed. The check happens before any
-  // git apply so a mixed patch is rejected atomically.
-  if (hasSecretValueInUnifiedDiff(patch, languageForValidatedPath)) {
-    throw new CodexProError("Secret-looking content is blocked from apply_patch. Use placeholders such as [REDACTED_SECRET].");
-  }
-
-  return withFileWriteLocks(absPaths, () => {
-    for (const touchedPath of paths) {
-      guard.resolve(workspace, touchedPath, { forWrite: true });
-      assertWriteToolAllowed(config, touchedPath);
+    if (!sameApplyPreflight(firstPreflight, lockedPreflight)) {
+      throw new CodexProError("Patch preflight changed while waiting for its write locks; retry.");
+    }
+    const lockedRecords = validateApplyPaths(config, guard, workspace, lockedPreflight);
+    if (!sameValidatedApplyPaths(firstRecords, lockedRecords)) {
+      throw new CodexProError("Patch path identities changed while waiting for its write locks; retry.");
     }
 
-    const check = spawnSync("git", ["apply", "--check", "--whitespace=nowarn"], {
-      cwd: workspace.root,
-      input: patch,
-      encoding: "utf8",
-      maxBuffer: config.maxOutputBytes,
-      env: { ...process.env, NO_COLOR: "1" }
-    });
-    if (check.error || check.status !== 0) {
-      throw new CodexProError(redactDiagnosticText(check.stderr?.trim() || check.stdout?.trim() || check.error?.message || "git apply --check failed"));
-    }
+    const lockedSimulation = await simulateWorkspacePatch(config, lockedRecords, patch);
+    const lockedValidated = validateSimulatedSource(lockedSimulation, lockedRecords);
 
-    const applied = spawnSync("git", ["apply", "--whitespace=nowarn"], {
-      cwd: workspace.root,
-      input: patch,
-      encoding: "utf8",
-      maxBuffer: config.maxOutputBytes,
-      env: { ...process.env, NO_COLOR: "1" }
-    });
+    const applied = runApplyGit(workspace.root, ["apply", "--whitespace=nowarn"], patch, config.maxOutputBytes);
     if (applied.error || applied.status !== 0) {
-      throw new CodexProError(redactDiagnosticText(applied.stderr?.trim() || applied.stdout?.trim() || applied.error?.message || "git apply failed"));
+      throw new CodexProError(gitCommandFailure(applied, "git apply failed"));
     }
-
-    const diff = redactUnifiedDiff(patch.trimEnd(), languageForValidatedPath);
-    const stats = diffStats(diff);
     return {
-      paths,
-      stdout: redactDiagnosticText(applied.stdout?.trim() || ""),
-      stderr: redactDiagnosticText(applied.stderr?.trim() || ""),
-      diff,
-      additions: stats.additions,
-      deletions: stats.deletions,
-      changed: true
+      paths: applyReportPaths(lockedPreflight),
+      stdout: redactDiagnosticText(String(applied.stdout ?? "").trim()),
+      stderr: redactDiagnosticText(String(applied.stderr ?? "").trim()),
+      diff: lockedValidated.diff,
+      additions: lockedValidated.additions,
+      deletions: lockedValidated.deletions,
+      changed: lockedValidated.changed
     };
   });
 }

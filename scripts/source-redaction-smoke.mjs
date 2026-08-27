@@ -1991,11 +1991,50 @@ try {
     name: 'apply_patch',
     arguments: { workspace_id: workspaceId, patch: mixedPatch }
   }), 'looks-Python mixed-language apply_patch');
-  assert.match(resultText(mixedBlocked), /Secret-looking content is blocked/);
+  // Git preflight is the first authority. This mixed patch repeats the
+  // already-applied Python block, so Git must reject it before source-policy
+  // classification of the later hostile material can run.
+  assert.match(resultText(mixedBlocked), /Checking patch|patch failed|does not apply/i);
   assert.equal(resultText(mixedBlocked).includes('ACTUAL_LITERAL_SECRET_7X9'), false, 'looks-Python mixed-language rejection leaked its hostile hunk');
   assert.equal(await fs.readFile(path.join(tmp, lawfulPatchPath), 'utf8'), mixedBeforePython, 'looks-Python mixed-language rejection partially mutated Python file');
   assert.equal(await fs.readFile(path.join(tmp, mixedPatchTextPath), 'utf8'), mixedBeforeText, 'looks-Python mixed-language rejection mutated non-Python file');
   await writeRawArtifact(rawArtifactDir, 'looks-python-mixed-apply-patch-rejected', mixedBlocked);
+
+  // Independent atomic policy proof: both Git hunks are applicable against
+  // fresh targets, but the Python side is source-policy hostile. The route
+  // must reject before mutating either the Python or non-Python file.
+  const policyAtomicPyPath = 'policy-atomic.py';
+  const policyAtomicTxtPath = 'policy-atomic.txt';
+  await writeFixture(tmp, policyAtomicPyPath, 'class PolicyAtomic:\n');
+  await writeFixture(tmp, policyAtomicTxtPath, 'class PolicyAtomicMirror:\n');
+  const policyAtomicPatch = [
+    `diff --git a/${policyAtomicPyPath} b/${policyAtomicPyPath}`,
+    `--- a/${policyAtomicPyPath}`,
+    `+++ b/${policyAtomicPyPath}`,
+    '@@ -1,1 +1,2 @@',
+    ' class PolicyAtomic:',
+    '+    token = ACTUAL_LITERAL_SECRET_7X9',
+    `diff --git a/${policyAtomicTxtPath} b/${policyAtomicTxtPath}`,
+    `--- a/${policyAtomicTxtPath}`,
+    `+++ b/${policyAtomicTxtPath}`,
+    '@@ -1,1 +1,2 @@',
+    ' class PolicyAtomicMirror:',
+    '+    mirror = "safe"',
+    ''
+  ].join('\n');
+  const policyAtomicGitCheck = spawnSync('git', ['apply', '--check', '--whitespace=nowarn'], { cwd: tmp, input: policyAtomicPatch, encoding: 'utf8' });
+  assert.equal(policyAtomicGitCheck.status, 0, `fully applicable mixed policy fixture was not accepted by Git: ${policyAtomicGitCheck.stderr || policyAtomicGitCheck.stdout}`);
+  const policyAtomicPyBefore = await fs.readFile(path.join(tmp, policyAtomicPyPath), 'utf8');
+  const policyAtomicTxtBefore = await fs.readFile(path.join(tmp, policyAtomicTxtPath), 'utf8');
+  const policyAtomicBlocked = assertToolError(await client.request('tools/call', {
+    name: 'apply_patch',
+    arguments: { workspace_id: workspaceId, patch: policyAtomicPatch }
+  }), 'fully applicable mixed-language policy atomicity');
+  assert.match(resultText(policyAtomicBlocked), /Secret-looking content is blocked/);
+  assert.equal(resultText(policyAtomicBlocked).includes('ACTUAL_LITERAL_SECRET_7X9'), false, 'fully applicable mixed policy rejection leaked hostile content');
+  assert.equal(await fs.readFile(path.join(tmp, policyAtomicPyPath), 'utf8'), policyAtomicPyBefore, 'fully applicable mixed policy rejection mutated Python file');
+  assert.equal(await fs.readFile(path.join(tmp, policyAtomicTxtPath), 'utf8'), policyAtomicTxtBefore, 'fully applicable mixed policy rejection mutated mirror file');
+  await writeRawArtifact(rawArtifactDir, 'fully-applicable-mixed-policy-atomicity-rejected', policyAtomicBlocked);
 
   const sourceRead = assertToolSuccess(await client.request('tools/call', { name: 'read', arguments: { workspace_id: workspaceId, path: 'source.ts' } }), 'source read');
   assert.equal(sourceRead.structuredContent.path, 'source.ts', 'source read hid its path');
@@ -3792,7 +3831,13 @@ try {
       name: 'write',
       arguments: { workspace_id: workspaceId, path: pathName, content: 'class R:\n' }
     }), `Python multiline hostile ${label} patch seed write`);
-    const hostileDiff = diff.replaceAll('multiline.py', pathName);
+    // Keep the producer patch identity equal to the seeded target. Git
+    // preflight now runs before source classification, so a mismatched path
+    // would test only "file not found" rather than the intended hostile
+    // source-policy rejection.
+    const hostileDiff = diff
+      .replaceAll('multiline.py', pathName)
+      .replaceAll('multiline-annotation.py', pathName);
     const before = await fs.readFile(path.join(tmp, pathName), 'utf8');
     const blocked = assertToolError(await client.request('tools/call', {
       name: 'apply_patch',
@@ -3927,7 +3972,10 @@ try {
     name: 'apply_patch',
     arguments: { workspace_id: workspaceId, patch: mixedAtomicPatch }
   }), 'mixed invalid/valid apply_patch atomicity');
-  assert.match(resultText(blockedMixedAtomicPatch), /unambiguous file paths/);
+  // Git preflight is authoritative before canonical path/source parsing; its
+  // malformed duplicate block may therefore report the producer's filename
+  // contradiction directly instead of the later path-ambiguity label.
+  assert.match(resultText(blockedMixedAtomicPatch), /inconsistent old filename|unambiguous file paths/i);
   assert.equal(resultText(blockedMixedAtomicPatch).includes('MIXED_INVALID_LITERAL'), false, 'mixed invalid/valid apply_patch leaked rejected payload');
   assert.equal(await fs.readFile(path.join(tmp, 'apply-rename-old.txt'), 'utf8'), mixedAtomicTxtBefore, 'mixed invalid/valid apply_patch mutated invalid-block file');
   assert.equal(await fs.readFile(path.join(tmp, 'apply-rename-old.py'), 'utf8'), mixedAtomicPyBefore, 'mixed invalid/valid apply_patch mutated valid-block file');
