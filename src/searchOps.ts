@@ -1,12 +1,13 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { TextDecoder } from "node:util";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, PathGuard } from "./guard.js";
 import { isHiddenRelativePath, listFiles, textScanByteLimit } from "./fsOps.js";
-import { redactDiagnosticText, redactSearchQuery, redactSensitiveTextPreservingLines, sourceLanguageForPath } from "./redact.js";
+import { redactDiagnosticText, redactSearchQuery, redactSensitiveTextPreservingLines, sourceLanguageForPath, truncateUtf8 } from "./redact.js";
 import { searchWorkspaceStructured, type AnalysisSearchIntent, type StructuredSearchResult } from "./analysis/index.js";
 
 export interface SearchOptions {
@@ -47,6 +48,7 @@ function truncateLine(line: string, max = 400): string {
 type RedactedSearchLines = string[] | null;
 const REDACTED_SEARCH_CONTEXT = "[REDACTED_SECRET]";
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+const RIPGREP_PARTIAL_RECORD_MAX_BYTES = 64 * 1024;
 
 function decodeSearchText(buffer: Buffer): string | null {
   if (buffer.includes(0)) return null;
@@ -127,58 +129,193 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
 
   return new Promise((resolve, reject) => {
     const child = spawn("rg", args, { cwd: workspace.root, env: { ...process.env, NO_COLOR: "1" } });
-    let stdout = "";
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    const maxOutputBytes = Math.max(0, config.maxOutputBytes);
+    const stderrMaxBytes = maxOutputBytes;
     let stderr = "";
+    let stderrBytes = 0;
+    let partialLine = "";
+    let partialLineBytes = 0;
+    let evidenceBytes = 0;
+    let visibleMatches = 0;
+    const admittedMatches: Array<{ path: string; line: number }> = [];
     let outputLimited = false;
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-      if (!outputLimited && Buffer.byteLength(stdout, "utf8") > config.maxOutputBytes) {
-        outputLimited = true;
+    let parserFailure: CodexProError | undefined;
+    let terminationRequested = false;
+    let settled = false;
+
+    const requestTermination = (): void => {
+      if (terminationRequested || settled) return;
+      terminationRequested = true;
+      try {
         child.kill("SIGTERM");
+      } catch {
+        // The close event still settles the request if the child already exited.
       }
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-    child.on("error", reject);
-    child.on("close", async (code) => {
-      if (code && code > 1) {
-        reject(new CodexProError(stderr.trim() || `ripgrep failed with exit code ${code}`));
+    };
+
+    const failParser = (message: string): void => {
+      if (parserFailure || outputLimited || settled) return;
+      parserFailure = new CodexProError(message);
+      partialLine = "";
+      partialLineBytes = 0;
+      requestTermination();
+    };
+
+    const appendStderr = (text: string): void => {
+      if (!text || stderrBytes >= stderrMaxBytes) return;
+      const remaining = stderrMaxBytes - stderrBytes;
+      const bounded = Buffer.byteLength(text, "utf8") <= remaining
+        ? text
+        : truncateUtf8(text, remaining);
+      if (!bounded) return;
+      stderr += bounded;
+      stderrBytes += Buffer.byteLength(bounded, "utf8");
+    };
+
+    const relativeMatchPath = (pathText: unknown): string | null => {
+      if (typeof pathText !== "string" || !pathText) return null;
+      const absPath = path.isAbsolute(pathText)
+        ? path.resolve(pathText)
+        : path.resolve(workspace.root, pathText);
+      const nativeRelativePath = path.relative(workspace.root, absPath);
+      if (
+        path.isAbsolute(nativeRelativePath) ||
+        nativeRelativePath === ".." ||
+        nativeRelativePath.startsWith(`..${path.sep}`)
+      ) {
+        return null;
+      }
+      const relativePath = nativeRelativePath.split(path.sep).join("/") || ".";
+      if (guard.isBlockedRelativePath(relativePath)) return null;
+      if (!options.includeHidden && isHiddenRelativePath(relativePath)) return null;
+      return relativePath;
+    };
+
+    const processRecord = (line: string, recordBytes: number): void => {
+      if (parserFailure || outputLimited || settled || !line.trim()) return;
+
+      let value: unknown;
+      try {
+        value = JSON.parse(line);
+      } catch {
+        failParser("ripgrep returned malformed JSON.");
         return;
       }
-      const matches: Array<{ path: string; line: number; text: string }> = [];
-      const lines = stdout.split("\n").filter(Boolean);
-      let visibleMatches = 0;
-      for (const line of lines) {
-        let value: any;
-        try {
-          value = JSON.parse(line);
-        } catch (error) {
-          if (outputLimited) continue;
-          reject(new CodexProError(`ripgrep returned malformed JSON: ${error instanceof Error ? error.message : String(error)}`));
+      if (!value || typeof value !== "object" || (value as { type?: unknown }).type !== "match") return;
+
+      const data = (value as { data?: unknown }).data;
+      if (!data || typeof data !== "object") return;
+      const pathValue = (data as { path?: unknown }).path;
+      const pathText = pathValue && typeof pathValue === "object"
+        ? (pathValue as { text?: unknown }).text
+        : undefined;
+      const relativePath = relativeMatchPath(pathText);
+      if (relativePath === null) return;
+
+      // Admission is deliberately before every accounting operation. This
+      // keeps excluded transport (hidden, blocked, or outside) out of the
+      // evidence budget and visible result counters.
+      visibleMatches += 1;
+      if (evidenceBytes + recordBytes > maxOutputBytes) {
+        outputLimited = true;
+        partialLine = "";
+        partialLineBytes = 0;
+        requestTermination();
+        return;
+      }
+      evidenceBytes += recordBytes;
+      if (admittedMatches.length >= options.maxResults) return;
+
+      const lineNumberValue = (data as { line_number?: unknown }).line_number;
+      admittedMatches.push({
+        path: relativePath,
+        line: Number(lineNumberValue ?? 0)
+      });
+    };
+
+    const consumeDecodedText = (text: string): void => {
+      if (!text || parserFailure || outputLimited || settled) return;
+      let offset = 0;
+      while (offset < text.length && !parserFailure && !outputLimited && !settled) {
+        const newline = text.indexOf("\n", offset);
+        const segmentEnd = newline < 0 ? text.length : newline;
+        const segment = text.slice(offset, segmentEnd);
+        const segmentBytes = Buffer.byteLength(segment, "utf8");
+        if (partialLineBytes + segmentBytes > RIPGREP_PARTIAL_RECORD_MAX_BYTES) {
+          failParser("ripgrep returned an oversized incomplete JSON record.");
           return;
         }
-        if (value.type !== "match") continue;
-        const absPath = path.resolve(value.data?.path?.text ?? "");
-        const rel = path.relative(workspace.root, absPath).split(path.sep).join("/");
-        if (rel.startsWith("..")) continue;
-        if (guard.isBlockedRelativePath(rel)) continue;
-        if (!options.includeHidden && isHiddenRelativePath(rel)) continue;
-        visibleMatches += 1;
-        if (matches.length >= options.maxResults) continue;
-        const lineText = String(value.data?.lines?.text ?? "").replace(/\r?\n$/, "");
-        const lineNumber = Number(value.data?.line_number ?? 0);
-        if (!redactedLinesByPath.has(rel)) {
-          redactedLinesByPath.set(rel, await loadRedactedSearchLines(config, guard, workspace, rel));
-        }
-        matches.push({
-          path: rel || ".",
-          line: lineNumber,
-          text: selectRedactedSearchLine(redactedLinesByPath.get(rel) ?? null, lineNumber)
-        });
+        partialLine += segment;
+        partialLineBytes += segmentBytes;
+        if (newline < 0) return;
+
+        processRecord(partialLine, partialLineBytes + 1);
+        partialLine = "";
+        partialLineBytes = 0;
+        offset = newline + 1;
       }
-      const text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
-      resolve({ text, matches, truncated: visibleMatches > matches.length || outputLimited, used: "ripgrep" });
+    };
+
+    const flushDecoder = (): void => {
+      if (parserFailure || outputLimited || settled) return;
+      consumeDecodedText(stdoutDecoder.end());
+      if (parserFailure || outputLimited || settled || !partialLine.trim()) return;
+      processRecord(partialLine, partialLineBytes);
+      partialLine = "";
+      partialLineBytes = 0;
+    };
+
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      consumeDecodedText(stdoutDecoder.write(chunk));
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      appendStderr(stderrDecoder.write(chunk));
+    });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    child.on("close", async (code) => {
+      if (settled) return;
+      try {
+        appendStderr(stderrDecoder.end());
+        flushDecoder();
+        if (parserFailure) {
+          settled = true;
+          reject(parserFailure);
+          return;
+        }
+        if (code && code > 1) {
+          const diagnostic = redactDiagnosticText(stderr.trim());
+          settled = true;
+          reject(new CodexProError(truncateUtf8(diagnostic || `ripgrep failed with exit code ${code}`, maxOutputBytes)));
+          return;
+        }
+
+        const matches: Array<{ path: string; line: number; text: string }> = [];
+        for (const admitted of admittedMatches) {
+          if (settled) return;
+          if (!redactedLinesByPath.has(admitted.path)) {
+            redactedLinesByPath.set(admitted.path, await loadRedactedSearchLines(config, guard, workspace, admitted.path));
+          }
+          matches.push({
+            path: admitted.path,
+            line: admitted.line,
+            text: selectRedactedSearchLine(redactedLinesByPath.get(admitted.path) ?? null, admitted.line)
+          });
+        }
+        if (settled) return;
+        const text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
+        settled = true;
+        resolve({ text, matches, truncated: visibleMatches > matches.length || outputLimited, used: "ripgrep" });
+      } catch (error) {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      }
     });
   });
 }
