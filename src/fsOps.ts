@@ -282,6 +282,10 @@ function isHiddenName(name: string): boolean {
   return name.startsWith(".") && name !== "." && name !== "..";
 }
 
+export function isHiddenRelativePath(relPath: string): boolean {
+  return normalizeRelPath(relPath).split("/").some(isHiddenName);
+}
+
 export async function repoTree(config: CodexProConfig, guard: PathGuard, workspace: Workspace, options: TreeOptions): Promise<TreeResult> {
   const target = guard.resolve(workspace, options.path ?? ".");
   const stat = await fsp.stat(target.absPath);
@@ -343,7 +347,7 @@ export async function listFiles(
   async function addFile(absFile: string): Promise<void> {
     const rel = displayPath(absFile, workspace.root);
     if (guard.isBlockedRelativePath(rel)) return;
-    if (!options.includeHidden && rel.split("/").some(isHiddenName)) return;
+    if (!options.includeHidden && isHiddenRelativePath(rel)) return;
     if (options.glob && !minimatch(rel, options.glob, { dot: true })) return;
     files.push(rel);
   }
@@ -362,7 +366,7 @@ export async function listFiles(
       const abs = path.join(absDir, entry.name);
       const rel = displayPath(abs, workspace.root);
       if (guard.isBlockedRelativePath(rel)) continue;
-      if (!options.includeHidden && rel.split("/").some(isHiddenName)) continue;
+      if (!options.includeHidden && isHiddenRelativePath(rel)) continue;
       if (entry.isDirectory()) await walk(abs);
       else if (entry.isFile()) await addFile(abs);
     }

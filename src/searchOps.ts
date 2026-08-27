@@ -265,6 +265,7 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
       query,
       intent: rawOptions.intent ?? "auto",
       includeTests: Boolean(rawOptions.includeTests),
+      includeHidden: options.includeHidden,
       regex: Boolean(rawOptions.regex),
       root: options.root,
       maxResults: options.maxResults

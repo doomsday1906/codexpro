@@ -1,6 +1,7 @@
 import type { CodexProConfig } from "../config.js";
 import fsp from "node:fs/promises";
 import { TextDecoder } from "node:util";
+import { isHiddenRelativePath } from "../fsOps.js";
 import type { PathGuard, Workspace } from "../guard.js";
 import { redactSearchQuery, redactSensitiveTextPreservingLines, sourceLanguageForPath } from "../redact.js";
 import { detectProjectTypes } from "./classify.js";
@@ -84,7 +85,7 @@ export async function searchWorkspaceStructured(
   config: CodexProConfig,
   guard: PathGuard,
   workspace: Workspace,
-  options: { query: string; intent?: AnalysisSearchIntent; includeTests?: boolean; regex?: boolean; root?: string; maxResults?: number }
+  options: { query: string; intent?: AnalysisSearchIntent; includeTests?: boolean; includeHidden?: boolean; regex?: boolean; root?: string; maxResults?: number }
 ): Promise<StructuredSearchResult> {
   const query = options.query.trim();
   if (!query) throw new Error("query is required.");
@@ -98,8 +99,10 @@ export async function searchWorkspaceStructured(
   const candidateLimit = Math.max(resultLimit, Math.min(resultLimit * 4, 20_000));
   const resolvedRoot = options.root?.trim() ? guard.resolve(workspace, options.root).relPath.replace(/^\.\/?$/, "") : "";
   const inScope = (filePath: string) => !resolvedRoot || filePath === resolvedRoot || filePath.startsWith(`${resolvedRoot}/`);
+  const includePath = (filePath: string) => options.includeHidden === true || !isHiddenRelativePath(filePath);
   const definitionsByPath = new Map<string, Map<number, WorkspaceAnalysis["symbols"][number]>>();
   for (const symbol of analysis.symbols) {
+    if (!includePath(symbol.path)) continue;
     const byLine = definitionsByPath.get(symbol.path) ?? new Map<number, WorkspaceAnalysis["symbols"][number]>();
     byLine.set(symbol.line, symbol);
     definitionsByPath.set(symbol.path, byLine);
@@ -125,7 +128,7 @@ export async function searchWorkspaceStructured(
 
   scan:
   for (const file of analysis.files) {
-    if (file.generated || (!options.includeTests && file.role === "test")) continue;
+    if (!includePath(file.path) || file.generated || (!options.includeTests && file.role === "test")) continue;
     if (!inScope(file.path) && !(options.includeTests && file.role === "test")) continue;
     if (scannedFiles >= config.analysisLimits.maxAnalyzedFiles || scannedBytes + file.bytes > config.analysisLimits.maxScannedBytes) {
       searchBudgetReached = true;
@@ -191,10 +194,11 @@ export async function searchWorkspaceStructured(
   if (intent === "references" || intent === "impact") {
     const definitionPaths = new Set(
       analysis.symbols
-        .filter((symbol) => symbol.name.toLowerCase() === lowered)
+        .filter((symbol) => includePath(symbol.path) && symbol.name.toLowerCase() === lowered)
         .map((symbol) => symbol.path)
     );
     for (const relationship of analysis.relationships) {
+      if (!includePath(relationship.from) || !includePath(relationship.to)) continue;
       if (!definitionPaths.has(relationship.to)) continue;
       const group = relationship.kind === "tests" ? "tests" : "references";
       if (group === "tests" && !options.includeTests) continue;
