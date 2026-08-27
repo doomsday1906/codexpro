@@ -5,7 +5,7 @@ import { TextDecoder } from "node:util";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, PathGuard } from "./guard.js";
-import { listFiles, textScanByteLimit } from "./fsOps.js";
+import { isHiddenRelativePath, listFiles, textScanByteLimit } from "./fsOps.js";
 import { redactDiagnosticText, redactSearchQuery, redactSensitiveTextPreservingLines, sourceLanguageForPath } from "./redact.js";
 import { searchWorkspaceStructured, type AnalysisSearchIntent, type StructuredSearchResult } from "./analysis/index.js";
 
@@ -112,6 +112,9 @@ function selectRedactedSearchLine(lines: RedactedSearchLines, lineNumber: number
 
 async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: Workspace, options: SearchOptions): Promise<SearchResult> {
   const target = guard.resolve(workspace, options.root ?? ".");
+  if (options.includeHidden === false && isHiddenRelativePath(target.relPath)) {
+    return { text: "No matches.", matches: [], truncated: false, used: "ripgrep" };
+  }
   const args = ["--json", "--line-number", "--with-filename", "--no-heading", "--color=never", "--max-columns", "500", "--max-count", "50", "--max-filesize", String(textScanByteLimit(config))];
   if (!options.regex) args.push("--fixed-strings");
   if (options.includeHidden) args.push("--hidden");
@@ -160,6 +163,7 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
         const rel = path.relative(workspace.root, absPath).split(path.sep).join("/");
         if (rel.startsWith("..")) continue;
         if (guard.isBlockedRelativePath(rel)) continue;
+        if (!options.includeHidden && isHiddenRelativePath(rel)) continue;
         visibleMatches += 1;
         if (matches.length >= options.maxResults) continue;
         const lineText = String(value.data?.lines?.text ?? "").replace(/\r?\n$/, "");
