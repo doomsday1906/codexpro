@@ -8,6 +8,12 @@ import { fileURLToPath } from 'node:url';
 const NEEDLE = 'BoundaryNeedleAlpha';
 const HIDDEN_SYMBOL = 'HiddenBoundaryDefinition';
 const REFERENCE_SYMBOL = 'BoundaryReferenceTarget';
+const ANALYSIS_ANCHOR_SYMBOL = 'VisibilityFairAnalysisAnchor';
+const ANALYSIS_SOURCE_COUNT = 24;
+const ANALYSIS_TARGET_COUNT = 6;
+const ANALYSIS_HIDDEN_FLOOD_COUNT = 120;
+const ANALYSIS_SCAN_PADDING_BYTES = 50_000;
+const ANALYSIS_HIDDEN_FLOOD_PADDING_BYTES = 10_000;
 const LIMIT_NEEDLE = 'BoundaryNeedleLimit';
 const FLOOD_NEEDLE = 'BoundaryNeedleAdmissionFlood';
 const BLOCKED_FLOOD_NEEDLE = 'BoundaryNeedleBlockedFlood';
@@ -18,15 +24,16 @@ const UNTERMINATED_RECORD_BYTES = 96_000;
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const serverEntry = path.join(projectRoot, 'dist', 'stdio.js');
 const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-search-evidence-'));
+let controlFixtureRoot;
 const realRgLookup = spawnSync('/bin/sh', ['-lc', 'command -v rg'], { encoding: 'utf8' });
 const realRgPath = realRgLookup.status === 0 ? realRgLookup.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) : '';
 
 class McpStdioClient {
-  constructor({ pathOverride, envOverrides = {} } = {}) {
+  constructor({ pathOverride, envOverrides = {}, root = fixtureRoot } = {}) {
     this.child = spawn(process.execPath, [
       serverEntry,
-      '--root', fixtureRoot,
-      '--allow-root', fixtureRoot,
+      '--root', root,
+      '--allow-root', root,
       '--bash', 'off',
       '--write', 'off',
       '--tool-mode', 'standard'
@@ -36,8 +43,8 @@ class McpStdioClient {
         ...process.env,
         ...envOverrides,
         ...(pathOverride === undefined ? {} : { PATH: pathOverride }),
-        CODEXPRO_ROOT: fixtureRoot,
-        CODEXPRO_ALLOWED_ROOTS: fixtureRoot,
+        CODEXPRO_ROOT: root,
+        CODEXPRO_ALLOWED_ROOTS: root,
         CODEXPRO_BLOCKED_GLOBS: 'blocked/**',
         CODEXPRO_TOOL_CARDS: '0'
       }
@@ -218,8 +225,8 @@ function assertHiddenTargetResult(result, expectedPath, label, expectedUsed) {
   assertPathPresent(structuredPaths(result), expectedPath, `${label} structured result`);
 }
 
-async function openMcpClient(clients, pathOverride, envOverrides = {}) {
-  const current = new McpStdioClient({ pathOverride, envOverrides });
+async function openMcpClient(clients, pathOverride, envOverrides = {}, root = fixtureRoot) {
+  const current = new McpStdioClient({ pathOverride, envOverrides, root });
   clients.push(current);
   await current.request('initialize', {
     protocolVersion: '2024-11-05',
@@ -252,16 +259,31 @@ function callSearch(current, workspaceId, arguments_) {
   });
 }
 
+async function inspectWorkspace(current, workspaceId, arguments_ = {}) {
+  const result = await current.request('tools/call', {
+    name: 'inspect_workspace',
+    arguments: { workspace_id: workspaceId, ...arguments_ }
+  });
+  assert.equal(result.isError, undefined, JSON.stringify(arguments_));
+  assert(result.structuredContent?.coverage, `inspect_workspace omitted coverage: ${JSON.stringify(result.structuredContent)}`);
+  return result;
+}
+
 async function exerciseHiddenTarget(search, target, expectedPath, label, expectedUsed) {
-  const omitted = await search({ query: NEEDLE, intent: 'symbol', path: target });
-  assertEmptyStructuredResult(omitted, `${label} omitted include_hidden`, expectedUsed);
+  const cases = {};
+  for (const intent of ['symbol', 'references', 'impact']) {
+    const intentLabel = `${label} ${intent}`;
+    const omitted = await search({ query: NEEDLE, intent, path: target, include_tests: true });
+    assertEmptyStructuredResult(omitted, `${intentLabel} omitted include_hidden`, expectedUsed);
 
-  const explicitFalse = await search({ query: NEEDLE, intent: 'symbol', path: target, include_hidden: false });
-  assertEmptyStructuredResult(explicitFalse, `${label} include_hidden=false`, expectedUsed);
+    const explicitFalse = await search({ query: NEEDLE, intent, path: target, include_tests: true, include_hidden: false });
+    assertEmptyStructuredResult(explicitFalse, `${intentLabel} include_hidden=false`, expectedUsed);
 
-  const explicitTrue = await search({ query: NEEDLE, intent: 'symbol', path: target, include_hidden: true });
-  assertHiddenTargetResult(explicitTrue, expectedPath, `${label} include_hidden=true`, expectedUsed);
-  return { omitted, explicitFalse, explicitTrue };
+    const explicitTrue = await search({ query: NEEDLE, intent, path: target, include_tests: true, include_hidden: true });
+    assertHiddenTargetResult(explicitTrue, expectedPath, `${intentLabel} include_hidden=true`, expectedUsed);
+    cases[intent] = { omitted, explicitFalse, explicitTrue };
+  }
+  return cases;
 }
 
 const clients = [];
@@ -289,6 +311,44 @@ try {
   // so impact/reference expansion is the only route that can surface it.
   await write('src/visible-hidden-definition-dependent.ts', `import '../.hidden-root.ts';\n`);
   await write('tests/visible-hidden-definition.test.ts', `import '../.hidden-root.ts';\n`);
+
+  // Keep a large hidden source flood beside a bounded visible source set. The
+  // analysis limits are all operator-valid minimums, so the fixture must be
+  // large enough to prove that visible evidence survives each cap.
+  const analysisTargets = Array.from({ length: ANALYSIS_TARGET_COUNT }, (_, index) => `./target-${String(index).padStart(2, '0')}.js`);
+  for (let index = 0; index < ANALYSIS_TARGET_COUNT; index += 1) {
+    await write(`analysis/target-${String(index).padStart(2, '0')}.ts`, `export function VisibilityFairTarget${index}() { return ${index}; }\n`);
+  }
+  const anchorImports = analysisTargets.map((specifier) => `import '${specifier}';`).join('\n');
+  await write('analysis/00-anchor.ts', `${anchorImports}\nexport function ${ANALYSIS_ANCHOR_SYMBOL}() { return true; }\n`);
+  const analysisPadding = 'x'.repeat(ANALYSIS_SCAN_PADDING_BYTES);
+  const hiddenFloodPadding = 'y'.repeat(ANALYSIS_HIDDEN_FLOOD_PADDING_BYTES);
+  for (let index = 0; index < ANALYSIS_SOURCE_COUNT; index += 1) {
+    const declarations = Array.from({ length: ANALYSIS_TARGET_COUNT }, (_, declaration) =>
+      `export function VisibilityFairSource${index}Symbol${declaration}() { return ${declaration}; }`
+    ).join('\n');
+    const imports = [
+      ...analysisTargets,
+      ...(index === 0 ? ['../.analysis-hidden/flood-000.js'] : [])
+    ].map((specifier) => `import '${specifier}';`).join('\n');
+    await write(`analysis/source-${String(index).padStart(2, '0')}.ts`, `${imports}\n${declarations}\n// ${analysisPadding}\n`);
+  }
+  await write('analysis/01-visible-dependent.ts', "import './target-00.js';\n");
+  await write('analysis/02-visible.test.ts', "import './target-00.js';\n");
+  const hiddenFloodContent = (index) => `import '../analysis/target-00.js';\nexport const hiddenFlood${index} = false;\n// ${hiddenFloodPadding}\n`;
+  assert(Buffer.byteLength(hiddenFloodContent(0), 'utf8') * ANALYSIS_HIDDEN_FLOOD_COUNT > 1_000_000, 'hidden flood did not exceed the valid scanned-byte floor');
+  for (let index = 0; index < ANALYSIS_HIDDEN_FLOOD_COUNT; index += 1) {
+    await write(`.analysis-hidden/flood-${String(index).padStart(3, '0')}.ts`, hiddenFloodContent(index));
+  }
+
+  controlFixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-search-evidence-control-'));
+  await fs.cp(fixtureRoot, controlFixtureRoot, {
+    recursive: true,
+    filter: (source) => {
+      const relative = path.relative(fixtureRoot, source);
+      return !relative.split(path.sep).some((component) => component.startsWith('.'));
+    }
+  });
 
   const { client, workspaceId } = await openMcpClient(clients);
   const search = makeSearch(client, workspaceId);
@@ -376,6 +436,171 @@ try {
   assertPathPresent(groupPaths(hiddenDefinitionImpactTrue, 'references'), 'src/visible-hidden-definition-dependent.ts', 'hidden definition impact dependent module');
   assertPathPresent(groupPaths(hiddenDefinitionImpactTrue, 'tests'), 'tests/visible-hidden-definition.test.ts', 'hidden definition impact dependent test');
 
+  const { client: analysisControlClient, workspaceId: analysisControlWorkspaceId } = await openMcpClient(clients, undefined, {}, controlFixtureRoot);
+  const analysisControl = await inspectWorkspace(analysisControlClient, analysisControlWorkspaceId);
+  const controlCoverage = analysisControl.structuredContent.coverage;
+  assert(controlCoverage.inventoryFiles < 100, `no-hidden control unexpectedly reached inventory floor: ${JSON.stringify(controlCoverage)}`);
+  assert(controlCoverage.analyzedFiles > 10, `no-hidden control did not include source flood: ${JSON.stringify(controlCoverage)}`);
+  assert(controlCoverage.scannedBytes > 1_000_000, `no-hidden control did not exceed scanned-byte floor: ${JSON.stringify(controlCoverage)}`);
+  assert(controlCoverage.symbolCount > 100, `no-hidden control did not exceed symbol floor: ${JSON.stringify(controlCoverage)}`);
+  assert(controlCoverage.relationshipCount > 100, `no-hidden control did not exceed relationship floor: ${JSON.stringify(controlCoverage)}`);
+  assert.equal(controlCoverage.truncated, false, `no-hidden control was unexpectedly truncated: ${JSON.stringify(controlCoverage)}`);
+  assert(!analysisControl.structuredContent.files.some((file) => file.path.startsWith('.')));
+
+  const { client: analysisFloodClient, workspaceId: analysisFloodWorkspaceId } = await openMcpClient(clients);
+  const analysisFlood = await inspectWorkspace(analysisFloodClient, analysisFloodWorkspaceId);
+  const floodCoverage = analysisFlood.structuredContent.coverage;
+  assert(floodCoverage.inventoryFiles > controlCoverage.inventoryFiles, `hidden flood did not increase inventory coverage: ${JSON.stringify({ control: controlCoverage, flood: floodCoverage })}`);
+  assert(floodCoverage.analyzedFiles >= controlCoverage.analyzedFiles, `hidden flood reduced analyzed coverage: ${JSON.stringify({ control: controlCoverage, flood: floodCoverage })}`);
+  assert(floodCoverage.symbolCount >= controlCoverage.symbolCount, `hidden flood reduced symbol coverage: ${JSON.stringify({ control: controlCoverage, flood: floodCoverage })}`);
+  assert(floodCoverage.relationshipCount > controlCoverage.relationshipCount, `hidden flood did not add relationship pressure: ${JSON.stringify({ control: controlCoverage, flood: floodCoverage })}`);
+  assert(analysisFlood.structuredContent.files.some((file) => file.path === '.analysis-hidden/flood-119.ts'));
+  assert(analysisFlood.structuredContent.relationships.some((relationship) =>
+    relationship.from === '.analysis-hidden/flood-000.ts' && relationship.to === 'analysis/target-00.ts'
+  ), 'hidden-to-visible relationship was absent from flooded analysis');
+
+  const controlSearch = makeSearch(analysisControlClient, analysisControlWorkspaceId);
+  const floodSearch = makeSearch(analysisFloodClient, analysisFloodWorkspaceId);
+  for (const intent of ['symbol', 'references', 'impact']) {
+    const controlVisible = await controlSearch({ query: REFERENCE_SYMBOL, intent, include_tests: true, include_hidden: false });
+    const floodVisible = await floodSearch({ query: REFERENCE_SYMBOL, intent, include_tests: true, include_hidden: false });
+    assertNoHiddenEvidence(controlVisible, `no-hidden control ${intent}`);
+    assertNoHiddenEvidence(floodVisible, `flooded visible ${intent}`);
+    for (const group of ['definitions', 'references', 'tests']) {
+      const controlPaths = groupPaths(controlVisible, group).sort();
+      const floodPaths = groupPaths(floodVisible, group).sort();
+      assert.deepEqual(floodPaths, controlPaths, `hidden flood changed visible ${intent} ${group} evidence`);
+    }
+    assertPathPresent(groupPaths(floodVisible, 'definitions'), 'src/reference-target.ts', `flooded visible ${intent} definition`);
+    if (intent !== 'symbol') {
+      assertPathPresent(groupPaths(floodVisible, 'references'), 'src/visible-dependent.ts', `flooded visible ${intent} dependent module`);
+      assertPathPresent(groupPaths(floodVisible, 'tests'), 'tests/visible-reference.test.ts', `flooded visible ${intent} dependent test`);
+    }
+  }
+
+  const { client: inventoryLimitClient, workspaceId: inventoryLimitWorkspaceId } = await openMcpClient(clients, undefined, {
+    CODEXPRO_ANALYSIS_MAX_INVENTORY_FILES: '100'
+  });
+  const inventoryLimited = await inspectWorkspace(inventoryLimitClient, inventoryLimitWorkspaceId);
+  const inventoryCoverage = inventoryLimited.structuredContent.coverage;
+  assert.equal(inventoryCoverage.inventoryFiles, 100, `inventory limit was not honored: ${JSON.stringify(inventoryCoverage)}`);
+  assert.equal(inventoryCoverage.truncated, true, `inventory limit was not reported: ${JSON.stringify(inventoryCoverage)}`);
+  assert(inventoryLimited.structuredContent.files.some((file) => file.path === 'analysis/00-anchor.ts'), 'inventory limit starved visible anchor');
+  assert(inventoryLimited.structuredContent.files.some((file) => file.path === 'analysis/source-23.ts'), 'inventory limit starved late visible source');
+  const inventoryLimitedAnchor = (await makeSearch(inventoryLimitClient, inventoryLimitWorkspaceId)({
+    query: ANALYSIS_ANCHOR_SYMBOL,
+    intent: 'symbol',
+    include_tests: true,
+    include_hidden: false
+  })).structuredContent.analysis.groups.definitions.find((match) => match.path === 'analysis/00-anchor.ts');
+  assert(inventoryLimitedAnchor?.reasons.includes('symbol definition'), 'inventory limit weakened visible definition authority');
+  const { client: inventoryControlLimitClient, workspaceId: inventoryControlLimitWorkspaceId } = await openMcpClient(clients, undefined, {
+    CODEXPRO_ANALYSIS_MAX_INVENTORY_FILES: '100'
+  }, controlFixtureRoot);
+  const inventoryControlLimited = await inspectWorkspace(inventoryControlLimitClient, inventoryControlLimitWorkspaceId);
+  assert.equal(inventoryControlLimited.structuredContent.coverage.inventoryFiles, controlCoverage.inventoryFiles, 'inventory control changed under equivalent limit');
+  assert.equal(inventoryControlLimited.structuredContent.coverage.truncated, false, 'no-hidden inventory control was falsely truncated');
+
+  const { client: analyzedLimitClient, workspaceId: analyzedLimitWorkspaceId } = await openMcpClient(clients, undefined, {
+    CODEXPRO_ANALYSIS_MAX_ANALYZED_FILES: '10'
+  });
+  const analyzedLimited = await inspectWorkspace(analyzedLimitClient, analyzedLimitWorkspaceId);
+  const analyzedCoverage = analyzedLimited.structuredContent.coverage;
+  assert.equal(analyzedCoverage.analyzedFiles, 10, `analyzed-file limit was not honored: ${JSON.stringify(analyzedCoverage)}`);
+  assert.equal(analyzedCoverage.truncated, true, `analyzed-file limit was not reported: ${JSON.stringify(analyzedCoverage)}`);
+  assert(analyzedLimited.structuredContent.symbols.some((symbol) => symbol.name === ANALYSIS_ANCHOR_SYMBOL && symbol.path === 'analysis/00-anchor.ts'), 'analyzed-file limit starved visible anchor');
+  const analyzedLimitedAnchor = (await makeSearch(analyzedLimitClient, analyzedLimitWorkspaceId)({
+    query: ANALYSIS_ANCHOR_SYMBOL,
+    intent: 'symbol',
+    include_tests: true,
+    include_hidden: false
+  })).structuredContent.analysis.groups.definitions.find((match) => match.path === 'analysis/00-anchor.ts');
+  assert(analyzedLimitedAnchor?.reasons.includes('symbol definition'), 'analyzed-file limit weakened visible definition authority');
+  const { client: analyzedControlLimitClient, workspaceId: analyzedControlLimitWorkspaceId } = await openMcpClient(clients, undefined, {
+    CODEXPRO_ANALYSIS_MAX_ANALYZED_FILES: '10'
+  }, controlFixtureRoot);
+  const analyzedControlLimited = await inspectWorkspace(analyzedControlLimitClient, analyzedControlLimitWorkspaceId);
+  assert.equal(analyzedControlLimited.structuredContent.coverage.analyzedFiles, analyzedCoverage.analyzedFiles, 'analyzed-file control/flood counts diverged under equivalent limit');
+  assert(analyzedControlLimited.structuredContent.symbols.some((symbol) => symbol.name === ANALYSIS_ANCHOR_SYMBOL && symbol.path === 'analysis/00-anchor.ts'), 'no-hidden analyzed-file control lost visible anchor');
+
+  const { client: scannedLimitClient, workspaceId: scannedLimitWorkspaceId } = await openMcpClient(clients, undefined, {
+    CODEXPRO_ANALYSIS_MAX_SCANNED_BYTES: '1000000'
+  });
+  const scannedLimited = await inspectWorkspace(scannedLimitClient, scannedLimitWorkspaceId);
+  const scannedCoverage = scannedLimited.structuredContent.coverage;
+  assert(scannedCoverage.scannedBytes <= 1_000_000, `scanned-byte limit was exceeded: ${JSON.stringify(scannedCoverage)}`);
+  assert(scannedCoverage.scannedBytes > 900_000, `scanned-byte control did not approach valid floor: ${JSON.stringify(scannedCoverage)}`);
+  assert.equal(scannedCoverage.truncated, true, `scanned-byte limit was not reported: ${JSON.stringify(scannedCoverage)}`);
+  assert(scannedLimited.structuredContent.symbols.some((symbol) => symbol.name === ANALYSIS_ANCHOR_SYMBOL && symbol.path === 'analysis/00-anchor.ts'), 'scanned-byte limit starved visible anchor');
+  const scannedLimitedAnchor = (await makeSearch(scannedLimitClient, scannedLimitWorkspaceId)({
+    query: ANALYSIS_ANCHOR_SYMBOL,
+    intent: 'symbol',
+    include_tests: true,
+    include_hidden: false
+  })).structuredContent.analysis.groups.definitions.find((match) => match.path === 'analysis/00-anchor.ts');
+  assert(scannedLimitedAnchor?.reasons.includes('symbol definition'), 'scanned-byte limit weakened visible definition authority');
+  const { client: scannedControlLimitClient, workspaceId: scannedControlLimitWorkspaceId } = await openMcpClient(clients, undefined, {
+    CODEXPRO_ANALYSIS_MAX_SCANNED_BYTES: '1000000'
+  }, controlFixtureRoot);
+  const scannedControlLimited = await inspectWorkspace(scannedControlLimitClient, scannedControlLimitWorkspaceId);
+  assert.equal(scannedControlLimited.structuredContent.coverage.scannedBytes, scannedCoverage.scannedBytes, 'scanned-byte control/flood coverage diverged under equivalent limit');
+  assert(scannedControlLimited.structuredContent.symbols.some((symbol) => symbol.name === ANALYSIS_ANCHOR_SYMBOL && symbol.path === 'analysis/00-anchor.ts'), 'no-hidden scanned-byte control lost visible anchor');
+
+  const { client: symbolLimitClient, workspaceId: symbolLimitWorkspaceId } = await openMcpClient(clients, undefined, {
+    CODEXPRO_ANALYSIS_MAX_SYMBOLS: '100'
+  });
+  const symbolLimited = await inspectWorkspace(symbolLimitClient, symbolLimitWorkspaceId);
+  const symbolCoverage = symbolLimited.structuredContent.coverage;
+  assert.equal(symbolCoverage.symbolCount, 100, `symbol limit was not honored: ${JSON.stringify(symbolCoverage)}`);
+  assert.equal(symbolLimited.structuredContent.symbols.length, 100, 'symbol output did not match coverage');
+  assert.equal(symbolCoverage.truncated, true, `symbol limit was not reported: ${JSON.stringify(symbolCoverage)}`);
+  assert(symbolLimited.structuredContent.symbols.some((symbol) => symbol.name === ANALYSIS_ANCHOR_SYMBOL && symbol.path === 'analysis/00-anchor.ts'), 'symbol limit starved visible anchor');
+  const symbolLimitedAnchor = (await makeSearch(symbolLimitClient, symbolLimitWorkspaceId)({
+    query: ANALYSIS_ANCHOR_SYMBOL,
+    intent: 'symbol',
+    include_tests: true,
+    include_hidden: false
+  })).structuredContent.analysis.groups.definitions.find((match) => match.path === 'analysis/00-anchor.ts');
+  assert(symbolLimitedAnchor?.reasons.includes('symbol definition'), 'symbol limit weakened visible definition authority');
+  const { client: symbolControlLimitClient, workspaceId: symbolControlLimitWorkspaceId } = await openMcpClient(clients, undefined, {
+    CODEXPRO_ANALYSIS_MAX_SYMBOLS: '100'
+  }, controlFixtureRoot);
+  const symbolControlLimited = await inspectWorkspace(symbolControlLimitClient, symbolControlLimitWorkspaceId);
+  assert.equal(symbolControlLimited.structuredContent.coverage.symbolCount, symbolCoverage.symbolCount, 'symbol control/flood counts diverged under equivalent limit');
+  assert(symbolControlLimited.structuredContent.symbols.some((symbol) => symbol.name === ANALYSIS_ANCHOR_SYMBOL && symbol.path === 'analysis/00-anchor.ts'), 'no-hidden symbol control lost visible anchor');
+
+  const { client: relationshipLimitClient, workspaceId: relationshipLimitWorkspaceId } = await openMcpClient(clients, undefined, {
+    CODEXPRO_ANALYSIS_MAX_RELATIONSHIPS: '100'
+  });
+  const relationshipLimited = await inspectWorkspace(relationshipLimitClient, relationshipLimitWorkspaceId);
+  const relationshipCoverage = relationshipLimited.structuredContent.coverage;
+  assert.equal(relationshipCoverage.relationshipCount, 100, `relationship limit was not honored: ${JSON.stringify(relationshipCoverage)}`);
+  assert.equal(relationshipLimited.structuredContent.relationships.length, 100, 'relationship output did not match coverage');
+  assert.equal(relationshipCoverage.truncated, true, `relationship limit was not reported: ${JSON.stringify(relationshipCoverage)}`);
+  assert(relationshipLimited.structuredContent.relationships.some((relationship) =>
+    relationship.from === 'analysis/01-visible-dependent.ts' && relationship.to === 'analysis/target-00.ts'
+  ), 'relationship limit starved late visible edge');
+  const relationshipLimitedSearch = makeSearch(relationshipLimitClient, relationshipLimitWorkspaceId);
+  for (const intent of ['references', 'impact']) {
+    const result = await relationshipLimitedSearch({
+      query: 'VisibilityFairTarget0',
+      intent,
+      include_tests: true,
+      include_hidden: false
+    });
+    assertNoHiddenEvidence(result, `relationship-limited ${intent}`);
+    assertPathPresent(groupPaths(result, 'references'), 'analysis/01-visible-dependent.ts', `relationship-limited ${intent} visible module`);
+    assertPathPresent(groupPaths(result, 'tests'), 'analysis/02-visible.test.ts', `relationship-limited ${intent} visible test`);
+  }
+  const { client: relationshipControlLimitClient, workspaceId: relationshipControlLimitWorkspaceId } = await openMcpClient(clients, undefined, {
+    CODEXPRO_ANALYSIS_MAX_RELATIONSHIPS: '100'
+  }, controlFixtureRoot);
+  const relationshipControlLimited = await inspectWorkspace(relationshipControlLimitClient, relationshipControlLimitWorkspaceId);
+  assert.equal(relationshipControlLimited.structuredContent.coverage.relationshipCount, relationshipCoverage.relationshipCount, 'relationship control/flood counts diverged under equivalent limit');
+  assert(relationshipControlLimited.structuredContent.relationships.some((relationship) =>
+    relationship.from === 'analysis/01-visible-dependent.ts' && relationship.to === 'analysis/target-00.ts'
+  ), 'no-hidden relationship control lost late visible edge');
+
   emptyPathDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-search-no-rg-'));
   const { client: nodeClient, workspaceId: nodeWorkspaceId } = await openMcpClient(clients, emptyPathDir);
   const nodeSearch = makeSearch(nodeClient, nodeWorkspaceId);
@@ -459,9 +684,13 @@ esac
   });
   const shimSearch = makeSearch(shimClient, shimWorkspaceId);
   const shimBeforeHiddenTarget = await fs.readFile(rgShimInvocationLog, 'utf8');
-  const shimHiddenTargetFalse = await shimSearch({ query: NEEDLE, intent: 'symbol', path: '.hidden-root.ts', include_hidden: false });
+  const shimHiddenTargetFalse = await shimSearch({ query: NEEDLE, intent: 'symbol', path: '.hidden-root.ts', include_tests: true, include_hidden: false });
   assertEmptyStructuredResult(shimHiddenTargetFalse, 'shim hidden root file include_hidden=false', 'ripgrep');
   assert.equal(await fs.readFile(rgShimInvocationLog, 'utf8'), shimBeforeHiddenTarget, 'explicit hidden target unexpectedly spawned ripgrep');
+  const shimBeforeHiddenDirectoryTarget = await fs.readFile(rgShimInvocationLog, 'utf8');
+  const shimHiddenDirectoryFalse = await shimSearch({ query: NEEDLE, intent: 'symbol', path: 'src/.hidden', include_tests: true, include_hidden: false });
+  assertEmptyStructuredResult(shimHiddenDirectoryFalse, 'shim hidden directory include_hidden=false', 'ripgrep');
+  assert.equal(await fs.readFile(rgShimInvocationLog, 'utf8'), shimBeforeHiddenDirectoryTarget, 'explicit hidden directory unexpectedly spawned ripgrep');
   const limitedHiddenBackend = await shimSearch({ query: LIMIT_NEEDLE, intent: 'symbol', path: '.', include_hidden: false, max_results: 1 });
   assert.equal(limitedHiddenBackend.structuredContent.used, 'ripgrep');
   assert.equal(limitedHiddenBackend.structuredContent.truncated, false, 'hidden backend output incorrectly counted toward visible result limit');
@@ -574,11 +803,13 @@ esac
   assertPathPresent(lexicalPaths(scopedTrue), 'src/.hidden/nested.ts', 'root-scoped lexical search with include_hidden=true');
   assertPathPresent(structuredPaths(scopedTrue), 'src/.hidden/nested.ts', 'root-scoped structured search with include_hidden=true');
 
-  const inspection = await client.request('tools/call', {
-    name: 'inspect_workspace',
-    arguments: { workspace_id: workspaceId, max_files: 100, max_symbols: 100, max_relationships: 100 }
-  });
-  assert.equal(inspection.isError, undefined);
+  const tightInspection = await inspectWorkspace(client, workspaceId, { max_files: 100, max_symbols: 100, max_relationships: 100 });
+  assert.equal(tightInspection.structuredContent.files.length, 100);
+  assert.equal(tightInspection.structuredContent.output_limited, true, 'tight inspect did not expose output truncation');
+  assert.equal(tightInspection.structuredContent.returned.files, 100);
+  assert.equal(tightInspection.structuredContent.coverage.inventoryFiles, floodCoverage.inventoryFiles, 'tight inspect changed coverage truth');
+
+  const inspection = await inspectWorkspace(client, workspaceId, { max_files: 300, max_symbols: 300, max_relationships: 300 });
   assert(inspection.structuredContent.files.some((file) => file.path === '.brv/context-tree/memory.md'));
   assert(inspection.structuredContent.files.some((file) => file.path === 'src/.hidden/nested.ts'));
   assert.equal(inspection.structuredContent.cache.hit, true);
@@ -602,6 +833,15 @@ esac
       blocked_outside_flood_excluded: { paths: lexicalPaths(blockedFloodExcluded), truncated: blockedFloodExcluded.structuredContent.truncated },
       max_output_bytes: SHIM_MAX_OUTPUT_BYTES
     },
+    analysis_coverage: {
+      no_hidden_control: controlCoverage,
+      hidden_flood_control: floodCoverage,
+      inventory_limited: inventoryCoverage,
+      analyzed_files_limited: analyzedCoverage,
+      scanned_bytes_limited: scannedCoverage,
+      symbols_limited: symbolCoverage,
+      relationships_limited: relationshipCoverage
+    },
     malformed_record: {
       is_error: malformedResult.isError === true,
       error_bytes: Buffer.byteLength(malformedErrorText, 'utf8'),
@@ -620,12 +860,17 @@ esac
       toggled_hit: includeHidden.structuredContent.analysis.cache.hit,
       same_key: includeHidden.structuredContent.analysis.cache.key === defaultHidden.structuredContent.analysis.cache.key
     },
-    inspect_workspace_hidden_files: inspection.structuredContent.files.filter((file) => isHiddenPath(file.path)).map((file) => file.path)
+    inspect_workspace_hidden_files: inspection.structuredContent.files.filter((file) => isHiddenPath(file.path)).map((file) => file.path),
+    inspect_workspace_tight: {
+      returned_files: tightInspection.structuredContent.returned.files,
+      output_limited: tightInspection.structuredContent.output_limited,
+      coverage_inventory_files: tightInspection.structuredContent.coverage.inventoryFiles
+    }
   }, null, 2));
   console.log('✓ search evidence boundary smoke test passed');
 } finally {
   for (const current of clients) current.close();
-  for (const disposable of [rgShimDir, emptyPathDir, fixtureRoot]) {
+  for (const disposable of [rgShimDir, emptyPathDir, controlFixtureRoot, fixtureRoot]) {
     if (disposable) await fs.rm(disposable, { recursive: true, force: true });
   }
 }

@@ -1,6 +1,7 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { CodexProConfig } from "../config.js";
+import { isHiddenRelativePath } from "../fsOps.js";
 import type { PathGuard, Workspace } from "../guard.js";
 import type { AnalysisLanguage, AnalysisSymbol, AnalysisSymbolKind, InventoryFile } from "./types.js";
 
@@ -98,7 +99,8 @@ export async function extractWorkspaceFiles(
   let sourceBudgetReached = false;
   let symbolBudgetReached = false;
   let skippedFiles = 0;
-  for (const file of inventoryFiles) {
+  const orderedFiles = [...inventoryFiles].sort((a, b) => Number(isHiddenRelativePath(a.path)) - Number(isHiddenRelativePath(b.path)) || a.path.localeCompare(b.path));
+  for (const file of orderedFiles) {
     if (!SOURCE_LANGUAGES.has(file.language) || file.generated) continue;
     if (extracted.length >= config.analysisLimits.maxAnalyzedFiles || scannedBytes + file.bytes > config.analysisLimits.maxScannedBytes) {
       sourceBudgetReached = true;

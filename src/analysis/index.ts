@@ -7,7 +7,7 @@ import { redactSearchQuery, redactSensitiveTextPreservingLines, sourceLanguageFo
 import { detectProjectTypes } from "./classify.js";
 import { getCachedWorkspaceAnalysis, invalidateWorkspaceAnalysis, setCachedWorkspaceAnalysis } from "./cache.js";
 import { extractWorkspaceFiles } from "./extract.js";
-import { buildRelationships } from "./graph.js";
+import { buildRelationshipsWithCoverage } from "./graph.js";
 import { inventoryWorkspace } from "./inventory.js";
 import { classifySearchIntent, emptySearchGroups, groupForFile, sortStructuredMatches } from "./rank.js";
 import type { AnalysisSearchIntent, StructuredSearchMatch, StructuredSearchResult, WorkspaceAnalysis } from "./types.js";
@@ -48,10 +48,18 @@ export async function inspectWorkspace(config: CodexProConfig, guard: PathGuard,
   if (cached) return { ...cached, cache: { hit: true, key } };
 
   const extraction = await extractWorkspaceFiles(config, guard, workspace, inventory.files);
-  const symbols = extraction.files.flatMap((file) => file.symbols).slice(0, config.analysisLimits.maxSymbols);
-  const relationships = buildRelationships(extraction.files, inventory.files, config.analysisLimits.maxRelationships);
+  const symbols = extraction.files
+    .flatMap((file) => file.symbols)
+    .sort((a, b) => Number(isHiddenRelativePath(a.path)) - Number(isHiddenRelativePath(b.path)) || a.path.localeCompare(b.path) || a.line - b.line)
+    .slice(0, config.analysisLimits.maxSymbols);
+  const relationshipResult = buildRelationshipsWithCoverage(extraction.files, inventory.files, config.analysisLimits.maxRelationships);
+  const relationships = relationshipResult.relationships;
   const languages = [...new Set(inventory.files.map((file) => file.language).filter((language) => language !== "unknown"))].sort();
-  const warnings = [...inventory.coverage.warnings, ...extraction.warnings];
+  const warnings = [
+    ...inventory.coverage.warnings,
+    ...extraction.warnings,
+    ...(relationshipResult.truncated ? ["Relationship extraction reached its configured limit."] : [])
+  ];
   const result: WorkspaceAnalysis = {
     schemaVersion: 1,
     workspaceId: workspace.id,
@@ -70,7 +78,7 @@ export async function inspectWorkspace(config: CodexProConfig, guard: PathGuard,
       scannedBytes: extraction.scannedBytes,
       symbolCount: symbols.length,
       relationshipCount: relationships.length,
-      truncated: inventory.coverage.truncated || extraction.truncated,
+      truncated: inventory.coverage.truncated || extraction.truncated || relationshipResult.truncated,
       warnings
     },
     warnings,
@@ -100,6 +108,18 @@ export async function searchWorkspaceStructured(
   const resolvedRoot = options.root?.trim() ? guard.resolve(workspace, options.root).relPath.replace(/^\.\/?$/, "") : "";
   const inScope = (filePath: string) => !resolvedRoot || filePath === resolvedRoot || filePath.startsWith(`${resolvedRoot}/`);
   const includePath = (filePath: string) => options.includeHidden === true || !isHiddenRelativePath(filePath);
+  if (resolvedRoot && options.includeHidden !== true && isHiddenRelativePath(resolvedRoot)) {
+    return {
+      schemaVersion: 1,
+      query: redactSearchQuery(query),
+      intent,
+      groups,
+      matches: [],
+      coverage: { ...analysis.coverage, warnings },
+      warnings,
+      cache: analysis.cache
+    };
+  }
   const definitionsByPath = new Map<string, Map<number, WorkspaceAnalysis["symbols"][number]>>();
   for (const symbol of analysis.symbols) {
     if (!includePath(symbol.path)) continue;

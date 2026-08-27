@@ -338,7 +338,7 @@ export async function repoTree(config: CodexProConfig, guard: PathGuard, workspa
 export async function listFiles(
   guard: PathGuard,
   workspace: Workspace,
-  options: { root?: string; glob?: string; includeHidden?: boolean; maxFiles: number }
+  options: { root?: string; glob?: string; includeHidden?: boolean; maxFiles: number; visibilityPriority?: boolean }
 ): Promise<string[]> {
   const target = guard.resolve(workspace, options.root ?? ".");
   const stat = await fsp.stat(target.absPath);
@@ -352,7 +352,7 @@ export async function listFiles(
     files.push(rel);
   }
 
-  async function walk(absDir: string): Promise<void> {
+  async function walkDefault(absDir: string): Promise<void> {
     if (files.length >= options.maxFiles) return;
     let entries: fs.Dirent[];
     try {
@@ -367,13 +367,98 @@ export async function listFiles(
       const rel = displayPath(abs, workspace.root);
       if (guard.isBlockedRelativePath(rel)) continue;
       if (!options.includeHidden && isHiddenRelativePath(rel)) continue;
-      if (entry.isDirectory()) await walk(abs);
+      if (entry.isDirectory()) await walkDefault(abs);
       else if (entry.isFile()) await addFile(abs);
     }
   }
 
-  if (stat.isFile()) await addFile(target.absPath);
-  else await walk(target.absPath);
+  if (!options.visibilityPriority) {
+    if (stat.isFile()) await addFile(target.absPath);
+    else await walkDefault(target.absPath);
+    return files;
+  }
+
+  interface FrontierEntry {
+    absPath: string;
+    relPath: string;
+    isDirectory: boolean;
+  }
+
+  class PathFrontier {
+    private readonly entries: FrontierEntry[] = [];
+
+    get size(): number {
+      return this.entries.length;
+    }
+
+    push(entry: FrontierEntry): void {
+      this.entries.push(entry);
+      let index = this.entries.length - 1;
+      while (index > 0) {
+        const parent = Math.floor((index - 1) / 2);
+        if (this.entries[parent].relPath.localeCompare(this.entries[index].relPath) <= 0) break;
+        [this.entries[parent], this.entries[index]] = [this.entries[index], this.entries[parent]];
+        index = parent;
+      }
+    }
+
+    pop(): FrontierEntry | undefined {
+      const first = this.entries[0];
+      if (!first) return undefined;
+      const last = this.entries.pop();
+      if (last && this.entries.length > 0) {
+        this.entries[0] = last;
+        let index = 0;
+        while (true) {
+          const left = index * 2 + 1;
+          const right = left + 1;
+          let smallest = index;
+          if (left < this.entries.length && this.entries[left].relPath.localeCompare(this.entries[smallest].relPath) < 0) {
+            smallest = left;
+          }
+          if (right < this.entries.length && this.entries[right].relPath.localeCompare(this.entries[smallest].relPath) < 0) {
+            smallest = right;
+          }
+          if (smallest === index) break;
+          [this.entries[index], this.entries[smallest]] = [this.entries[smallest], this.entries[index]];
+          index = smallest;
+        }
+      }
+      return first;
+    }
+  }
+
+  const visibleFrontier = new PathFrontier();
+  const hiddenFrontier = new PathFrontier();
+  const enqueue = (entry: FrontierEntry): void => {
+    if (guard.isBlockedRelativePath(entry.relPath)) return;
+    if (!options.includeHidden && isHiddenRelativePath(entry.relPath)) return;
+    const frontier = isHiddenRelativePath(entry.relPath) ? hiddenFrontier : visibleFrontier;
+    frontier.push(entry);
+  };
+
+  const expand = async (entry: FrontierEntry): Promise<void> => {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(entry.absPath, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const child of entries) {
+      const absPath = path.join(entry.absPath, child.name);
+      const relPath = displayPath(absPath, workspace.root);
+      if (child.isDirectory()) enqueue({ absPath, relPath, isDirectory: true });
+      else if (child.isFile()) enqueue({ absPath, relPath, isDirectory: false });
+    }
+  };
+
+  enqueue({ absPath: target.absPath, relPath: target.relPath, isDirectory: stat.isDirectory() });
+  while (files.length < options.maxFiles && (visibleFrontier.size > 0 || hiddenFrontier.size > 0)) {
+    const next = visibleFrontier.pop() ?? hiddenFrontier.pop();
+    if (!next) break;
+    if (next.isDirectory) await expand(next);
+    else await addFile(next.absPath);
+  }
   return files;
 }
 

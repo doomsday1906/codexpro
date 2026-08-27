@@ -1,14 +1,19 @@
 import { createHash } from "node:crypto";
 import fsp from "node:fs/promises";
 import type { CodexProConfig } from "../config.js";
-import { listFiles, textScanByteLimit } from "../fsOps.js";
+import { isHiddenRelativePath, listFiles, textScanByteLimit } from "../fsOps.js";
 import type { PathGuard, Workspace } from "../guard.js";
 import { classifyFileRole, classifyLanguage, isEntrypoint, isGeneratedFile } from "./classify.js";
 import type { InventoryFile, InventoryResult } from "./types.js";
 
 export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuard, workspace: Workspace): Promise<InventoryResult> {
   const maxFiles = config.analysisLimits.maxInventoryFiles;
-  const candidates = await listFiles(guard, workspace, { root: ".", includeHidden: true, maxFiles: maxFiles + 1 });
+  const candidates = await listFiles(guard, workspace, {
+    root: ".",
+    includeHidden: true,
+    maxFiles: maxFiles + 1,
+    visibilityPriority: true
+  });
   const truncated = candidates.length > maxFiles;
   const files: InventoryFile[] = [];
 
@@ -33,7 +38,7 @@ export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuar
     }
   }
 
-  files.sort((a, b) => a.path.localeCompare(b.path));
+  files.sort((a, b) => Number(isHiddenRelativePath(a.path)) - Number(isHiddenRelativePath(b.path)) || a.path.localeCompare(b.path));
   const fingerprint = createHash("sha256")
     .update(files.map((file) => `${file.path}:${file.bytes}:${file.modifiedMs}`).join("\n"))
     .digest("hex");
