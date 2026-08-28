@@ -335,21 +335,94 @@ export async function repoTree(config: CodexProConfig, guard: PathGuard, workspa
   return { text: lines.join("\n"), entries, truncated };
 }
 
-export async function listFiles(
+export interface ListFilesOptions {
+  root?: string;
+  glob?: string;
+  includeHidden?: boolean;
+  maxFiles: number;
+  visibilityPriority?: boolean;
+}
+
+/**
+ * Internal facts for the visibility-priority traversal. This deliberately
+ * describes the bounded recursive walk rather than exposing implementation
+ * state (such as a deferred path frontier) through the MCP result.
+ */
+export interface ListFilesTraversal {
+  immediateEntries: number;
+  immediateEntriesVisited: number;
+  visibleExpansions: number;
+  hiddenExpansions: number;
+  maxRetainedTraversalState: number;
+  phaseTransitions: number;
+  phaseSequence: Array<"V" | "H">;
+  phases: Array<"V" | "H">;
+  hiddenEntriesObserved: number;
+  hiddenEntriesProcessed: number;
+  visibleFilesAdmitted: number;
+  hiddenFilesAdmitted: number;
+  phaseVComplete: boolean;
+  phaseHStarted: boolean;
+  phaseHComplete: boolean;
+  phaseVUnresolved: boolean;
+  phaseHUnresolved: boolean;
+  hiddenNamespaceUnresolved: boolean;
+  capacityExhausted: boolean;
+  complete: boolean;
+  unresolved: boolean;
+  truncated: boolean;
+}
+
+export interface ListFilesResult {
+  files: string[];
+  truncated: boolean;
+  traversal?: ListFilesTraversal;
+}
+
+function compareCodeUnit(left: string, right: string): number {
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+function compareRepositoryRelativeEntries(
+  left: { name: string },
+  right: { name: string },
+  relDir: string
+): number {
+  const leftPath = normalizeRelPath(path.join(relDir, left.name));
+  const rightPath = normalizeRelPath(path.join(relDir, right.name));
+  return compareCodeUnit(leftPath, rightPath) || compareCodeUnit(left.name, right.name);
+}
+
+/**
+ * List files with optional visibility priority. The priority route is a
+ * deterministic two-phase walk:
+ *
+ *   V — walk visible directories, record hidden immediate entries, and admit
+ *       visible files until the requested capacity is full;
+ *   H — if capacity remains, rewalk the visible tree and expand each observed
+ *       hidden directory once, admitting only hidden files for the remainder.
+ *
+ * Only the current recursive path is retained. Hidden directories are never
+ * queued for later work, so a repository-sized hidden frontier cannot starve
+ * the visible phase or inflate retained traversal state.
+ */
+export async function listFilesDetailed(
   guard: PathGuard,
   workspace: Workspace,
-  options: { root?: string; glob?: string; includeHidden?: boolean; maxFiles: number; visibilityPriority?: boolean }
-): Promise<string[]> {
+  options: ListFilesOptions
+): Promise<ListFilesResult> {
   const target = guard.resolve(workspace, options.root ?? ".");
   const stat = await fsp.stat(target.absPath);
   const files: string[] = [];
 
-  async function addFile(absFile: string): Promise<void> {
+  async function addFile(absFile: string): Promise<boolean> {
     const rel = displayPath(absFile, workspace.root);
-    if (guard.isBlockedRelativePath(rel)) return;
-    if (!options.includeHidden && isHiddenRelativePath(rel)) return;
-    if (options.glob && !minimatch(rel, options.glob, { dot: true })) return;
+    if (guard.isBlockedRelativePath(rel)) return false;
+    if (!options.includeHidden && isHiddenRelativePath(rel)) return false;
+    if (options.glob && !minimatch(rel, options.glob, { dot: true })) return false;
     files.push(rel);
+    return true;
   }
 
   async function walkDefault(absDir: string): Promise<void> {
@@ -375,91 +448,252 @@ export async function listFiles(
   if (!options.visibilityPriority) {
     if (stat.isFile()) await addFile(target.absPath);
     else await walkDefault(target.absPath);
-    return files;
+    return { files, truncated: false };
   }
 
-  interface FrontierEntry {
-    absPath: string;
-    relPath: string;
-    isDirectory: boolean;
-  }
-
-  class PathFrontier {
-    private readonly entries: FrontierEntry[] = [];
-
-    get size(): number {
-      return this.entries.length;
-    }
-
-    push(entry: FrontierEntry): void {
-      this.entries.push(entry);
-      let index = this.entries.length - 1;
-      while (index > 0) {
-        const parent = Math.floor((index - 1) / 2);
-        if (this.entries[parent].relPath.localeCompare(this.entries[index].relPath) <= 0) break;
-        [this.entries[parent], this.entries[index]] = [this.entries[index], this.entries[parent]];
-        index = parent;
-      }
-    }
-
-    pop(): FrontierEntry | undefined {
-      const first = this.entries[0];
-      if (!first) return undefined;
-      const last = this.entries.pop();
-      if (last && this.entries.length > 0) {
-        this.entries[0] = last;
-        let index = 0;
-        while (true) {
-          const left = index * 2 + 1;
-          const right = left + 1;
-          let smallest = index;
-          if (left < this.entries.length && this.entries[left].relPath.localeCompare(this.entries[smallest].relPath) < 0) {
-            smallest = left;
-          }
-          if (right < this.entries.length && this.entries[right].relPath.localeCompare(this.entries[smallest].relPath) < 0) {
-            smallest = right;
-          }
-          if (smallest === index) break;
-          [this.entries[index], this.entries[smallest]] = [this.entries[smallest], this.entries[index]];
-          index = smallest;
-        }
-      }
-      return first;
-    }
-  }
-
-  const visibleFrontier = new PathFrontier();
-  const hiddenFrontier = new PathFrontier();
-  const enqueue = (entry: FrontierEntry): void => {
-    if (guard.isBlockedRelativePath(entry.relPath)) return;
-    if (!options.includeHidden && isHiddenRelativePath(entry.relPath)) return;
-    const frontier = isHiddenRelativePath(entry.relPath) ? hiddenFrontier : visibleFrontier;
-    frontier.push(entry);
+  const maxFiles = Number.isFinite(options.maxFiles) ? Math.max(0, Math.floor(options.maxFiles)) : 0;
+  const traversalState = {
+    immediateEntries: 0,
+    visibleExpansions: 0,
+    hiddenExpansions: 0,
+    maxRetainedTraversalState: 0,
+    phaseTransitions: 0,
+    phaseSequence: ["V"] as Array<"V" | "H">,
+    hiddenEntriesObserved: 0,
+    hiddenEntriesProcessed: 0,
+    visibleFilesAdmitted: 0,
+    hiddenFilesAdmitted: 0,
+    phaseVComplete: false,
+    phaseHStarted: false,
+    phaseHComplete: false,
+    phaseVUnresolved: false,
+    phaseHUnresolved: false,
+    hiddenNamespaceUnresolved: false,
+    unresolved: false
   };
 
-  const expand = async (entry: FrontierEntry): Promise<void> => {
+  // A count is enough to carry Phase V's hidden observations into Phase H.
+  // Keeping no path list is the important memory invariant here: Phase H
+  // reconstructs the same order by re-reading each directory.
+  let pendingVisiblePhaseHiddenEntries = 0;
+  let activeTraversalState = 0;
+  let capacityReached = maxFiles === 0;
+
+  function hiddenEligible(relPath: string): boolean {
+    return options.includeHidden === true && isHiddenRelativePath(relPath);
+  }
+
+  function markUnresolved(phase: "V" | "H"): void {
+    traversalState.unresolved = true;
+    if (phase === "V") traversalState.phaseVUnresolved = true;
+    else traversalState.phaseHUnresolved = true;
+  }
+
+  function canObserve(relPath: string, entry: fs.Dirent): boolean {
+    if (guard.isBlockedRelativePath(relPath)) return false;
+    if (!options.includeHidden && isHiddenRelativePath(relPath)) return false;
+    return entry.isDirectory() || entry.isFile();
+  }
+
+  function markUnprocessedEntries(entries: fs.Dirent[], fromIndex: number, absDir: string): void {
+    for (let index = fromIndex; index < entries.length; index += 1) {
+      const entry = entries[index];
+      const relPath = displayPath(path.join(absDir, entry.name), workspace.root);
+      if (canObserve(relPath, entry)) {
+        markUnresolved("V");
+        return;
+      }
+    }
+  }
+
+  async function readEntries(absDir: string, relDir: string, hiddenParent: boolean, phase: "V" | "H"): Promise<fs.Dirent[] | undefined> {
+    if (hiddenParent) traversalState.hiddenExpansions += 1;
+    else traversalState.visibleExpansions += 1;
     let entries: fs.Dirent[];
     try {
-      entries = await fsp.readdir(entry.absPath, { withFileTypes: true });
+      entries = await fsp.readdir(absDir, { withFileTypes: true });
     } catch {
-      return;
+      markUnresolved(phase);
+      return undefined;
     }
-    for (const child of entries) {
-      const absPath = path.join(entry.absPath, child.name);
-      const relPath = displayPath(absPath, workspace.root);
-      if (child.isDirectory()) enqueue({ absPath, relPath, isDirectory: true });
-      else if (child.isFile()) enqueue({ absPath, relPath, isDirectory: false });
-    }
-  };
-
-  enqueue({ absPath: target.absPath, relPath: target.relPath, isDirectory: stat.isDirectory() });
-  while (files.length < options.maxFiles && (visibleFrontier.size > 0 || hiddenFrontier.size > 0)) {
-    const next = visibleFrontier.pop() ?? hiddenFrontier.pop();
-    if (!next) break;
-    if (next.isDirectory) await expand(next);
-    else await addFile(next.absPath);
+    entries.sort((left, right) => compareRepositoryRelativeEntries(left, right, relDir));
+    traversalState.immediateEntries += entries.length;
+    return entries;
   }
-  return files;
+
+  async function phaseVisible(absDir: string, relDir: string): Promise<void> {
+    activeTraversalState += 1;
+    traversalState.maxRetainedTraversalState = Math.max(traversalState.maxRetainedTraversalState, activeTraversalState);
+    try {
+      if (capacityReached) return;
+      const entries = await readEntries(absDir, relDir, false, "V");
+      if (!entries) return;
+
+      for (let index = 0; index < entries.length; index += 1) {
+        if (files.length >= maxFiles) {
+          capacityReached = true;
+          markUnprocessedEntries(entries, index, absDir);
+          return;
+        }
+        const entry = entries[index];
+        const absPath = path.join(absDir, entry.name);
+        const relPath = displayPath(absPath, workspace.root);
+        if (!canObserve(relPath, entry)) continue;
+        const hidden = hiddenEligible(relPath);
+        if (hidden) {
+          traversalState.hiddenEntriesObserved += 1;
+          pendingVisiblePhaseHiddenEntries += 1;
+          continue;
+        }
+        if (entry.isDirectory()) {
+          await phaseVisible(absPath, relPath);
+          if (capacityReached) {
+            markUnprocessedEntries(entries, index + 1, absDir);
+            return;
+          }
+        } else if (entry.isFile()) {
+          const admitted = await addFile(absPath);
+          if (admitted) {
+            traversalState.visibleFilesAdmitted += 1;
+            if (files.length >= maxFiles) capacityReached = true;
+          }
+        }
+      }
+    } finally {
+      activeTraversalState -= 1;
+    }
+  }
+
+  async function phaseHidden(absDir: string, relDir: string, hiddenParent: boolean): Promise<void> {
+    activeTraversalState += 1;
+    traversalState.maxRetainedTraversalState = Math.max(traversalState.maxRetainedTraversalState, activeTraversalState);
+    try {
+      if (files.length >= maxFiles) {
+        capacityReached = true;
+        return;
+      }
+      const entries = await readEntries(absDir, relDir, hiddenParent, "H");
+      if (!entries) return;
+
+      for (let index = 0; index < entries.length; index += 1) {
+        if (files.length >= maxFiles) {
+          capacityReached = true;
+          markUnprocessedHiddenEntries(entries, index, absDir, hiddenParent);
+          return;
+        }
+        const entry = entries[index];
+        const absPath = path.join(absDir, entry.name);
+        const relPath = displayPath(absPath, workspace.root);
+        if (!canObserve(relPath, entry)) continue;
+        const hidden = hiddenEligible(relPath);
+        if (hidden && !hiddenParent && pendingVisiblePhaseHiddenEntries > 0) {
+          pendingVisiblePhaseHiddenEntries -= 1;
+          traversalState.hiddenEntriesProcessed += 1;
+        }
+        if (entry.isDirectory()) {
+          await phaseHidden(absPath, relPath, hidden);
+          if (files.length >= maxFiles) {
+            markUnprocessedHiddenEntries(entries, index + 1, absDir, hiddenParent);
+            return;
+          }
+        } else if (entry.isFile() && hidden) {
+          const admitted = await addFile(absPath);
+          if (admitted) {
+            traversalState.hiddenFilesAdmitted += 1;
+            if (files.length >= maxFiles) capacityReached = true;
+          }
+        }
+      }
+    } finally {
+      activeTraversalState -= 1;
+    }
+  }
+
+  function markUnprocessedHiddenEntries(entries: fs.Dirent[], fromIndex: number, absDir: string, hiddenParent: boolean): void {
+    for (let index = fromIndex; index < entries.length; index += 1) {
+      const entry = entries[index];
+      const relPath = displayPath(path.join(absDir, entry.name), workspace.root);
+      if (!canObserve(relPath, entry)) continue;
+      if (hiddenParent || hiddenEligible(relPath)) {
+        markUnresolved("H");
+        return;
+      }
+    }
+  }
+
+  function markPendingHiddenNamespace(): void {
+    if (pendingVisiblePhaseHiddenEntries > 0) {
+      // This can be true when capacity ends Phase V before H starts. Keep it
+      // separate from phaseHUnresolved, which describes work actually begun.
+      traversalState.hiddenNamespaceUnresolved = true;
+      traversalState.unresolved = true;
+    }
+  }
+
+  if (stat.isFile()) {
+    // An explicitly selected file is the traversal root. Treat it as the
+    // visible root for priority purposes so root-file callers remain useful.
+    if (maxFiles > 0 && (options.includeHidden || !isHiddenRelativePath(target.relPath))) {
+      const admitted = await addFile(target.absPath);
+      if (admitted) traversalState.visibleFilesAdmitted += 1;
+    }
+    traversalState.phaseVComplete = true;
+  } else if (stat.isDirectory() && maxFiles > 0) {
+    await phaseVisible(target.absPath, target.relPath === "." ? "" : target.relPath);
+    traversalState.phaseVComplete = !traversalState.phaseVUnresolved;
+  }
+
+  // A full visible result is still partial when hidden entries or unprocessed
+  // visible namespace were observed. There is no useful H work once capacity
+  // is full, and importantly no hidden directory is descended in that case.
+  if (files.length >= maxFiles && maxFiles > 0) {
+    capacityReached = true;
+    markPendingHiddenNamespace();
+  } else if (stat.isDirectory() && options.includeHidden === true && pendingVisiblePhaseHiddenEntries > 0) {
+    traversalState.phaseHStarted = true;
+    traversalState.phaseTransitions = 1;
+    traversalState.phaseSequence.push("H");
+    await phaseHidden(target.absPath, target.relPath === "." ? "" : target.relPath, false);
+    markPendingHiddenNamespace();
+    traversalState.phaseHComplete = !traversalState.phaseHUnresolved;
+  }
+
+  const capacityExhausted = maxFiles > 0 && files.length >= maxFiles;
+  const complete = !traversalState.unresolved;
+
+  const traversal: ListFilesTraversal = {
+    immediateEntries: traversalState.immediateEntries,
+    immediateEntriesVisited: traversalState.immediateEntries,
+    visibleExpansions: traversalState.visibleExpansions,
+    hiddenExpansions: traversalState.hiddenExpansions,
+    maxRetainedTraversalState: traversalState.maxRetainedTraversalState,
+    phaseTransitions: traversalState.phaseTransitions,
+    phaseSequence: traversalState.phaseSequence,
+    phases: traversalState.phaseSequence,
+    hiddenEntriesObserved: traversalState.hiddenEntriesObserved,
+    hiddenEntriesProcessed: traversalState.hiddenEntriesProcessed,
+    visibleFilesAdmitted: traversalState.visibleFilesAdmitted,
+    hiddenFilesAdmitted: traversalState.hiddenFilesAdmitted,
+    phaseVComplete: traversalState.phaseVComplete,
+    phaseHStarted: traversalState.phaseHStarted,
+    phaseHComplete: traversalState.phaseHComplete,
+    phaseVUnresolved: traversalState.phaseVUnresolved,
+    phaseHUnresolved: traversalState.phaseHUnresolved,
+    hiddenNamespaceUnresolved: traversalState.hiddenNamespaceUnresolved,
+    capacityExhausted,
+    complete,
+    unresolved: traversalState.unresolved,
+    truncated: traversalState.unresolved
+  };
+  return { files, traversal, truncated: traversal.truncated };
+}
+
+export async function listFiles(
+  guard: PathGuard,
+  workspace: Workspace,
+  options: ListFilesOptions
+): Promise<string[]> {
+  return (await listFilesDetailed(guard, workspace, options)).files;
 }
 
 export async function readTextFile(

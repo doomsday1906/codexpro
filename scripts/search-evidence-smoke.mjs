@@ -3,7 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const NEEDLE = 'BoundaryNeedleAlpha';
 const HIDDEN_SYMBOL = 'HiddenBoundaryDefinition';
@@ -23,10 +23,17 @@ const SHIM_MAX_OUTPUT_BYTES = 4000;
 const UNTERMINATED_RECORD_BYTES = 96_000;
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const serverEntry = path.join(projectRoot, 'dist', 'stdio.js');
+const importBuilt = (relativePath) => import(pathToFileURL(path.join(projectRoot, 'dist', relativePath)).href);
 const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-search-evidence-'));
 let controlFixtureRoot;
+const inventoryEvidenceRoots = [];
 const realRgLookup = spawnSync('/bin/sh', ['-lc', 'command -v rg'], { encoding: 'utf8' });
 const realRgPath = realRgLookup.status === 0 ? realRgLookup.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) : '';
+const [{ loadConfig }, { PathGuard, WorkspaceManager }, { listFilesDetailed }] = await Promise.all([
+  importBuilt('config.js'),
+  importBuilt('guard.js'),
+  importBuilt('fsOps.js')
+]);
 
 class McpStdioClient {
   constructor({ pathOverride, envOverrides = {}, root = fixtureRoot } = {}) {
@@ -225,6 +232,308 @@ function assertHiddenTargetResult(result, expectedPath, label, expectedUsed) {
   assertPathPresent(structuredPaths(result), expectedPath, `${label} structured result`);
 }
 
+async function writeInto(root, relativePath, content) {
+  const target = path.join(root, relativePath);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.writeFile(target, content, 'utf8');
+}
+
+async function makeDirectInventory(root) {
+  const config = loadConfig(['--root', root, '--allow-root', root, '--bash', 'off', '--write', 'off']);
+  // Keep direct diagnostics focused on the one blocked route under test.
+  config.blockedGlobs = ['blocked/**'];
+  const guard = new PathGuard(config);
+  const workspace = new WorkspaceManager(config).defaultWorkspace();
+  return { guard, workspace };
+}
+
+async function createVisibilityFixture({ visibleCount = 0, hiddenDirectoryCount = 0, hiddenFileCount = 0, order = 'visible-first' } = {}) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-inventory-visibility-'));
+  inventoryEvidenceRoots.push(root);
+  const visibleFiles = Array.from({ length: visibleCount }, (_, index) => `visible-${String(index).padStart(3, '0')}.ts`);
+  const hiddenDirectories = Array.from({ length: hiddenDirectoryCount }, (_, index) => `.hidden-dir-${String(index).padStart(5, '0')}`);
+  const hiddenFiles = Array.from({ length: hiddenFileCount }, (_, index) => `.hidden-evidence/hidden-${String(index).padStart(3, '0')}.ts`);
+  const createVisible = async () => {
+    for (const relativePath of visibleFiles) await writeInto(root, relativePath, `export const ${relativePath.replace(/[^A-Za-z0-9]/g, '_')} = true;\n`);
+  };
+  const createHidden = async () => {
+    for (const relativePath of hiddenDirectories) await fs.mkdir(path.join(root, relativePath));
+    for (const relativePath of hiddenFiles) await writeInto(root, relativePath, `export function HiddenEvidence${relativePath.replace(/[^A-Za-z0-9]/g, '_')}() { return true; }\n`);
+  };
+  if (order === 'hidden-first') {
+    await createHidden();
+    await createVisible();
+  } else {
+    await createVisible();
+    await createHidden();
+  }
+  return { root, visibleFiles, hiddenDirectories, hiddenFiles };
+}
+
+function directTraversalSummary(result) {
+  return {
+    files: result.files,
+    truncated: result.truncated,
+    traversal: result.traversal
+  };
+}
+
+function assertVisibilityTraversal(result, expected, label) {
+  assert.deepEqual(result.files, expected.files, `${label} retained files diverged`);
+  assert.equal(result.truncated, expected.truncated, `${label} returned truncation diverged`);
+  assert.equal(result.traversal.immediateEntries, expected.immediateEntries, `${label} immediate entry count diverged`);
+  assert.equal(result.traversal.immediateEntriesVisited, expected.immediateEntries, `${label} immediate entry visit count diverged`);
+  assert.equal(result.traversal.visibleExpansions, expected.visibleExpansions, `${label} visible expansion count diverged`);
+  assert.equal(result.traversal.hiddenExpansions, expected.hiddenExpansions, `${label} hidden expansion count diverged`);
+  assert.equal(result.traversal.maxRetainedTraversalState, expected.maxRetainedState, `${label} retained traversal state diverged`);
+  assert.deepEqual(result.traversal.phaseSequence, expected.phaseSequence, `${label} phase sequence diverged`);
+  assert.equal(result.traversal.phaseTransitions, expected.phaseTransitions, `${label} phase transition count diverged`);
+  assert.equal(result.traversal.visibleFilesAdmitted, expected.visibleFilesAdmitted, `${label} visible admission count diverged`);
+  assert.equal(result.traversal.hiddenFilesAdmitted, expected.hiddenFilesAdmitted, `${label} hidden admission count diverged`);
+  assert.equal(result.traversal.hiddenEntriesObserved, expected.hiddenEntriesObserved, `${label} hidden observation count diverged`);
+  assert.equal(result.traversal.hiddenEntriesProcessed, expected.hiddenEntriesProcessed, `${label} hidden processing count diverged`);
+  assert.equal(result.traversal.unresolved, expected.unresolved, `${label} unresolved coverage diverged`);
+}
+
+async function runVisibilityPriorityInventoryProof() {
+  const proof = { cases: {}, reverseOrder: {} };
+  const run = async (fixture, maxFiles, label, expected) => {
+    const { guard, workspace } = await makeDirectInventory(fixture.root);
+    const result = await listFilesDetailed(guard, workspace, {
+      root: '.',
+      includeHidden: true,
+      maxFiles,
+      visibilityPriority: true
+    });
+    assertVisibilityTraversal(result, expected, label);
+    return result;
+  };
+
+  for (const [label, hiddenDirectoryCount] of [['A', 500], ['B', 12_000]]) {
+    const visibleCount = 100;
+    const expectedFiles = Array.from({ length: visibleCount }, (_, index) => `visible-${String(index).padStart(3, '0')}.ts`);
+    const expected = {
+      files: expectedFiles,
+      truncated: true,
+      immediateEntries: visibleCount + hiddenDirectoryCount,
+      visibleExpansions: 1,
+      hiddenExpansions: 0,
+      maxRetainedState: 1,
+      phaseSequence: ['V'],
+      phaseTransitions: 0,
+      visibleFilesAdmitted: visibleCount,
+      hiddenFilesAdmitted: 0,
+      hiddenEntriesObserved: hiddenDirectoryCount,
+      hiddenEntriesProcessed: 0,
+      unresolved: true
+    };
+    const visibleFirst = await createVisibilityFixture({ visibleCount, hiddenDirectoryCount, order: 'visible-first' });
+    const hiddenFirst = await createVisibilityFixture({ visibleCount, hiddenDirectoryCount, order: 'hidden-first' });
+    const visibleResult = await run(visibleFirst, visibleCount, `${label} visible-first`, expected);
+    const hiddenResult = await run(hiddenFirst, visibleCount, `${label} hidden-first`, expected);
+    assert.deepEqual(hiddenResult.files, visibleResult.files, `${label} reverse physical creation changed retained visible identity`);
+    assert.deepEqual(hiddenResult.traversal, visibleResult.traversal, `${label} reverse physical creation changed structured traversal evidence`);
+    proof.cases[label] = directTraversalSummary(visibleResult);
+    proof.reverseOrder[label] = true;
+  }
+
+  const nestedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-inventory-nested-'));
+  inventoryEvidenceRoots.push(nestedRoot);
+  await fs.mkdir(path.join(nestedRoot, 'visible-dir'));
+  await fs.mkdir(path.join(nestedRoot, 'visible-dir', '.hidden-descendant'));
+  await fs.mkdir(path.join(nestedRoot, '.hidden-sibling'));
+  await fs.mkdir(path.join(nestedRoot, '.hidden-sibling', 'arbitrary-descendant'));
+  await writeInto(nestedRoot, 'visible-root.ts', 'export const visibleRoot = true;\n');
+  await writeInto(nestedRoot, 'visible-dir/visible-nested.ts', 'export const visibleNested = true;\n');
+  await writeInto(nestedRoot, 'visible-dir/.hidden-descendant/deep.ts', 'export const hiddenDeep = true;\n');
+  await writeInto(nestedRoot, '.hidden-sibling/arbitrary-descendant/any-name.data', 'hidden arbitrary descendant\n');
+  const nestedExpected = {
+    files: ['visible-dir/visible-nested.ts', 'visible-root.ts', '.hidden-sibling/arbitrary-descendant/any-name.data', 'visible-dir/.hidden-descendant/deep.ts'],
+    truncated: false,
+    immediateEntries: 13,
+    visibleExpansions: 4,
+    hiddenExpansions: 3,
+    maxRetainedState: 3,
+    phaseSequence: ['V', 'H'],
+    phaseTransitions: 1,
+    visibleFilesAdmitted: 2,
+    hiddenFilesAdmitted: 2,
+    hiddenEntriesObserved: 2,
+    hiddenEntriesProcessed: 2,
+    unresolved: false
+  };
+  const nestedResult = await run({ root: nestedRoot }, 10, 'D nested visible/hidden namespaces', nestedExpected);
+  proof.cases.D = directTraversalSummary(nestedResult);
+
+  const retainedExpected = (visibleFiles, hiddenFiles) => ({
+    files: [...visibleFiles, ...hiddenFiles.slice(0, 5)],
+    truncated: true,
+    immediateEntries: 203,
+    visibleExpansions: 2,
+    hiddenExpansions: 1,
+    maxRetainedState: 2,
+    phaseSequence: ['V', 'H'],
+    phaseTransitions: 1,
+    visibleFilesAdmitted: 95,
+    hiddenFilesAdmitted: 5,
+    hiddenEntriesObserved: 1,
+    hiddenEntriesProcessed: 1,
+    unresolved: true
+  });
+  const eResults = {};
+  for (const order of ['visible-first', 'hidden-first']) {
+    const fixture = await createVisibilityFixture({ visibleCount: 95, hiddenFileCount: 11, order });
+    const expectedFiles = Array.from({ length: 95 }, (_, index) => `visible-${String(index).padStart(3, '0')}.ts`);
+    const hiddenFiles = Array.from({ length: 11 }, (_, index) => `.hidden-evidence/hidden-${String(index).padStart(3, '0')}.ts`);
+    eResults[order] = await run(fixture, 100, `E ${order}`, retainedExpected(expectedFiles, hiddenFiles));
+
+    const { client, workspaceId } = await openMcpClient(clients, undefined, {
+      CODEXPRO_ANALYSIS_MAX_INVENTORY_FILES: '100'
+    }, fixture.root);
+    const search = makeSearch(client, workspaceId);
+    const falseResult = await search({ query: 'HiddenEvidence', intent: 'symbol', include_tests: true, include_hidden: false });
+    assertNoHiddenEvidence(falseResult, `E ${order} include_hidden=false`);
+    const falseCache = cacheEvidence(falseResult);
+    assert.equal(falseCache.hit, false, `E ${order} include_hidden=false was not the cold analysis`);
+    const trueResult = await search({ query: 'HiddenEvidence', intent: 'symbol', include_tests: true, include_hidden: true });
+    const trueCache = cacheEvidence(trueResult);
+    assert.equal(trueCache.hit, true, `E ${order} include_hidden=true did not reuse the shared analysis`);
+    assert.equal(trueCache.key, falseCache.key, `E ${order} include_hidden=true used a different analysis cache key`);
+    const retained = new Set(hiddenFiles.slice(0, 5));
+    const structuredHidden = structuredPaths(trueResult).filter(isHiddenPath);
+    assert(structuredHidden.length > 0, `E ${order} include_hidden=true omitted retained hidden structured evidence`);
+    assert(structuredHidden.every((candidate) => retained.has(candidate)), `E ${order} structured search returned hidden evidence outside retained inventory: ${JSON.stringify(structuredHidden)}`);
+    const inspected = await inspectWorkspace(client, workspaceId, { max_files: 200, max_symbols: 200, max_relationships: 200 });
+    assert.equal(inspected.structuredContent.cache?.hit, true, `E ${order} inspect_workspace did not reuse the shared analysis`);
+    assert.equal(inspected.structuredContent.cache?.key, trueCache.key, `E ${order} inspect_workspace used a different analysis cache key`);
+    const inspectedHidden = inspected.structuredContent.files.filter((file) => isHiddenPath(file.path)).map((file) => file.path);
+    assert.deepEqual(inspectedHidden, [...retained].sort(), `E ${order} inspect returned non-retained hidden evidence`);
+    eResults[order].mcp = {
+      include_hidden_false_cache: falseCache,
+      include_hidden_false_hidden: falseResult.structuredContent.matches.filter((match) => isHiddenPath(match.path)).map((match) => match.path),
+      include_hidden_true_cache: trueCache,
+      include_hidden_true_structured_hidden: structuredHidden,
+      inspect_cache: inspected.structuredContent.cache,
+      inspect_hidden: inspectedHidden
+    };
+    if (order === 'visible-first') {
+      proof.cacheFingerprint = await runCacheFingerprintRegression({ root: fixture.root, client, workspaceId, search, hiddenFiles });
+    }
+  }
+  assert.deepEqual(eResults['hidden-first'].files, eResults['visible-first'].files, 'E reverse physical creation changed retained hidden identity');
+  assert.deepEqual(eResults['hidden-first'].traversal, eResults['visible-first'].traversal, 'E reverse physical creation changed structured traversal evidence');
+  proof.cases.E = Object.fromEntries(Object.entries(eResults).map(([order, result]) => [order, { ...directTraversalSummary(result), mcp: result.mcp }]));
+
+  const zeroRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-inventory-zero-capacity-'));
+  inventoryEvidenceRoots.push(zeroRoot);
+  await fs.mkdir(path.join(zeroRoot, '.hidden-zero'));
+  await writeInto(zeroRoot, 'visible-zero.ts', 'export const visibleZero = true;\n');
+  await writeInto(zeroRoot, '.hidden-zero/hidden-zero.ts', 'export const hiddenZero = true;\n');
+  const zeroResult = await run({ root: zeroRoot }, 0, 'F zero remaining capacity', {
+    files: [],
+    truncated: false,
+    immediateEntries: 0,
+    visibleExpansions: 0,
+    hiddenExpansions: 0,
+    maxRetainedState: 0,
+    phaseSequence: ['V'],
+    phaseTransitions: 0,
+    visibleFilesAdmitted: 0,
+    hiddenFilesAdmitted: 0,
+    hiddenEntriesObserved: 0,
+    hiddenEntriesProcessed: 0,
+    unresolved: false
+  });
+  assert.equal(zeroResult.traversal.phases.includes('H'), false, 'F zero capacity unexpectedly entered hidden phase');
+  proof.cases.F = directTraversalSummary(zeroResult);
+  return proof;
+}
+
+function cacheEvidence(result) {
+  const cache = result.structuredContent?.analysis?.cache;
+  assert(cache && typeof cache.key === 'string', `search omitted cache evidence: ${JSON.stringify(result.structuredContent)}`);
+  return { hit: cache.hit, key: cache.key };
+}
+
+function hiddenStructuredPaths(result) {
+  return structuredPaths(result).filter(isHiddenPath).sort();
+}
+
+async function runCacheFingerprintRegression({ root, client, workspaceId, search, hiddenFiles }) {
+  const query = 'HiddenEvidence';
+  const baseline = await search({ query, intent: 'symbol', include_tests: true, include_hidden: true });
+  const baselineCache = cacheEvidence(baseline);
+  assert.equal(baselineCache.hit, true, 'cache regression baseline did not reuse the existing E analysis');
+  const baselineHidden = hiddenStructuredPaths(baseline);
+  assert.deepEqual(baselineHidden, hiddenFiles.slice(0, 5).sort(), 'cache regression baseline retained the wrong hidden evidence');
+
+  await fs.appendFile(path.join(root, 'visible-000.ts'), '\n// admitted visible cache mutation\n', 'utf8');
+  const visibleChanged = await search({ query, intent: 'symbol', include_tests: true, include_hidden: true });
+  const visibleChangedCache = cacheEvidence(visibleChanged);
+  assert.equal(visibleChangedCache.hit, false, 'admitted visible mutation did not invalidate analysis cache');
+  assert.notEqual(visibleChangedCache.key, baselineCache.key, 'admitted visible mutation reused the old cache key');
+
+  await fs.appendFile(path.join(root, hiddenFiles[0]), '\n// admitted hidden cache mutation\n', 'utf8');
+  const hiddenChanged = await search({ query, intent: 'symbol', include_tests: true, include_hidden: true });
+  const hiddenChangedCache = cacheEvidence(hiddenChanged);
+  assert.equal(hiddenChangedCache.hit, false, 'admitted hidden mutation did not invalidate analysis cache');
+  assert.notEqual(hiddenChangedCache.key, visibleChangedCache.key, 'admitted hidden mutation reused the old cache key');
+
+  const earlierHidden = '.hidden-evidence/hidden-00.ts';
+  await writeInto(root, earlierHidden, 'export function HiddenEvidence_earlier() { return true; }\n');
+  const earlierAdded = await search({ query, intent: 'symbol', include_tests: true, include_hidden: true });
+  const earlierAddedCache = cacheEvidence(earlierAdded);
+  const expectedAfterEarlier = [earlierHidden, ...hiddenFiles.slice(0, 4)].sort();
+  assert.equal(earlierAddedCache.hit, false, 'earlier hidden admission change did not invalidate analysis cache');
+  assert.notEqual(earlierAddedCache.key, hiddenChangedCache.key, 'earlier hidden admission change reused the old cache key');
+  assert.deepEqual(hiddenStructuredPaths(earlierAdded), expectedAfterEarlier, 'earlier hidden source did not change retained hidden selection');
+
+  const retainedBeforeBeyondMutation = hiddenStructuredPaths(earlierAdded);
+  const beyondRetained = hiddenFiles.at(-1);
+  await fs.appendFile(path.join(root, beyondRetained), '\n// beyond retained cache mutation\n', 'utf8');
+  const beyondChanged = await search({ query, intent: 'symbol', include_tests: true, include_hidden: true });
+  const beyondChangedCache = cacheEvidence(beyondChanged);
+  assert.equal(beyondChangedCache.hit, true, 'beyond-retained hidden mutation unexpectedly invalidated bounded cache');
+  assert.equal(beyondChangedCache.key, earlierAddedCache.key, 'beyond-retained hidden mutation changed bounded cache key');
+  assert.deepEqual(hiddenStructuredPaths(beyondChanged), retainedBeforeBeyondMutation, 'beyond-retained hidden mutation changed retained output');
+
+  await fs.rm(path.join(root, beyondRetained));
+  const beyondDeleted = await search({ query, intent: 'symbol', include_tests: true, include_hidden: true });
+  const beyondDeletedCache = cacheEvidence(beyondDeleted);
+  assert.equal(beyondDeletedCache.hit, true, 'beyond-retained hidden deletion unexpectedly invalidated bounded cache');
+  assert.equal(beyondDeletedCache.key, earlierAddedCache.key, 'beyond-retained hidden deletion changed bounded cache key');
+  assert.deepEqual(hiddenStructuredPaths(beyondDeleted), retainedBeforeBeyondMutation, 'beyond-retained hidden deletion changed retained output');
+
+  await fs.rm(path.join(root, 'visible-094.ts'));
+  const visibleRemoved = await search({ query, intent: 'symbol', include_tests: true, include_hidden: true });
+  const visibleRemovedCache = cacheEvidence(visibleRemoved);
+  const expectedAfterVisibleRemoval = [earlierHidden, ...hiddenFiles.slice(0, 5)].sort();
+  assert.equal(visibleRemovedCache.hit, false, 'visible removal did not invalidate analysis cache');
+  assert.notEqual(visibleRemovedCache.key, beyondDeletedCache.key, 'visible removal reused the old cache key');
+  assert.deepEqual(hiddenStructuredPaths(visibleRemoved), expectedAfterVisibleRemoval, 'visible removal did not open one hidden inventory slot');
+  const inspectedAfterVisibleRemoval = await inspectWorkspace(client, workspaceId, { max_files: 200, max_symbols: 200, max_relationships: 200 });
+  const inspectedHiddenAfterVisibleRemoval = inspectedAfterVisibleRemoval.structuredContent.files
+    .filter((file) => isHiddenPath(file.path))
+    .map((file) => file.path)
+    .sort();
+  assert.deepEqual(inspectedHiddenAfterVisibleRemoval, expectedAfterVisibleRemoval, 'visible removal did not expose the newly eligible hidden file through inspect');
+  const visibleRemovedAgain = await search({ query, intent: 'symbol', include_tests: true, include_hidden: true });
+  const visibleRemovedAgainCache = cacheEvidence(visibleRemovedAgain);
+  assert.equal(visibleRemovedAgainCache.hit, true, 'unchanged post-removal analysis did not reuse cache');
+  assert.equal(visibleRemovedAgainCache.key, visibleRemovedCache.key, 'unchanged post-removal analysis changed cache key');
+
+  return {
+    baseline: { cache: baselineCache, retained_hidden: baselineHidden },
+    admitted_visible_modified: visibleChangedCache,
+    admitted_hidden_modified: hiddenChangedCache,
+    earlier_hidden_added: { cache: earlierAddedCache, retained_hidden: expectedAfterEarlier },
+    beyond_retained_modified: { cache: beyondChangedCache, retained_hidden: retainedBeforeBeyondMutation },
+    beyond_retained_deleted: { cache: beyondDeletedCache, retained_hidden: retainedBeforeBeyondMutation },
+    visible_removed: { cache: visibleRemovedCache, retained_hidden: expectedAfterVisibleRemoval, inspect_hidden: inspectedHiddenAfterVisibleRemoval },
+    visible_removed_repeat: visibleRemovedAgainCache
+  };
+}
+
 async function openMcpClient(clients, pathOverride, envOverrides = {}, root = fixtureRoot) {
   const current = new McpStdioClient({ pathOverride, envOverrides, root });
   clients.push(current);
@@ -349,6 +658,8 @@ try {
       return !relative.split(path.sep).some((component) => component.startsWith('.'));
     }
   });
+
+  const visibilityPriorityProof = await runVisibilityPriorityInventoryProof();
 
   const { client, workspaceId } = await openMcpClient(clients);
   const search = makeSearch(client, workspaceId);
@@ -842,6 +1153,7 @@ esac
       symbols_limited: symbolCoverage,
       relationships_limited: relationshipCoverage
     },
+    visibility_priority_inventory: visibilityPriorityProof,
     malformed_record: {
       is_error: malformedResult.isError === true,
       error_bytes: Buffer.byteLength(malformedErrorText, 'utf8'),
@@ -870,7 +1182,7 @@ esac
   console.log('✓ search evidence boundary smoke test passed');
 } finally {
   for (const current of clients) current.close();
-  for (const disposable of [rgShimDir, emptyPathDir, controlFixtureRoot, fixtureRoot]) {
+  for (const disposable of [...inventoryEvidenceRoots, rgShimDir, emptyPathDir, controlFixtureRoot, fixtureRoot]) {
     if (disposable) await fs.rm(disposable, { recursive: true, force: true });
   }
 }
