@@ -19,6 +19,17 @@ const FLOOD_NEEDLE = 'BoundaryNeedleAdmissionFlood';
 const BLOCKED_FLOOD_NEEDLE = 'BoundaryNeedleBlockedFlood';
 const MALFORMED_NEEDLE = 'BoundaryNeedleMalformedRecord';
 const AFTER_MALFORMED_NEEDLE = 'BoundaryNeedleAfterMalformedRecord';
+const ELIGIBLE_CAPACITY_SYMBOL = 'EligibleCapacityDefinition';
+const HIDDEN_ELIGIBLE_CAPACITY_SYMBOL = 'HiddenEligibleCapacityDefinition';
+const PROMOTED_CAPACITY_SYMBOL = 'PromotedCapacityDefinition';
+const OUTSIDE_CAPACITY_SYMBOL = 'OutsideCapacityLeak';
+const ELIGIBLE_CAPACITY_INVENTORY_LIMIT = 100;
+const VISIBLE_INELIGIBLE_PREFIX_COUNT = 100;
+const HIDDEN_INELIGIBLE_BINARY_COUNT = 2;
+const HIDDEN_INELIGIBLE_OVERSIZED_COUNT = 3;
+const HIDDEN_ELIGIBLE_CAPACITY_COUNT = 11;
+const INELIGIBLE_OVERSIZED_BYTES = 16_001;
+const HOSTILE_VISIBLE_BINARY_COUNT = 10_000;
 const SHIM_MAX_OUTPUT_BYTES = 4000;
 const UNTERMINATED_RECORD_BYTES = 96_000;
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -29,10 +40,11 @@ let controlFixtureRoot;
 const inventoryEvidenceRoots = [];
 const realRgLookup = spawnSync('/bin/sh', ['-lc', 'command -v rg'], { encoding: 'utf8' });
 const realRgPath = realRgLookup.status === 0 ? realRgLookup.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) : '';
-const [{ loadConfig }, { PathGuard, WorkspaceManager }, { listFilesDetailed }] = await Promise.all([
+const [{ loadConfig }, { PathGuard, WorkspaceManager }, { listFiles, listFilesDetailed }, { inventoryWorkspace }] = await Promise.all([
   importBuilt('config.js'),
   importBuilt('guard.js'),
-  importBuilt('fsOps.js')
+  importBuilt('fsOps.js'),
+  importBuilt('analysis/inventory.js')
 ]);
 
 class McpStdioClient {
@@ -149,7 +161,7 @@ function groupedMatches(result) {
 }
 
 function assertSearchSucceeded(result, label) {
-  assert.equal(result.isError, undefined, `${label} returned an MCP error`);
+  assert.equal(result.isError, undefined, `${label} returned an MCP error: ${mcpErrorText(result)}`);
   assert(result.structuredContent.analysis, `${label} omitted structured analysis`);
   assert.deepEqual(result.structuredContent.analysis.matches, groupedMatches(result), `${label} flat/grouped structured results diverged`);
 }
@@ -238,6 +250,12 @@ async function writeInto(root, relativePath, content) {
   await fs.writeFile(target, content, 'utf8');
 }
 
+async function writeRawInto(root, relativePath, content) {
+  const target = path.join(root, relativePath);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.writeFile(target, content);
+}
+
 async function makeDirectInventory(root) {
   const config = loadConfig(['--root', root, '--allow-root', root, '--bash', 'off', '--write', 'off']);
   // Keep direct diagnostics focused on the one blocked route under test.
@@ -268,6 +286,184 @@ async function createVisibilityFixture({ visibleCount = 0, hiddenDirectoryCount 
     await createHidden();
   }
   return { root, visibleFiles, hiddenDirectories, hiddenFiles };
+}
+
+function sortedPaths(paths) {
+  return [...paths].sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+}
+
+function binaryFixtureContent(label, index) {
+  return Buffer.from(`export const ${label}${index} = true;\0binary fixture payload\n`, 'utf8');
+}
+
+function oversizedFixtureContent(label, index) {
+  return `export const ${label}${index} = true;\n${'x'.repeat(INELIGIBLE_OVERSIZED_BYTES)}\n`;
+}
+
+async function createEligibilityFixture({
+  visibleBinaryCount = 0,
+  visibleOversizedCount = 0,
+  visibleEligiblePaths = [],
+  extraVisibleIneligiblePaths = [],
+  hiddenBinaryCount = 0,
+  hiddenOversizedCount = 0,
+  hiddenEligibleCount = 0,
+  order = 'ineligible-first',
+  includeBoundaryArtifacts = true
+} = {}) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-eligibility-capacity-'));
+  inventoryEvidenceRoots.push(root);
+  const visibleBinaryPaths = Array.from({ length: visibleBinaryCount }, (_, index) =>
+    `000-visible-ineligible-binary-${String(index).padStart(3, '0')}.ts`
+  );
+  const visibleOversizedPaths = Array.from({ length: visibleOversizedCount }, (_, index) =>
+    `050-visible-ineligible-oversized-${String(index).padStart(3, '0')}.ts`
+  );
+  const hiddenBinaryPaths = Array.from({ length: hiddenBinaryCount }, (_, index) =>
+    `.hidden-capacity/000-hidden-ineligible-binary-${String(index).padStart(3, '0')}.ts`
+  );
+  const hiddenOversizedPaths = Array.from({ length: hiddenOversizedCount }, (_, index) =>
+    `.hidden-capacity/050-hidden-ineligible-oversized-${String(index).padStart(3, '0')}.ts`
+  );
+  const hiddenEligiblePaths = Array.from({ length: hiddenEligibleCount }, (_, index) =>
+    `.hidden-capacity/100-hidden-eligible-${String(index).padStart(3, '0')}.ts`
+  );
+  const visibleIneligiblePaths = [...visibleBinaryPaths, ...visibleOversizedPaths, ...extraVisibleIneligiblePaths];
+  const hiddenIneligiblePaths = [...hiddenBinaryPaths, ...hiddenOversizedPaths];
+  const outsideRoot = includeBoundaryArtifacts
+    ? await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-eligibility-outside-'))
+    : undefined;
+  if (outsideRoot) inventoryEvidenceRoots.push(outsideRoot);
+  const blockedPath = 'blocked/capacity-secret.ts';
+  const symlinkPath = 'z-outside-capacity-symlink.ts';
+  const outsidePath = outsideRoot ? path.join(outsideRoot, 'outside.ts') : undefined;
+
+  const createVisibleIneligible = async () => {
+    for (const [index, relativePath] of visibleBinaryPaths.entries()) {
+      await writeRawInto(root, relativePath, binaryFixtureContent('VisibleBinaryIneligible', index));
+    }
+    for (const [index, relativePath] of visibleOversizedPaths.entries()) {
+      await writeInto(root, relativePath, oversizedFixtureContent('VisibleOversizedIneligible', index));
+    }
+    for (const relativePath of extraVisibleIneligiblePaths) {
+      await writeInto(root, relativePath, oversizedFixtureContent('VisibleTransitionIneligible', 0));
+    }
+  };
+  const createVisibleEligible = async () => {
+    for (const [index, relativePath] of visibleEligiblePaths.entries()) {
+      const symbol = relativePath === '999-late-eligible-definition.ts'
+        ? ELIGIBLE_CAPACITY_SYMBOL
+        : `VisibleCapacityDefinition${index}`;
+      await writeInto(root, relativePath, `export function ${symbol}() { return true; }\n`);
+    }
+  };
+  const createHidden = async () => {
+    for (const [index, relativePath] of hiddenBinaryPaths.entries()) {
+      await writeRawInto(root, relativePath, binaryFixtureContent('HiddenBinaryIneligible', index));
+    }
+    for (const [index, relativePath] of hiddenOversizedPaths.entries()) {
+      await writeInto(root, relativePath, oversizedFixtureContent('HiddenOversizedIneligible', index));
+    }
+    for (const [index, relativePath] of hiddenEligiblePaths.entries()) {
+      await writeInto(root, relativePath, `export function ${HIDDEN_ELIGIBLE_CAPACITY_SYMBOL}() { return true; }\n`);
+    }
+  };
+  const createBoundaryArtifacts = async () => {
+    if (!includeBoundaryArtifacts) return;
+    await writeInto(root, blockedPath, `export function BlockedCapacitySecret() { return true; }\n`);
+    assert(outsidePath, 'outside fixture path was not created');
+    await writeInto(outsideRoot, 'outside.ts', `export function ${OUTSIDE_CAPACITY_SYMBOL}() { return true; }\n`);
+    await fs.symlink(outsidePath, path.join(root, symlinkPath), 'file');
+  };
+
+  if (order === 'eligible-first') {
+    await createVisibleEligible();
+    await createHidden();
+    await createVisibleIneligible();
+    await createBoundaryArtifacts();
+  } else {
+    await createVisibleIneligible();
+    await createHidden();
+    await createVisibleEligible();
+    await createBoundaryArtifacts();
+  }
+  return {
+    root,
+    visibleBinaryPaths,
+    visibleOversizedPaths,
+    visibleIneligiblePaths,
+    visibleEligiblePaths,
+    hiddenBinaryPaths,
+    hiddenOversizedPaths,
+    hiddenIneligiblePaths,
+    hiddenEligiblePaths,
+    blockedPath: includeBoundaryArtifacts ? blockedPath : undefined,
+    symlinkPath: includeBoundaryArtifacts ? symlinkPath : undefined,
+    outsidePath,
+    transitionIneligiblePath: extraVisibleIneligiblePaths[0]
+  };
+}
+
+async function createHostilePrefixFixture() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-eligibility-hostile-prefix-'));
+  inventoryEvidenceRoots.push(root);
+  for (let index = 0; index < HOSTILE_VISIBLE_BINARY_COUNT; index += 1) {
+    const relativePath = `000-hostile-ineligible-binary-${String(index).padStart(5, '0')}.ts`;
+    await writeRawInto(root, relativePath, binaryFixtureContent('HostileBinaryIneligible', index));
+  }
+  const targetPath = '99999-late-hostile-definition.ts';
+  await writeInto(root, targetPath, `export function ${ELIGIBLE_CAPACITY_SYMBOL}() { return true; }\n`);
+  return { root, targetPath };
+}
+
+async function exerciseUnreadableInventoryProbe(fixture) {
+  const relativePath = '001-unreadable-capacity.ts';
+  const target = path.join(fixture.root, relativePath);
+  await writeInto(fixture.root, relativePath, 'export function UnreadableCapacityDefinition() { return true; }\n');
+  try {
+    await fs.chmod(target, 0o000);
+    try {
+      await fs.readFile(target);
+      await fs.chmod(target, 0o644);
+      await fs.rm(target, { force: true });
+      return {
+        path: relativePath,
+        exercised: false,
+        listed: false,
+        note: 'Unreadable seam not exercised: this process can read a mode-000 fixture (likely elevated permissions).'
+      };
+    } catch {
+      const config = loadConfig(['--root', fixture.root, '--allow-root', fixture.root, '--bash', 'off', '--write', 'off']);
+      config.blockedGlobs = ['blocked/**'];
+      config.maxReadBytes = 4_000;
+      config.analysisLimits.maxInventoryFiles = ELIGIBLE_CAPACITY_INVENTORY_LIMIT;
+      const { guard, workspace } = await makeDirectInventory(fixture.root);
+      const inventory = await inventoryWorkspace(config, guard, workspace);
+      assert.deepEqual(inventory.files.map((file) => file.path), fixture.visibleEligiblePaths, 'unreadable inventory probe lost the later eligible file');
+      assert.equal(inventory.coverage.inventoryFiles, fixture.visibleEligiblePaths.length, 'unreadable inventory probe reported the wrong eligible count');
+      assert.equal(inventory.coverage.truncated, false, 'unreadable inventory probe reported false truncation');
+      await fs.chmod(target, 0o644);
+      await fs.rm(target, { force: true });
+      return {
+        path: relativePath,
+        exercised: true,
+        listed: false,
+        note: 'Mode-000 unreadable fixture exercised through direct inventoryWorkspace; fixture removed before ripgrep MCP proof.',
+        inventory: {
+          files: inventory.files.map((file) => file.path),
+          coverage: inventory.coverage
+        }
+      };
+    }
+  } catch (error) {
+    await fs.rm(target, { force: true });
+    return {
+      path: relativePath,
+      exercised: false,
+      listed: false,
+      note: `Unreadable seam not exercised: chmod mode-000 unavailable (${error instanceof Error ? error.message : String(error)}).`
+    };
+  }
 }
 
 function directTraversalSummary(result) {
@@ -534,6 +730,444 @@ async function runCacheFingerprintRegression({ root, client, workspaceId, search
   };
 }
 
+function analysisCoverage(result) {
+  const coverage = result.structuredContent?.analysis?.coverage ?? result.structuredContent?.coverage;
+  assert(coverage, `analysis result omitted coverage: ${JSON.stringify(result.structuredContent)}`);
+  return coverage;
+}
+
+function searchProjection(result) {
+  return {
+    used: result.structuredContent.used,
+    lexical: sortedPaths(lexicalPaths(result)),
+    structured: result.structuredContent.analysis.matches.map(({ path: matchPath, line, group, score, reasons, confidence, source }) => ({
+      path: matchPath,
+      line,
+      group,
+      score,
+      reasons,
+      confidence,
+      source
+    })),
+    coverage: analysisCoverage(result)
+  };
+}
+
+function expectedInventoryPaths(visiblePaths, hiddenPaths) {
+  const expected = [...visiblePaths, ...hiddenPaths];
+  return sortedPaths(expected);
+}
+
+function assertInventoryProjection(result, fixture, {
+  visiblePaths,
+  hiddenPaths,
+  truncated,
+  unreadable,
+  label
+}) {
+  const expected = expectedInventoryPaths(visiblePaths, hiddenPaths);
+  const actualPaths = result.structuredContent.files.map((file) => file.path);
+  assert.deepEqual(sortedPaths(actualPaths), expected, `${label} retained eligible inventory diverged`);
+  assert.equal(new Set(actualPaths).size, actualPaths.length, `${label} inventory duplicated a file`);
+  const retained = new Set(expected);
+  for (const forbidden of [...fixture.visibleIneligiblePaths, ...fixture.hiddenIneligiblePaths, fixture.blockedPath, fixture.symlinkPath].filter(Boolean)) {
+    if (retained.has(forbidden)) continue;
+    assertPathAbsent(actualPaths, forbidden, `${label} retained ineligible/boundary path`);
+  }
+  if (fixture.outsidePath) {
+    assert(!JSON.stringify(result.structuredContent.files).includes(fixture.outsidePath), `${label} leaked outside path ${fixture.outsidePath}`);
+  }
+  const coverage = result.structuredContent.coverage;
+  assert.equal(coverage.inventoryFiles, expected.length, `${label} eligible inventory count diverged`);
+  assert.equal(coverage.analyzedFiles, expected.length, `${label} eligible analyzed count diverged`);
+  assert(coverage.scannedBytes > 0, `${label} analysis scanned no eligible source bytes`);
+  assert.equal(coverage.truncated, truncated, `${label} eligibility-aware truncation truth diverged`);
+  if (truncated) {
+    assert(coverage.warnings.some((warning) => warning.includes(`Inventory truncated at ${ELIGIBLE_CAPACITY_INVENTORY_LIMIT} files.`)), `${label} omitted bounded inventory warning`);
+  }
+  return {
+    paths: actualPaths,
+    coverage: {
+      inventoryFiles: coverage.inventoryFiles,
+      analyzedFiles: coverage.analyzedFiles,
+      scannedBytes: coverage.scannedBytes,
+      symbolCount: coverage.symbolCount,
+      relationshipCount: coverage.relationshipCount,
+      truncated: coverage.truncated,
+      warnings: coverage.warnings
+    }
+  };
+}
+
+async function assertOrdinaryListFilesSemantics(fixture, unreadable, label) {
+  const { guard, workspace } = await makeDirectInventory(fixture.root);
+  const ordinary = await listFiles(guard, workspace, {
+    root: '.',
+    includeHidden: true,
+    maxFiles: 1_000
+  });
+  const expectedRegular = [
+    ...fixture.visibleEligiblePaths,
+    ...fixture.visibleIneligiblePaths,
+    ...fixture.hiddenEligiblePaths,
+    ...fixture.hiddenIneligiblePaths,
+    ...(unreadable?.listed ? [unreadable.path] : [])
+  ];
+  assert.deepEqual(sortedPaths(ordinary), sortedPaths(expectedRegular), `${label} ordinary listFiles semantics changed`);
+  for (const expectedPath of [...fixture.visibleIneligiblePaths, ...fixture.hiddenIneligiblePaths]) {
+    assertPathPresent(ordinary, expectedPath, `${label} ordinary listFiles omitted ineligible regular file`);
+  }
+  assertPathAbsent(ordinary, fixture.blockedPath, `${label} ordinary listFiles leaked blocked file`);
+  assertPathAbsent(ordinary, fixture.symlinkPath, `${label} ordinary listFiles admitted outside symlink`);
+  if (fixture.outsidePath) assert(!ordinary.includes(fixture.outsidePath), `${label} ordinary listFiles admitted outside absolute path`);
+  return {
+    count: ordinary.length,
+    ineligible_visible_count: fixture.visibleIneligiblePaths.length,
+    ineligible_hidden_count: fixture.hiddenIneligiblePaths.length,
+    unreadable_listed: unreadable?.listed === true
+  };
+}
+
+async function runEligibilityCapacityMcpProof() {
+  const proof = {
+    visible_prefix: { cases: {}, reverse_creation_order: true },
+    hidden_capacity: { cases: {}, reverse_creation_order: true },
+    cache_transitions: {},
+    unreadable: null
+  };
+  const visiblePrefixCases = [];
+  let visiblePrefixUnreadable;
+  for (const order of ['ineligible-first', 'eligible-first']) {
+    const fixture = await createEligibilityFixture({
+      visibleBinaryCount: VISIBLE_INELIGIBLE_PREFIX_COUNT / 2,
+      visibleOversizedCount: VISIBLE_INELIGIBLE_PREFIX_COUNT / 2,
+      visibleEligiblePaths: ['999-late-eligible-definition.ts'],
+      includeBoundaryArtifacts: true,
+      order
+    });
+    const unreadable = await exerciseUnreadableInventoryProbe(fixture);
+    if (!visiblePrefixUnreadable) visiblePrefixUnreadable = unreadable;
+    const { client, workspaceId } = await openMcpClient(clients, undefined, {
+      CODEXPRO_ANALYSIS_MAX_INVENTORY_FILES: String(ELIGIBLE_CAPACITY_INVENTORY_LIMIT),
+      CODEXPRO_MAX_READ_BYTES: '4000'
+    }, fixture.root);
+    const search = makeSearch(client, workspaceId);
+    const targetSearch = await search({
+      query: ELIGIBLE_CAPACITY_SYMBOL,
+      intent: 'symbol',
+      include_tests: true,
+      include_hidden: false
+    });
+    assert.equal(targetSearch.structuredContent.used, 'ripgrep', `visible ineligible prefix ${order} did not use real ripgrep`);
+    assertPathPresent(lexicalPaths(targetSearch), '999-late-eligible-definition.ts', `visible ineligible prefix ${order} lexical target`);
+    const targetDefinition = groupPaths(targetSearch, 'definitions').find((matchPath) => matchPath === '999-late-eligible-definition.ts');
+    assert(targetDefinition, `visible ineligible prefix ${order} structured target definition missing`);
+    assertNoHiddenEvidence(targetSearch, `visible ineligible prefix ${order} hidden filtering`);
+    const inspected = await inspectWorkspace(client, workspaceId, { max_files: 200, max_symbols: 200, max_relationships: 200 });
+    const inspectionEvidence = assertInventoryProjection(inspected, fixture, {
+      visiblePaths: fixture.visibleEligiblePaths,
+      hiddenPaths: [],
+      truncated: false,
+      unreadable,
+      label: `visible ineligible prefix ${order} inspect_workspace`
+    });
+    assert(inspected.structuredContent.symbols.some((symbol) => symbol.name === ELIGIBLE_CAPACITY_SYMBOL && symbol.path === '999-late-eligible-definition.ts'), `visible ineligible prefix ${order} inspect lost target symbol`);
+    const ordinary = await assertOrdinaryListFilesSemantics(fixture, unreadable, `visible ineligible prefix ${order}`);
+    visiblePrefixCases.push({
+      order,
+      search: searchProjection(targetSearch),
+      inspect: inspectionEvidence,
+      ordinary,
+      unreadable
+    });
+  }
+  assert.deepEqual(visiblePrefixCases[1].search, visiblePrefixCases[0].search, 'visible ineligible prefix reverse creation changed MCP search evidence');
+  assert.deepEqual(visiblePrefixCases[1].inspect, visiblePrefixCases[0].inspect, 'visible ineligible prefix reverse creation changed inspect evidence');
+  assert.deepEqual(visiblePrefixCases[1].ordinary, visiblePrefixCases[0].ordinary, 'visible ineligible prefix reverse creation changed ordinary list semantics');
+  proof.visible_prefix.cases = Object.fromEntries(visiblePrefixCases.map((entry) => [entry.order, entry]));
+  proof.unreadable = visiblePrefixUnreadable;
+
+  const hiddenVisiblePaths = Array.from({ length: 95 }, (_, index) => `visible-${String(index).padStart(3, '0')}.ts`);
+  const hiddenCapacityCases = [];
+  let hiddenCapacityState;
+  for (const order of ['ineligible-first', 'eligible-first']) {
+    const fixture = await createEligibilityFixture({
+      visibleEligiblePaths: hiddenVisiblePaths,
+      extraVisibleIneligiblePaths: ['visible-ineligible-transition.ts'],
+      hiddenBinaryCount: HIDDEN_INELIGIBLE_BINARY_COUNT,
+      hiddenOversizedCount: HIDDEN_INELIGIBLE_OVERSIZED_COUNT,
+      hiddenEligibleCount: HIDDEN_ELIGIBLE_CAPACITY_COUNT,
+      includeBoundaryArtifacts: true,
+      order
+    });
+    const { client, workspaceId } = await openMcpClient(clients, undefined, {
+      CODEXPRO_ANALYSIS_MAX_INVENTORY_FILES: String(ELIGIBLE_CAPACITY_INVENTORY_LIMIT),
+      CODEXPRO_MAX_READ_BYTES: '4000'
+    }, fixture.root);
+    const search = makeSearch(client, workspaceId);
+    const hiddenFalse = await search({
+      query: HIDDEN_ELIGIBLE_CAPACITY_SYMBOL,
+      intent: 'symbol',
+      include_tests: true,
+      include_hidden: false
+    });
+    assertNoHiddenEvidence(hiddenFalse, `hidden capacity ${order} include_hidden=false`);
+    assert.deepEqual(structuredPaths(hiddenFalse), [], `hidden capacity ${order} include_hidden=false returned hidden structured evidence`);
+    const hiddenTrue = await search({
+      query: HIDDEN_ELIGIBLE_CAPACITY_SYMBOL,
+      intent: 'symbol',
+      include_tests: true,
+      include_hidden: true
+    });
+    const expectedHidden = fixture.hiddenEligiblePaths.slice(0, 5);
+    const hiddenStructured = structuredPaths(hiddenTrue).filter(isHiddenPath).sort();
+    assert.deepEqual(hiddenStructured, sortedPaths(expectedHidden), `hidden capacity ${order} include_hidden=true did not retain exactly five eligible hidden files`);
+    assert(hiddenStructured.every((candidate) => !fixture.hiddenIneligiblePaths.includes(candidate)), `hidden capacity ${order} retained hidden ineligible evidence`);
+    assert.equal(analysisCoverage(hiddenTrue).inventoryFiles, ELIGIBLE_CAPACITY_INVENTORY_LIMIT, `hidden capacity ${order} did not report the full eligible inventory capacity`);
+    assert.equal(analysisCoverage(hiddenTrue).truncated, true, `hidden capacity ${order} did not report beyond-retained eligible truncation`);
+    const inspected = await inspectWorkspace(client, workspaceId, { max_files: 200, max_symbols: 200, max_relationships: 200 });
+    const inspectionEvidence = assertInventoryProjection(inspected, fixture, {
+      visiblePaths: hiddenVisiblePaths,
+      hiddenPaths: expectedHidden,
+      truncated: true,
+      label: `hidden capacity ${order} inspect_workspace`
+    });
+    const ordinary = await assertOrdinaryListFilesSemantics(fixture, null, `hidden capacity ${order}`);
+    const hiddenFalseCache = cacheEvidence(hiddenFalse);
+    const hiddenTrueCache = cacheEvidence(hiddenTrue);
+    assert.equal(hiddenTrueCache.hit, true, `hidden capacity ${order} include_hidden=true missed shared analysis cache`);
+    assert.equal(hiddenTrueCache.key, hiddenFalseCache.key, `hidden capacity ${order} hidden filter changed analysis cache key`);
+    const caseEvidence = {
+      order,
+      include_hidden_false: {
+        search: searchProjection(hiddenFalse),
+        cache: hiddenFalseCache
+      },
+      include_hidden_true: {
+        search: searchProjection(hiddenTrue),
+        retained_hidden: hiddenStructured,
+        cache: hiddenTrueCache
+      },
+      inspect: inspectionEvidence,
+      ordinary
+    };
+    hiddenCapacityCases.push(caseEvidence);
+    if (!hiddenCapacityState) hiddenCapacityState = { fixture, client, workspaceId, search, expectedVisible: hiddenVisiblePaths, expectedHidden };
+  }
+  assert.deepEqual(
+    hiddenCapacityCases[1].include_hidden_true.search,
+    hiddenCapacityCases[0].include_hidden_true.search,
+    'hidden capacity reverse creation changed include_hidden=true MCP search evidence'
+  );
+  assert.deepEqual(hiddenCapacityCases[1].inspect, hiddenCapacityCases[0].inspect, 'hidden capacity reverse creation changed inspect evidence');
+  assert.deepEqual(hiddenCapacityCases[1].ordinary, hiddenCapacityCases[0].ordinary, 'hidden capacity reverse creation changed ordinary list semantics');
+  proof.hidden_capacity.cases = Object.fromEntries(hiddenCapacityCases.map((entry) => [entry.order, entry]));
+  proof.cache_transitions = await runEligibilityCacheTransitions(hiddenCapacityState);
+  proof.hostile_prefix = await runHostilePrefixMcpProof();
+  return proof;
+}
+
+async function runEligibilityCacheTransitions({ fixture, client, workspaceId, search, expectedVisible, expectedHidden }) {
+  const baseline = await search({
+    query: HIDDEN_ELIGIBLE_CAPACITY_SYMBOL,
+    intent: 'symbol',
+    include_tests: true,
+    include_hidden: true
+  });
+  const baselineCache = cacheEvidence(baseline);
+  assert.equal(baselineCache.hit, true, 'eligibility cache baseline did not reuse hidden capacity analysis');
+  const baselineInspection = await inspectWorkspace(client, workspaceId, { max_files: 200, max_symbols: 200, max_relationships: 200 });
+  const baselineEvidence = assertInventoryProjection(baselineInspection, fixture, {
+    visiblePaths: expectedVisible,
+    hiddenPaths: expectedHidden,
+    truncated: true,
+    label: 'eligibility cache baseline'
+  });
+
+  const transitionPath = fixture.transitionIneligiblePath;
+  assert(transitionPath, 'eligibility transition fixture omitted its ineligible visible path');
+  await writeInto(fixture.root, transitionPath, `export function ${PROMOTED_CAPACITY_SYMBOL}() { return true; }\n`);
+  const promoted = await search({
+    query: PROMOTED_CAPACITY_SYMBOL,
+    intent: 'symbol',
+    include_tests: true,
+    include_hidden: true
+  });
+  const promotedCache = cacheEvidence(promoted);
+  assert.equal(promotedCache.hit, false, 'ineligible-to-eligible transition reused the old cache');
+  assert.notEqual(promotedCache.key, baselineCache.key, 'ineligible-to-eligible transition kept the old cache key');
+  assertPathPresent(groupPaths(promoted, 'definitions'), transitionPath, 'ineligible-to-eligible transition omitted promoted definition');
+  const promotedHidden = fixture.hiddenEligiblePaths.slice(0, 4);
+  const promotedInspection = await inspectWorkspace(client, workspaceId, { max_files: 200, max_symbols: 200, max_relationships: 200 });
+  const promotedEvidence = assertInventoryProjection(promotedInspection, fixture, {
+    visiblePaths: [...expectedVisible, transitionPath],
+    hiddenPaths: promotedHidden,
+    truncated: true,
+    label: 'ineligible-to-eligible transition'
+  });
+
+  await writeInto(fixture.root, transitionPath, oversizedFixtureContent('VisibleTransitionIneligible', 1));
+  const demotedVisible = await search({
+    query: HIDDEN_ELIGIBLE_CAPACITY_SYMBOL,
+    intent: 'symbol',
+    include_tests: true,
+    include_hidden: true
+  });
+  const demotedVisibleCache = cacheEvidence(demotedVisible);
+  assert.notEqual(demotedVisibleCache.key, promotedCache.key, 'eligible-to-ineligible visible transition kept the old cache key');
+  if (demotedVisibleCache.hit) {
+    assert.equal(demotedVisibleCache.key, baselineCache.key, 'eligible-to-ineligible visible transition hit an unrelated stale cache entry');
+  }
+  const retainedVisibleAfterDemotion = expectedVisible;
+  const demotedVisibleInspection = await inspectWorkspace(client, workspaceId, { max_files: 200, max_symbols: 200, max_relationships: 200 });
+  const demotedVisibleEvidence = assertInventoryProjection(demotedVisibleInspection, fixture, {
+    visiblePaths: retainedVisibleAfterDemotion,
+    hiddenPaths: expectedHidden,
+    truncated: true,
+    label: 'eligible-to-ineligible visible transition'
+  });
+
+  const retainedHiddenPath = fixture.hiddenEligiblePaths[0];
+  await writeRawInto(fixture.root, retainedHiddenPath, binaryFixtureContent('HiddenRetainedIneligible', 0));
+  const demotedHidden = await search({
+    query: HIDDEN_ELIGIBLE_CAPACITY_SYMBOL,
+    intent: 'symbol',
+    include_tests: true,
+    include_hidden: true
+  });
+  const demotedHiddenCache = cacheEvidence(demotedHidden);
+  assert.equal(demotedHiddenCache.hit, false, 'retained eligible-to-ineligible hidden transition reused the old cache');
+  assert.notEqual(demotedHiddenCache.key, demotedVisibleCache.key, 'retained eligible-to-ineligible hidden transition kept the old cache key');
+  const retainedAfterDemotion = fixture.hiddenEligiblePaths.slice(1, 6);
+  assert.deepEqual(structuredPaths(demotedHidden).filter(isHiddenPath).sort(), sortedPaths(retainedAfterDemotion), 'retained eligible-to-ineligible transition did not admit the next eligible hidden file');
+  const demotedHiddenInspection = await inspectWorkspace(client, workspaceId, { max_files: 200, max_symbols: 200, max_relationships: 200 });
+  const demotedHiddenEvidence = assertInventoryProjection(demotedHiddenInspection, fixture, {
+    visiblePaths: retainedVisibleAfterDemotion,
+    hiddenPaths: retainedAfterDemotion,
+    truncated: true,
+    label: 'retained eligible-to-ineligible hidden transition'
+  });
+
+  const beyondRetainedPath = fixture.hiddenEligiblePaths.at(-1);
+  await fs.appendFile(path.join(fixture.root, beyondRetainedPath), '\n// beyond retained eligible mutation\n', 'utf8');
+  const beyondRetained = await search({
+    query: HIDDEN_ELIGIBLE_CAPACITY_SYMBOL,
+    intent: 'symbol',
+    include_tests: true,
+    include_hidden: true
+  });
+  const beyondRetainedCache = cacheEvidence(beyondRetained);
+  assert.equal(beyondRetainedCache.hit, true, 'beyond-retained eligible mutation unexpectedly invalidated bounded cache');
+  assert.equal(beyondRetainedCache.key, demotedHiddenCache.key, 'beyond-retained eligible mutation changed bounded cache key');
+  assert.deepEqual(structuredPaths(beyondRetained).filter(isHiddenPath).sort(), sortedPaths(retainedAfterDemotion), 'beyond-retained eligible mutation changed retained hidden output');
+  const beyondRetainedInspection = await inspectWorkspace(client, workspaceId, { max_files: 200, max_symbols: 200, max_relationships: 200 });
+  const beyondRetainedEvidence = assertInventoryProjection(beyondRetainedInspection, fixture, {
+    visiblePaths: retainedVisibleAfterDemotion,
+    hiddenPaths: retainedAfterDemotion,
+    truncated: true,
+    label: 'beyond-retained eligible mutation'
+  });
+
+  return {
+    baseline: { cache: baselineCache, inspect: baselineEvidence },
+    ineligible_to_eligible: { cache: promotedCache, retained_hidden: promotedHidden, inspect: promotedEvidence },
+    eligible_to_ineligible_visible: {
+      cache: demotedVisibleCache,
+      reused_prior_baseline: demotedVisibleCache.hit && demotedVisibleCache.key === baselineCache.key,
+      retained_visible: retainedVisibleAfterDemotion,
+      inspect: demotedVisibleEvidence
+    },
+    retained_eligible_to_ineligible_hidden: { cache: demotedHiddenCache, retained_hidden: retainedAfterDemotion, inspect: demotedHiddenEvidence },
+    beyond_retained_mutation: { cache: beyondRetainedCache, retained_hidden: retainedAfterDemotion, inspect: beyondRetainedEvidence }
+  };
+}
+
+async function runHostilePrefixMcpProof() {
+  const fixture = await createHostilePrefixFixture();
+  const { guard, workspace } = await makeDirectInventory(fixture.root);
+  const direct = await listFilesDetailed(guard, workspace, {
+    root: '.',
+    includeHidden: true,
+    maxFiles: ELIGIBLE_CAPACITY_INVENTORY_LIMIT,
+    visibilityPriority: true,
+    admitFile: async ({ absPath }) => {
+      try {
+        await guard.assertTextFile(absPath, 4_000);
+        return { retained: true };
+      } catch {
+        return undefined;
+      }
+    }
+  });
+  assert.deepEqual(direct.files, [fixture.targetPath], 'hostile visible ineligible prefix direct inventory lost the later eligible file');
+  assert.equal(direct.truncated, false, 'hostile visible ineligible prefix direct inventory reported truncation');
+  assert(direct.traversal, 'hostile visible ineligible prefix omitted traversal evidence');
+  assert.equal(direct.traversal.immediateEntries, HOSTILE_VISIBLE_BINARY_COUNT + 1, 'hostile visible ineligible prefix did not observe every root entry');
+  assert.equal(direct.traversal.immediateEntriesVisited, HOSTILE_VISIBLE_BINARY_COUNT + 1, 'hostile visible ineligible prefix did not visit every root entry');
+  assert.equal(direct.traversal.visibleExpansions, 1, 'hostile visible ineligible prefix expanded an unexpected visible namespace');
+  assert.equal(direct.traversal.hiddenExpansions, 0, 'hostile visible ineligible prefix expanded an unexpected hidden namespace');
+  assert(direct.traversal.maxRetainedTraversalState <= 2, `hostile visible ineligible prefix retained unbounded traversal state: ${direct.traversal.maxRetainedTraversalState}`);
+  assert.deepEqual(direct.traversal.phaseSequence, ['V'], 'hostile visible ineligible prefix entered an unexpected traversal phase');
+  assert.equal(direct.traversal.phaseTransitions, 0, 'hostile visible ineligible prefix performed an unexpected phase transition');
+  assert.equal(direct.traversal.visibleFilesAdmitted, 1, 'hostile visible ineligible prefix admitted the wrong visible count');
+  assert.equal(direct.traversal.hiddenFilesAdmitted, 0, 'hostile visible ineligible prefix admitted hidden files');
+  assert.equal(direct.traversal.unresolved, false, 'hostile visible ineligible prefix left traversal unresolved');
+  assert.equal(direct.traversal.complete, true, 'hostile visible ineligible prefix did not complete traversal');
+
+  const { client, workspaceId } = await openMcpClient(clients, undefined, {
+    CODEXPRO_ANALYSIS_MAX_INVENTORY_FILES: String(ELIGIBLE_CAPACITY_INVENTORY_LIMIT),
+    CODEXPRO_MAX_READ_BYTES: '4000'
+  }, fixture.root);
+  const search = makeSearch(client, workspaceId);
+  const searched = await search({
+    query: ELIGIBLE_CAPACITY_SYMBOL,
+    intent: 'symbol',
+    include_tests: true,
+    include_hidden: false
+  });
+  assert.equal(searched.structuredContent.used, 'ripgrep', 'hostile visible ineligible prefix did not use real ripgrep');
+  assertPathPresent(lexicalPaths(searched), fixture.targetPath, 'hostile visible ineligible prefix lexical target');
+  assertPathPresent(groupPaths(searched, 'definitions'), fixture.targetPath, 'hostile visible ineligible prefix structured target definition');
+  assertNoHiddenEvidence(searched, 'hostile visible ineligible prefix hidden filtering');
+  const searchedCoverage = analysisCoverage(searched);
+  assert.equal(searchedCoverage.inventoryFiles, 1, 'hostile visible ineligible prefix reported the wrong eligible inventory count');
+  assert.equal(searchedCoverage.analyzedFiles, 1, 'hostile visible ineligible prefix analyzed the wrong eligible count');
+  assert.equal(searchedCoverage.truncated, false, 'hostile visible ineligible prefix reported false truncation');
+
+  const inspected = await inspectWorkspace(client, workspaceId, { max_files: 200, max_symbols: 200, max_relationships: 200 });
+  const inspectedPaths = inspected.structuredContent.files.map((file) => file.path);
+  assert.deepEqual(inspectedPaths, [fixture.targetPath], 'hostile visible ineligible prefix inspect_workspace retained the wrong files');
+  assert(inspected.structuredContent.symbols.some((symbol) => symbol.name === ELIGIBLE_CAPACITY_SYMBOL && symbol.path === fixture.targetPath), 'hostile visible ineligible prefix inspect_workspace lost the target symbol');
+  assert.equal(inspected.structuredContent.coverage.inventoryFiles, 1, 'hostile visible ineligible prefix inspect_workspace reported the wrong eligible count');
+  assert.equal(inspected.structuredContent.coverage.analyzedFiles, 1, 'hostile visible ineligible prefix inspect_workspace analyzed the wrong eligible count');
+  assert.equal(inspected.structuredContent.coverage.truncated, false, 'hostile visible ineligible prefix inspect_workspace reported false truncation');
+
+  return {
+    fixture_files: HOSTILE_VISIBLE_BINARY_COUNT + 1,
+    ineligible_binary_prefix: HOSTILE_VISIBLE_BINARY_COUNT,
+    retained_eligible_files: [fixture.targetPath],
+    search: searchProjection(searched),
+    inspect: {
+      retained_files: inspectedPaths,
+      coverage: inspected.structuredContent.coverage
+    },
+    direct_traversal: {
+      retained_files: direct.files,
+      truncated: direct.truncated,
+      immediate_entries: direct.traversal.immediateEntries,
+      immediate_entries_visited: direct.traversal.immediateEntriesVisited,
+      visible_expansions: direct.traversal.visibleExpansions,
+      hidden_expansions: direct.traversal.hiddenExpansions,
+      max_retained_traversal_state: direct.traversal.maxRetainedTraversalState,
+      phase_sequence: direct.traversal.phaseSequence,
+      visible_files_admitted: direct.traversal.visibleFilesAdmitted,
+      hidden_files_admitted: direct.traversal.hiddenFilesAdmitted,
+      complete: direct.traversal.complete,
+      unresolved: direct.traversal.unresolved
+    }
+  };
+}
+
 async function openMcpClient(clients, pathOverride, envOverrides = {}, root = fixtureRoot) {
   const current = new McpStdioClient({ pathOverride, envOverrides, root });
   clients.push(current);
@@ -660,6 +1294,7 @@ try {
   });
 
   const visibilityPriorityProof = await runVisibilityPriorityInventoryProof();
+  const eligibilityCapacityProof = await runEligibilityCapacityMcpProof();
 
   const { client, workspaceId } = await openMcpClient(clients);
   const search = makeSearch(client, workspaceId);
@@ -1154,6 +1789,7 @@ esac
       relationships_limited: relationshipCoverage
     },
     visibility_priority_inventory: visibilityPriorityProof,
+    eligibility_capacity_mcp: eligibilityCapacityProof,
     malformed_record: {
       is_error: malformedResult.isError === true,
       error_bytes: Buffer.byteLength(malformedErrorText, 'utf8'),

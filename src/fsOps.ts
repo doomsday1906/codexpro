@@ -335,12 +335,23 @@ export async function repoTree(config: CodexProConfig, guard: PathGuard, workspa
   return { text: lines.join("\n"), entries, truncated };
 }
 
-export interface ListFilesOptions {
+export interface ListFilesCandidate {
+  absPath: string;
+  relPath: string;
+}
+
+export interface ListFilesOptions<TPrepared = never> {
   root?: string;
   glob?: string;
   includeHidden?: boolean;
   maxFiles: number;
   visibilityPriority?: boolean;
+  /**
+   * Optional admission hook for callers that need a file policy stronger than
+   * path/visibility/glob filtering. A rejected candidate consumes no file
+   * capacity; an accepted value is retained for request-local reuse.
+   */
+  admitFile?: (candidate: ListFilesCandidate) => Promise<TPrepared | null | undefined>;
 }
 
 /**
@@ -373,9 +384,15 @@ export interface ListFilesTraversal {
   truncated: boolean;
 }
 
-export interface ListFilesResult {
+export interface ListFilesPreparedFile<TPrepared> {
+  path: string;
+  prepared: TPrepared;
+}
+
+export interface ListFilesResult<TPrepared = never> {
   files: string[];
   truncated: boolean;
+  preparedFiles?: ListFilesPreparedFile<TPrepared>[];
   traversal?: ListFilesTraversal;
 }
 
@@ -407,21 +424,30 @@ function compareRepositoryRelativeEntries(
  * queued for later work, so a repository-sized hidden frontier cannot starve
  * the visible phase or inflate retained traversal state.
  */
-export async function listFilesDetailed(
+export async function listFilesDetailed<TPrepared = never>(
   guard: PathGuard,
   workspace: Workspace,
-  options: ListFilesOptions
-): Promise<ListFilesResult> {
+  options: ListFilesOptions<TPrepared>
+): Promise<ListFilesResult<TPrepared>> {
   const target = guard.resolve(workspace, options.root ?? ".");
   const stat = await fsp.stat(target.absPath);
   const files: string[] = [];
+  const preparedFiles: ListFilesPreparedFile<TPrepared>[] | undefined = options.admitFile ? [] : undefined;
+
+  function withPreparedFiles(result: ListFilesResult<TPrepared>): ListFilesResult<TPrepared> {
+    if (preparedFiles) result.preparedFiles = preparedFiles;
+    return result;
+  }
 
   async function addFile(absFile: string): Promise<boolean> {
     const rel = displayPath(absFile, workspace.root);
     if (guard.isBlockedRelativePath(rel)) return false;
     if (!options.includeHidden && isHiddenRelativePath(rel)) return false;
     if (options.glob && !minimatch(rel, options.glob, { dot: true })) return false;
+    const prepared = await options.admitFile?.({ absPath: absFile, relPath: rel });
+    if (options.admitFile && prepared == null) return false;
     files.push(rel);
+    preparedFiles?.push({ path: rel, prepared: prepared as TPrepared });
     return true;
   }
 
@@ -448,7 +474,7 @@ export async function listFilesDetailed(
   if (!options.visibilityPriority) {
     if (stat.isFile()) await addFile(target.absPath);
     else await walkDefault(target.absPath);
-    return { files, truncated: false };
+    return withPreparedFiles({ files, truncated: false });
   }
 
   const maxFiles = Number.isFinite(options.maxFiles) ? Math.max(0, Math.floor(options.maxFiles)) : 0;
@@ -685,7 +711,7 @@ export async function listFilesDetailed(
     unresolved: traversalState.unresolved,
     truncated: traversalState.unresolved
   };
-  return { files, traversal, truncated: traversal.truncated };
+  return withPreparedFiles({ files, traversal, truncated: traversal.truncated });
 }
 
 export async function listFiles(
