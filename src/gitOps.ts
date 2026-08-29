@@ -94,39 +94,27 @@ export class GitExecutionError extends CodexProError {
 }
 
 const GIT_REVIEWER_GLOBAL_ARGS = ["--no-replace-objects", "--no-pager", "-c", "color.ui=false"] as const;
-const GIT_ENVIRONMENT_ROUTING_KEYS = [
-  "GIT_DIR",
-  "GIT_WORK_TREE",
-  "GIT_INDEX_FILE",
-  "GIT_COMMON_DIR",
-  "GIT_OBJECT_DIRECTORY",
-  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-  "GIT_NAMESPACE",
-  "GIT_ATTR_SOURCE",
-  "GIT_PREFIX",
-  "GIT_CONFIG",
-  "GIT_LITERAL_PATHSPECS",
-  "GIT_GLOB_PATHSPECS",
-  "GIT_NOGLOB_PATHSPECS",
-  "GIT_ICASE_PATHSPECS"
-] as const;
 
 function gitReviewerEnvironment(): NodeJS.ProcessEnv {
-  const environment: NodeJS.ProcessEnv = {
-    ...process.env,
+  // Git has a large and growing environment surface for repository routing,
+  // object lookup, shallow history, pathspec behavior, tracing, credentials,
+  // and external helpers. Preserve PATH and other non-Git process essentials,
+  // but never inherit any Git-controlled variable by default.
+  const environment: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!/^GIT_/iu.test(key) && value !== undefined) environment[key] = value;
+  }
+  Object.assign(environment, {
     GIT_NO_REPLACE_OBJECTS: "1",
     GIT_NO_LAZY_FETCH: "1",
     GIT_OPTIONAL_LOCKS: "0",
     GIT_TERMINAL_PROMPT: "0",
+    GIT_CONFIG_NOSYSTEM: "1",
     GIT_PAGER: "cat",
     NO_COLOR: "1",
     LC_ALL: "C",
     LANG: "C"
-  };
-  for (const key of GIT_ENVIRONMENT_ROUTING_KEYS) delete environment[key];
-  for (const key of Object.keys(environment)) {
-    if (/^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS)$/.test(key)) delete environment[key];
-  }
+  });
   return environment;
 }
 

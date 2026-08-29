@@ -480,6 +480,61 @@ assert.equal(environmentProbe.stdout, "1||||");
 assert.equal(environmentProbe.stderr, "");
 console.log("PASS child environment forces GIT_NO_LAZY_FETCH=1 and clears inherited pathspec switches");
 
+// Hostile shallow/trace controls must not cross the runner boundary. First
+// observe their direct-Git effects, then remove the supporting trace artifacts
+// and exercise the production runner under the same inherited values.
+const historyRoot = path.join(fixtureRoot, "history-environment-repo");
+await mkdir(historyRoot);
+mustGitAt(historyRoot, ["init", "--quiet"]);
+mustGitAt(historyRoot, ["config", "user.name", "History Environment Smoke"]);
+mustGitAt(historyRoot, ["config", "user.email", "history-environment@example.test"]);
+await writeFile(path.join(historyRoot, "root.txt"), "root\n");
+mustGitAt(historyRoot, ["add", "root.txt"]);
+mustGitAt(historyRoot, ["commit", "--quiet", "-m", "history root"]);
+const historyRootSha = text(mustGitAt(historyRoot, ["rev-parse", "HEAD"]).stdout).trim();
+await writeFile(path.join(historyRoot, "tip.txt"), "tip\n");
+mustGitAt(historyRoot, ["add", "tip.txt"]);
+mustGitAt(historyRoot, ["commit", "--quiet", "-m", "history tip"]);
+const historyTipSha = text(mustGitAt(historyRoot, ["rev-parse", "HEAD"]).stdout).trim();
+const hostileShallowFile = path.join(fixtureRoot, "hostile-shallow");
+await writeFile(hostileShallowFile, `${historyTipSha}\n`, "utf8");
+const tracePaths = [
+  path.join(fixtureRoot, "git-trace.log"),
+  path.join(fixtureRoot, "git-trace2.log"),
+  path.join(fixtureRoot, "git-trace2-event.log"),
+  path.join(fixtureRoot, "git-trace-performance.log")
+];
+const hostileTraceEnvironment = {
+  GIT_SHALLOW_FILE: hostileShallowFile,
+  GIT_TRACE: tracePaths[0],
+  GIT_TRACE2: tracePaths[1],
+  GIT_TRACE2_EVENT: tracePaths[2],
+  GIT_TRACE_PERFORMANCE: tracePaths[3]
+};
+const directHostileHistory = directGitAt(historyRoot, ["rev-list", "--reverse", "HEAD"], { env: hostileTraceEnvironment });
+assert.equal(directHostileHistory.status, 0);
+const directHostileLines = text(directHostileHistory.stdout).trim().split(/\r?\n/).filter(Boolean);
+assert.deepEqual(directHostileLines, [historyTipSha]);
+const directTracePaths = [];
+for (const tracePath of tracePaths) {
+  if (await exists(tracePath)) directTracePaths.push(tracePath);
+}
+assert.ok(directTracePaths.length > 0, "direct Git did not produce a trace artifact from the hostile trace controls");
+console.log(`RAW_OBSERVATION: inherited GIT_SHALLOW_FILE made direct rev-list expose only tip ${historyTipSha.slice(0, 12)}; direct GIT_TRACE* produced ${directTracePaths.length} trace artifact(s)`);
+for (const tracePath of tracePaths) await rm(tracePath, { force: true });
+
+const historyWorkspace = { id: "history-environment-smoke", root: historyRoot, openedAt: new Date().toISOString() };
+const runnerHostileHistory = await withEnvironment(hostileTraceEnvironment, () =>
+  runGitReadOnly(runnerConfig, historyWorkspace, ["rev-list", "--reverse", "HEAD"])
+);
+const runnerHostileLines = runnerHostileHistory.stdout.trim().split(/\r?\n/).filter(Boolean);
+assert.deepEqual(runnerHostileLines, [historyRootSha, historyTipSha]);
+for (const tracePath of tracePaths) {
+  assert.equal(await exists(tracePath), false, `runner allowed inherited Git trace output at ${tracePath}`);
+}
+console.log(`SANITY_VERDICT: MATCH (runner returned complete direct history [${historyRootSha.slice(0, 12)}, ${historyTipSha.slice(0, 12)}] and created no hostile trace artifacts)`);
+console.log("PASS sealed Git environment ignores inherited GIT_SHALLOW_FILE and GIT_TRACE* controls");
+
 // Replacement-ref target evidence is collected by ordinary Git before checking
 // the runner's immutable-review result.
 const treeSha = text(mustGit(["rev-parse", "HEAD^{tree}"]).stdout).trim();
