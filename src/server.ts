@@ -98,6 +98,55 @@ const GIT_SHOW_COMMIT_ARGUMENTS_SCHEMA = z.object({
   ref: REVIEW_REF_SCHEMA
 }).strict();
 
+// The MCP SDK uses the published Zod object for both tools/list conversion
+// and transport-level tools/call validation. Keep a bounded, permissive
+// envelope at that boundary so caller-controlled unknown key names cannot be
+// copied into an SDK validation error. The strict schemas above remain the
+// runtime source of truth and are applied by registerCodexTool.
+const GIT_RESOLVE_REF_TRANSPORT_SCHEMA = z.object({
+  workspace_id: z.unknown().optional(),
+  ref: z.unknown().optional()
+}).passthrough();
+const GIT_RESOLVE_REF_PUBLIC_SCHEMA = z.object(GIT_RESOLVE_REF_ARGUMENTS_SCHEMA.shape).strict();
+GIT_RESOLVE_REF_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_RESOLVE_REF_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_RESOLVE_REF_PUBLIC_SCHEMA.safeParse;
+GIT_RESOLVE_REF_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_RESOLVE_REF_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_RESOLVE_REF_PUBLIC_SCHEMA.safeParseAsync;
+
+const GIT_MERGE_BASE_TRANSPORT_SCHEMA = z.object({
+  workspace_id: z.unknown().optional(),
+  left_ref: z.unknown().optional(),
+  right_ref: z.unknown().optional()
+}).passthrough();
+const GIT_MERGE_BASE_PUBLIC_SCHEMA = z.object(GIT_MERGE_BASE_ARGUMENTS_SCHEMA.shape).strict();
+GIT_MERGE_BASE_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_MERGE_BASE_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_MERGE_BASE_PUBLIC_SCHEMA.safeParse;
+GIT_MERGE_BASE_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_MERGE_BASE_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_MERGE_BASE_PUBLIC_SCHEMA.safeParseAsync;
+
+const GIT_LOG_TRANSPORT_SCHEMA = z.object({
+  workspace_id: z.unknown().optional(),
+  start_ref: z.unknown().optional(),
+  path: z.unknown().optional(),
+  max_count: z.unknown().optional()
+}).passthrough();
+const GIT_LOG_PUBLIC_SCHEMA = z.object(GIT_LOG_ARGUMENTS_SCHEMA.shape).strict();
+GIT_LOG_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_LOG_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_LOG_PUBLIC_SCHEMA.safeParse;
+GIT_LOG_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_LOG_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_LOG_PUBLIC_SCHEMA.safeParseAsync;
+
+const GIT_SHOW_COMMIT_TRANSPORT_SCHEMA = z.object({
+  workspace_id: z.unknown().optional(),
+  ref: z.unknown().optional()
+}).passthrough();
+const GIT_SHOW_COMMIT_PUBLIC_SCHEMA = z.object(GIT_SHOW_COMMIT_ARGUMENTS_SCHEMA.shape).strict();
+GIT_SHOW_COMMIT_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_SHOW_COMMIT_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_SHOW_COMMIT_PUBLIC_SCHEMA.safeParse;
+GIT_SHOW_COMMIT_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_SHOW_COMMIT_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_SHOW_COMMIT_PUBLIC_SCHEMA.safeParseAsync;
+
+const READ_AT_REF_TRANSPORT_SCHEMA = z.object({
+  workspace_id: z.unknown().optional(),
+  ref: z.unknown().optional(),
+  path: z.unknown().optional(),
+  start_line: z.unknown().optional(),
+  end_line: z.unknown().optional(),
+  max_bytes: z.unknown().optional()
+}).passthrough();
+
 function readAtRefArgumentsSchema(maxReadBytes: number) {
   const boundedMaxReadBytes = Math.max(1, Math.floor(maxReadBytes));
   return z.object({
@@ -108,6 +157,14 @@ function readAtRefArgumentsSchema(maxReadBytes: number) {
     end_line: REVIEW_LINE_SCHEMA.optional(),
     max_bytes: z.number().int().min(1).max(boundedMaxReadBytes).optional()
   }).strict();
+}
+
+function readAtRefPublicSchemas(maxReadBytes: number) {
+  const runtimeSchema = readAtRefArgumentsSchema(maxReadBytes);
+  const publicSchema = z.object(runtimeSchema.shape).strict();
+  publicSchema.safeParse = ((args: unknown) => READ_AT_REF_TRANSPORT_SCHEMA.safeParse(args)) as typeof publicSchema.safeParse;
+  publicSchema.safeParseAsync = ((args: unknown) => READ_AT_REF_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof publicSchema.safeParseAsync;
+  return { publicSchema, runtimeSchema };
 }
 
 const READ_MANY_ITEM_SCHEMA = z.object({
@@ -1829,6 +1886,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
   const workspaces = new WorkspaceManager(config);
   const reviewCheckpoints = new Map<string, string>();
   const guard = new PathGuard(config);
+  const readAtRefSchemas = readAtRefPublicSchemas(config.maxReadBytes);
   const server = new McpServer({ name: "CodexPro", version: "0.30.0" }, { instructions: serverInstructions(config) });
   registeredToolNamesByServer.set(server as object, []);
   registerToolCardResource(server, config);
@@ -3080,7 +3138,8 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Resolve Git Ref",
       description: "Resolve one bounded local Git commit-ish to an immutable full commit identity without changing repository state or contacting remotes.",
-      inputSchema: GIT_RESOLVE_REF_ARGUMENTS_SCHEMA,
+      inputSchema: GIT_RESOLVE_REF_PUBLIC_SCHEMA,
+      runtimeInputSchema: GIT_RESOLVE_REF_ARGUMENTS_SCHEMA,
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
         "openai/toolInvocation/invoking": "Resolving Git ref...",
@@ -3115,7 +3174,8 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Git Merge Base",
       description: "Resolve two local Git refs once and return all best merge bases plus truthful ancestor and incomplete-history state.",
-      inputSchema: GIT_MERGE_BASE_ARGUMENTS_SCHEMA,
+      inputSchema: GIT_MERGE_BASE_PUBLIC_SCHEMA,
+      runtimeInputSchema: GIT_MERGE_BASE_ARGUMENTS_SCHEMA,
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
         "openai/toolInvocation/invoking": "Computing Git merge bases...",
@@ -3160,7 +3220,8 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Git Log",
       description: "Read a bounded structured local Git history from one immutable starting ref, optionally filtered by a validated historical repository-tree path.",
-      inputSchema: GIT_LOG_ARGUMENTS_SCHEMA,
+      inputSchema: GIT_LOG_PUBLIC_SCHEMA,
+      runtimeInputSchema: GIT_LOG_ARGUMENTS_SCHEMA,
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
         "openai/toolInvocation/invoking": "Reading structured Git history...",
@@ -3208,7 +3269,8 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Show Git Commit",
       description: "Read bounded local Git commit metadata and message text for one immutable ref; it does not produce a patch or first-parent diff.",
-      inputSchema: GIT_SHOW_COMMIT_ARGUMENTS_SCHEMA,
+      inputSchema: GIT_SHOW_COMMIT_PUBLIC_SCHEMA,
+      runtimeInputSchema: GIT_SHOW_COMMIT_ARGUMENTS_SCHEMA,
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
         "openai/toolInvocation/invoking": "Reading Git commit...",
@@ -3266,7 +3328,8 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Read File at Git Ref",
       description: "Read a bounded text blob from an immutable historical Git tree path without checkout or symlink dereference; source text uses the existing public-read redaction boundary.",
-      inputSchema: readAtRefArgumentsSchema(config.maxReadBytes),
+      inputSchema: readAtRefSchemas.publicSchema,
+      runtimeInputSchema: readAtRefSchemas.runtimeSchema,
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
         "openai/toolInvocation/invoking": "Reading historical source...",
