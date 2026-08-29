@@ -106,6 +106,12 @@ try {
   const largeBytes = Buffer.from("L".repeat(150 * 1024), "utf8");
   const tooLargeBytes = Buffer.from("O".repeat(config.maxReadBytes + 1), "utf8");
   const rangeRaw = Array.from({ length: 12_000 }, (_, index) => `line-${String(index).padStart(5, "0")}`).join("\n") + "\n";
+  const unrangedRaw = [
+    "historical first line",
+    "historical second line",
+    `historical third line ${"u".repeat(13)}`
+  ].join("\n") + "\n";
+  assert.equal(Buffer.byteLength(unrangedRaw, "utf8"), 81);
 
   await writeFile(path.join(repoRoot, "deleted.txt"), deletedText, "utf8");
   await writeFile(path.join(repoRoot, "old-name.txt"), renamedText, "utf8");
@@ -120,6 +126,7 @@ try {
   await writeFile(path.join(repoRoot, "large.txt"), largeBytes);
   await writeFile(path.join(repoRoot, "too-large.txt"), tooLargeBytes);
   await writeFile(path.join(repoRoot, "range-budget.txt"), rangeRaw, "utf8");
+  await writeFile(path.join(repoRoot, "unranged-budget.txt"), unrangedRaw, "utf8");
   await writeFile(path.join(repoRoot, "private.txt"), privateRaw, "utf8");
   await writeFile(path.join(repoRoot, ".env"), "SECRET_ENV=do-not-return\n", "utf8");
   await mkdir(path.join(repoRoot, "dir"), { recursive: true });
@@ -278,6 +285,43 @@ try {
   console.log("RAW_OBSERVATION: range-budget blob stayed below acquisition cap while numbered full-range projection exceeded max_bytes");
   console.log("PASS raw range-byte admission and truthful line/truncation metadata");
 
+  const advertisedUnrangedBytes = Number(gitText(repoRoot, ["cat-file", "-s", `${rootSha}:unranged-budget.txt`]));
+  assert.equal(advertisedUnrangedBytes, 81);
+  await expectHistoricalFailure(
+    "unranged requested max_bytes",
+    () => readAtRef(config, guard, workspace, { ref: rootSha, path: "unranged-budget.txt", maxBytes: 12 }),
+    "oversized"
+  );
+  await assert.rejects(
+    () => readPublicTextFile(config, filesystemGuard, workspace, "unranged-budget.txt", { maxBytes: 12 }),
+    /File is too large/u
+  );
+  for (const maxBytes of [81, 100]) {
+    const historicalUnranged = await readAtRef(config, guard, workspace, {
+      ref: rootSha,
+      path: "unranged-budget.txt",
+      maxBytes
+    });
+    const currentUnranged = await readPublicTextFile(config, filesystemGuard, workspace, "unranged-budget.txt", { maxBytes });
+    assert.deepEqual(
+      {
+        path: historicalUnranged.path,
+        text: historicalUnranged.text,
+        startLine: historicalUnranged.startLine,
+        endLine: historicalUnranged.endLine,
+        totalLines: historicalUnranged.totalLines,
+        bytes: historicalUnranged.bytes,
+        sha256: historicalUnranged.sha256,
+        truncated: historicalUnranged.truncated
+      },
+      currentUnranged,
+      `historical un-ranged projection diverged from current filesystem semantics at max_bytes=${maxBytes}`
+    );
+    assert.equal(historicalUnranged.bytes, advertisedUnrangedBytes);
+  }
+  console.log("RAW_OBSERVATION: real 81-byte un-ranged blob rejected max_bytes=12 and succeeded at exact/within budgets");
+  console.log("RAW_OBSERVATION: historical and current filesystem un-ranged max_bytes behavior matched");
+
   const binDir = path.join(fixtureRoot, "armed-git");
   await mkdir(binDir, { recursive: true });
   const sentinel = path.join(fixtureRoot, "cat-file-sentinel");
@@ -305,8 +349,15 @@ try {
       "oversized"
     );
     await assert.rejects(access(sentinel, fsConstants.F_OK));
+    await expectHistoricalFailure(
+      "unranged requested max_bytes pre-read rejection",
+      () => readAtRef(config, guard, workspace, { ref: rootSha, path: "unranged-budget.txt", maxBytes: 12 }),
+      "oversized"
+    );
+    await assert.rejects(access(sentinel, fsConstants.F_OK));
     console.log("RAW_OBSERVATION: armed real-git wrapper saw no cat-file invocation for advertised oversized blob");
-    console.log("PASS oversized blob rejected before content acquisition");
+    console.log("RAW_OBSERVATION: armed real-git wrapper also saw no cat-file invocation for un-ranged request budget below blob size");
+    console.log("PASS configured/requested un-ranged oversized blobs rejected before content acquisition");
   } finally {
     if (previousPath === undefined) delete process.env.PATH;
     else process.env.PATH = previousPath;

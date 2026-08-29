@@ -122,9 +122,9 @@ function validateLineOption(value: unknown): void {
 }
 
 interface ValidatedHistoricalBlobOptions {
-  /** The immutable blob acquisition ceiling; never narrowed by a range budget. */
+  /** Whole-blob ceiling: configured for ranges, requested/configured for full reads. */
   readonly acquisitionMaxBytes: number;
-  /** The optional raw numbered-range budget applied by the shared projector. */
+  /** The bounded budget passed to the shared projector. */
   readonly projectionMaxBytes: number;
 }
 
@@ -142,8 +142,9 @@ function validateOptions(
 
   if (!isPositiveInteger(config.maxReadBytes)) throw failure("invalid-max-bytes");
   if (options.maxBytes !== undefined && !isPositiveInteger(options.maxBytes)) throw failure("invalid-max-bytes");
-  const acquisitionMaxBytes = config.maxReadBytes;
-  const projectionMaxBytes = Math.min(options.maxBytes ?? acquisitionMaxBytes, acquisitionMaxBytes);
+  const projectionMaxBytes = Math.min(options.maxBytes ?? config.maxReadBytes, config.maxReadBytes);
+  const hasRange = options.startLine !== undefined || options.endLine !== undefined;
+  const acquisitionMaxBytes = hasRange ? config.maxReadBytes : projectionMaxBytes;
   if (!isPositiveInteger(projectionMaxBytes)) throw failure("invalid-max-bytes");
   return { acquisitionMaxBytes, projectionMaxBytes };
 }
