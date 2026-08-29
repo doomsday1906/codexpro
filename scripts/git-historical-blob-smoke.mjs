@@ -6,7 +6,9 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
+import { readPublicTextFile } from "../dist/fsOps.js";
 import { HistoricalBlobError, readAtRef } from "../dist/gitHistoricalBlob.js";
+import { PathGuard } from "../dist/guard.js";
 
 const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "codexpro-git-historical-blob-"));
 const repoRoot = path.join(fixtureRoot, "repo");
@@ -150,6 +152,7 @@ try {
   console.log("PREDICATE: TRUE — independent ls-tree observations establish old-path presence before operation evaluation");
 
   const workspace = { id: "historical-blob-smoke", root: repoRoot, openedAt: new Date().toISOString() };
+  const filesystemGuard = new PathGuard({ blockedGlobs: [] });
   const before = snapshot(repoRoot);
 
   const deleted = await readAtRef(config, guard, workspace, { ref: rootSha, path: "deleted.txt" });
@@ -226,11 +229,52 @@ try {
   assert.equal(rangedLine.text, "12000 | line-11999");
   assert.equal(rangedLine.totalLines, 12_001);
   assert.equal(rangedLine.truncated, true);
+
+  const advertisedRangeBytes = Number(gitText(repoRoot, ["cat-file", "-s", `${rootSha}:range-budget.txt`]));
+  assert.ok(advertisedRangeBytes > 20);
+  const narrowRangedLine = await readAtRef(config, guard, workspace, {
+    ref: rootSha,
+    path: "range-budget.txt",
+    startLine: 12_000,
+    endLine: 12_000,
+    maxBytes: 20
+  });
+  const currentNarrowRangedLine = await readPublicTextFile(config, filesystemGuard, workspace, "range-budget.txt", {
+    startLine: 12_000,
+    endLine: 12_000,
+    maxBytes: 20
+  });
+  assert.equal(narrowRangedLine.text, "12000 | line-11999");
+  assert.deepEqual(
+    {
+      path: narrowRangedLine.path,
+      text: narrowRangedLine.text,
+      startLine: narrowRangedLine.startLine,
+      endLine: narrowRangedLine.endLine,
+      totalLines: narrowRangedLine.totalLines,
+      bytes: narrowRangedLine.bytes,
+      sha256: narrowRangedLine.sha256,
+      truncated: narrowRangedLine.truncated
+    },
+    currentNarrowRangedLine,
+    "historical selected-range projection diverged from current filesystem semantics"
+  );
+  await expectHistoricalFailure(
+    "selected range over requested budget",
+    () => readAtRef(config, guard, workspace, { ref: rootSha, path: "range-budget.txt", startLine: 1, endLine: 1, maxBytes: 5 }),
+    "range-too-large"
+  );
+  await assert.rejects(
+    () => readPublicTextFile(config, filesystemGuard, workspace, "range-budget.txt", { startLine: 1, endLine: 1, maxBytes: 5 }),
+    /Selected line range is too large/u
+  );
   await expectHistoricalFailure(
     "raw numbered range budget",
     () => readAtRef(config, guard, workspace, { ref: rootSha, path: "range-budget.txt", startLine: 1, endLine: 12_000, maxBytes: config.maxReadBytes }),
     "range-too-large"
   );
+  console.log(`RAW_OBSERVATION: real ${advertisedRangeBytes}-byte blob exceeded requested 20-byte budget while selected line was 18 bytes`);
+  console.log("RAW_OBSERVATION: historical and current filesystem selected-range projections matched; inverse 5-byte budget rejected both");
   console.log("RAW_OBSERVATION: range-budget blob stayed below acquisition cap while numbered full-range projection exceeded max_bytes");
   console.log("PASS raw range-byte admission and truthful line/truncation metadata");
 

@@ -121,7 +121,17 @@ function validateLineOption(value: unknown): void {
   if (value !== undefined && !isPositiveInteger(value)) throw failure("invalid-range");
 }
 
-function validateOptions(config: GitHistoricalBlobConfig, options: GitHistoricalBlobOptions): number {
+interface ValidatedHistoricalBlobOptions {
+  /** The immutable blob acquisition ceiling; never narrowed by a range budget. */
+  readonly acquisitionMaxBytes: number;
+  /** The optional raw numbered-range budget applied by the shared projector. */
+  readonly projectionMaxBytes: number;
+}
+
+function validateOptions(
+  config: GitHistoricalBlobConfig,
+  options: GitHistoricalBlobOptions
+): ValidatedHistoricalBlobOptions {
   if (!options || typeof options !== "object" || Array.isArray(options)) throw failure("invalid-input");
   if (typeof options.ref !== "string" || options.ref.length === 0) throw failure("invalid-input");
   validateLineOption(options.startLine);
@@ -132,9 +142,10 @@ function validateOptions(config: GitHistoricalBlobConfig, options: GitHistorical
 
   if (!isPositiveInteger(config.maxReadBytes)) throw failure("invalid-max-bytes");
   if (options.maxBytes !== undefined && !isPositiveInteger(options.maxBytes)) throw failure("invalid-max-bytes");
-  const effectiveMaxBytes = Math.min(options.maxBytes ?? config.maxReadBytes, config.maxReadBytes);
-  if (!isPositiveInteger(effectiveMaxBytes)) throw failure("invalid-max-bytes");
-  return effectiveMaxBytes;
+  const acquisitionMaxBytes = config.maxReadBytes;
+  const projectionMaxBytes = Math.min(options.maxBytes ?? acquisitionMaxBytes, acquisitionMaxBytes);
+  if (!isPositiveInteger(projectionMaxBytes)) throw failure("invalid-max-bytes");
+  return { acquisitionMaxBytes, projectionMaxBytes };
 }
 
 function objectIdPattern(objectFormat: GitObjectFormat): RegExp {
@@ -244,7 +255,7 @@ export async function readAtRef(
   workspace: Workspace,
   options: GitHistoricalBlobOptions
 ): Promise<GitHistoricalBlobResult> {
-  const effectiveMaxBytes = validateOptions(config, options);
+  const validatedOptions = validateOptions(config, options);
 
   let resolved: GitReviewRef;
   try {
@@ -273,7 +284,9 @@ export async function readAtRef(
   ]);
   const entry = parseTreeEntry(treeEntryResult.copyStdoutBytes(), canonicalPath, resolved.objectFormat);
   if (entry.size === undefined || entry.entryKind === undefined) throw failure("type-mismatch");
-  if (entry.size > effectiveMaxBytes) throw failure("oversized", { advertised: entry.size, limit: effectiveMaxBytes });
+  if (entry.size > validatedOptions.acquisitionMaxBytes) {
+    throw failure("oversized", { advertised: entry.size, limit: validatedOptions.acquisitionMaxBytes });
+  }
 
   let blobResult;
   try {
@@ -303,7 +316,7 @@ export async function readAtRef(
       sha256: blobSha,
       startLine: options.startLine,
       endLine: options.endLine,
-      maxBytes: effectiveMaxBytes
+      maxBytes: validatedOptions.projectionMaxBytes
     });
   } catch (error) {
     throw mapProjectionFailure(error);
