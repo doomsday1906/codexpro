@@ -31,6 +31,17 @@ const ERROR_SECRET = "invalid-review-surface-ref-secret-7X9";
 const BLOCKED_SECRET = "ENV_REVIEW_SURFACE_SECRET_7X9";
 const BINARY_SECRET = "BINARY_REVIEW_SURFACE_SECRET_7X9";
 const OVERSIZED_SECRET = "OVERSIZED_REVIEW_SURFACE_SECRET_7X9";
+const HOSTILE_UNKNOWN_KEY = "OPENAI_API_KEY=sk-unknown-key-name-review-surface-7X9";
+
+async function pathExists(absolutePath) {
+  try {
+    await lstat(absolutePath);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
 
 function gitEnv() {
   const env = {
@@ -43,13 +54,23 @@ function gitEnv() {
   delete env.GIT_CONFIG;
   delete env.GIT_NO_REPLACE_OBJECTS;
   delete env.GIT_NO_LAZY_FETCH;
+  delete env.GIT_SHALLOW_FILE;
+  delete env.GIT_TRACE;
+  delete env.GIT_TRACE2;
+  delete env.GIT_TRACE2_EVENT;
+  delete env.GIT_TRACE_PERFORMANCE;
   return env;
 }
 
 function directGit(root, args, options = {}) {
+  const env = gitEnv();
+  for (const [key, value] of Object.entries(options.env ?? {})) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
   const result = spawnSync("git", args, {
     cwd: root,
-    env: gitEnv(),
+    env,
     input: options.input,
     encoding: "buffer",
     stdio: ["pipe", "pipe", "pipe"]
@@ -174,9 +195,12 @@ function assertNoRaw(value, literals, label) {
 
 function assertHostileEnvelope(result, literals, label) {
   assertNoRaw(result, literals, `${label} complete response`);
-  assertNoRaw(result?.content, literals, `${label} content`);
-  assertNoRaw(result?.structuredContent, literals, `${label} structuredContent`);
-  assertNoRaw(result?._meta, literals, `${label} _meta`);
+  const envelope = result?.result ?? result;
+  assertNoRaw(envelope, literals, `${label} MCP result`);
+  assertNoRaw(envelope?.content, literals, `${label} content`);
+  assertNoRaw(envelope?.structuredContent, literals, `${label} structuredContent`);
+  assertNoRaw(envelope?._meta, literals, `${label} _meta`);
+  assertNoRaw(result?.text, literals, `${label} protocol text`);
 }
 
 function resultText(result) {
@@ -184,11 +208,25 @@ function resultText(result) {
 }
 
 class McpStdioClient {
-  constructor(defaultRoot, targetParent, targetRoot, mode) {
+  constructor(defaultRoot, targetParent, targetRoot, mode, environment = {}) {
     this.buffer = "";
     this.nextId = 1;
     this.pending = new Map();
     this.stderr = "";
+    const env = {
+      ...process.env,
+      CODEXPRO_ROOT: defaultRoot,
+      CODEXPRO_ALLOWED_ROOTS: [targetParent, targetRoot].join(path.delimiter),
+      CODEXPRO_TOOL_CARDS: "0",
+      CODEXPRO_CODEX_SESSIONS: "off",
+      CODEXPRO_BASH_MODE: "off",
+      CODEXPRO_WRITE_MODE: "off",
+      CODEXPRO_MAX_READ_BYTES: "4000"
+    };
+    for (const [key, value] of Object.entries(environment)) {
+      if (value === undefined) delete env[key];
+      else env[key] = value;
+    }
     this.child = spawn(process.execPath, [
       "dist/stdio.js",
       "--root", defaultRoot,
@@ -199,16 +237,7 @@ class McpStdioClient {
       "--tool-mode", mode
     ], {
       cwd: path.resolve("."),
-      env: {
-        ...process.env,
-        CODEXPRO_ROOT: defaultRoot,
-        CODEXPRO_ALLOWED_ROOTS: [targetParent, targetRoot].join(path.delimiter),
-        CODEXPRO_TOOL_CARDS: "0",
-        CODEXPRO_CODEX_SESSIONS: "off",
-        CODEXPRO_BASH_MODE: "off",
-        CODEXPRO_WRITE_MODE: "off",
-        CODEXPRO_MAX_READ_BYTES: "4000"
-      },
+      env,
       stdio: ["pipe", "pipe", "pipe"]
     });
     this.child.stdout.on("data", (chunk) => this.onData(String(chunk)));
@@ -268,8 +297,8 @@ class McpStdioClient {
   }
 }
 
-async function startClient(defaultRoot, targetParent, targetRoot, mode) {
-  const client = new McpStdioClient(defaultRoot, targetParent, targetRoot, mode);
+async function startClient(defaultRoot, targetParent, targetRoot, mode, environment = {}) {
+  const client = new McpStdioClient(defaultRoot, targetParent, targetRoot, mode, environment);
   const initialize = await client.request("initialize", {
     protocolVersion: "2024-11-05",
     capabilities: {},
@@ -408,6 +437,7 @@ try {
   ].join("\n"), "utf8");
   const binaryBytes = Buffer.concat([Buffer.from(BINARY_SECRET, "utf8"), Buffer.from([0x00, 0xff, 0x00])]);
   const oversizedBytes = Buffer.from(`${OVERSIZED_SECRET}\n${"O".repeat(4_200)}`, "utf8");
+  const rangeBytes = Buffer.from(["range first", "range second", "R".repeat(240), ""].join("\n"), "utf8");
   const rootSubject = `review root OPENAI_API_KEY=${COMMIT_SECRET}`;
   const rootBody = `Authorization: Bearer ${BODY_SECRET}\nroot body exact\n`;
   const rootDeletedPath = "deleted old π.txt";
@@ -418,6 +448,7 @@ try {
   const hiddenPath = ".hidden-history.txt";
   const symlinkPath = "historical-link";
   const symlinkTargetPath = "symlink-target.txt";
+  const rangePath = "range-budget.txt";
   const tabPath = "tab\tname.txt";
   const newlinePath = "newline\nname.txt";
 
@@ -431,6 +462,7 @@ try {
   await writeFile(path.join(targetRoot, "credentials.pem"), `-----BEGIN PRIVATE KEY-----\n${BLOCKED_SECRET}\n-----END PRIVATE KEY-----\n`, "utf8");
   await writeFile(path.join(targetRoot, "binary.bin"), binaryBytes);
   await writeFile(path.join(targetRoot, "oversized.txt"), oversizedBytes);
+  await writeFile(path.join(targetRoot, rangePath), rangeBytes);
   await writeFile(path.join(targetRoot, symlinkTargetPath), `SYMLINK_TARGET_SECRET_7X9\n`, "utf8");
   await writeFile(path.join(targetRoot, tabPath), "tab path direct fixture\n", "utf8");
   await writeFile(path.join(targetRoot, newlinePath), "newline path direct fixture\n", "utf8");
@@ -489,7 +521,8 @@ try {
   const symlinkEntry = rootEntries.get(symlinkPath);
   const binaryEntry = rootEntries.get("binary.bin");
   const oversizedEntry = rootEntries.get("oversized.txt");
-  assert.ok(deletedEntry && oldRenameEntry && renamedEntry && privateEntry && symlinkEntry && binaryEntry && oversizedEntry);
+  const rangeEntry = rootEntries.get(rangePath);
+  assert.ok(deletedEntry && oldRenameEntry && renamedEntry && privateEntry && symlinkEntry && binaryEntry && oversizedEntry && rangeEntry);
   assert.equal(rootEntries.has(rootDeletedPath), true);
   assert.equal(mergeEntries.has(rootDeletedPath), false);
   assert.equal(rootEntries.has(oldRenamePath), true);
@@ -502,6 +535,8 @@ try {
   assert.deepEqual(directEntryBlob(targetRoot, symlinkEntry), Buffer.from(symlinkTargetPath, "utf8"));
   assert.deepEqual(directEntryBlob(targetRoot, binaryEntry), binaryBytes);
   assert.equal(directEntryBlob(targetRoot, oversizedEntry).includes(Buffer.from(OVERSIZED_SECRET, "utf8")), true);
+  assert.deepEqual(directEntryBlob(targetRoot, rangeEntry), rangeBytes);
+  assert.equal(rangeBytes.byteLength <= 4_000, true);
   assert.equal(rootCommit.parents.length, 0);
   assert.equal(mergeCommit.parents.length, 2);
   assert.deepEqual(directBases, [linearSha]);
@@ -513,6 +548,49 @@ try {
   assert.equal(directMergeLog[0], mergeSha);
   assert.equal(directRootLog[0], rootSha);
   assert.equal(defaultSha.length, 40);
+
+  // Establish the inherited-Git-environment hazard directly before any
+  // public MCP process is started. The shallow file must truncate history,
+  // and each requested trace variable must create a real artifact. Those
+  // direct-oracle artifacts are removed before the target snapshot.
+  const directLogArgs = ["rev-list", "--max-count=100", mergeSha];
+  const directHistoryResult = directGit(targetRoot, directLogArgs);
+  assert.equal(directHistoryResult.status, 0);
+  const directHistoryIds = directHistoryResult.stdout.toString("utf8").trim().split("\n").filter(Boolean);
+  assert.deepEqual(directHistoryIds, directMergeLog);
+  const hostileShallowPath = path.join(fixtureRoot, "hostile-shallow-file");
+  const traceDir = path.join(targetRoot, ".reviewer-direct-traces");
+  const tracePaths = {
+    GIT_TRACE: path.join(traceDir, "git-trace.log"),
+    GIT_TRACE2: path.join(traceDir, "git-trace2.log"),
+    GIT_TRACE2_EVENT: path.join(traceDir, "git-trace2-event.log"),
+    GIT_TRACE_PERFORMANCE: path.join(traceDir, "git-trace-performance.log")
+  };
+  await writeFile(hostileShallowPath, `${linearSha}\n`, "utf8");
+  const shallowResult = directGit(targetRoot, directLogArgs, { env: { GIT_SHALLOW_FILE: hostileShallowPath } });
+  assert.equal(shallowResult.status, 0, shallowResult.stderr.toString("utf8"));
+  const shallowHistoryIds = shallowResult.stdout.toString("utf8").trim().split("\n").filter(Boolean);
+  assert.equal(shallowHistoryIds.length < directHistoryIds.length, true);
+  assert.equal(shallowHistoryIds.includes(rootSha), false);
+  assert.equal(shallowHistoryIds.includes(linearSha), true);
+  await mkdir(traceDir, { recursive: true });
+  for (const [variable, tracePath] of Object.entries(tracePaths)) {
+    const traced = directGit(targetRoot, directLogArgs, { env: { [variable]: tracePath } });
+    assert.equal(traced.status, 0, `${variable}: ${traced.stderr.toString("utf8")}`);
+    assert.equal(await pathExists(tracePath), true, `${variable} did not create a trace artifact`);
+    assert.equal((await readFile(tracePath)).byteLength > 0, true, `${variable} trace artifact was empty`);
+  }
+  console.log(`RAW_OBSERVATION: direct Git with GIT_SHALLOW_FILE=${hostileShallowPath} returned ${shallowHistoryIds.length}/${directHistoryIds.length} merge-tip commits and omitted root; each GIT_TRACE* path produced non-empty bytes.`);
+  console.log("PREDICATE: TRUE — hostile inherited Git environment independently causes shallow-history truncation and trace-file writes before MCP interpretation.");
+  await rm(traceDir, { recursive: true, force: true });
+  // Preserve a writable, snapshot-visible destination directory for the
+  // hostile public child. Direct trace files are gone, but an unsealed child
+  // must still be able to recreate each file for the negative assertion.
+  await mkdir(traceDir, { recursive: true });
+  assert.equal(await pathExists(traceDir), true);
+  for (const tracePath of Object.values(tracePaths)) assert.equal(await pathExists(tracePath), false);
+  const hostileGitEnvironment = { GIT_SHALLOW_FILE: hostileShallowPath, ...tracePaths };
+
   console.log("AUTHORITY: A002 MISSION_ANCHOR + P002 MISSION_PLAN TASK-007/AP-011/AP-012 and AC-001..AC-007 define the expected reviewer outcome.");
   console.log(`TARGET_PRODUCER/ROUTE: fresh ordinary MCP stdio server processes in full/standard/minimal modes, five public tools, target=${targetCanonicalRoot}, nested under allowed parent; no production 8787 route.`);
   console.log(`TARGET_EVIDENCE: direct Git object database/filesystem fixture observations plus complete serialized MCP response envelopes and native commands.`);
@@ -594,7 +672,9 @@ try {
   console.log("RAW_OBSERVATION: dirty fixture directly shows one staged tracked modification, one unstaged tracked modification, and one untracked file before reviewer calls.");
   console.log("PREDICATE: TRUE — dirty/staged/unstaged/untracked state is independently established from raw Git status/diff/list output.");
   const before = await repositorySnapshot(targetRoot);
-  secondClient = (await startClient(defaultRoot, targetParent, targetRoot, "full")).client;
+  assert.equal(await pathExists(traceDir), true, "hostile trace destination directory missing before snapshot");
+  for (const tracePath of Object.values(tracePaths)) assert.equal(await pathExists(tracePath), false, `hostile trace destination was not empty before snapshot: ${tracePath}`);
+  secondClient = (await startClient(defaultRoot, targetParent, targetRoot, "full", hostileGitEnvironment)).client;
 
   const targetLiterals = [DEFAULT_SENTINEL];
   const resolveHeadOut = await callTool(secondClient, "git_resolve_ref", { workspace_id: workspaceId, ref: "HEAD" });
@@ -634,15 +714,22 @@ try {
   assertHostileEnvelope({ structuredContent: divergent }, targetLiterals, "merge base target");
   console.log("PASS merge-base truth: divergent, ancestor, multiple-best-base criss-cross, and unrelated histories retained direct results.");
 
-  const logResult = expectSuccess(await callTool(secondClient, "git_log", { workspace_id: workspaceId, start_ref: "merge-tip", max_count: 100 }), "structured merge log");
+  assert.equal(await pathExists(traceDir), true, "hostile trace destination directory missing before public call");
+  for (const tracePath of Object.values(tracePaths)) assert.equal(await pathExists(tracePath), false, `trace path was not clean before public call: ${tracePath}`);
+  const logOutput = await callTool(secondClient, "git_log", { workspace_id: workspaceId, start_ref: "merge-tip", max_count: 100 });
+  const logResult = expectSuccess(logOutput, "structured merge log");
   const log = logResult.structuredContent;
   assertPublicEnvelope(log, workspaceId, targetCanonicalRoot, "git_log");
   assert.equal(log.start.full_sha, mergeSha);
   assert.deepEqual(log.commits.map((commit) => commit.full_sha), directMergeLog);
+  assert.deepEqual(log.commits.map((commit) => commit.full_sha), directHistoryIds);
   assert.deepEqual(log.commits[0].parents, directParents(targetRoot, mergeSha));
   assert.equal(log.commits.some((commit) => commit.full_sha === rootSha), true);
   assert.equal(log.commits.some((commit) => commit.subject.includes(COMMIT_SECRET)), false);
   assertHostileEnvelope(logResult, [COMMIT_SECRET, BODY_SECRET, DEFAULT_SENTINEL], "git_log hostile messages");
+  assert.equal(await pathExists(traceDir), true, "hostile trace destination directory disappeared during public call");
+  for (const tracePath of Object.values(tracePaths)) assert.equal(await pathExists(tracePath), false, `public Git call created hostile trace artifact: ${tracePath}`);
+  console.log("PASS sealed Git environment: the same hostile shallow/trace variables yielded complete direct-equivalent public history and zero trace-file writes.");
   const oldPathLog = expectSuccess(await callTool(secondClient, "git_log", { workspace_id: workspaceId, start_ref: "root-lightweight", path: `./${rootDeletedPath}`, max_count: 20 }), "old deleted path log").structuredContent;
   assert.equal(oldPathLog.path, rootDeletedPath);
   assert.deepEqual(oldPathLog.commits.map((commit) => commit.full_sha), [rootSha]);
@@ -709,6 +796,47 @@ try {
   assert.equal(symlinkResult.text.includes("SYMLINK_TARGET_SECRET_7X9"), false);
   console.log("PASS historical source: deleted/renamed/Unicode/space/leading-dash/hidden paths, complete metadata, typed source redaction, and symlink target-text semantics match direct tree facts.");
 
+  const selectedRangeBytes = Buffer.from("range second", "utf8");
+  const selectedRangeText = numberLines(selectedRangeBytes, 2);
+  const selectedRangeBudget = Buffer.byteLength(selectedRangeText, "utf8");
+  assert.equal(rangeBytes.byteLength > selectedRangeBudget, true);
+  assert.equal(rangeBytes.byteLength <= 4_000, true);
+  console.log(`RAW_OBSERVATION: direct range blob bytes=${rangeBytes.byteLength} (within configured 4000-byte acquisition limit), numbered line-2 frame bytes=${selectedRangeBudget}; direct blob SHA-256=${sha256(rangeBytes)}.`);
+  console.log("PREDICATE: TRUE — direct blob bytes independently establish that the complete file exceeds the requested range budget while the selected numbered frame fits exactly.");
+  const rangeOutput = await callTool(secondClient, "read_at_ref", {
+    workspace_id: workspaceId,
+    ref: rootSha,
+    path: rangePath,
+    start_line: 2,
+    end_line: 2,
+    max_bytes: selectedRangeBudget
+  });
+  const rangeResult = expectSuccess(rangeOutput, "historical range at exact framed budget");
+  const rangeData = rangeResult.structuredContent;
+  assertPublicEnvelope(rangeData, workspaceId, targetCanonicalRoot, "historical range");
+  assert.equal(rangeData.commit_sha, rootSha);
+  assert.equal(rangeData.path, rangePath);
+  assert.equal(rangeData.text, selectedRangeText);
+  assert.equal(rangeData.start_line, 2);
+  assert.equal(rangeData.end_line, 2);
+  assert.equal(rangeData.total_lines, 4);
+  assert.equal(rangeData.bytes, rangeBytes.byteLength);
+  assert.equal(rangeData.sha256, sha256(rangeBytes));
+  assert.equal(rangeData.blob_sha, rangeEntry.oid);
+  assert.equal(rangeData.truncated, true);
+  assertHostileEnvelope(rangeResult, [DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], "historical range");
+  const tooSmallRangeOutput = await callTool(secondClient, "read_at_ref", {
+    workspace_id: workspaceId,
+    ref: rootSha,
+    path: rangePath,
+    start_line: 2,
+    end_line: 2,
+    max_bytes: selectedRangeBudget - 1
+  });
+  expectError(tooSmallRangeOutput, "historical range below framed budget");
+  assertHostileEnvelope(tooSmallRangeOutput, [DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], "historical range below budget");
+  console.log("PASS historical range budget: exact numbered-frame bytes succeed with full blob/hash metadata, while one byte less fails.");
+
   const hostilePathCases = [
     ["blocked .env", ".env", BLOCKED_SECRET],
     ["blocked credential PEM", "credentials.pem", BLOCKED_SECRET],
@@ -721,7 +849,7 @@ try {
   for (const [label, relativePath, literal] of hostilePathCases) {
     const output = await callTool(secondClient, "read_at_ref", { workspace_id: workspaceId, ref: label === "missing old path at merge" ? mergeSha : rootSha, path: relativePath });
     expectError(output, label);
-    assertHostileEnvelope(output.result, [literal, BLOCKED_SECRET, BINARY_SECRET, OVERSIZED_SECRET, DEFAULT_SENTINEL], label);
+    assertHostileEnvelope(output, [literal, BLOCKED_SECRET, BINARY_SECRET, OVERSIZED_SECRET, DEFAULT_SENTINEL], label);
   }
   console.log("PASS hostile path/type cases: blocked .env/credential, binary, oversized, absent old path, and control-name validator failures are bounded and leak-free.");
 
@@ -737,10 +865,10 @@ try {
 
   const invalidRefOutput = await callTool(secondClient, "git_resolve_ref", { workspace_id: workspaceId, ref: ERROR_SECRET });
   expectError(invalidRefOutput, "invalid hostile ref");
-  assertHostileEnvelope(invalidRefOutput.result, [ERROR_SECRET, DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], "invalid ref error");
+  assertHostileEnvelope(invalidRefOutput, [ERROR_SECRET, DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], "invalid ref error");
   const missingPathOutput = await callTool(secondClient, "read_at_ref", { workspace_id: workspaceId, ref: rootSha, path: `missing-${ERROR_SECRET}.txt` });
   expectError(missingPathOutput, "missing hostile path");
-  assertHostileEnvelope(missingPathOutput.result, [ERROR_SECRET, DEFAULT_SENTINEL, SOURCE_SECRET], "missing path error");
+  assertHostileEnvelope(missingPathOutput, [ERROR_SECRET, DEFAULT_SENTINEL, SOURCE_SECRET], "missing path error");
   console.log("PASS hostile response envelope: source, commit, invalid-ref, missing-path, blocked-path, binary, and oversized literals are absent from content/structuredContent/_meta/complete result.");
 
   const omissionCalls = [
@@ -754,7 +882,7 @@ try {
     const output = await callTool(secondClient, name, args);
     const errorText = expectError(output, `${name} omitted workspace_id`);
     assert.match(errorText, /workspace_id/iu, `${name} omission did not identify workspace_id`);
-    assertHostileEnvelope(output.result, [DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], `${name} omission`);
+    assertHostileEnvelope(output, [DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], `${name} omission`);
   }
   console.log("PASS missing-ID boundary: every reviewer tool fails before default workspace fallback in a fresh MCP session.");
 
@@ -766,12 +894,12 @@ try {
     ["read_at_ref", { workspace_id: workspaceId, ref: "HEAD", path: rootDeletedPath }]
   ];
   for (const [name, args] of unknownCalls) {
-    const output = await callTool(secondClient, name, { ...args, unexpected_top_level: ERROR_SECRET });
+    const output = await callTool(secondClient, name, { ...args, [HOSTILE_UNKNOWN_KEY]: "ignored" });
     const errorText = expectError(output, `${name} unknown key`);
     assert.match(errorText, /unknown|unrecognized|invalid arguments/iu, `${name} unknown-key error was not schema rejection`);
-    assertHostileEnvelope(output.result, [ERROR_SECRET, DEFAULT_SENTINEL, SOURCE_SECRET], `${name} unknown key`);
+    assertHostileEnvelope(output, [HOSTILE_UNKNOWN_KEY, DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], `${name} unknown key`);
   }
-  console.log("PASS strict argument boundary: each reviewer schema rejects unknown top-level keys without exposing hostile values.");
+  console.log("PASS strict argument boundary: each reviewer schema rejects a raw secret-looking unknown property name without exposing it in protocol text/content/structuredContent/_meta/complete result.");
 
   await secondClient.close();
   secondClient = undefined;
