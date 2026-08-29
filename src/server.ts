@@ -14,6 +14,8 @@ import { importAttachmentFile } from "./importOps.js";
 import { searchWorkspace } from "./searchOps.js";
 import { runBash } from "./bashOps.js";
 import { gitDiff, gitDiffStatus, gitLog, gitStatus } from "./gitOps.js";
+import { gitLogStructured, gitMergeBase, gitResolveRef, gitShowCommit } from "./gitHistoryOps.js";
+import { readAtRef } from "./gitHistoricalBlob.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
@@ -34,6 +36,79 @@ const READ_MANY_MAX_TOTAL_BYTES = 100_000;
 const READ_MANY_RESPONSE_FRAMING_RESERVE_BYTES = 1_024;
 const READ_MANY_MAX_PATH_CHARS = 2_000;
 const READ_MANY_MAX_ERROR_CHARS = 512;
+
+const REVIEW_REF_MAX_BYTES = 512;
+const REVIEW_PATH_MAX_BYTES = 4_096;
+const REVIEW_MAX_COUNT = 100;
+const REVIEW_DEFAULT_MAX_COUNT = 20;
+
+const REVIEW_WORKSPACE_ID_SCHEMA = z.string()
+  .min(1)
+  .max(128)
+  .refine((value) => value.trim() === value, "workspace_id must not have surrounding whitespace.")
+  .describe("Explicit workspace id from open_current_workspace or open_workspace.");
+
+const REVIEW_REF_SCHEMA = z.string()
+  .min(1)
+  .max(REVIEW_REF_MAX_BYTES)
+  .refine(
+    (value) =>
+      Buffer.byteLength(value, "utf8") <= REVIEW_REF_MAX_BYTES &&
+      value.trim() === value &&
+      !/[\u0000-\u001f\u007f]/u.test(value) &&
+      !value.startsWith("-"),
+    "ref must be a bounded commit-ish without controls, surrounding whitespace, or option-looking input."
+  )
+  .describe("Bounded local commit-ish such as HEAD, a branch, tag, SHA, or HEAD~1.");
+
+const REVIEW_PATH_SCHEMA = z.string()
+  .min(1)
+  .max(REVIEW_PATH_MAX_BYTES)
+  .refine(
+    (value) => Buffer.byteLength(value, "utf8") <= REVIEW_PATH_MAX_BYTES,
+    `path must be at most ${REVIEW_PATH_MAX_BYTES} UTF-8 bytes.`
+  )
+  .describe("Historical repository-tree path; it need not exist in the current checkout.");
+
+const REVIEW_LINE_SCHEMA = z.number()
+  .int()
+  .min(1)
+  .max(Number.MAX_SAFE_INTEGER);
+
+const GIT_RESOLVE_REF_ARGUMENTS_SCHEMA = z.object({
+  workspace_id: REVIEW_WORKSPACE_ID_SCHEMA,
+  ref: REVIEW_REF_SCHEMA
+}).strict();
+
+const GIT_MERGE_BASE_ARGUMENTS_SCHEMA = z.object({
+  workspace_id: REVIEW_WORKSPACE_ID_SCHEMA,
+  left_ref: REVIEW_REF_SCHEMA,
+  right_ref: REVIEW_REF_SCHEMA
+}).strict();
+
+const GIT_LOG_ARGUMENTS_SCHEMA = z.object({
+  workspace_id: REVIEW_WORKSPACE_ID_SCHEMA,
+  start_ref: REVIEW_REF_SCHEMA.default("HEAD"),
+  path: REVIEW_PATH_SCHEMA.optional(),
+  max_count: z.number().int().min(1).max(REVIEW_MAX_COUNT).default(REVIEW_DEFAULT_MAX_COUNT)
+}).strict();
+
+const GIT_SHOW_COMMIT_ARGUMENTS_SCHEMA = z.object({
+  workspace_id: REVIEW_WORKSPACE_ID_SCHEMA,
+  ref: REVIEW_REF_SCHEMA
+}).strict();
+
+function readAtRefArgumentsSchema(maxReadBytes: number) {
+  const boundedMaxReadBytes = Math.max(1, Math.floor(maxReadBytes));
+  return z.object({
+    workspace_id: REVIEW_WORKSPACE_ID_SCHEMA,
+    ref: REVIEW_REF_SCHEMA,
+    path: REVIEW_PATH_SCHEMA,
+    start_line: REVIEW_LINE_SCHEMA.optional(),
+    end_line: REVIEW_LINE_SCHEMA.optional(),
+    max_bytes: z.number().int().min(1).max(boundedMaxReadBytes).optional()
+  }).strict();
+}
 
 const READ_MANY_ITEM_SCHEMA = z.object({
   path: z.string()
@@ -403,6 +478,42 @@ function errorResult(error: unknown): any {
   };
 }
 
+function publicGitReviewRef(ref: {
+  input: string;
+  objectFormat: string;
+  fullSha: string;
+  shortSha: string;
+}): Record<string, unknown> {
+  return {
+    input_ref: ref.input,
+    object_format: ref.objectFormat,
+    full_sha: ref.fullSha,
+    short_sha: ref.shortSha
+  };
+}
+
+function publicGitLogCommit(commit: {
+  fullSha: string;
+  shortSha: string;
+  parents: readonly string[];
+  authorName: string;
+  authoredAt: string;
+  committerName: string;
+  committedAt: string;
+  subject: string;
+}): Record<string, unknown> {
+  return {
+    full_sha: commit.fullSha,
+    short_sha: commit.shortSha,
+    parents: commit.parents,
+    author_name: commit.authorName,
+    authored_at: commit.authoredAt,
+    committer_name: commit.committerName,
+    committed_at: commit.committedAt,
+    subject: commit.subject
+  };
+}
+
 function validateToolArgs(name: string, options: Record<string, unknown>, args: unknown): any {
   const inputSchema = options.runtimeInputSchema ?? options.inputSchema;
   if (
@@ -699,6 +810,11 @@ const FULL_TOOL_NAMES = [
   "apply_patch",
   "import_file",
   "bash",
+  "git_resolve_ref",
+  "git_merge_base",
+  "git_log",
+  "git_show_commit",
+  "read_at_ref",
   "git_status",
   "git_diff",
   "show_changes",
@@ -809,34 +925,35 @@ function registerCodexTool(
 function serverInstructions(config: CodexProConfig): string {
   const editInstruction =
     config.connectionTest
-      ? "4. Connection test mode is read-only. Write, patch, export, and handoff-writing tools are unavailable."
+      ? "5. Connection test mode is read-only. Write, patch, export, and handoff-writing tools are unavailable."
       : config.writeMode === "workspace"
-      ? "4. Edit source files with write/edit/apply_patch. After edits, call show_changes once for git status, diff stats, and review diff."
+      ? "5. Edit source files with write/edit/apply_patch. After edits, call show_changes once for git status, diff stats, and review diff."
       : config.writeMode === "handoff"
-        ? "4. Source writes are disabled and generic write/edit/apply_patch tools are unavailable. Use handoff_to_agent/handoff_to_codex for plans."
-        : "4. Write/edit/apply_patch tools are disabled. Do not attempt direct file writes; use handoff or context export workflows instead.";
+        ? "5. Source writes are disabled and generic write/edit/apply_patch tools are unavailable. Use handoff_to_agent/handoff_to_codex for plans."
+        : "5. Write/edit/apply_patch tools are disabled. Do not attempt direct file writes; use handoff or context export workflows instead.";
   const bashInstruction =
     config.bashMode === "off"
-      ? "5. Bash is disabled and the bash tool is unavailable. Do not attempt shell commands."
-      : "5. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.";
+      ? "6. Bash is disabled and the bash tool is unavailable. Do not attempt shell commands."
+      : "6. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.";
 
   return [
     "CodexPro connects ChatGPT to explicitly allowed local development workspaces.",
     "",
     "Preferred workflow:",
-    "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects; that selection stays active for this MCP session.",
-    "2. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
-    "3. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
+    "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects; session-selected workspace is reliable only when the client preserves the same MCP session.",
+    "2. For correctness-sensitive Git tools (git_resolve_ref, git_merge_base, git_log, git_show_commit, read_at_ref), always pass the explicit workspace_id returned by open_current_workspace/open_workspace.",
+    "3. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
+    "4. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
     editInstruction,
     bashInstruction,
-    "6. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad inspection calls.",
+    "7. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad inspection calls.",
     config.codexSessions !== "off"
-      ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
+      ? `8. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
     config.requireBashSession && config.bashSessionId
-      ? `8. Bash session guard is enabled. Every bash call must include session_id="${config.bashSessionId}".`
+      ? `9. Bash session guard is enabled. Every bash call must include session_id="${config.bashSessionId}".`
       : config.bashSessionId
-        ? `8. Bash session label for this server is "${config.bashSessionId}".`
+        ? `9. Bash session label for this server is "${config.bashSessionId}".`
         : "",
     "",
     `Current modes: tool=${config.toolMode}, bash=${config.bashMode}, write=${config.writeMode}.`
@@ -2953,6 +3070,263 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       });
       const text = bashTextResult(config, result);
       return diagnosticTextResult(text, { workspace_id: workspace.id, root: workspace.root, ...result, bash_session_id: result.bashSessionId ?? null });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "git_resolve_ref",
+    {
+      title: "Resolve Git Ref",
+      description: "Resolve one bounded local Git commit-ish to an immutable full commit identity without changing repository state or contacting remotes.",
+      inputSchema: GIT_RESOLVE_REF_ARGUMENTS_SCHEMA,
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Resolving Git ref...",
+        "openai/toolInvocation/invoked": "Git ref resolved"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const resolved = await gitResolveRef(config, workspace, args.ref);
+      const text = [
+        "# Resolve Git Ref",
+        "",
+        `Workspace: ${workspace.root}`,
+        `Input ref: ${resolved.input}`,
+        `Object format: ${resolved.objectFormat}`,
+        `Commit: ${resolved.fullSha}`,
+        `Short commit: ${resolved.shortSha}`
+      ].join("\n");
+      return textResult(text, {
+        schema_version: 1,
+        workspace_id: workspace.id,
+        root: workspace.root,
+        ...publicGitReviewRef(resolved)
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "git_merge_base",
+    {
+      title: "Git Merge Base",
+      description: "Resolve two local Git refs once and return all best merge bases plus truthful ancestor and incomplete-history state.",
+      inputSchema: GIT_MERGE_BASE_ARGUMENTS_SCHEMA,
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Computing Git merge bases...",
+        "openai/toolInvocation/invoked": "Git merge bases ready"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await gitMergeBase(config, workspace, args.left_ref, args.right_ref);
+      const text = [
+        "# Git Merge Base",
+        "",
+        `Workspace: ${workspace.root}`,
+        `Left ref: ${result.left.input} (${result.left.fullSha})`,
+        `Right ref: ${result.right.input} (${result.right.fullSha})`,
+        `Merge bases: ${result.mergeBases.length ? result.mergeBases.join(", ") : "none"}`,
+        `Left is ancestor: ${result.leftIsAncestor === null ? "unknown" : result.leftIsAncestor}`,
+        `Right is ancestor: ${result.rightIsAncestor === null ? "unknown" : result.rightIsAncestor}`,
+        `Unrelated: ${result.unrelated === null ? "unknown" : result.unrelated}`,
+        `History complete: ${result.historyComplete}`
+      ].join("\n");
+      return textResult(text, {
+        schema_version: 1,
+        workspace_id: workspace.id,
+        root: workspace.root,
+        object_format: result.objectFormat,
+        left: publicGitReviewRef(result.left),
+        right: publicGitReviewRef(result.right),
+        merge_bases: result.mergeBases,
+        left_is_ancestor: result.leftIsAncestor,
+        right_is_ancestor: result.rightIsAncestor,
+        unrelated: result.unrelated,
+        history_complete: result.historyComplete
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "git_log",
+    {
+      title: "Git Log",
+      description: "Read a bounded structured local Git history from one immutable starting ref, optionally filtered by a validated historical repository-tree path.",
+      inputSchema: GIT_LOG_ARGUMENTS_SCHEMA,
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Reading structured Git history...",
+        "openai/toolInvocation/invoked": "Structured Git history ready"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await gitLogStructured(config, guard, workspace, {
+        startRef: args.start_ref,
+        path: args.path,
+        maxCount: args.max_count
+      });
+      const commits = result.commits.map(publicGitLogCommit);
+      const text = [
+        "# Git Log",
+        "",
+        `Workspace: ${workspace.root}`,
+        `Start ref: ${result.start.input} (${result.start.fullSha})`,
+        `Path: ${result.path ?? "all paths"}`,
+        `Commits returned: ${result.commits.length}`,
+        `Has more: ${result.hasMore}`,
+        "",
+        ...result.commits.map((commit) =>
+          `- ${commit.fullSha} ${commit.authoredAt} ${commit.authorName}: ${commit.subject}`
+        )
+      ].join("\n");
+      return textResult(text, {
+        schema_version: 1,
+        workspace_id: workspace.id,
+        root: workspace.root,
+        start: publicGitReviewRef(result.start),
+        commits,
+        has_more: result.hasMore,
+        max_count: result.maxCount,
+        ...(result.path === undefined ? {} : { path: result.path })
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "git_show_commit",
+    {
+      title: "Show Git Commit",
+      description: "Read bounded local Git commit metadata and message text for one immutable ref; it does not produce a patch or first-parent diff.",
+      inputSchema: GIT_SHOW_COMMIT_ARGUMENTS_SCHEMA,
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Reading Git commit...",
+        "openai/toolInvocation/invoked": "Git commit ready"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await gitShowCommit(config, workspace, args.ref);
+      const text = [
+        "# Git Commit",
+        "",
+        `Workspace: ${workspace.root}`,
+        `Ref: ${result.input} (${result.fullSha})`,
+        `Tree: ${result.treeSha}`,
+        `Parents: ${result.parents.length ? result.parents.join(", ") : "none"}`,
+        `Root: ${result.isRoot}`,
+        `Merge: ${result.isMerge}`,
+        `Author: ${result.authorName} (${result.authoredAt})`,
+        `Committer: ${result.committerName} (${result.committedAt})`,
+        `Subject: ${result.subject}`,
+        `Message bytes: ${result.messageBytes}${result.messageTruncated ? " (truncated)" : ""}`,
+        "",
+        "## Body",
+        "",
+        result.body
+      ].join("\n");
+      return textResult(text, {
+        schema_version: 1,
+        workspace_id: workspace.id,
+        root: workspace.root,
+        ref: publicGitReviewRef(result),
+        commit_sha: result.fullSha,
+        object_format: result.objectFormat,
+        tree_sha: result.treeSha,
+        parents: result.parents,
+        is_root: result.isRoot,
+        is_merge: result.isMerge,
+        author_name: result.authorName,
+        authored_at: result.authoredAt,
+        committer_name: result.committerName,
+        committed_at: result.committedAt,
+        subject: result.subject,
+        body: result.body,
+        message_bytes: result.messageBytes,
+        message_truncated: result.messageTruncated
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "read_at_ref",
+    {
+      title: "Read File at Git Ref",
+      description: "Read a bounded text blob from an immutable historical Git tree path without checkout or symlink dereference; source text uses the existing public-read redaction boundary.",
+      inputSchema: readAtRefArgumentsSchema(config.maxReadBytes),
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Reading historical source...",
+        "openai/toolInvocation/invoked": "Historical source ready"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await readAtRef(config, guard, workspace, {
+        ref: args.ref,
+        path: args.path,
+        startLine: args.start_line,
+        endLine: args.end_line,
+        maxBytes: args.max_bytes
+      });
+      const body = publicSourceBody(result.text);
+      const text = [
+        {
+          kind: "normal" as const,
+          text: [
+            "# Read Historical File",
+            "",
+            `Workspace: ${workspace.root}`,
+            `Ref: ${result.ref.input} (${result.commitSha})`,
+            `Path: ${result.path}`,
+            `Git mode: ${result.gitMode}`,
+            `Entry kind: ${result.entryKind}`,
+            `Lines: ${result.startLine}-${result.endLine} of ${result.totalLines}`,
+            `Bytes: ${result.bytes}`,
+            `Blob SHA: ${result.blobSha}`,
+            `SHA-256: ${result.sha256}`,
+            `Truncated: ${result.truncated}`,
+            "",
+            "```text"
+          ].join("\n")
+        },
+        body,
+        { kind: "normal" as const, text: "\n```" }
+      ] as const;
+      return textResult(text, {
+        schema_version: 1,
+        workspace_id: workspace.id,
+        root: workspace.root,
+        ref: publicGitReviewRef(result.ref),
+        object_format: result.ref.objectFormat,
+        commit_sha: result.commitSha,
+        path: result.path,
+        git_mode: result.gitMode,
+        entry_kind: result.entryKind,
+        blob_sha: result.blobSha,
+        text: result.text,
+        start_line: result.startLine,
+        end_line: result.endLine,
+        total_lines: result.totalLines,
+        bytes: result.bytes,
+        sha256: result.sha256,
+        truncated: result.truncated
+      }, {}, {
+        sourceFields: [{ path: ["text"], body }]
+      });
     }
   );
 
