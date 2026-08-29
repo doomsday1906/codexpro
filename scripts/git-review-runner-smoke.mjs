@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
+import { access, chmod, mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -12,7 +12,7 @@ import {
   gitStatus,
   runGitReadOnly
 } from "../dist/gitOps.js";
-import { PathGuard } from "../dist/guard.js";
+import { CodexProError, PathGuard } from "../dist/guard.js";
 
 const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "codexpro-git-review-runner-"));
 const repoRoot = path.join(fixtureRoot, "repo");
@@ -25,12 +25,17 @@ function asBuffer(value) {
   return Buffer.from(String(value));
 }
 
-function directGit(args, options = {}) {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1" };
+function directGitAt(root, args, options = {}) {
+  const env = {
+    ...process.env,
+    ...options.env,
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_CONFIG_NOSYSTEM: "1"
+  };
   delete env.GIT_NO_REPLACE_OBJECTS;
   delete env.GIT_CONFIG;
   const result = spawnSync("git", args, {
-    cwd: repoRoot,
+    cwd: root,
     env,
     input: options.input,
     encoding: "buffer",
@@ -45,8 +50,22 @@ function directGit(args, options = {}) {
   };
 }
 
+function directGit(args, options = {}) {
+  return directGitAt(repoRoot, args, options);
+}
+
 function mustGit(args, options = {}) {
   const result = directGit(args, options);
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `fixture git failed: ${args.join(" ")} status=${result.status} error=${result.error?.message ?? ""} stderr=${result.stderr.toString("utf8")}`
+    );
+  }
+  return result;
+}
+
+function mustGitAt(root, args, options = {}) {
+  const result = directGitAt(root, args, options);
   if (result.error || result.status !== 0) {
     throw new Error(
       `fixture git failed: ${args.join(" ")} status=${result.status} error=${result.error?.message ?? ""} stderr=${result.stderr.toString("utf8")}`
@@ -128,6 +147,7 @@ function configEnvironment(maxGitTimeoutMs) {
     CODEXPRO_HTTP_TOKEN: undefined,
     CODEBASE_BRIDGE_HTTP_TOKEN: undefined,
     CODEXPRO_CONTEXT_DIR: ".ai-bridge",
+    CODEXPRO_MAX_READ_BYTES: "180000",
     CODEXPRO_MAX_OUTPUT_BYTES: "120000",
     CODEXPRO_MAX_GIT_TIMEOUT_MS: maxGitTimeoutMs
   };
@@ -148,11 +168,24 @@ async function expectFailure(operation, expectedFailure) {
   }
 }
 
+async function expectInvalidStdoutOverride(options, label) {
+  try {
+    await runGitReadOnly(runnerConfig, workspace, ["runner-invalid-stdout-override"], options);
+    assert.fail(`expected invalid stdout override to fail (${label})`);
+  } catch (error) {
+    assert.ok(error instanceof CodexProError, `expected bounded CodexProError for ${label}`);
+    assert.equal(error instanceof GitExecutionError, false, `${label} unexpectedly spawned Git`);
+    assert.ok(error.message.length < 200, `${label} error was not bounded`);
+  }
+}
+
 function assertBoundedResult(result, cap) {
   assert.ok(result && typeof result.stdout === "string");
   assert.ok(result && typeof result.stderr === "string");
-  assert.ok(Buffer.byteLength(result.stdout, "utf8") <= cap);
-  assert.ok(Buffer.byteLength(result.stderr, "utf8") <= cap);
+  assert.equal(typeof result.copyStdoutBytes, "function");
+  assert.equal(typeof result.copyStderrBytes, "function");
+  assert.ok(result.copyStdoutBytes().length <= cap);
+  assert.ok(result.copyStderrBytes().length <= cap);
   assert.ok(result.exitCode === null || Number.isInteger(result.exitCode));
 }
 
@@ -162,7 +195,7 @@ function aliasCommand(pidFile, body) {
 
 const baseConfig = await configFor();
 const guard = new PathGuard(baseConfig);
-const runnerConfig = { maxGitTimeoutMs: 3_000, maxOutputBytes: 120_000 };
+const runnerConfig = { maxGitTimeoutMs: 3_000, maxOutputBytes: 120_000, maxReadBytes: 180_000 };
 
 // Build a disposable real repository and capture direct Git observations before
 // interpreting the compiled runner's classifications.
@@ -214,6 +247,103 @@ assert.equal(success.stdoutOverflow, false);
 assert.equal(success.stderrOverflow, false);
 console.log("PASS success captures stdout separately, empty stderr, numeric exit=0, and no timeout/overflow");
 
+// A real local Git blob containing invalid UTF-8 proves that the runner keeps
+// the producer's bytes intact while retaining decoded-string compatibility.
+const invalidUtf8Bytes = Buffer.concat([
+  Buffer.from([0xff, 0xfe, 0x00, 0x80, 0xc3, 0x28]),
+  Buffer.from("RUNNER_RAW_BYTES_SENTINEL", "utf8")
+]);
+const invalidUtf8Blob = text(mustGit(["hash-object", "-w", "--stdin"], { input: invalidUtf8Bytes }).stdout).trim();
+const invalidUtf8Result = await runGitReadOnly(runnerConfig, workspace, ["cat-file", "blob", invalidUtf8Blob]);
+assert.equal(invalidUtf8Result.exitCode, 0);
+assert.equal(Buffer.isBuffer(invalidUtf8Result.stdout), false);
+assert.equal(invalidUtf8Result.stdout.includes("RUNNER_RAW_BYTES_SENTINEL"), true);
+assert.deepEqual(invalidUtf8Result.copyStdoutBytes(), invalidUtf8Bytes);
+const firstCopy = invalidUtf8Result.copyStdoutBytes();
+const secondCopy = invalidUtf8Result.copyStdoutBytes();
+firstCopy[0] ^= 0xff;
+assert.deepEqual(secondCopy, invalidUtf8Bytes);
+assert.deepEqual(invalidUtf8Result.copyStdoutBytes(), invalidUtf8Bytes);
+const invalidJson = JSON.stringify(invalidUtf8Result);
+const invalidSpreadJson = JSON.stringify({ ...invalidUtf8Result });
+assert.equal(invalidJson.includes("RUNNER_RAW_BYTES_SENTINEL"), false);
+assert.equal(invalidJson.includes(invalidUtf8Bytes.toString("hex")), false);
+assert.equal(invalidSpreadJson.includes("RUNNER_RAW_BYTES_SENTINEL"), false);
+assert.equal("stdout" in { ...invalidUtf8Result }, false);
+assert.equal("stderr" in { ...invalidUtf8Result }, false);
+assert.equal(Object.values({ ...invalidUtf8Result }).some((value) => Buffer.isBuffer(value)), false);
+const invalidSummary = invalidUtf8Result.toJSON();
+assert.equal(invalidSummary.stdoutBytes, invalidUtf8Bytes.length);
+assert.equal(invalidSummary.stderrBytes, 0);
+assert.equal("stdout" in invalidSummary, false);
+assert.equal("stderr" in invalidSummary, false);
+console.log(`PASS explicit byte copies preserve invalid UTF-8 (${invalidUtf8Bytes.length} bytes); strings and serialization expose no raw sentinel`);
+
+// The read budget may authorize a larger stdout cap for a historical blob,
+// while stderr remains independently constrained by maxOutputBytes.
+const exactStdoutAlias = "runner-stdout-exact-read-cap";
+const exactStdoutBytes = 180_000;
+mustGit(["config", `alias.${exactStdoutAlias}`, aliasCommand(path.join(fixtureRoot, "stdout-exact.pid"), `dd if=/dev/zero bs=${exactStdoutBytes} count=1 2>/dev/null`)]);
+const defaultStdout = await expectFailure(() => runGitReadOnly(runnerConfig, workspace, [exactStdoutAlias]), "stdout-overflow");
+assert.equal(defaultStdout.result.copyStdoutBytes().length, runnerConfig.maxOutputBytes);
+assert.equal(defaultStdout.result.stdoutOverflow, true);
+console.log(`PASS default stdout cap remains maxOutputBytes=${runnerConfig.maxOutputBytes} when maxReadBytes is larger`);
+const exactStdout = await runGitReadOnly(runnerConfig, workspace, [exactStdoutAlias], { stdoutMaxBytes: exactStdoutBytes });
+assert.equal(exactStdout.exitCode, 0);
+assert.equal(exactStdout.stdoutOverflow, false);
+assert.equal(exactStdout.copyStdoutBytes().length, exactStdoutBytes);
+console.log(`PASS stdout override admits exact ${exactStdoutBytes}-byte output with no overflow`);
+
+const beyondStdoutAlias = "runner-stdout-one-byte-beyond-read-cap";
+mustGit(["config", `alias.${beyondStdoutAlias}`, aliasCommand(path.join(fixtureRoot, "stdout-beyond.pid"), `dd if=/dev/zero bs=${exactStdoutBytes + 1} count=1 2>/dev/null`)]);
+const beyondStdout = await expectFailure(
+  () => runGitReadOnly(runnerConfig, workspace, [beyondStdoutAlias], { stdoutMaxBytes: exactStdoutBytes }),
+  "stdout-overflow"
+);
+assert.equal(beyondStdout.result.copyStdoutBytes().length, exactStdoutBytes);
+assert.equal(beyondStdout.result.stdoutOverflow, true);
+console.log(`PASS first byte beyond exact stdout override marks overflow at ${exactStdoutBytes} bytes`);
+
+const stderrBeyondOutputAlias = "runner-stderr-one-byte-beyond-output-cap";
+const stderrOutputCap = 120_000;
+mustGit([
+  "config",
+  `alias.${stderrBeyondOutputAlias}`,
+  aliasCommand(path.join(fixtureRoot, "stderr-beyond-output.pid"), `dd if=/dev/zero bs=${stderrOutputCap + 1} count=1 1>&2 2>/dev/null`)
+]);
+const stderrBeyondOutput = await expectFailure(
+  () => runGitReadOnly(runnerConfig, workspace, [stderrBeyondOutputAlias], { stdoutMaxBytes: exactStdoutBytes }),
+  "stderr-overflow"
+);
+assert.equal(stderrBeyondOutput.result.stdoutOverflow, false);
+assert.equal(stderrBeyondOutput.result.stderrOverflow, true);
+assert.equal(stderrBeyondOutput.result.copyStdoutBytes().length, 0);
+assert.equal(stderrBeyondOutput.result.copyStderrBytes().length, stderrOutputCap);
+console.log(`PASS stderr remains independently limited to maxOutputBytes=${stderrOutputCap}`);
+
+mustGit(["config", "alias.runner-empty-output", "!true"]);
+const emptyOutput = await runGitReadOnly(runnerConfig, workspace, ["runner-empty-output"], { stdoutMaxBytes: 0 });
+assert.equal(emptyOutput.exitCode, 0);
+assert.equal(emptyOutput.stdout, "");
+assert.equal(emptyOutput.copyStdoutBytes().length, 0);
+assert.equal(emptyOutput.stdoutOverflow, false);
+console.log("PASS zero stdout cap succeeds for an empty producer");
+
+const invalidOverrideMarker = path.join(fixtureRoot, "invalid-stdout-override-spawned");
+mustGit(["config", "alias.runner-invalid-stdout-override", aliasCommand(invalidOverrideMarker, "true")]);
+for (const [options, label] of [
+  [{ stdoutMaxBytes: -1 }, "negative"],
+  [{ stdoutMaxBytes: 1.5 }, "noninteger"],
+  [{ stdoutMaxBytes: Number.NaN }, "nan"],
+  [{ stdoutMaxBytes: Number.POSITIVE_INFINITY }, "infinite"],
+  [{ stdoutMaxBytes: exactStdoutBytes + 1 }, "above-ceiling"],
+  [{ stdoutMaxBytes: "180000" }, "wrong-type"]
+]) {
+  await expectInvalidStdoutOverride(options, label);
+  assert.equal(await exists(invalidOverrideMarker), false, `${label} override spawned Git`);
+}
+console.log("PASS invalid stdout overrides reject as bounded CodexProError before spawn (including above-ceiling)");
+
 const missing = await expectFailure(
   () => runGitReadOnly(runnerConfig, workspace, ["cat-file", "-p", "0000000000000000000000000000000000000000"]),
   "exit"
@@ -254,6 +384,19 @@ const timeoutPid = Number.parseInt(text(await readFile(timeoutPidFile)), 10);
 assert.equal(await processIsAlive(timeoutPid), false);
 assert.equal(await exists(timeoutSurvivor), false);
 console.log(`PASS timeout timedOut=true, producer pid=${timeoutPid} terminated, no survivor marker after grace`);
+
+const secretSentinel = "RUNNER_SECRET_SENTINEL";
+mustGit(["config", "alias.runner-secret-timeout", aliasCommand(path.join(fixtureRoot, "secret-timeout.pid"), `printf "%s" "${secretSentinel}"; sleep 30`)]);
+const secretError = await expectFailure(
+  () => runGitReadOnly({ maxGitTimeoutMs: 1_000, maxOutputBytes: 120_000, maxReadBytes: 180_000 }, workspace, ["runner-secret-timeout"]),
+  "timeout"
+);
+assert.match(secretError.result.stdout, new RegExp(secretSentinel));
+for (const serialized of [JSON.stringify(secretError), JSON.stringify({ ...secretError }), JSON.stringify({ result: secretError.result })]) {
+  assert.equal(serialized.includes(secretSentinel), false, "serialized Git failure leaked captured stdout");
+}
+assert.equal(JSON.stringify(secretError.result.toJSON()).includes(secretSentinel), false);
+console.log("PASS GitExecutionError/result JSON and object spread omit captured raw text and sentinel");
 
 const outputCap = 64;
 const stdoutPidFile = path.join(fixtureRoot, "stdout-overflow.pid");
@@ -312,6 +455,31 @@ assert.equal(noShell.result.timedOut, false);
 assert.equal(await exists(shellSentinel), false);
 console.log("PASS fixed executable and shell=false: metacharacter argv did not create a file");
 
+// The runner fixes lazy-fetch behavior and removes inherited pathspec routing
+// switches before spawning Git. The alias observes the child environment
+// directly, while the parent intentionally supplies contradictory values.
+mustGit([
+  "config",
+  "alias.runner-environment-probe",
+  aliasCommand(
+    path.join(fixtureRoot, "environment-probe.pid"),
+    `printf "%s|%s|%s|%s|%s" "$GIT_NO_LAZY_FETCH" "$GIT_LITERAL_PATHSPECS" "$GIT_GLOB_PATHSPECS" "$GIT_NOGLOB_PATHSPECS" "$GIT_ICASE_PATHSPECS"`
+  )
+]);
+const environmentProbe = await withEnvironment(
+  {
+    GIT_NO_LAZY_FETCH: "0",
+    GIT_LITERAL_PATHSPECS: "1",
+    GIT_GLOB_PATHSPECS: "1",
+    GIT_NOGLOB_PATHSPECS: "1",
+    GIT_ICASE_PATHSPECS: "1"
+  },
+  () => runGitReadOnly(runnerConfig, workspace, ["runner-environment-probe"])
+);
+assert.equal(environmentProbe.stdout, "1||||");
+assert.equal(environmentProbe.stderr, "");
+console.log("PASS child environment forces GIT_NO_LAZY_FETCH=1 and clears inherited pathspec switches");
+
 // Replacement-ref target evidence is collected by ordinary Git before checking
 // the runner's immutable-review result.
 const treeSha = text(mustGit(["rev-parse", "HEAD^{tree}"]).stdout).trim();
@@ -341,6 +509,60 @@ const promptResult = await expectFailure(
 assert.equal(promptResult.result.timedOut, false);
 assert.ok(promptResult.result.stderr.length > 0);
 console.log("PASS offline credential operation returned bounded failure without waiting for terminal prompt");
+
+// Build a real promisor-style repository whose committed blob is then removed.
+// A local remote helper is armed as a sentinel so ordinary Git first proves
+// that this fixture would hydrate, after which the runner must fail locally
+// with GIT_NO_LAZY_FETCH=1 and leave the sentinel untouched.
+const promisorRoot = path.join(fixtureRoot, "promisor-repo");
+await mkdir(promisorRoot);
+mustGitAt(promisorRoot, ["init", "--quiet"]);
+mustGitAt(promisorRoot, ["config", "user.name", "Promisor Smoke"]);
+mustGitAt(promisorRoot, ["config", "user.email", "promisor-smoke@example.test"]);
+const missingObjectPayload = Buffer.from("promisor missing blob payload\n", "utf8");
+await writeFile(path.join(promisorRoot, "missing.txt"), missingObjectPayload);
+mustGitAt(promisorRoot, ["add", "missing.txt"]);
+mustGitAt(promisorRoot, ["commit", "--quiet", "-m", "promisor base commit"]);
+const promisorCommit = text(mustGitAt(promisorRoot, ["rev-parse", "HEAD"]).stdout).trim();
+const missingBlob = text(mustGitAt(promisorRoot, ["rev-parse", "HEAD:missing.txt"]).stdout).trim();
+const objectDirectory = text(mustGitAt(promisorRoot, ["rev-parse", "--git-path", "objects"]).stdout).trim();
+const missingObjectPath = path.resolve(promisorRoot, objectDirectory, missingBlob.slice(0, 2), missingBlob.slice(2));
+assert.equal(await exists(missingObjectPath), true, "fixture blob was not a loose object before removal");
+await rm(missingObjectPath);
+assert.equal(await exists(missingObjectPath), false);
+mustGitAt(promisorRoot, ["config", "extensions.partialClone", "origin"]);
+mustGitAt(promisorRoot, ["config", "remote.origin.promisor", "true"]);
+mustGitAt(promisorRoot, ["config", "remote.origin.partialclonefilter", "blob:none"]);
+
+const helperBin = path.join(fixtureRoot, "promisor-helper-bin");
+const helperSentinel = path.join(fixtureRoot, "promisor-helper-invoked");
+await mkdir(helperBin);
+await writeFile(
+  path.join(helperBin, "git-remote-sentinel"),
+  `#!/bin/sh\nprintf '%s' invoked > '${helperSentinel}'\nexit 1\n`,
+  "utf8"
+);
+await chmod(path.join(helperBin, "git-remote-sentinel"), 0o755);
+mustGitAt(promisorRoot, ["config", "remote.origin.url", `sentinel::${promisorRoot}`]);
+const promisorPath = `${helperBin}:${process.env.PATH ?? ""}`;
+const lazyDirect = await withEnvironment({ GIT_NO_LAZY_FETCH: undefined }, () =>
+  directGitAt(promisorRoot, ["show", `${promisorCommit}:missing.txt`], { env: { PATH: promisorPath } })
+);
+assert.notEqual(lazyDirect.status, 0, "lazy helper fixture unexpectedly returned success");
+assert.equal(await exists(helperSentinel), true, "ordinary Git did not invoke the armed local remote-helper sentinel");
+await rm(helperSentinel);
+console.log("RAW_OBSERVATION: direct Git against the missing promisor blob failed and invoked the armed local helper when lazy fetch was allowed");
+
+const promisorWorkspace = { id: "promisor-smoke", root: promisorRoot, openedAt: new Date().toISOString() };
+const noLazyPromisorError = await withEnvironment(
+  { GIT_NO_LAZY_FETCH: "0", PATH: promisorPath },
+  () => expectFailure(() => runGitReadOnly(runnerConfig, promisorWorkspace, ["show", `${promisorCommit}:missing.txt`]), "exit")
+);
+assert.equal(noLazyPromisorError.result.timedOut, false);
+assert.ok(noLazyPromisorError.result.stderr.length > 0);
+assert.equal(await exists(helperSentinel), false, "runner invoked the remote-helper sentinel despite GIT_NO_LAZY_FETCH=1");
+console.log("SANITY_VERDICT: MATCH (real missing-object reviewer command failed locally; no helper sentinel was created by the runner)");
+console.log("PASS GIT_NO_LAZY_FETCH=1 prevents lazy hydration for the real promisor/missing-object fixture");
 
 const finalHead = text(mustGit(["rev-parse", "HEAD"]).stdout).trim();
 assert.equal(finalHead, initialSha);

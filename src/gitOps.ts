@@ -4,14 +4,65 @@ import type { Workspace } from "./guard.js";
 import { CodexProError, PathGuard } from "./guard.js";
 import { redactDiagnosticText, redactSensitiveText, redactUnifiedDiff, sourceLanguageForPath, type SourceLanguage } from "./redact.js";
 
-export interface GitExecutionResult {
-  stdout: string;
-  stderr: string;
-  exitCode: number | null;
-  signal: NodeJS.Signals | null;
-  timedOut: boolean;
-  stdoutOverflow: boolean;
-  stderrOverflow: boolean;
+export interface GitExecutionResultSummary {
+  readonly exitCode: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly timedOut: boolean;
+  readonly stdoutOverflow: boolean;
+  readonly stderrOverflow: boolean;
+  readonly stdoutBytes: number;
+  readonly stderrBytes: number;
+}
+
+/**
+ * A bounded Git result whose raw streams stay private until a caller asks for
+ * an explicit copy. The string getters retain the old runner compatibility
+ * surface, while the serialization surface contains only status/count facts.
+ */
+export class GitExecutionResult {
+  #stdout: Buffer;
+  #stderr: Buffer;
+
+  constructor(
+    stdout: Buffer,
+    stderr: Buffer,
+    readonly exitCode: number | null,
+    readonly signal: NodeJS.Signals | null,
+    readonly timedOut: boolean,
+    readonly stdoutOverflow: boolean,
+    readonly stderrOverflow: boolean
+  ) {
+    this.#stdout = Buffer.from(stdout);
+    this.#stderr = Buffer.from(stderr);
+  }
+
+  get stdout(): string {
+    return this.#stdout.toString("utf8");
+  }
+
+  get stderr(): string {
+    return this.#stderr.toString("utf8");
+  }
+
+  copyStdoutBytes(): Buffer {
+    return Buffer.from(this.#stdout);
+  }
+
+  copyStderrBytes(): Buffer {
+    return Buffer.from(this.#stderr);
+  }
+
+  toJSON(): GitExecutionResultSummary {
+    return {
+      exitCode: this.exitCode,
+      signal: this.signal,
+      timedOut: this.timedOut,
+      stdoutOverflow: this.stdoutOverflow,
+      stderrOverflow: this.stderrOverflow,
+      stdoutBytes: this.#stdout.length,
+      stderrBytes: this.#stderr.length
+    };
+  }
 }
 
 export type GitExecutionFailure = "spawn" | "exit" | "signal" | "timeout" | "stdout-overflow" | "stderr-overflow";
@@ -30,6 +81,16 @@ export class GitExecutionError extends CodexProError {
     super(`Git reviewer execution failed (${failure}).`);
     this.name = "GitExecutionError";
   }
+
+  toJSON(): object {
+    return {
+      name: this.name,
+      message: this.message,
+      failure: this.failure,
+      spawnErrorCode: this.spawnErrorCode,
+      result: this.result.toJSON()
+    };
+  }
 }
 
 const GIT_REVIEWER_GLOBAL_ARGS = ["--no-replace-objects", "--no-pager", "-c", "color.ui=false"] as const;
@@ -43,13 +104,18 @@ const GIT_ENVIRONMENT_ROUTING_KEYS = [
   "GIT_NAMESPACE",
   "GIT_ATTR_SOURCE",
   "GIT_PREFIX",
-  "GIT_CONFIG"
+  "GIT_CONFIG",
+  "GIT_LITERAL_PATHSPECS",
+  "GIT_GLOB_PATHSPECS",
+  "GIT_NOGLOB_PATHSPECS",
+  "GIT_ICASE_PATHSPECS"
 ] as const;
 
 function gitReviewerEnvironment(): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
     ...process.env,
     GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_NO_LAZY_FETCH: "1",
     GIT_OPTIONAL_LOCKS: "0",
     GIT_TERMINAL_PROMPT: "0",
     GIT_PAGER: "cat",
@@ -87,6 +153,10 @@ class BoundedGitOutput {
 
   text(): string {
     return this.bytes.subarray(0, this.length).toString("utf8");
+  }
+
+  copyBytes(): Buffer {
+    return Buffer.from(this.bytes.subarray(0, this.length));
   }
 }
 
@@ -132,15 +202,20 @@ function gitExecutionFailure(
  * the bounded, separately captured result on the error.
  */
 export async function runGitReadOnly(
-  config: Pick<CodexProConfig, "maxGitTimeoutMs" | "maxOutputBytes">,
+  config: Pick<CodexProConfig, "maxGitTimeoutMs" | "maxOutputBytes"> &
+    Partial<Pick<CodexProConfig, "maxReadBytes">>,
   workspace: Workspace,
-  args: readonly string[]
+  args: readonly string[],
+  options?: { readonly stdoutMaxBytes?: number }
 ): Promise<GitExecutionResult> {
   const maxOutputBytes = Number.isFinite(config.maxOutputBytes) ? Math.max(1, Math.floor(config.maxOutputBytes)) : 1;
+  const maxReadBytes = Number.isFinite(config.maxReadBytes) ? Math.max(0, Math.floor(config.maxReadBytes as number)) : undefined;
+  const stdoutCeiling = Math.max(maxOutputBytes, maxReadBytes ?? 0);
+  const stdoutMaxBytes = stdoutLimit(options, maxOutputBytes, stdoutCeiling);
   const timeoutMs = Number.isFinite(config.maxGitTimeoutMs)
     ? Math.max(1, Math.min(300_000, Math.floor(config.maxGitTimeoutMs)))
     : 60_000;
-  const stdout = new BoundedGitOutput(maxOutputBytes);
+  const stdout = new BoundedGitOutput(stdoutMaxBytes);
   const stderr = new BoundedGitOutput(maxOutputBytes);
 
   return new Promise((resolve, reject) => {
@@ -190,15 +265,15 @@ export async function runGitReadOnly(
       closed = true;
       clearTimeout(timeoutTimer);
       if (escalationTimer) clearTimeout(escalationTimer);
-      const result: GitExecutionResult = {
-        stdout: stdout.text(),
-        stderr: stderr.text(),
-        exitCode: spawnError ? null : exitCode,
+      const result = new GitExecutionResult(
+        stdout.copyBytes(),
+        stderr.copyBytes(),
+        spawnError ? null : exitCode,
         signal,
         timedOut,
-        stdoutOverflow: stdout.overflow,
-        stderrOverflow: stderr.overflow
-      };
+        stdout.overflow,
+        stderr.overflow
+      );
       const failure = gitExecutionFailure(result, spawnError);
       if (failure) {
         reject(new GitExecutionError(result, failure, spawnError?.code));
@@ -207,6 +282,26 @@ export async function runGitReadOnly(
       }
     });
   });
+}
+
+function stdoutLimit(
+  options: { readonly stdoutMaxBytes?: number } | undefined,
+  defaultLimit: number,
+  ceiling: number
+): number {
+  if (options === undefined) return defaultLimit;
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    throw new CodexProError("Git reviewer stdout limit override is invalid.");
+  }
+  const override = options.stdoutMaxBytes;
+  if (override === undefined) return defaultLimit;
+  if (!Number.isInteger(override) || override < 0) {
+    throw new CodexProError("Git reviewer stdout limit override is invalid.");
+  }
+  if (override > ceiling) {
+    throw new CodexProError("Git reviewer stdout limit override exceeds its authorized ceiling.");
+  }
+  return override;
 }
 
 function runGit(
