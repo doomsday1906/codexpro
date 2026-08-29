@@ -32,6 +32,21 @@ export interface ReadFileResult {
   truncated: boolean;
 }
 
+export interface PublicSourceProjectionInput {
+  /** Canonical repository-relative path used for source-language selection. */
+  logicalPath: string;
+  /** Complete decoded raw source snapshot, before any line-window selection. */
+  text: string;
+  /** Exact byte count for the complete source snapshot, supplied by acquisition. */
+  bytes: number;
+  /** Exact full-file SHA-256 metadata, supplied by acquisition. */
+  sha256: string;
+  startLine?: number;
+  endLine?: number;
+  /** Effective max-byte limit for this projection, after caller/config caps. */
+  maxBytes?: number;
+}
+
 export interface DiffResult {
   diff: string;
   additions: number;
@@ -174,6 +189,13 @@ interface LoadedTextFile {
   allLines: string[];
 }
 
+interface ReadFileWindowSnapshot {
+  path: string;
+  allLines: string[];
+  bytes: number;
+  sha256: string;
+}
+
 async function loadTextFile(
   config: CodexProConfig,
   guard: PathGuard,
@@ -191,14 +213,14 @@ async function loadTextFile(
 }
 
 function readFileWindow(
-  loaded: LoadedTextFile,
+  snapshot: ReadFileWindowSnapshot,
   options: { startLine?: number; endLine?: number; maxBytes?: number },
-  lines = loaded.allLines,
-  budgetLines = loaded.allLines
+  lines = snapshot.allLines,
+  budgetLines = snapshot.allLines
 ): ReadFileResult {
   const maxBytes = options.maxBytes;
   const hasRange = options.startLine !== undefined || options.endLine !== undefined;
-  const totalLines = loaded.allLines.length;
+  const totalLines = snapshot.allLines.length;
   const startLine = Math.max(1, Math.floor(options.startLine ?? 1));
   const endLine = Math.min(totalLines, Math.floor(options.endLine ?? totalLines));
   if (endLine < startLine) {
@@ -214,15 +236,43 @@ function readFileWindow(
     throw new CodexProError(`Selected line range is too large. Limit: ${maxBytes} bytes.`);
   }
   return {
-    path: loaded.resolved.relPath,
+    path: snapshot.path,
     text: numbered,
     startLine,
     endLine,
     totalLines,
-    bytes: loaded.buffer.byteLength,
-    sha256: sha256(loaded.text),
+    bytes: snapshot.bytes,
+    sha256: snapshot.sha256,
     truncated: startLine > 1 || endLine < totalLines
   };
+}
+
+/**
+ * Build the public source projection from one complete source snapshot. The
+ * complete snapshot is redacted before line-window framing so declarations or
+ * syntax outside a requested range can still influence source policy.
+ */
+export function projectPublicSourceText(input: PublicSourceProjectionInput): ReadFileResult {
+  const rawLines = splitLines(input.text);
+  const redactedLines = splitLines(redactSensitiveTextPreservingLines(input.text, {
+    context: "source",
+    language: sourceLanguageForPath(input.logicalPath)
+  }));
+  return readFileWindow(
+    {
+      path: input.logicalPath,
+      allLines: rawLines,
+      bytes: input.bytes,
+      sha256: input.sha256
+    },
+    {
+      startLine: input.startLine,
+      endLine: input.endLine,
+      maxBytes: input.maxBytes
+    },
+    redactedLines,
+    rawLines
+  );
 }
 
 export function makeUnifiedDiff(oldText: string, newText: string, relPath: string, maxChars = 60_000): DiffResult {
@@ -731,15 +781,17 @@ export async function readTextFile(
 ): Promise<ReadFileResult> {
   const loaded = await loadTextFile(config, guard, workspace, filePath, options);
   const maxBytes = Math.min(options.maxBytes ?? config.maxReadBytes, config.maxReadBytes);
-  return readFileWindow(loaded, { ...options, maxBytes });
+  return readFileWindow(
+    {
+      path: loaded.resolved.relPath,
+      allLines: loaded.allLines,
+      bytes: loaded.buffer.byteLength,
+      sha256: sha256(loaded.text)
+    },
+    { ...options, maxBytes }
+  );
 }
 
-/**
- * Build the public read projection from one complete source snapshot. The
- * raw readTextFile primitive remains unchanged for internal callers; public
- * handlers use this variant so source-sensitive policy sees declarations and
- * syntax outside the requested line range before framing the response.
- */
 export async function readPublicTextFile(
   config: CodexProConfig,
   guard: PathGuard,
@@ -749,11 +801,15 @@ export async function readPublicTextFile(
 ): Promise<ReadFileResult> {
   const loaded = await loadTextFile(config, guard, workspace, filePath, options);
   const maxBytes = Math.min(options.maxBytes ?? config.maxReadBytes, config.maxReadBytes);
-  const redactedLines = splitLines(redactSensitiveTextPreservingLines(loaded.text, {
-    context: "source",
-    language: sourceLanguageForPath(loaded.resolved.relPath)
-  }));
-  return readFileWindow(loaded, { ...options, maxBytes }, redactedLines, loaded.allLines);
+  return projectPublicSourceText({
+    logicalPath: loaded.resolved.relPath,
+    text: loaded.text,
+    bytes: loaded.buffer.byteLength,
+    sha256: sha256(loaded.text),
+    startLine: options.startLine,
+    endLine: options.endLine,
+    maxBytes
+  });
 }
 
 export async function writeTextFile(
