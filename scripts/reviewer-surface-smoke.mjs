@@ -195,13 +195,37 @@ function assertNoRaw(value, literals, label) {
 
 function assertHostileEnvelope(result, literals, label) {
   assertNoRaw(result, literals, `${label} complete response`);
-  const envelope = result?.result ?? result;
+  const rawResponse = result?.rawResponse ?? result?.response;
+  assertNoRaw(rawResponse, literals, `${label} complete raw JSON-RPC response`);
+  const protocolError = result?.protocolErrorObject ?? rawResponse?.error;
+  assertNoRaw(protocolError, literals, `${label} protocol error`);
+  assertNoRaw(protocolError?.data, literals, `${label} protocol error data`);
+  assertNoRaw(protocolError?.message, literals, `${label} protocol error message`);
+  const envelope = result?.result ?? rawResponse?.result ?? result;
   assertNoRaw(envelope, literals, `${label} MCP result`);
   assertNoRaw(envelope?.content, literals, `${label} content`);
   assertNoRaw(envelope?.structuredContent, literals, `${label} structuredContent`);
   assertNoRaw(envelope?._meta, literals, `${label} _meta`);
   assertNoRaw(result?.text, literals, `${label} protocol text`);
 }
+
+// Supporting self-falsifier: a secret that exists only under protocol
+// error.data must make the hostile-envelope assertion fail.
+const DATA_ONLY_PROTOCOL_SECRET = "DATA_ONLY_PROTOCOL_ERROR_SECRET_7X9";
+assert.throws(
+  () => assertHostileEnvelope({
+    protocolError: true,
+    result: null,
+    text: "safe protocol error",
+    rawResponse: {
+      jsonrpc: "2.0",
+      id: 1,
+      error: { code: -32602, message: "safe protocol error", data: { detail: DATA_ONLY_PROTOCOL_SECRET } }
+    }
+  }, [DATA_ONLY_PROTOCOL_SECRET], "supporting data-only protocol envelope"),
+  /leaked raw literal DATA_ONLY_PROTOCOL_ERROR_SECRET_7X9/u
+);
+console.log("SUPPORTING_FALSIFIER: data-only protocol error literal is caught by complete-envelope/error.data scanning.");
 
 function resultText(result) {
   return result?.content?.find?.((part) => part.type === "text")?.text ?? serialized(result?.structuredContent ?? result);
@@ -264,8 +288,18 @@ class McpStdioClient {
       const { resolve, reject, timer } = this.pending.get(message.id);
       clearTimeout(timer);
       this.pending.delete(message.id);
-      if (message.error) reject(new Error(message.error.message));
-      else resolve(message.result);
+      if (message.error) {
+        const error = new Error(message.error.message ?? "MCP protocol error");
+        error.name = "McpProtocolError";
+        error.code = message.error.code;
+        error.data = message.error.data;
+        error.id = message.id;
+        error.jsonrpc = message.jsonrpc;
+        error.error = message.error;
+        error.response = message;
+        error.rawResponse = message;
+        reject(error);
+      } else resolve(message);
     }
   }
 
@@ -299,21 +333,29 @@ class McpStdioClient {
 
 async function startClient(defaultRoot, targetParent, targetRoot, mode, environment = {}) {
   const client = new McpStdioClient(defaultRoot, targetParent, targetRoot, mode, environment);
-  const initialize = await client.request("initialize", {
+  const initializeResponse = await client.request("initialize", {
     protocolVersion: "2024-11-05",
     capabilities: {},
     clientInfo: { name: "reviewer-surface-smoke", version: "1.0.0" }
   });
   client.notify("notifications/initialized");
-  return { client, initialize };
+  return { client, initialize: initializeResponse.result, initializeResponse };
 }
 
 async function callTool(client, name, args) {
   try {
-    const result = await client.request("tools/call", { name, arguments: args });
-    return { protocolError: false, result, text: resultText(result) };
+    const rawResponse = await client.request("tools/call", { name, arguments: args });
+    const result = rawResponse.result;
+    return { protocolError: false, result, rawResponse, text: resultText(result) };
   } catch (error) {
-    return { protocolError: true, result: null, text: error instanceof Error ? error.message : String(error) };
+    const rawResponse = error?.rawResponse ?? error?.response ?? null;
+    return {
+      protocolError: true,
+      result: null,
+      rawResponse,
+      protocolErrorObject: rawResponse?.error ?? error?.error ?? null,
+      text: error instanceof Error ? error.message : String(error)
+    };
   }
 }
 
@@ -537,6 +579,8 @@ try {
   assert.equal(directEntryBlob(targetRoot, oversizedEntry).includes(Buffer.from(OVERSIZED_SECRET, "utf8")), true);
   assert.deepEqual(directEntryBlob(targetRoot, rangeEntry), rangeBytes);
   assert.equal(rangeBytes.byteLength <= 4_000, true);
+  assert.equal(oversizedBytes.byteLength, oversizedEntry.size);
+  assert.equal(oversizedBytes.byteLength > 4_000, true);
   assert.equal(rootCommit.parents.length, 0);
   assert.equal(mergeCommit.parents.length, 2);
   assert.deepEqual(directBases, [linearSha]);
@@ -596,7 +640,7 @@ try {
   console.log(`TARGET_EVIDENCE: direct Git object database/filesystem fixture observations plus complete serialized MCP response envelopes and native commands.`);
   console.log(`RAW_OBSERVATION: default HEAD=${defaultSha} contains ${DEFAULT_SENTINEL}; target root=${rootSha}, linear=${linearSha}, side=${sideSha}, main=${mainSha}, merge=${mergeSha}, object-format=${targetObjectFormat}.`);
   console.log(`RAW_OBSERVATION: root parents=${JSON.stringify(rootCommit.parents)}, merge parents=${JSON.stringify(mergeCommit.parents)}, unique base=${JSON.stringify(directBases)}, criss-cross bases=${JSON.stringify(directCrissBases)}, unrelated=${unrelated}.`);
-  console.log(`RAW_OBSERVATION: deleted/renamed historical entries are root-only; symlink mode/type=${symlinkEntry.mode}/${symlinkEntry.type} and raw target bytes are ${symlinkTargetPath}; binary has NUL; oversized bytes=${oversizedEntry.size}.`);
+  console.log(`RAW_OBSERVATION: deleted/renamed historical entries are root-only; symlink mode/type=${symlinkEntry.mode}/${symlinkEntry.type} and raw target bytes are ${symlinkTargetPath}; binary has NUL; oversized bytes=${oversizedEntry.size} > configured max 4000; range blob bytes=${rangeBytes.byteLength}.`);
   console.log(`RAW_OBSERVATION: raw private source contains ${SOURCE_SECRET}; raw root subject/body contain secret-looking literals; .env/credentials contain ${BLOCKED_SECRET}; tab/newline names are present in the direct tree.`);
   console.log("PREDICATE: TRUE — direct Git/tree facts establish every target condition before interpreting any public response: root/linear/divergent/merge, tags, old paths, source secret, blocked paths, symlink, binary, oversized, dirty-state capacity, and hostile messages.");
   console.log("SANITY_VERDICT: MATCH — raw target facts and accepted authority agree on the required public observable distinctions; implementation labels and test verdicts have not been used as raw evidence.");
@@ -606,7 +650,8 @@ try {
   // fixture setup outside the immutable before/after window.
   const fullSession = await startClient(defaultRoot, targetParent, targetRoot, "full");
   firstClient = fullSession.client;
-  const firstListing = await firstClient.request("tools/list", {});
+  const firstListingResponse = await firstClient.request("tools/list", {});
+  const firstListing = firstListingResponse.result;
   const firstNames = (firstListing.tools ?? []).map((tool) => tool.name);
   for (const name of REVIEW_TOOLS) assert.equal(firstNames.includes(name), true, `full mode omitted ${name}`);
   const firstByName = new Map((firstListing.tools ?? []).map((tool) => [tool.name, tool]));
@@ -629,7 +674,8 @@ try {
   for (const mode of ["standard", "minimal"]) {
     const session = await startClient(defaultRoot, targetParent, targetRoot, mode);
     try {
-      const listing = await session.client.request("tools/list", {});
+      const listingResponse = await session.client.request("tools/list", {});
+      const listing = listingResponse.result;
       const names = (listing.tools ?? []).map((tool) => tool.name);
       assert.equal(names.some((name) => REVIEW_TOOLS.includes(name)), false, `${mode} exposed full-only reviewer tool`);
     } finally {
@@ -684,7 +730,7 @@ try {
   assert.equal(resolveHead.full_sha, mergeSha);
   assert.equal(resolveHead.short_sha, mergeSha.slice(0, 12));
   assert.equal(resolveHead.object_format, targetObjectFormat);
-  assertHostileEnvelope(resolveHeadResult, targetLiterals, "resolve target");
+  assertHostileEnvelope(resolveHeadOut, targetLiterals, "resolve target");
 
   for (const [ref, expected] of [["root-lightweight", rootSha], ["root-annotated", rootSha], [rootSha, rootSha]]) {
     const result = expectSuccess(await callTool(secondClient, "git_resolve_ref", { workspace_id: workspaceId, ref }), `resolve ${ref}`).structuredContent;
@@ -726,7 +772,7 @@ try {
   assert.deepEqual(log.commits[0].parents, directParents(targetRoot, mergeSha));
   assert.equal(log.commits.some((commit) => commit.full_sha === rootSha), true);
   assert.equal(log.commits.some((commit) => commit.subject.includes(COMMIT_SECRET)), false);
-  assertHostileEnvelope(logResult, [COMMIT_SECRET, BODY_SECRET, DEFAULT_SENTINEL], "git_log hostile messages");
+  assertHostileEnvelope(logOutput, [COMMIT_SECRET, BODY_SECRET, DEFAULT_SENTINEL], "git_log hostile messages");
   assert.equal(await pathExists(traceDir), true, "hostile trace destination directory disappeared during public call");
   for (const tracePath of Object.values(tracePaths)) assert.equal(await pathExists(tracePath), false, `public Git call created hostile trace artifact: ${tracePath}`);
   console.log("PASS sealed Git environment: the same hostile shallow/trace variables yielded complete direct-equivalent public history and zero trace-file writes.");
@@ -752,7 +798,7 @@ try {
   assert.match(`${shownRoot.subject}\n${shownRoot.body}`, /\[REDACTED_SECRET\]/u);
   assert.equal(shownRoot.message_bytes, rootCommit.messageBytes);
   assert.equal(shownRoot.message_truncated, false);
-  assertHostileEnvelope(shownRootResult, [COMMIT_SECRET, BODY_SECRET, DEFAULT_SENTINEL], "git_show_commit hostile message");
+  assertHostileEnvelope(shownRootOut, [COMMIT_SECRET, BODY_SECRET, DEFAULT_SENTINEL], "git_show_commit hostile message");
   const shownMerge = expectSuccess(await callTool(secondClient, "git_show_commit", { workspace_id: workspaceId, ref: mergeSha }), "show merge commit").structuredContent;
   assert.deepEqual(shownMerge.parents, mergeCommit.parents);
   assert.equal(shownMerge.is_merge, true);
@@ -787,7 +833,7 @@ try {
   assert.equal(privateResult.structuredContent.blob_sha, privateEntry.oid);
   assert.equal(privateResult.structuredContent.bytes, privateBytes.byteLength);
   assert.equal(privateResult.structuredContent.sha256, sha256(privateBytes));
-  assertHostileEnvelope(privateResult, [SOURCE_SECRET, DEFAULT_SENTINEL], "read private source");
+  assertHostileEnvelope(privateOutput, [SOURCE_SECRET, DEFAULT_SENTINEL], "read private source");
   assert.equal(rootBlobSha, deletedEntry.oid);
   const symlinkResult = expectSuccess(await callTool(secondClient, "read_at_ref", { workspace_id: workspaceId, ref: rootSha, path: symlinkPath }), "read historical symlink").structuredContent;
   assert.equal(symlinkResult.entry_kind, "symlink");
@@ -795,6 +841,44 @@ try {
   assert.equal(symlinkResult.text, numberLines(Buffer.from(symlinkTargetPath, "utf8")));
   assert.equal(symlinkResult.text.includes("SYMLINK_TARGET_SECRET_7X9"), false);
   console.log("PASS historical source: deleted/renamed/Unicode/space/leading-dash/hidden paths, complete metadata, typed source redaction, and symlink target-text semantics match direct tree facts.");
+
+  const unRangedWithinOutput = await callTool(secondClient, "read_at_ref", {
+    workspace_id: workspaceId,
+    ref: rootSha,
+    path: rangePath,
+    max_bytes: rangeBytes.byteLength
+  });
+  const unRangedWithinResult = expectSuccess(unRangedWithinOutput, "un-ranged historical blob within max_bytes");
+  const unRangedWithinData = unRangedWithinResult.structuredContent;
+  assertPublicEnvelope(unRangedWithinData, workspaceId, targetCanonicalRoot, "un-ranged historical blob");
+  assert.equal(unRangedWithinData.commit_sha, rootSha);
+  assert.equal(unRangedWithinData.path, rangePath);
+  assert.equal(unRangedWithinData.text, numberLines(rangeBytes));
+  assert.equal(unRangedWithinData.start_line, 1);
+  assert.equal(unRangedWithinData.end_line, 4);
+  assert.equal(unRangedWithinData.total_lines, 4);
+  assert.equal(unRangedWithinData.bytes, rangeBytes.byteLength);
+  assert.equal(unRangedWithinData.sha256, sha256(rangeBytes));
+  assert.equal(unRangedWithinData.blob_sha, rangeEntry.oid);
+  assert.equal(unRangedWithinData.truncated, false);
+  assertHostileEnvelope(unRangedWithinOutput, [DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], "un-ranged historical blob");
+  const unRangedBelowOutput = await callTool(secondClient, "read_at_ref", {
+    workspace_id: workspaceId,
+    ref: rootSha,
+    path: rangePath,
+    max_bytes: 16
+  });
+  expectError(unRangedBelowOutput, "un-ranged historical blob below requested max_bytes");
+  assertHostileEnvelope(unRangedBelowOutput, [DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], "un-ranged historical blob below requested max_bytes");
+  const unRangedOversizedOutput = await callTool(secondClient, "read_at_ref", {
+    workspace_id: workspaceId,
+    ref: rootSha,
+    path: "oversized.txt",
+    max_bytes: 4_000
+  });
+  expectError(unRangedOversizedOutput, "un-ranged historical blob over max_bytes");
+  assertHostileEnvelope(unRangedOversizedOutput, [OVERSIZED_SECRET, DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], "un-ranged historical blob over max_bytes");
+  console.log("PASS un-ranged historical max_bytes: real blob at its exact requested limit returns full metadata, while smaller requested and configured limits fail before projection.");
 
   const selectedRangeBytes = Buffer.from("range second", "utf8");
   const selectedRangeText = numberLines(selectedRangeBytes, 2);
@@ -824,7 +908,7 @@ try {
   assert.equal(rangeData.sha256, sha256(rangeBytes));
   assert.equal(rangeData.blob_sha, rangeEntry.oid);
   assert.equal(rangeData.truncated, true);
-  assertHostileEnvelope(rangeResult, [DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], "historical range");
+  assertHostileEnvelope(rangeOutput, [DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], "historical range");
   const tooSmallRangeOutput = await callTool(secondClient, "read_at_ref", {
     workspace_id: workspaceId,
     ref: rootSha,
