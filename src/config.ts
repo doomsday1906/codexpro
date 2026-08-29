@@ -31,6 +31,7 @@ export interface CodexProConfig {
   maxWriteBytes: number;
   maxOutputBytes: number;
   maxBashTimeoutMs: number;
+  maxGitTimeoutMs: number;
   maxImportBytes: number;
   maxSearchResults: number;
   maxHttpSessions: number;
@@ -327,6 +328,8 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     maxOutputBytes: numberFrom(process.env.CODEXPRO_MAX_OUTPUT_BYTES, 120_000, 4_000, 2_000_000),
     // Default hard cap is 10 minutes. Operators can raise up to 15 minutes.
     maxBashTimeoutMs: numberFrom(process.env.CODEXPRO_MAX_BASH_TIMEOUT_MS, 600_000, 1_000, 900_000),
+    // Historical reviewer Git calls get a separate 60-second cap, never above 5 minutes.
+    maxGitTimeoutMs: numberFrom(process.env.CODEXPRO_MAX_GIT_TIMEOUT_MS, 60_000, 1_000, 300_000),
     maxImportBytes: numberFrom(process.env.CODEXPRO_MAX_IMPORT_BYTES, 5_000_000, 1_000, 50_000_000),
     maxSearchResults: numberFrom(process.env.CODEXPRO_MAX_SEARCH_RESULTS, 200, 5, 2_000),
     maxHttpSessions: numberFrom(process.env.CODEXPRO_MAX_HTTP_SESSIONS, 64, 1, 512),
