@@ -1168,3 +1168,124 @@ export const gitDiffRangeMetadata = collectGitDiffRangeMetadata;
 
 /** Alias retained for operation-oriented patch consumers. */
 export const gitDiffRangePatch = collectGitDiffRangePatch;
+
+/**
+ * Public-domain changed-file record. The operation internals deliberately use
+ * camelCase names, while the MCP result contract is locked to snake_case.
+ */
+export interface GitDiffRangeChangedFile {
+  readonly status: GitDiffRangeStatus;
+  readonly old_path: string | null;
+  readonly new_path: string | null;
+  readonly similarity: number | null;
+  readonly additions: number | null;
+  readonly deletions: number | null;
+  readonly binary: boolean;
+}
+
+/**
+ * Exact structured result domain for the integrated historical range
+ * operation. Internal producer-only fields such as eligibleChangedFiles and
+ * renameCopyDetectionComplete are intentionally not part of this type.
+ */
+export interface GitDiffRangeResult {
+  readonly schema_version: 1;
+  readonly workspace_id: string;
+  readonly root: string;
+  readonly comparison_mode: "direct-two-tree";
+  readonly object_format: GitObjectFormat;
+  readonly base_ref_input: string;
+  readonly base_commit_sha: string;
+  readonly head_ref_input: string;
+  readonly head_commit_sha: string;
+  readonly path?: string;
+  readonly changed_file_count: number;
+  readonly eligible_changed_file_count: number;
+  readonly returned_file_count: number;
+  readonly changed_files_truncated: boolean;
+  readonly blocked_files_omitted: number;
+  readonly changed_files: readonly GitDiffRangeChangedFile[];
+  readonly patch: string;
+  readonly patch_requested: boolean;
+  readonly patch_included: boolean;
+  readonly patch_truncated: boolean;
+  readonly patch_bytes: number;
+  readonly patch_limit: number;
+  readonly patch_files_included: number;
+  readonly patch_files_omitted: number;
+  readonly patch_omission_counts: {
+    readonly blocked: number;
+    readonly binary: number;
+    readonly budget: number;
+    readonly too_large: number;
+    readonly file_limit: number;
+    readonly disabled: number;
+  };
+  readonly warnings: readonly string[];
+}
+
+/** Alias for callers that use the operation-oriented result name. */
+export type GitDiffRangeStructuredResult = GitDiffRangeResult;
+
+/**
+ * Project the already-proven metadata and patch engine into the locked public
+ * structured contract. The engine remains the sole producer of changed-file
+ * and patch truth; this layer only adds workspace context and renames fields.
+ */
+export async function gitDiffRange(
+  config: GitDiffRangeConfig,
+  guard: Pick<PathGuard, "isBlockedRelativePath">,
+  workspace: Workspace,
+  options: GitDiffRangePatchOptions
+): Promise<GitDiffRangeResult> {
+  const result = await collectGitDiffRangePatch(config, guard, workspace, options);
+  const warnings = result.changedFilesTruncated
+    ? [...result.warnings, "Changed-file metadata was truncated to the max_files prefix."]
+    : [...result.warnings];
+  return {
+    schema_version: 1,
+    workspace_id: workspace.id,
+    root: workspace.root,
+    comparison_mode: "direct-two-tree",
+    object_format: result.identity.objectFormat,
+    base_ref_input: result.identity.base.input,
+    base_commit_sha: result.identity.base.fullSha,
+    head_ref_input: result.identity.head.input,
+    head_commit_sha: result.identity.head.fullSha,
+    ...(result.identity.path === undefined ? {} : { path: result.identity.path }),
+    changed_file_count: result.changedFileCount,
+    eligible_changed_file_count: result.eligibleChangedFileCount,
+    returned_file_count: result.returnedFileCount,
+    changed_files_truncated: result.changedFilesTruncated,
+    blocked_files_omitted: result.blockedFilesOmitted,
+    changed_files: result.changedFiles.map((record) => ({
+      status: record.status,
+      old_path: record.oldPath,
+      new_path: record.newPath,
+      similarity: record.similarity,
+      additions: record.additions,
+      deletions: record.deletions,
+      binary: record.binary
+    })),
+    patch: result.patch,
+    patch_requested: result.patchRequested,
+    patch_included: result.patchIncluded,
+    patch_truncated: result.patchTruncated,
+    patch_bytes: result.patchBytes,
+    patch_limit: result.patchLimit,
+    patch_files_included: result.patchFilesIncluded,
+    patch_files_omitted: result.patchFilesOmitted,
+    patch_omission_counts: {
+      blocked: result.patchOmissionCounts.blocked,
+      binary: result.patchOmissionCounts.binary,
+      budget: result.patchOmissionCounts.budget,
+      too_large: result.patchOmissionCounts.tooLarge,
+      file_limit: result.patchOmissionCounts.fileLimit,
+      disabled: result.patchOmissionCounts.disabled
+    },
+    warnings: [...new Set(warnings)]
+  };
+}
+
+/** Alias retained for callers that use the collect-oriented operation name. */
+export const collectGitDiffRange = gitDiffRange;

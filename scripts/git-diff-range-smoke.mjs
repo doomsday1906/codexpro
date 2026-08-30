@@ -318,7 +318,8 @@ async function repositoryState(repoRoot, relevantPaths = []) {
     ["unstaged", ["diff", "--binary"]],
     ["status", ["status", "--porcelain=v1", "-z"]],
     ["config", ["config", "--local", "--null", "--list"]],
-    ["remotes", ["remote", "-v"]]
+    ["remotes", ["remote", "-v"]],
+    ["worktrees", ["worktree", "list", "--porcelain"]]
   ]) {
     const result = directGit(repoRoot, args);
     commandFacts[name] = {
@@ -465,7 +466,26 @@ async function makeDivergentFixture() {
   await writeFixture(repoRoot, "right-only.txt", "right\n");
   const rightSha = await commitAll(repoRoot, "right branch");
   const mergeBase = directTrimmed(repoRoot, ["merge-base", leftSha, rightSha]);
-  return { repoRoot, commonSha, leftSha, rightSha, mergeBase };
+  // The moving-ref falsifier needs a symbolic branch ref whose deliberate
+  // test-side update does not create a reflog entry. Disable automatic ref
+  // logs before creating that branch, then restore the exact SHA after the
+  // operation. The target must never see this mutation as product state.
+  mustGit(repoRoot, ["config", "core.logAllRefUpdates", "false"]);
+  const movingHeadRef = "refs/heads/moving-head";
+  mustGit(repoRoot, ["update-ref", movingHeadRef, rightSha]);
+  await writeFixture(repoRoot, "common.txt", "common dirty in worktree\n");
+  await writeFixture(repoRoot, "right-only.txt", "right\nstaged dirty in worktree\n");
+  mustGit(repoRoot, ["add", "right-only.txt"]);
+  await writeFixture(repoRoot, "moving-ref-untracked.txt", "must remain untracked\n");
+  return {
+    repoRoot,
+    commonSha,
+    leftSha,
+    rightSha,
+    mergeBase,
+    movingHeadRef,
+    relevantPaths: ["common.txt", "left-only.txt", "right-only.txt", "moving-ref-untracked.txt"]
+  };
 }
 
 async function makePatchFixture() {
@@ -698,6 +718,7 @@ const [{ loadConfig }, { CodexProError, PathGuard, WorkspaceManager }, target, p
 const {
   collectGitDiffRangeMetadata,
   collectGitDiffRangePatch,
+  gitDiffRange,
   GitDiffRangeError
 } = target;
 const { redactUnifiedDiff: policyRedactUnifiedDiff } = policy;
@@ -718,6 +739,108 @@ function assertMetadataResult(result, expected, label) {
   assert.equal(result.returnedFileCount, expected.length, `${label}: returned count mismatch`);
   assert.equal(result.changedFilesTruncated, false, `${label}: unexpected truncation`);
   assert.equal(result.blockedFilesOmitted, 0, `${label}: unexpected blocked omission`);
+}
+
+const STRUCTURED_RESULT_KEYS = [
+  "base_commit_sha",
+  "base_ref_input",
+  "changed_file_count",
+  "changed_files",
+  "changed_files_truncated",
+  "comparison_mode",
+  "eligible_changed_file_count",
+  "head_commit_sha",
+  "head_ref_input",
+  "object_format",
+  "patch",
+  "patch_bytes",
+  "patch_files_included",
+  "patch_files_omitted",
+  "patch_included",
+  "patch_limit",
+  "patch_omission_counts",
+  "patch_requested",
+  "patch_truncated",
+  "root",
+  "schema_version",
+  "warnings",
+  "workspace_id",
+  "blocked_files_omitted",
+  "returned_file_count"
+];
+const STRUCTURED_CHANGED_FILE_KEYS = ["additions", "binary", "deletions", "new_path", "old_path", "similarity", "status"];
+const STRUCTURED_OMISSION_KEYS = ["binary", "blocked", "budget", "disabled", "file_limit", "too_large"];
+
+function publicChangedFile(record) {
+  return {
+    status: record.status,
+    old_path: record.oldPath,
+    new_path: record.newPath,
+    similarity: record.similarity,
+    additions: record.additions,
+    deletions: record.deletions,
+    binary: record.binary
+  };
+}
+
+function directRedactedPatch(repoRoot, base, head, records, contextLines = 3) {
+  return records.filter((record) => !record.binary).map((record) => {
+    const raw = directPatch(repoRoot, base, head, record, contextLines);
+    const source = record.status === "T" || (record.oldPath ?? record.newPath ?? "").includes("\n")
+      ? OBSERVATION_UTF8_FATAL.decode(raw.bytes)
+      : rawPatchFragmentForRecord(raw.bytes, record, `integrated expected ${record.status}:${record.newPath ?? record.oldPath}`).fragment;
+    return policyRedactUnifiedDiff(source);
+  }).join("");
+}
+
+function assertStructuredContract(result, expected, label) {
+  const expectedStructuredKeys = expected.path === undefined ? STRUCTURED_RESULT_KEYS : [...STRUCTURED_RESULT_KEYS, "path"];
+  assert.deepEqual(Object.keys(result).sort(), [...expectedStructuredKeys].sort(), `${label}: structured key set drifted`);
+  assert.equal(result.schema_version, 1, `${label}: schema version drifted`);
+  assert.equal(result.workspace_id, expected.workspace.id, `${label}: workspace id drifted`);
+  assert.equal(result.root, expected.workspace.root, `${label}: canonical root drifted`);
+  assert.equal(result.comparison_mode, "direct-two-tree", `${label}: comparison mode drifted`);
+  assert.equal(result.object_format, "sha1", `${label}: object format drifted`);
+  assert.equal(result.base_ref_input, expected.baseInput, `${label}: base input was not preserved`);
+  assert.equal(result.base_commit_sha, expected.baseSha, `${label}: base SHA was not captured`);
+  assert.equal(result.head_ref_input, expected.headInput, `${label}: head input was not preserved`);
+  assert.equal(result.head_commit_sha, expected.headSha, `${label}: head SHA was not captured`);
+  if (expected.path === undefined) assert.equal(Object.hasOwn(result, "path"), false, `${label}: unexpected path key`);
+  else assert.equal(result.path, expected.path, `${label}: historical path was not canonicalized`);
+
+  assert.equal(result.changed_file_count, expected.rawRecords.length, `${label}: raw changed count drifted`);
+  assert.equal(result.eligible_changed_file_count, expected.eligibleRecords.length, `${label}: eligible count drifted`);
+  assert.equal(result.returned_file_count, expected.returnedRecords.length, `${label}: returned count drifted`);
+  assert.deepEqual(result.changed_files, expected.returnedRecords.map(publicChangedFile), `${label}: changed file projection drifted`);
+  assert.equal(result.changed_files_truncated, expected.returnedRecords.length < expected.eligibleRecords.length, `${label}: metadata truncation truth drifted`);
+  assert.equal(result.blocked_files_omitted, expected.omissionCounts.blocked, `${label}: blocked count drifted`);
+
+  assert.equal(result.patch, expected.patch, `${label}: patch bytes/content drifted from direct raw producer`);
+  assert.equal(result.patch_requested, expected.patchRequested, `${label}: patch request truth drifted`);
+  assert.equal(result.patch_included, expected.patch.length > 0, `${label}: patch inclusion truth drifted`);
+  assert.equal(result.patch_truncated, expected.patchTruncated, `${label}: patch truncation truth drifted`);
+  assert.equal(result.patch_bytes, Buffer.byteLength(expected.patch, "utf8"), `${label}: public patch byte count drifted`);
+  assert.equal(result.patch_limit, expected.patchLimit, `${label}: patch limit drifted`);
+  assert.equal(result.patch_files_included, expected.patchFilesIncluded, `${label}: patch included count drifted`);
+  assert.equal(result.patch_files_omitted, Object.values(expected.omissionCounts).reduce((sum, count) => sum + count, 0), `${label}: patch omitted count drifted`);
+  assert.deepEqual(Object.keys(result.patch_omission_counts).sort(), [...STRUCTURED_OMISSION_KEYS].sort(), `${label}: omission key set drifted`);
+  assert.deepEqual(result.patch_omission_counts, expected.omissionCounts, `${label}: omission classifications drifted`);
+  assert.deepEqual(result.warnings, expected.warnings, `${label}: warning set drifted`);
+  assert.equal(Object.hasOwn(result, "eligibleChangedFiles"), false, `${label}: internal eligibleChangedFiles leaked`);
+  assert.equal(Object.hasOwn(result, "identity"), false, `${label}: internal identity leaked`);
+  assert.equal(Object.hasOwn(result, "renameCopyDetectionComplete"), false, `${label}: internal completeness leaked`);
+  for (const record of result.changed_files) {
+    assert.deepEqual(Object.keys(record).sort(), [...STRUCTURED_CHANGED_FILE_KEYS].sort(), `${label}: changed-file key set drifted`);
+  }
+  assertNoForbiddenPatchLiterals(result, label);
+}
+
+function assertWarningSafety(result, label, forbiddenValues = []) {
+  assert.ok(Array.isArray(result.warnings), `${label}: warnings was not an array`);
+  const serializedWarnings = JSON.stringify(result.warnings);
+  for (const value of [".env.patch", ...forbiddenValues, ...FORBIDDEN_PATCH_LITERALS]) {
+    assert.equal(serializedWarnings.includes(value), false, `${label}: warning leaked ${JSON.stringify(value)}`);
+  }
 }
 
 function assertTargetFailure(error, reason, label) {
@@ -749,6 +872,256 @@ async function expectTargetFailure(operation, reason, label) {
     return assertTargetFailure(error, reason, label);
   }
 }
+
+const integratedDivergentContext = targetContext(divergent.repoRoot);
+const integratedDivergentBefore = await repositoryState(divergent.repoRoot, divergent.relevantPaths);
+const integratedDirectExpectedPatch = directRedactedPatch(
+  divergent.repoRoot,
+  divergent.leftSha,
+  divergent.rightSha,
+  directDivergent.records
+);
+const integratedDirectResult = await gitDiffRange(
+  integratedDivergentContext.config,
+  integratedDivergentContext.guard,
+  integratedDivergentContext.workspace,
+  { baseRef: "left", headRef: "right", includePatch: true }
+);
+const integratedDivergentAfter = await repositoryState(divergent.repoRoot, divergent.relevantPaths);
+assert.deepEqual(integratedDivergentAfter, integratedDivergentBefore, "integrated direct operation changed repository state");
+assertStructuredContract(integratedDirectResult, {
+  workspace: integratedDivergentContext.workspace,
+  baseInput: "left",
+  baseSha: divergent.leftSha,
+  headInput: "right",
+  headSha: divergent.rightSha,
+  rawRecords: directDivergent.records,
+  eligibleRecords: directDivergent.records,
+  returnedRecords: directDivergent.records,
+  patch: integratedDirectExpectedPatch,
+  patchRequested: true,
+  patchTruncated: false,
+  patchLimit: 60_000,
+  patchFilesIncluded: directDivergent.records.filter((record) => !record.binary).length,
+  omissionCounts: { blocked: 0, binary: 0, budget: 0, too_large: 0, file_limit: 0, disabled: 0 },
+  warnings: []
+}, "integrated direct divergent result");
+assert.notDeepEqual(integratedDirectResult.changed_files, directMergeBase.records.map(publicChangedFile), "integrated operation silently used merge-base semantics");
+console.log("PASS AP-007 integrated exported operation returns direct base-tip to head-tip metadata/patch, not implicit merge-base semantics");
+
+const integratedMergeResult = await gitDiffRange(
+  integratedDivergentContext.config,
+  integratedDivergentContext.guard,
+  integratedDivergentContext.workspace,
+  { baseRef: divergent.mergeBase, headRef: divergent.rightSha, includePatch: false }
+);
+assertStructuredContract(integratedMergeResult, {
+  workspace: integratedDivergentContext.workspace,
+  baseInput: divergent.mergeBase,
+  baseSha: divergent.mergeBase,
+  headInput: divergent.rightSha,
+  headSha: divergent.rightSha,
+  rawRecords: directMergeBase.records,
+  eligibleRecords: directMergeBase.records,
+  returnedRecords: directMergeBase.records,
+  patch: "",
+  patchRequested: false,
+  patchTruncated: false,
+  patchLimit: 60_000,
+  patchFilesIncluded: 0,
+  omissionCounts: { blocked: 0, binary: 0, budget: 0, too_large: 0, file_limit: 0, disabled: directMergeBase.records.filter((record) => !record.binary).length },
+  warnings: ["Patch generation was disabled by request."]
+}, "explicit merge-base composition result");
+console.log("PASS explicit merge-base SHA composition produces the PR-style result with truthful disabled-patch warning");
+
+const integratedSameShaContext = targetContext(matrix.repoRoot);
+const integratedSameSha = await gitDiffRange(
+  integratedSameShaContext.config,
+  integratedSameShaContext.guard,
+  integratedSameShaContext.workspace,
+  { baseRef: matrix.baseSha, headRef: matrix.baseSha, includePatch: false }
+);
+assertStructuredContract(integratedSameSha, {
+  workspace: integratedSameShaContext.workspace,
+  baseInput: matrix.baseSha,
+  baseSha: matrix.baseSha,
+  headInput: matrix.baseSha,
+  headSha: matrix.baseSha,
+  rawRecords: [],
+  eligibleRecords: [],
+  returnedRecords: [],
+  patch: "",
+  patchRequested: false,
+  patchTruncated: false,
+  patchLimit: 60_000,
+  patchFilesIncluded: 0,
+  omissionCounts: { blocked: 0, binary: 0, budget: 0, too_large: 0, file_limit: 0, disabled: 0 },
+  warnings: []
+}, "integrated same-SHA result");
+const integratedFilterRaw = matrixRawAddFilter.records;
+const integratedFilter = await gitDiffRange(
+  integratedSameShaContext.config,
+  integratedSameShaContext.guard,
+  integratedSameShaContext.workspace,
+  { baseRef: matrix.baseSha, headRef: matrix.headSha, path: "filter-add.txt", includePatch: false }
+);
+assertStructuredContract(integratedFilter, {
+  workspace: integratedSameShaContext.workspace,
+  baseInput: matrix.baseSha,
+  baseSha: matrix.baseSha,
+  headInput: matrix.headSha,
+  headSha: matrix.headSha,
+  path: "filter-add.txt",
+  rawRecords: integratedFilterRaw,
+  eligibleRecords: integratedFilterRaw,
+  returnedRecords: integratedFilterRaw,
+  patch: "",
+  patchRequested: false,
+  patchTruncated: false,
+  patchLimit: 60_000,
+  patchFilesIncluded: 0,
+  omissionCounts: { blocked: 0, binary: 0, budget: 0, too_large: 0, file_limit: 0, disabled: integratedFilterRaw.filter((record) => !record.binary).length },
+  warnings: integratedFilterRaw.some((record) => !record.binary) ? ["Patch generation was disabled by request."] : []
+}, "integrated historical path-filter result");
+console.log("PASS integrated same-SHA zero result and historical old/new path-filter contract");
+
+const integratedPatchContext = targetContext(patchFixture.repoRoot);
+const integratedPatchEligible = patchRaw.records.filter((record) => record.oldPath !== patchFixture.blockedPath && record.newPath !== patchFixture.blockedPath);
+const integratedPatchText = directRedactedPatch(patchFixture.repoRoot, patchFixture.baseSha, patchFixture.headSha, integratedPatchEligible);
+const integratedPatchResult = await gitDiffRange(
+  integratedPatchContext.config,
+  integratedPatchContext.guard,
+  integratedPatchContext.workspace,
+  { baseRef: patchFixture.baseSha, headRef: patchFixture.headSha, includePatch: true, maxFiles: 200 }
+);
+assertStructuredContract(integratedPatchResult, {
+  workspace: integratedPatchContext.workspace,
+  baseInput: patchFixture.baseSha,
+  baseSha: patchFixture.baseSha,
+  headInput: patchFixture.headSha,
+  headSha: patchFixture.headSha,
+  rawRecords: patchRaw.records,
+  eligibleRecords: integratedPatchEligible,
+  returnedRecords: integratedPatchEligible,
+  patch: integratedPatchText,
+  patchRequested: true,
+  patchTruncated: false,
+  patchLimit: 60_000,
+  patchFilesIncluded: integratedPatchEligible.filter((record) => !record.binary).length,
+  omissionCounts: {
+    blocked: patchRaw.records.length - integratedPatchEligible.length,
+    binary: integratedPatchEligible.filter((record) => record.binary).length,
+    budget: 0,
+    too_large: 0,
+    file_limit: 0,
+    disabled: 0
+  },
+  warnings: ["Blocked changed records were omitted from patch evidence.", "Binary changed records were omitted from patch payload."]
+}, "integrated blocked/binary warning result");
+assertWarningSafety(integratedPatchResult, "integrated blocked/binary warnings", [patchFixture.blockedPath, patchFixture.binaryPath]);
+console.log("PASS integrated blocked/binary omissions and warning truth contain no blocked path/source leakage");
+
+const integratedLimitedRecords = integratedPatchEligible.slice(0, 2);
+const integratedLimitedResult = await gitDiffRange(
+  integratedPatchContext.config,
+  integratedPatchContext.guard,
+  integratedPatchContext.workspace,
+  { baseRef: patchFixture.baseSha, headRef: patchFixture.headSha, includePatch: false, maxFiles: 2 }
+);
+const integratedLimitedWarnings = [
+  "Blocked changed records were omitted from patch evidence.",
+  "Patch evidence omits records beyond the max_files prefix.",
+  ...(integratedLimitedRecords.some((record) => record.binary) ? ["Binary changed records were omitted from patch payload."] : []),
+  ...(integratedLimitedRecords.some((record) => !record.binary) ? ["Patch generation was disabled by request."] : []),
+  "Changed-file metadata was truncated to the max_files prefix."
+];
+assertStructuredContract(integratedLimitedResult, {
+  workspace: integratedPatchContext.workspace,
+  baseInput: patchFixture.baseSha,
+  baseSha: patchFixture.baseSha,
+  headInput: patchFixture.headSha,
+  headSha: patchFixture.headSha,
+  rawRecords: patchRaw.records,
+  eligibleRecords: integratedPatchEligible,
+  returnedRecords: integratedLimitedRecords,
+  patch: "",
+  patchRequested: false,
+  patchTruncated: false,
+  patchLimit: 60_000,
+  patchFilesIncluded: 0,
+  omissionCounts: {
+    blocked: patchRaw.records.length - integratedPatchEligible.length,
+    binary: integratedLimitedRecords.filter((record) => record.binary).length,
+    budget: 0,
+    too_large: 0,
+    file_limit: integratedPatchEligible.length - integratedLimitedRecords.length,
+    disabled: integratedLimitedRecords.filter((record) => !record.binary).length
+  },
+  warnings: integratedLimitedWarnings
+}, "integrated max_files warning result");
+assertWarningSafety(integratedLimitedResult, "integrated max_files warnings", [patchFixture.blockedPath, patchFixture.binaryPath]);
+console.log("PASS integrated max_files truncation, disabled, binary, blocked warning counts and metadata prefix truth");
+
+const integratedAddedRecord = patchRaw.records.find((record) => record.newPath === "added.py");
+assert.ok(integratedAddedRecord, "integrated budget fixture missing added.py record");
+const integratedAddedPatch = directRedactedPatch(patchFixture.repoRoot, patchFixture.baseSha, patchFixture.headSha, [integratedAddedRecord]);
+const integratedBudgetResult = await gitDiffRange(
+  integratedPatchContext.config,
+  integratedPatchContext.guard,
+  integratedPatchContext.workspace,
+  {
+    baseRef: patchFixture.baseSha,
+    headRef: patchFixture.headSha,
+    path: "added.py",
+    maxPatchBytes: Buffer.byteLength(integratedAddedPatch, "utf8") - 1
+  }
+);
+assertStructuredContract(integratedBudgetResult, {
+  workspace: integratedPatchContext.workspace,
+  baseInput: patchFixture.baseSha,
+  baseSha: patchFixture.baseSha,
+  headInput: patchFixture.headSha,
+  headSha: patchFixture.headSha,
+  path: "added.py",
+  rawRecords: [integratedAddedRecord],
+  eligibleRecords: [integratedAddedRecord],
+  returnedRecords: [integratedAddedRecord],
+  patch: "",
+  patchRequested: true,
+  patchTruncated: true,
+  patchLimit: Buffer.byteLength(integratedAddedPatch, "utf8") - 1,
+  patchFilesIncluded: 0,
+  omissionCounts: { blocked: 0, binary: 0, budget: 1, too_large: 0, file_limit: 0, disabled: 0 },
+  warnings: ["Patch evidence stopped before the next complete fragment at the public byte limit."]
+}, "integrated budget warning result");
+assertWarningSafety(integratedBudgetResult, "integrated budget warning", ["added.py", patchFixture.baseSha, patchFixture.headSha]);
+
+const integratedTooLargeResult = await gitDiffRange(
+  integratedPatchContext.config,
+  integratedPatchContext.guard,
+  integratedPatchContext.workspace,
+  { baseRef: patchFixture.baseSha, headRef: patchFixture.headSha, path: "added.py", patchFragmentMaxBytes: 1 }
+);
+assertStructuredContract(integratedTooLargeResult, {
+  workspace: integratedPatchContext.workspace,
+  baseInput: patchFixture.baseSha,
+  baseSha: patchFixture.baseSha,
+  headInput: patchFixture.headSha,
+  headSha: patchFixture.headSha,
+  path: "added.py",
+  rawRecords: [integratedAddedRecord],
+  eligibleRecords: [integratedAddedRecord],
+  returnedRecords: [integratedAddedRecord],
+  patch: "",
+  patchRequested: true,
+  patchTruncated: true,
+  patchLimit: 60_000,
+  patchFilesIncluded: 0,
+  omissionCounts: { blocked: 0, binary: 0, budget: 0, too_large: 1, file_limit: 0, disabled: 0 },
+  warnings: ["Patch evidence stopped at a fragment beyond the bounded acquisition limit."]
+}, "integrated too-large warning result");
+assertWarningSafety(integratedTooLargeResult, "integrated too-large warning", ["added.py", patchFixture.baseSha, patchFixture.headSha]);
+console.log("PASS integrated budget and too_large warnings are truthful, bounded, and source/ref-literal free");
 
 const matrixContext = targetContext(matrix.repoRoot);
 const matrixBefore = await repositoryState(matrix.repoRoot, matrix.relevantPaths);
@@ -906,6 +1279,29 @@ if (process.env.CODEXPRO_TAMPER === "patch-header" && args.includes("--patch") &
 }
 process.stdout.write(stdout);
 process.stderr.write(child.stderr ?? Buffer.alloc(0));
+const movingRef = process.env.CODEXPRO_MOVE_REF;
+const movingTarget = process.env.CODEXPRO_MOVE_TO;
+const resolutionMarker = process.env.CODEXPRO_MOVE_RESOLUTION_MARKER;
+const resolutionArg = movingRef === undefined ? undefined : movingRef + "^{commit}";
+const endpointResolution = child.status === 0 && args.includes("--verify") && args.some((arg) => arg.endsWith("^{commit}"));
+if (endpointResolution && movingRef && movingTarget && resolutionArg !== undefined && args.includes(resolutionArg)) {
+  if (resolutionMarker) {
+    const waitStarted = Date.now();
+    while (!fs.existsSync(resolutionMarker) && Date.now() - waitStarted < 10_000) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    }
+    if (!fs.existsSync(resolutionMarker)) process.exit(1);
+  }
+  const move = spawnSync(process.env.CODEXPRO_REAL_GIT, ["update-ref", movingRef, movingTarget], {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  if (move.status !== 0) process.exit(move.status ?? 1);
+  if (logPath) fs.appendFileSync(logPath, JSON.stringify(["__deliberate_ref_move__", movingRef, movingTarget]) + "\\n");
+} else if (endpointResolution && resolutionMarker) {
+  fs.writeFileSync(resolutionMarker, "resolved\\n");
+}
 process.exit(child.status ?? 1);
 `,
   "utf8"
@@ -1033,6 +1429,120 @@ async function readLoggedArgs(logPath) {
     .filter(Boolean)
     .map((line) => JSON.parse(line));
 }
+
+async function withMovingRef(label, operation) {
+  const logPath = path.join(wrapperDir, `${label}.jsonl`);
+  const resolutionMarker = path.join(wrapperDir, `${label}-resolutions.marker`);
+  await writeFile(logPath, "", "utf8");
+  try {
+    await unlink(resolutionMarker);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const previousPath = process.env.PATH;
+  const previousLog = process.env.CODEXPRO_GIT_ARG_LOG;
+  const previousReal = process.env.CODEXPRO_REAL_GIT;
+  const previousTamper = process.env.CODEXPRO_TAMPER;
+  const previousMoveRef = process.env.CODEXPRO_MOVE_REF;
+  const previousMoveTo = process.env.CODEXPRO_MOVE_TO;
+  const previousMarker = process.env.CODEXPRO_MOVE_RESOLUTION_MARKER;
+  process.env.PATH = `${wrapperDir}${path.delimiter}${systemPath}`;
+  process.env.CODEXPRO_GIT_ARG_LOG = logPath;
+  process.env.CODEXPRO_REAL_GIT = realGit;
+  delete process.env.CODEXPRO_TAMPER;
+  process.env.CODEXPRO_MOVE_REF = divergent.movingHeadRef;
+  process.env.CODEXPRO_MOVE_TO = divergent.commonSha;
+  process.env.CODEXPRO_MOVE_RESOLUTION_MARKER = resolutionMarker;
+  try {
+    return await operation(logPath, resolutionMarker);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (previousLog === undefined) delete process.env.CODEXPRO_GIT_ARG_LOG;
+    else process.env.CODEXPRO_GIT_ARG_LOG = previousLog;
+    if (previousReal === undefined) delete process.env.CODEXPRO_REAL_GIT;
+    else process.env.CODEXPRO_REAL_GIT = previousReal;
+    if (previousTamper === undefined) delete process.env.CODEXPRO_TAMPER;
+    else process.env.CODEXPRO_TAMPER = previousTamper;
+    if (previousMoveRef === undefined) delete process.env.CODEXPRO_MOVE_REF;
+    else process.env.CODEXPRO_MOVE_REF = previousMoveRef;
+    if (previousMoveTo === undefined) delete process.env.CODEXPRO_MOVE_TO;
+    else process.env.CODEXPRO_MOVE_TO = previousMoveTo;
+    if (previousMarker === undefined) delete process.env.CODEXPRO_MOVE_RESOLUTION_MARKER;
+    else process.env.CODEXPRO_MOVE_RESOLUTION_MARKER = previousMarker;
+  }
+}
+
+const movingBefore = await repositoryState(divergent.repoRoot, divergent.relevantPaths);
+let movingRun;
+try {
+  movingRun = await withMovingRef("moving-ref", async (logPath) => {
+    const result = await gitDiffRange(
+      integratedDivergentContext.config,
+      integratedDivergentContext.guard,
+      integratedDivergentContext.workspace,
+      { baseRef: "left", headRef: divergent.movingHeadRef, includePatch: true }
+    );
+    const stateWhileMoved = await repositoryState(divergent.repoRoot, divergent.relevantPaths);
+    return { result, stateWhileMoved, entries: await readLoggedArgs(logPath) };
+  });
+} finally {
+  // This is deliberate fixture cleanup, not a product write. The ref was
+  // created with reflogs disabled, so restoring it must return every snapshot
+  // dimension exactly to its pre-test value.
+  mustGit(divergent.repoRoot, ["update-ref", divergent.movingHeadRef, divergent.rightSha]);
+}
+const movingAfter = await repositoryState(divergent.repoRoot, divergent.relevantPaths);
+assert.deepEqual(movingAfter, movingBefore, "moving-ref operation changed repository state after deliberate ref restoration");
+const refsBeforeMove = Buffer.from(movingBefore.commandFacts.refs.stdout, "base64").toString("utf8");
+const refsWhileMoved = Buffer.from(movingRun.stateWhileMoved.commandFacts.refs.stdout, "base64").toString("utf8");
+assert.ok(refsBeforeMove.includes(`${divergent.movingHeadRef}\u0000${divergent.rightSha}`), "moving-ref baseline did not contain its original SHA");
+assert.ok(refsWhileMoved.includes(`${divergent.movingHeadRef}\u0000${divergent.commonSha}`), "moving-ref harness did not physically move the branch ref");
+assert.notEqual(refsWhileMoved, refsBeforeMove, "moving-ref harness state did not differ while the deliberate move was armed");
+for (const [name, facts] of Object.entries(movingBefore.commandFacts)) {
+  if (name === "refs") continue;
+  assert.deepEqual(movingRun.stateWhileMoved.commandFacts[name], facts, `moving-ref operation changed ${name} beyond deliberate ref mutation`);
+}
+assert.deepEqual(movingRun.stateWhileMoved.files, movingBefore.files, "moving-ref operation changed tracked/untracked file bytes");
+const moveIndex = movingRun.entries.findIndex((entry) => Array.isArray(entry) && entry[0] === "__deliberate_ref_move__");
+assert.ok(moveIndex >= 0, "moving-ref harness did not physically move its symbolic ref");
+const resolutionIndices = movingRun.entries
+  .map((entry, index) => [entry, index])
+  .filter(([entry]) => Array.isArray(entry) && entry.includes("--verify"))
+  .map(([, index]) => index);
+assert.equal(resolutionIndices.length, 2, "moving-ref harness did not observe exactly one resolution per endpoint");
+assert.ok(resolutionIndices.every((index) => index < moveIndex), "moving-ref harness moved the ref before both endpoint resolutions completed");
+const downstreamDiffIndices = movingRun.entries
+  .map((entry, index) => [entry, index])
+  .filter(([entry]) => Array.isArray(entry) && entry.includes("diff"))
+  .map(([, index]) => index);
+assert.ok(downstreamDiffIndices.length >= 2, "moving-ref harness did not observe metadata diff producers");
+assert.ok(downstreamDiffIndices.every((index) => index > moveIndex), "moving-ref harness moved the ref after downstream diff started");
+const movingDiffArgs = movingRun.entries.filter((entry) => Array.isArray(entry) && entry.includes("diff"));
+for (const args of movingDiffArgs) {
+  assert.ok(args.includes(divergent.leftSha), `moving-ref metadata producer lost captured base SHA: ${JSON.stringify(args)}`);
+  assert.ok(args.includes(divergent.rightSha), `moving-ref metadata producer lost captured head SHA: ${JSON.stringify(args)}`);
+  assert.equal(args.includes(divergent.movingHeadRef), false, "moving-ref metadata producer received symbolic head ref");
+  assert.equal(args.includes(divergent.commonSha), false, "moving-ref metadata producer followed moved ref");
+}
+assertStructuredContract(movingRun.result, {
+  workspace: integratedDivergentContext.workspace,
+  baseInput: "left",
+  baseSha: divergent.leftSha,
+  headInput: divergent.movingHeadRef,
+  headSha: divergent.rightSha,
+  rawRecords: directDivergent.records,
+  eligibleRecords: directDivergent.records,
+  returnedRecords: directDivergent.records,
+  patch: integratedDirectExpectedPatch,
+  patchRequested: true,
+  patchTruncated: false,
+  patchLimit: 60_000,
+  patchFilesIncluded: directDivergent.records.filter((record) => !record.binary).length,
+  omissionCounts: { blocked: 0, binary: 0, budget: 0, too_large: 0, file_limit: 0, disabled: 0 },
+  warnings: []
+}, "moving-ref pinned result");
+console.log("PASS AP-007 moving-ref falsifier: two endpoint resolutions precede deliberate branch move, downstream args use captured full SHAs, output remains original comparison");
 
 function expectedRedactedRecord(record, contextLines = 3) {
   const raw = directPatch(patchFixture.repoRoot, patchFixture.baseSha, patchFixture.headSha, record, contextLines);
