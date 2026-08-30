@@ -499,17 +499,45 @@ while (Date.now() < deadline) {
       fs.renameSync(candidate, foreignSentinel);
       fs.writeFileSync(candidate, replacement, { mode: 0o600 });
       const replacedAt = Date.now();
-      // Keep the foreign inode/content observable while the product performs
-      // its remaining ownership checks. This removes scheduler luck from the
-      // falsifier without ever touching the real index pathname.
-      while (Date.now() < replacedAt + 1000) {
+      const crypto = require("node:crypto");
+      const snapshot = (filePath) => {
+        const stat = fs.lstatSync(filePath);
+        const bytes = fs.readFileSync(filePath);
+        return {
+          device: stat.dev,
+          inode: stat.ino,
+          mode: stat.mode & 0o7777,
+          size: bytes.length,
+          sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+          contentBase64: bytes.toString("base64")
+        };
+      };
+      const replacementSnapshot = snapshot(candidate);
+      const foreignSnapshot = snapshot(foreignSentinel);
+      const violations = [];
+      const recordViolation = (reason) => {
+        if (!violations.includes(reason)) violations.push(reason);
+      };
+      const observe = (filePath, expected, label) => {
         try {
-          fs.writeFileSync(candidate, replacement, { mode: 0o600 });
-        } catch {
-          // A missing candidate remains recovery truth; do not recreate it.
+          const current = snapshot(filePath);
+          for (const key of ["device", "inode", "mode", "size", "sha256", "contentBase64"]) {
+            if (current[key] !== expected[key]) recordViolation(label + "_" + key + "_changed");
+          }
+        } catch (error) {
+          recordViolation(label + "_missing_or_unreadable_" + (error?.code || "ERROR"));
         }
+      };
+      // After the one initial rename/write, this mutator only observes. Any
+      // disappearance or identity/content drift is retained permanently even
+      // if a later observation happens to look correct.
+      while (Date.now() < replacedAt + 1000) {
+        observe(candidate, replacementSnapshot, "replacement");
+        observe(foreignSentinel, foreignSnapshot, "foreign_sentinel");
         Atomics.wait(sleep, 0, 0, 2);
       }
+      observe(candidate, replacementSnapshot, "replacement");
+      observe(foreignSentinel, foreignSnapshot, "foreign_sentinel");
       fs.writeFileSync(markerPath, JSON.stringify({
         pid: process.pid,
         uid: typeof process.getuid === "function" ? process.getuid() : null,
@@ -517,6 +545,9 @@ while (Date.now() < deadline) {
         foreignSentinel,
         originalSize: original.length,
         originalSha256,
+        replacementSnapshot,
+        foreignSnapshot,
+        violations,
         replacedAt,
         doneAt: Date.now()
       }) + "\\n");
@@ -860,6 +891,28 @@ fs.writeFileSync(resultPath, JSON.stringify({
     const nonCooperativeAfter = await repositorySnapshot(nonCooperativeRoot, nonCooperativePaths);
     const nonCooperativeCandidateRelative = path.relative(nonCooperativeRoot, nonCooperativeMarker.candidate);
     const nonCooperativeCandidate = await pathState(nonCooperativeRoot, nonCooperativeCandidateRelative);
+    // The mutator must prove uninterrupted identity, not merely leave a
+    // matching pathname at the end. Its persistent violation list catches any
+    // disappearance/drift observed during the public call.
+    assert.deepEqual(nonCooperativeMarker.violations, [], "replacement identity was not uninterrupted during the public call");
+    const nonCooperativeReplacementAfter = await rawFileSnapshot(nonCooperativeMarker.candidate);
+    const nonCooperativeForeignAfter = await rawFileSnapshot(nonCooperativeMarker.foreignSentinel);
+    assert.deepEqual({
+      device: nonCooperativeReplacementAfter.device,
+      inode: nonCooperativeReplacementAfter.inode,
+      mode: nonCooperativeReplacementAfter.mode,
+      size: nonCooperativeReplacementAfter.size,
+      sha256: nonCooperativeReplacementAfter.sha256,
+      contentBase64: nonCooperativeReplacementAfter.bytes.toString("base64")
+    }, nonCooperativeMarker.replacementSnapshot, "replacement pathname did not retain its exact observed identity/content");
+    assert.deepEqual({
+      device: nonCooperativeForeignAfter.device,
+      inode: nonCooperativeForeignAfter.inode,
+      mode: nonCooperativeForeignAfter.mode,
+      size: nonCooperativeForeignAfter.size,
+      sha256: nonCooperativeForeignAfter.sha256,
+      contentBase64: nonCooperativeForeignAfter.bytes.toString("base64")
+    }, nonCooperativeMarker.foreignSnapshot, "foreign sentinel identity/content changed after initial rename");
 
     // PASS 1: raw child/process/path facts prove the trigger before checking
     // whether the public route reported success, failure, or a classification.
