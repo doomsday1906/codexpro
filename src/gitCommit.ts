@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { TextDecoder } from "node:util";
@@ -37,7 +38,10 @@ export type GitCommitFailureReason =
   | "unsupported-path"
   | "malformed-output"
   | "execution"
-  | "preflight-changed";
+  | "preflight-changed"
+  | "no-changes"
+  | "postcondition"
+  | "recovery-required";
 
 const FAILURE_MESSAGES: Record<GitCommitFailureReason, string> = {
   "invalid-input": "Git commit input is invalid.",
@@ -57,7 +61,10 @@ const FAILURE_MESSAGES: Record<GitCommitFailureReason, string> = {
   "unsupported-path": "Git commit path has an unsupported filesystem type.",
   "malformed-output": "Git returned malformed commit preflight output.",
   execution: "Git commit preflight failed during local Git execution.",
-  "preflight-changed": "Git commit preflight changed while waiting for its locks; retry."
+  "preflight-changed": "Git commit preflight changed while waiting for its locks; retry.",
+  "no-changes": "Git commit selection has no tree changes.",
+  postcondition: "Git commit postcondition could not be proven; recovery is required.",
+  "recovery-required": "Git commit failure left state that requires manual recovery."
 };
 
 /** Constant-message, JSON-safe internal failure. Caller data is never echoed. */
@@ -85,7 +92,12 @@ export interface GitWorktreeEntryState {
   readonly kind: GitWorktreeEntryKind;
   readonly mode: number | null;
   readonly size: number | null;
+  /** SHA-256 of the exact bytes exposed by the worktree (or symlink target). */
+  readonly rawContentHash: string | null;
+  /** Git object id for the same bytes without Git clean filters. */
   readonly contentHash: string | null;
+  /** Git object id Git's ordinary clean/filter path would commit. */
+  readonly gitBlobId: string | null;
   readonly linkTarget: string | null;
 }
 
@@ -285,14 +297,20 @@ async function runGitAllowExit(
   }
 }
 
-function parseIndexEntries(bytes: Buffer, format: "sha1" | "sha256", selected: ReadonlySet<string>): Map<string, GitIndexEntry[]> {
+function parseIndexEntries(
+  bytes: Buffer,
+  format: "sha1" | "sha256",
+  selected?: ReadonlySet<string>
+): Map<string, GitIndexEntry[]> {
   const entries = new Map<string, GitIndexEntry[]>();
   for (const field of nulFields(bytes)) {
     const tab = field.indexOf(0x09);
     if (tab <= 0) return fail("malformed-output");
     const header = decodeGitUtf8(field.subarray(0, tab));
     const entryPath = decodeGitUtf8(field.subarray(tab + 1));
-    if (!selected.has(entryPath) || CONTROL_CHARACTER_PATTERN.test(entryPath)) return fail("malformed-output");
+    if ((selected !== undefined && !selected.has(entryPath)) || CONTROL_CHARACTER_PATTERN.test(entryPath)) {
+      return fail("malformed-output");
+    }
     const match = /^(\d{6}) ([0-9a-f]+) ([0-3])$/iu.exec(header);
     if (!match || !objectIdPattern(format).test(match[2])) return fail("malformed-output");
     const entry: GitIndexEntry = {
@@ -356,6 +374,170 @@ function parseStatusPaths(bytes: Buffer): Map<string, string> {
   return statuses;
 }
 
+interface GitRepositorySnapshot {
+  readonly index: Map<string, GitIndexEntry[]>;
+  readonly statuses: Map<string, string>;
+  readonly worktree: Map<string, GitWorktreeEntryState>;
+}
+
+interface GitBranchState {
+  readonly ref: string;
+  readonly branch: string;
+  readonly head: string;
+}
+
+interface GitIntentReceipt {
+  readonly path: string;
+  readonly indexEntries: readonly GitIndexEntry[];
+  readonly status: string;
+  readonly intentFlags: string;
+}
+
+interface GitRawDiffEntry {
+  readonly path: string;
+  readonly status: string;
+  readonly oldMode: string;
+  readonly newMode: string;
+  readonly newBlobId: string | null;
+}
+
+interface GitTreeEntry {
+  readonly mode: string;
+  readonly type: "blob" | "tree" | "commit";
+  readonly objectId: string;
+  readonly path: string;
+}
+
+function sameIndexEntries(left: readonly GitIndexEntry[], right: readonly GitIndexEntry[]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function sameWorktreeState(left: GitWorktreeEntryState | undefined, right: GitWorktreeEntryState | undefined): boolean {
+  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+}
+
+function mapKeys(...maps: ReadonlyMap<string, unknown>[]): Set<string> {
+  const keys = new Set<string>();
+  for (const map of maps) {
+    for (const key of map.keys()) keys.add(key);
+  }
+  return keys;
+}
+
+function assertUnselectedSnapshotPreserved(
+  before: GitRepositorySnapshot,
+  after: GitRepositorySnapshot,
+  selected: ReadonlySet<string>
+): boolean {
+  for (const relativePath of mapKeys(before.index, after.index, before.statuses, after.statuses, before.worktree, after.worktree)) {
+    if (selected.has(relativePath)) continue;
+    if (!sameIndexEntries(before.index.get(relativePath) ?? [], after.index.get(relativePath) ?? [])) return false;
+    if ((before.statuses.get(relativePath) ?? "") !== (after.statuses.get(relativePath) ?? "")) return false;
+    if (!sameWorktreeState(before.worktree.get(relativePath), after.worktree.get(relativePath))) return false;
+  }
+  return true;
+}
+
+async function captureRepositorySnapshot(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  format: "sha1" | "sha256"
+): Promise<GitRepositorySnapshot> {
+  const indexResult = await runGitChecked(config, workspace, ["ls-files", "--stage", "-z"]);
+  const statusResult = await runGitChecked(config, workspace, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
+  const index = parseIndexEntries(indexResult.copyStdoutBytes(), format);
+  const statuses = parseStatusPaths(statusResult.copyStdoutBytes());
+  const worktree = new Map<string, GitWorktreeEntryState>();
+  for (const relativePath of statuses.keys()) {
+    const inspected = await inspectWorktreeState(config, workspace, relativePath, format);
+    worktree.set(relativePath, inspected.state);
+  }
+  return { index, statuses, worktree };
+}
+
+function parseRawDiffEntries(
+  bytes: Buffer,
+  format: "sha1" | "sha256",
+  selected: ReadonlySet<string>
+): Map<string, GitRawDiffEntry> {
+  const fields = nulFields(bytes);
+  if (fields.length % 2 !== 0) return fail("malformed-output");
+  const entries = new Map<string, GitRawDiffEntry>();
+  for (let index = 0; index < fields.length; index += 2) {
+    const header = decodeGitUtf8(fields[index]);
+    const relativePath = decodeGitUtf8(fields[index + 1]);
+    const match = /^:(\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) ([A-Z])$/iu.exec(header);
+    if (!match || !selected.has(relativePath) || CONTROL_CHARACTER_PATTERN.test(relativePath)) {
+      return fail("malformed-output");
+    }
+    const [oldMode, newMode, oldBlobId, newBlobId, status] = match.slice(1);
+    const fullLength = format === "sha1" ? 40 : 64;
+    if (
+      !/^[0-9a-f]+$/iu.test(oldBlobId) ||
+      !/^[0-9a-f]+$/iu.test(newBlobId) ||
+      oldBlobId.length > fullLength ||
+      newBlobId.length > fullLength
+    ) {
+      return fail("malformed-output");
+    }
+    if (entries.has(relativePath)) return fail("malformed-output");
+    entries.set(relativePath, {
+      path: relativePath,
+      status,
+      oldMode,
+      newMode,
+      newBlobId:
+        newMode === "000000" || /^0+$/u.test(newBlobId) || newBlobId.length !== fullLength
+          ? null
+          : newBlobId.toLowerCase()
+    });
+  }
+  return entries;
+}
+
+function parseChangedPathRecords(bytes: Buffer): Map<string, string> {
+  const fields = nulFields(bytes);
+  if (fields.length % 2 !== 0) return fail("malformed-output");
+  const entries = new Map<string, string>();
+  for (let index = 0; index < fields.length; index += 2) {
+    const status = decodeGitUtf8(fields[index]);
+    const relativePath = decodeGitUtf8(fields[index + 1]);
+    if (!/^[A-Z]$/u.test(status) || !relativePath || CONTROL_CHARACTER_PATTERN.test(relativePath)) {
+      return fail("malformed-output");
+    }
+    if (entries.has(relativePath)) return fail("malformed-output");
+    entries.set(relativePath, status);
+  }
+  return entries;
+}
+
+function parseTreeEntries(
+  bytes: Buffer,
+  format: "sha1" | "sha256",
+  selected: ReadonlySet<string>
+): Map<string, GitTreeEntry> {
+  const entries = new Map<string, GitTreeEntry>();
+  for (const field of nulFields(bytes)) {
+    const tab = field.indexOf(0x09);
+    if (tab <= 0) return fail("malformed-output");
+    const header = decodeGitUtf8(field.subarray(0, tab));
+    const relativePath = decodeGitUtf8(field.subarray(tab + 1));
+    const match = /^(\d{6}) (blob|tree|commit) ([0-9a-f]+)$/iu.exec(header);
+    if (!match || !selected.has(relativePath) || CONTROL_CHARACTER_PATTERN.test(relativePath)) {
+      return fail("malformed-output");
+    }
+    if (!objectIdPattern(format).test(match[3])) return fail("malformed-output");
+    if (entries.has(relativePath)) return fail("malformed-output");
+    entries.set(relativePath, {
+      mode: match[1],
+      type: match[2] as GitTreeEntry["type"],
+      objectId: match[3].toLowerCase(),
+      path: relativePath
+    });
+  }
+  return entries;
+}
+
 async function assertParentChain(root: string, absPath: string): Promise<void> {
   const relative = path.relative(root, absPath);
   if (!isSubpath(absPath, root) || relative === "") return fail("invalid-path");
@@ -382,6 +564,24 @@ function hashBytes(value: Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+async function hashFileBytes(absPath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(absPath);
+    stream.on("data", (chunk: Buffer | string) => hash.update(chunk));
+    stream.once("error", reject);
+    stream.once("end", () => resolve(hash.digest("hex")));
+  });
+}
+
+function gitBlobIdForBytes(value: Uint8Array, format: "sha1" | "sha256"): string {
+  const bytes = Buffer.from(value);
+  return createHash(format)
+    .update(Buffer.from(`blob ${bytes.length}\u0000`, "utf8"))
+    .update(bytes)
+    .digest("hex");
+}
+
 async function stableRegularFileState(
   config: GitCommitConfig,
   workspace: Workspace,
@@ -394,11 +594,33 @@ async function stableRegularFileState(
     try {
       before = await fsp.lstat(absPath);
     } catch {
-      return { kind: "missing", mode: null, size: null, contentHash: null, linkTarget: null };
+      return {
+        kind: "missing",
+        mode: null,
+        size: null,
+        rawContentHash: null,
+        contentHash: null,
+        gitBlobId: null,
+        linkTarget: null
+      };
     }
     if (!before.isFile()) return fail("unsupported-path");
-    const hashResult = await runGitChecked(config, workspace, ["hash-object", "--no-filters", "--", relativePath]);
-    const contentHash = parseObjectId(oneLine(hashResult), format);
+    let rawContentHash: string;
+    let contentHash: string;
+    let gitBlobId: string;
+    try {
+      const [rawContentHashResult, hashResult, cleanResult] = await Promise.all([
+        hashFileBytes(absPath),
+        runGitChecked(config, workspace, ["hash-object", "--no-filters", "--", relativePath]),
+        runGitChecked(config, workspace, ["hash-object", `--path=${relativePath}`, "--", relativePath])
+      ]);
+      rawContentHash = rawContentHashResult;
+      contentHash = parseObjectId(oneLine(hashResult), format);
+      gitBlobId = parseObjectId(oneLine(cleanResult), format);
+    } catch (error) {
+      if (error instanceof GitCommitError) throw error;
+      return fail("execution");
+    }
     let after: Awaited<ReturnType<typeof fsp.lstat>>;
     try {
       after = await fsp.lstat(absPath);
@@ -417,7 +639,9 @@ async function stableRegularFileState(
         kind: "file",
         mode: modeBits(after.mode),
         size: after.size,
+        rawContentHash,
         contentHash,
+        gitBlobId,
         linkTarget: null
       };
     }
@@ -440,12 +664,34 @@ async function inspectWorktreeState(
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") {
-      return { absPath, state: { kind: "missing", mode: null, size: null, contentHash: null, linkTarget: null } };
+      return {
+        absPath,
+        state: {
+          kind: "missing",
+          mode: null,
+          size: null,
+          rawContentHash: null,
+          contentHash: null,
+          gitBlobId: null,
+          linkTarget: null
+        }
+      };
     }
     return fail("invalid-path");
   }
   if (stat.isDirectory()) {
-    return { absPath, state: { kind: "directory", mode: modeBits(stat.mode), size: null, contentHash: null, linkTarget: null } };
+    return {
+      absPath,
+      state: {
+        kind: "directory",
+        mode: modeBits(stat.mode),
+        size: null,
+        rawContentHash: null,
+        contentHash: null,
+        gitBlobId: null,
+        linkTarget: null
+      }
+    };
   }
   if (stat.isSymbolicLink()) {
     let target: string;
@@ -460,7 +706,9 @@ async function inspectWorktreeState(
         kind: "symlink",
         mode: modeBits(stat.mode),
         size: Buffer.byteLength(target, "utf8"),
-        contentHash: hashBytes(Buffer.from(target, "utf8")),
+        rawContentHash: hashBytes(Buffer.from(target, "utf8")),
+        contentHash: gitBlobIdForBytes(Buffer.from(target, "utf8"), format),
+        gitBlobId: gitBlobIdForBytes(Buffer.from(target, "utf8"), format),
         linkTarget: target
       }
     };
@@ -468,7 +716,18 @@ async function inspectWorktreeState(
   if (stat.isFile()) {
     return { absPath, state: await stableRegularFileState(config, workspace, absPath, relativePath, format) };
   }
-  return { absPath, state: { kind: "other", mode: modeBits(stat.mode), size: stat.size, contentHash: null, linkTarget: null } };
+  return {
+    absPath,
+    state: {
+      kind: "other",
+      mode: modeBits(stat.mode),
+      size: stat.size,
+      rawContentHash: null,
+      contentHash: null,
+      gitBlobId: null,
+      linkTarget: null
+    }
+  };
 }
 
 async function markerPath(config: GitCommitConfig, workspace: Workspace, marker: string): Promise<string> {
@@ -674,5 +933,531 @@ export async function withGitCommitLocks<T>(
       if (!sameGitCommitPreflight(first, locked)) return fail("preflight-changed");
       return task(locked);
     });
+  });
+}
+
+export interface GitCommitResult {
+  readonly schema_version: 1;
+  readonly workspace_id: string;
+  readonly root: string;
+  readonly branch: string;
+  readonly old_head: string;
+  readonly new_head: string;
+  readonly requested_path_count: number;
+  readonly committed_path_count: number;
+  readonly committed_paths: readonly string[];
+}
+
+function sameRepositorySnapshot(left: GitRepositorySnapshot, right: GitRepositorySnapshot): boolean {
+  for (const relativePath of mapKeys(left.index, right.index, left.statuses, right.statuses, left.worktree, right.worktree)) {
+    if (!sameIndexEntries(left.index.get(relativePath) ?? [], right.index.get(relativePath) ?? [])) return false;
+    if ((left.statuses.get(relativePath) ?? "") !== (right.statuses.get(relativePath) ?? "")) return false;
+    if (!sameWorktreeState(left.worktree.get(relativePath), right.worktree.get(relativePath))) return false;
+  }
+  return true;
+}
+
+async function currentBranchState(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  format: "sha1" | "sha256"
+): Promise<GitBranchState | undefined> {
+  try {
+    const ref = oneLine(await runGitChecked(config, workspace, ["symbolic-ref", "--quiet", "HEAD"]));
+    if (!ref.startsWith("refs/heads/") || ref.length <= "refs/heads/".length) return undefined;
+    const head = parseObjectId(
+      oneLine(await runGitChecked(config, workspace, ["rev-parse", "--verify", "HEAD^{commit}"])),
+      format
+    );
+    return { ref, branch: ref.slice("refs/heads/".length), head };
+  } catch {
+    return undefined;
+  }
+}
+
+async function remoteRefsSnapshot(config: GitCommitConfig, workspace: Workspace): Promise<string> {
+  const result = await runGitChecked(config, workspace, ["for-each-ref", "--format=%(refname)=%(objectname)", "refs/remotes"]);
+  const value = decodeGitUtf8(result.copyStdoutBytes());
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) return fail("malformed-output");
+  return value;
+}
+
+async function selectedWorktreeStates(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  preflight: GitCommitPreflight
+): Promise<Map<string, GitWorktreeEntryState>> {
+  const states = new Map<string, GitWorktreeEntryState>();
+  for (const selected of preflight.selected) {
+    const inspected = await inspectWorktreeState(config, workspace, selected.path, preflight.objectFormat);
+    states.set(selected.path, inspected.state);
+  }
+  return states;
+}
+
+function selectedWorktreeStatesMatch(
+  preflight: GitCommitPreflight,
+  states: ReadonlyMap<string, GitWorktreeEntryState>
+): boolean {
+  return preflight.selected.every((selected) => sameWorktreeState(selected.worktree, states.get(selected.path)));
+}
+
+function selectedSnapshotMatchesPreflight(
+  preflight: GitCommitPreflight,
+  snapshot: GitRepositorySnapshot,
+  states: ReadonlyMap<string, GitWorktreeEntryState>
+): boolean {
+  return preflight.selected.every(
+    (selected) =>
+      sameIndexEntries(selected.indexEntries, snapshot.index.get(selected.path) ?? []) &&
+      selected.status === (snapshot.statuses.get(selected.path) ?? "") &&
+      sameWorktreeState(selected.worktree, states.get(selected.path))
+  );
+}
+
+function selectedStateMap(preflight: GitCommitPreflight): Map<string, GitCommitPathPreflight> {
+  return new Map(preflight.selected.map((selected) => [selected.path, selected]));
+}
+
+function parseIntentDebugFlags(bytes: Buffer, expectedPath: string): string | undefined {
+  if (bytes.length === 0) return undefined;
+  const separator = bytes.indexOf(0);
+  if (separator <= 0) return fail("malformed-output");
+  const header = decodeGitUtf8(bytes.subarray(0, separator));
+  const pathSeparator = header.indexOf("\t");
+  if (pathSeparator <= 0 || header.slice(pathSeparator + 1) !== expectedPath) {
+    return fail("malformed-output");
+  }
+  const debug = decodeGitUtf8(bytes.subarray(separator + 1));
+  const matches = [...debug.matchAll(/(?:^|\n)[^\n]*\bflags:\s*([0-9a-f]+)\s*(?:\n|$)/giu)];
+  if (matches.length !== 1) return fail("malformed-output");
+  const flags = matches[0][1].toLowerCase();
+  try {
+    if ((BigInt(`0x${flags}`) & 0x20000000n) === 0n) return fail("malformed-output");
+  } catch {
+    return fail("malformed-output");
+  }
+  return flags;
+}
+
+async function intentDebugFlags(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  paths: readonly string[]
+): Promise<Map<string, string | undefined>> {
+  const flags = new Map<string, string | undefined>();
+  for (const relativePath of paths) {
+    const result = await runGitChecked(config, workspace, ["ls-files", "--debug", "--stage", "-z", "--", relativePath]);
+    flags.set(relativePath, parseIntentDebugFlags(result.copyStdoutBytes(), relativePath));
+  }
+  return flags;
+}
+
+function collectIntentReceipts(
+  preflight: GitCommitPreflight,
+  baseline: GitRepositorySnapshot,
+  current: GitRepositorySnapshot,
+  intentFlags: ReadonlyMap<string, string | undefined>
+): GitIntentReceipt[] | undefined {
+  const receipts: GitIntentReceipt[] = [];
+  const emptyBlobId = gitBlobIdForBytes(Buffer.alloc(0), preflight.objectFormat);
+  for (const selected of preflight.selected) {
+    if (selected.indexEntries.length !== 0) continue;
+    const currentEntries = current.index.get(selected.path) ?? [];
+    const currentStatus = current.statuses.get(selected.path) ?? "";
+    if (currentEntries.length === 0) {
+      if (
+        currentStatus !== (baseline.statuses.get(selected.path) ?? "") ||
+        intentFlags.get(selected.path) !== undefined ||
+        !sameWorktreeState(selected.worktree, current.worktree.get(selected.path))
+      ) {
+        return undefined;
+      }
+      continue;
+    }
+    if (
+      currentEntries.length !== 1 ||
+      currentEntries[0].stage !== 0 ||
+      currentEntries[0].objectId !== emptyBlobId ||
+      currentStatus !== ".A" ||
+      intentFlags.get(selected.path) === undefined ||
+      !sameWorktreeState(selected.worktree, current.worktree.get(selected.path))
+    ) {
+      return undefined;
+    }
+    receipts.push({
+      path: selected.path,
+      indexEntries: currentEntries,
+      status: currentStatus,
+      intentFlags: intentFlags.get(selected.path) as string
+    });
+  }
+  return receipts;
+}
+
+async function restoreOwnedIntentEntries(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  preflight: GitCommitPreflight,
+  baseline: GitRepositorySnapshot,
+  baselineRemoteRefs: string,
+  receipts: readonly GitIntentReceipt[]
+): Promise<void> {
+  if (receipts.length === 0) return;
+  try {
+    const owned = new Set(receipts.map((receipt) => receipt.path));
+    const current = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+    const currentIntentFlags = await intentDebugFlags(config, workspace, receipts.map((receipt) => receipt.path));
+    const states = await selectedWorktreeStates(config, workspace, preflight);
+    const branch = await currentBranchState(config, workspace, preflight.objectFormat);
+    if (
+      branch === undefined ||
+      branch.ref !== `refs/heads/${preflight.branch}` ||
+      branch.head !== preflight.head ||
+      (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs ||
+      !assertUnselectedSnapshotPreserved(baseline, current, owned) ||
+      !selectedWorktreeStatesMatch(preflight, states)
+    ) {
+      return fail("recovery-required");
+    }
+    for (const receipt of receipts) {
+      if (
+        !sameIndexEntries(receipt.indexEntries, current.index.get(receipt.path) ?? []) ||
+        receipt.status !== (current.statuses.get(receipt.path) ?? "") ||
+        currentIntentFlags.get(receipt.path) !== receipt.intentFlags
+      ) {
+        return fail("recovery-required");
+      }
+    }
+
+    await runGitChecked(config, workspace, ["update-index", "--force-remove", "--", ...receipts.map((receipt) => receipt.path)]);
+    const restored = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+    const restoredStates = await selectedWorktreeStates(config, workspace, preflight);
+    if (!sameRepositorySnapshot(baseline, restored) || !selectedWorktreeStatesMatch(preflight, restoredStates)) {
+      return fail("recovery-required");
+    }
+  } catch (error) {
+    if (error instanceof GitCommitError && error.reason === "recovery-required") throw error;
+    return fail("recovery-required");
+  }
+}
+
+async function prepareIntentEntries(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  preflight: GitCommitPreflight,
+  baseline: GitRepositorySnapshot,
+  baselineRemoteRefs: string
+): Promise<GitIntentReceipt[]> {
+  const candidates = preflight.selected.filter(
+    (selected) => selected.indexEntries.length === 0 && selected.worktree.kind !== "missing"
+  );
+  if (candidates.length === 0) return [];
+
+  let commandError: unknown;
+  try {
+    await runGitChecked(config, workspace, ["add", "-N", "--", ...candidates.map((candidate) => candidate.path)]);
+  } catch (error) {
+    commandError = error;
+  }
+
+  let current: GitRepositorySnapshot;
+  try {
+    current = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+  } catch {
+    return fail("recovery-required");
+  }
+  let intentFlags: Map<string, string | undefined>;
+  try {
+    intentFlags = await intentDebugFlags(config, workspace, candidates.map((candidate) => candidate.path));
+  } catch {
+    return fail("recovery-required");
+  }
+  const receipts = collectIntentReceipts(preflight, baseline, current, intentFlags);
+  const owned = new Set((receipts ?? []).map((receipt) => receipt.path));
+  if (receipts === undefined || !assertUnselectedSnapshotPreserved(baseline, current, owned)) {
+    return fail("recovery-required");
+  }
+  if (commandError !== undefined || receipts.length !== candidates.length) {
+    if (receipts.length > 0) {
+      await restoreOwnedIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs, receipts);
+    }
+    if (commandError instanceof GitCommitError) throw commandError;
+    return fail("execution");
+  }
+  return receipts;
+}
+
+async function expectedTreeChanges(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  preflight: GitCommitPreflight
+): Promise<Map<string, GitRawDiffEntry>> {
+  const selected = new Set(preflight.request.paths);
+  const diff = await runGitChecked(config, workspace, [
+    "diff",
+    "--raw",
+    "-z",
+    "--full-index",
+    "--no-renames",
+    "--no-ext-diff",
+    "--no-textconv",
+    preflight.head,
+    "--",
+    ...preflight.request.paths
+  ]);
+  const entries = parseRawDiffEntries(diff.copyStdoutBytes(), preflight.objectFormat, selected);
+  const states = selectedStateMap(preflight);
+  for (const entry of entries.values()) {
+    const selectedState = states.get(entry.path);
+    if (selectedState === undefined) return fail("malformed-output");
+    if (entry.newMode === "000000") {
+      if (selectedState.worktree.kind !== "missing") return fail("preflight-changed");
+      continue;
+    }
+    if (selectedState.worktree.kind !== "file" && selectedState.worktree.kind !== "symlink") {
+      return fail("preflight-changed");
+    }
+    const expectedBlobId = selectedState.worktree.gitBlobId;
+    if (expectedBlobId === null) return fail("preflight-changed");
+    if (entry.newBlobId !== null && entry.newBlobId !== expectedBlobId) return fail("preflight-changed");
+    entries.set(entry.path, { ...entry, newBlobId: expectedBlobId });
+  }
+  return entries;
+}
+
+async function treeEntries(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  commit: string,
+  paths: readonly string[],
+  format: "sha1" | "sha256"
+): Promise<Map<string, GitTreeEntry>> {
+  const result = await runGitChecked(config, workspace, ["ls-tree", "-z", "--full-tree", commit, "--", ...paths]);
+  return parseTreeEntries(result.copyStdoutBytes(), format, new Set(paths));
+}
+
+async function changedTreePaths(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  oldHead: string,
+  newHead: string
+): Promise<Map<string, string>> {
+  const result = await runGitChecked(config, workspace, [
+    "diff-tree",
+    "-r",
+    "--no-commit-id",
+    "--name-status",
+    "-z",
+    "--no-renames",
+    oldHead,
+    newHead
+  ]);
+  return parseChangedPathRecords(result.copyStdoutBytes());
+}
+
+async function commitFailureRestoration(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  preflight: GitCommitPreflight,
+  baseline: GitRepositorySnapshot,
+  baselineRemoteRefs: string,
+  receipts: readonly GitIntentReceipt[]
+): Promise<void> {
+  try {
+    const current = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+    const states = await selectedWorktreeStates(config, workspace, preflight);
+    const branch = await currentBranchState(config, workspace, preflight.objectFormat);
+    if (
+      branch === undefined ||
+      branch.ref !== `refs/heads/${preflight.branch}` ||
+      branch.head !== preflight.head ||
+      (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs
+    ) {
+      return fail("recovery-required");
+    }
+    if (receipts.length === 0) {
+      if (!sameRepositorySnapshot(baseline, current) || !selectedWorktreeStatesMatch(preflight, states)) {
+        return fail("recovery-required");
+      }
+      return;
+    }
+    await restoreOwnedIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs, receipts);
+  } catch (error) {
+    if (error instanceof GitCommitError && error.reason === "recovery-required") throw error;
+    return fail("recovery-required");
+  }
+}
+
+async function verifyCommitPostconditions(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  preflight: GitCommitPreflight,
+  baseline: GitRepositorySnapshot,
+  baselineRemoteRefs: string,
+  expectedChanges: ReadonlyMap<string, GitRawDiffEntry>
+): Promise<GitCommitResult> {
+  try {
+    const branch = await currentBranchState(config, workspace, preflight.objectFormat);
+    if (
+      branch === undefined ||
+      branch.ref !== `refs/heads/${preflight.branch}` ||
+      branch.head === preflight.head
+    ) {
+      return fail("postcondition");
+    }
+    const parentLine = oneLine(await runGitChecked(config, workspace, ["rev-list", "--parents", "--max-count=1", branch.head]));
+    const parents = parentLine.split(" ").filter(Boolean);
+    if (parents.length !== 2 || parents[0] !== branch.head || parents[1] !== preflight.head) return fail("postcondition");
+
+    const actualChanges = await changedTreePaths(config, workspace, preflight.head, branch.head);
+    const selected = new Set(preflight.request.paths);
+    if (
+      actualChanges.size !== expectedChanges.size ||
+      [...actualChanges.keys()].some((relativePath) => !expectedChanges.has(relativePath)) ||
+      [...expectedChanges.keys()].some((relativePath) => actualChanges.get(relativePath) !== expectedChanges.get(relativePath)?.status)
+    ) {
+      return fail("postcondition");
+    }
+    if ([...actualChanges.keys()].some((relativePath) => !selected.has(relativePath))) return fail("postcondition");
+
+    const oldTree = await treeEntries(config, workspace, preflight.head, preflight.request.paths, preflight.objectFormat);
+    const newTree = await treeEntries(config, workspace, branch.head, preflight.request.paths, preflight.objectFormat);
+    for (const relativePath of preflight.request.paths) {
+      const oldEntry = oldTree.get(relativePath);
+      const newEntry = newTree.get(relativePath);
+      if (JSON.stringify(oldEntry ?? null) !== JSON.stringify(newEntry ?? null) && !expectedChanges.has(relativePath)) {
+        return fail("postcondition");
+      }
+      const expected = expectedChanges.get(relativePath);
+      if (expected === undefined) continue;
+      if (expected.newMode === "000000") {
+        if (newEntry !== undefined) return fail("postcondition");
+      } else if (
+        newEntry === undefined ||
+        newEntry.type !== "blob" ||
+        newEntry.mode !== expected.newMode ||
+        newEntry.objectId !== expected.newBlobId
+      ) {
+        return fail("postcondition");
+      }
+    }
+
+    const after = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+    const selectedPaths = new Set(preflight.request.paths);
+    if (
+      !assertUnselectedSnapshotPreserved(baseline, after, selectedPaths) ||
+      [...after.statuses.keys()].some((relativePath) => selectedPaths.has(relativePath)) ||
+      (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs
+    ) {
+      return fail("postcondition");
+    }
+    for (const relativePath of preflight.request.paths) {
+      const treeEntry = newTree.get(relativePath);
+      const indexEntries = after.index.get(relativePath) ?? [];
+      if (treeEntry === undefined) {
+        if (indexEntries.length !== 0) return fail("postcondition");
+      } else if (
+        indexEntries.length !== 1 ||
+        indexEntries[0].stage !== 0 ||
+        indexEntries[0].mode !== treeEntry.mode ||
+        indexEntries[0].objectId !== treeEntry.objectId
+      ) {
+        return fail("postcondition");
+      }
+    }
+    return {
+      schema_version: 1,
+      workspace_id: preflight.workspaceId,
+      root: preflight.root,
+      branch: preflight.branch,
+      old_head: preflight.head,
+      new_head: branch.head,
+      requested_path_count: preflight.request.paths.length,
+      committed_path_count: actualChanges.size,
+      committed_paths: [...actualChanges.keys()]
+    };
+  } catch (error) {
+    if (error instanceof GitCommitError && error.reason === "postcondition") throw error;
+    return fail("postcondition");
+  }
+}
+
+/**
+ * Execute one ordinary local commit for an already explicit workspace. The
+ * operation owns only selected-path intent preparation; all other state is
+ * observed and compared, never broadly repaired.
+ */
+export async function gitCommit(
+  config: GitCommitConfig,
+  guard: Pick<PathGuard, "isBlockedRelativePath">,
+  workspace: Workspace,
+  rawInput: unknown
+): Promise<GitCommitResult> {
+  return withGitCommitLocks(config, guard, workspace, rawInput, async (preflight) => {
+    const baseline = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+    const baselineRemoteRefs = await remoteRefsSnapshot(config, workspace);
+    const baselineBranch = await currentBranchState(config, workspace, preflight.objectFormat);
+    const initialStates = await selectedWorktreeStates(config, workspace, preflight);
+    if (
+      baselineBranch === undefined ||
+      baselineBranch.ref !== `refs/heads/${preflight.branch}` ||
+      baselineBranch.head !== preflight.head ||
+      !selectedSnapshotMatchesPreflight(preflight, baseline, initialStates)
+    ) {
+      return fail("preflight-changed");
+    }
+
+    let receipts: GitIntentReceipt[] = [];
+    let commitAttempted = false;
+    try {
+      receipts = await prepareIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs);
+      const selectedAfterPreparation = await selectedWorktreeStates(config, workspace, preflight);
+      const preparedSnapshot = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+      if (
+        !selectedWorktreeStatesMatch(preflight, selectedAfterPreparation) ||
+        !assertUnselectedSnapshotPreserved(baseline, preparedSnapshot, new Set(receipts.map((receipt) => receipt.path)))
+      ) {
+        return fail("preflight-changed");
+      }
+
+      const expectedChanges = await expectedTreeChanges(config, workspace, preflight);
+      if (expectedChanges.size === 0) {
+        await restoreOwnedIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs, receipts);
+        receipts = [];
+        return fail("no-changes");
+      }
+      const beforeCommitBranch = await currentBranchState(config, workspace, preflight.objectFormat);
+      if (
+        beforeCommitBranch === undefined ||
+        beforeCommitBranch.ref !== `refs/heads/${preflight.branch}` ||
+        beforeCommitBranch.head !== preflight.head ||
+        (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs
+      ) {
+        return fail("preflight-changed");
+      }
+
+      commitAttempted = true;
+      try {
+        await runGitMutation(config, workspace, [
+          "commit",
+          "--only",
+          "--message",
+          preflight.request.message,
+          "--",
+          ...preflight.request.paths
+        ]);
+      } catch (error) {
+        await commitFailureRestoration(config, workspace, preflight, baseline, baselineRemoteRefs, receipts);
+        if (error instanceof GitCommitError) throw error;
+        return fail("execution");
+      }
+      return await verifyCommitPostconditions(config, workspace, preflight, baseline, baselineRemoteRefs, expectedChanges);
+    } catch (error) {
+      if (!commitAttempted && receipts.length > 0) {
+        await restoreOwnedIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs, receipts);
+      }
+      throw error;
+    }
   });
 }
