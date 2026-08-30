@@ -590,10 +590,15 @@ function assertPreparedSnapshotPreserved(
 }
 
 /**
- * Before a ref advance, an ordinary failure may leave selected-path drift
- * attributable to the caller/helper. Unselected physical state and repository
- * metadata, however, must still be unchanged; otherwise the failure is
- * recovery truth rather than an ordinary execution/preflight result.
+ * Before a ref advance, an ordinary failure under the supported concurrency
+ * model (RepoConnect-owned writers, ordinary Git-lock-cooperative writers,
+ * and synchronous cooperative hooks) may leave selected-path drift
+ * attributable to the caller/helper.
+ * Unselected physical state and repository metadata must still be unchanged
+ * by RepoConnect mechanics while ownership remains provable; otherwise the
+ * failure is recovery truth rather than an ordinary execution/preflight
+ * result. This check does not claim atomic restoration against
+ * NON_COOPERATIVE_LOCAL_INTERFERENCE.
  */
 async function assertPreAdvanceStatePreserved(
   config: GitCommitConfig,

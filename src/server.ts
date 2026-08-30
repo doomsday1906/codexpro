@@ -3334,7 +3334,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     "git_commit",
     {
       title: "Git Commit",
-      description: `Create one ordinary local commit for exactly the named file or symlink identities in an explicitly supplied workspace, only when expected_head is the exact current full commit SHA. Unrelated staged, unstaged, and untracked work is preserved; hooks and configured Git policy remain enabled; no remote operations are performed. Available only in full tool mode with CODEXPRO_WRITE_MODE=workspace.`,
+      description: `Create one ordinary local commit for exactly the named file or symlink identities in an explicitly supplied workspace, only when expected_head is the exact current full commit SHA. Under the supported concurrency model—RepoConnect-owned writers, ordinary Git-lock-cooperative writers, and synchronous cooperative hooks—unrelated staged, unstaged, and untracked work is preserved and tool-owned temporary state is restored on failure while ownership remains provable. NON_COOPERATIVE_LOCAL_INTERFERENCE (raw same-UID lock-bypassing or background pathname mutation) is outside the atomic restoration guarantee and may return recovery-required. Hooks and configured Git policy remain enabled; no remote operations are performed. Available only in full tool mode with CODEXPRO_WRITE_MODE=workspace.`,
       inputSchema: GIT_COMMIT_PUBLIC_SCHEMA,
       runtimeInputSchema: GIT_COMMIT_ARGUMENTS_SCHEMA,
       annotations: GIT_COMMIT_ANNOTATIONS,

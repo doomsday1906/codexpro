@@ -8,8 +8,9 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-// Exact authority: MISSION_ANCHOR.md A001 Laws 001/002/004/005/007/008/009/010/012/013/015
-// and MISSION_PLAN.md P001 TASK-006 AP-011/AP-012. This script owns hostile public proof,
+// Exact authority: MISSION_CORRECTIONS.md COR-001 DEC-001/DEC-003, MISSION_ANCHOR.md A002
+// Laws 001/002/004/005/007/008/009/010/011/012/013/015, and MISSION_PLAN.md P002
+// TASK-006R1 AP-011/AP-012. This script owns hostile public proof,
 // not final acceptance. Target producer/route is a real MCP HTTP call -> WorkspaceManager
 // -> gitCommit -> ordinary native Git in disposable local repositories. Direct Git refs,
 // trees, index/worktree bytes, hook artifacts, and remote-tracking refs are TARGET_EVIDENCE;
@@ -30,6 +31,20 @@ const failureRoot = path.join(failureParent, "failure-target");
 const failureHooks = path.join(fixtureRoot, "failure-hooks");
 const failureHookLog = path.join(fixtureRoot, "failure-hook-events.log");
 const failureSecretEvidence = path.join(fixtureRoot, "failure-hook-secret-evidence.log");
+const nonCooperativeParent = path.join(fixtureRoot, "non-cooperative-parent");
+const nonCooperativeRoot = path.join(nonCooperativeParent, "non-cooperative-target");
+const nonCooperativeHooks = path.join(fixtureRoot, "non-cooperative-hooks");
+const nonCooperativeHookLog = path.join(fixtureRoot, "non-cooperative-hook-events.log");
+const nonCooperativeMutatorScript = path.join(fixtureRoot, "non-cooperative-mutator.cjs");
+const nonCooperativeReplacementMarker = path.join(fixtureRoot, "non-cooperative-replacement.json");
+const nonCooperativeForeignSentinel = path.join(nonCooperativeRoot, "foreign-sentinel.bin");
+const nonCooperativeReplacementBytes = Buffer.from("NON_COOPERATIVE_REPLACEMENT_SENTINEL\n", "utf8");
+const schedulingRoot = path.join(fixtureRoot, "final-scheduling-window");
+const schedulingPath = path.join(schedulingRoot, "owned-path.tmp");
+const schedulingForeignSentinel = path.join(schedulingRoot, "foreign-sentinel.bin");
+const schedulingGate = path.join(fixtureRoot, "final-scheduling-window.gate");
+const schedulingResult = path.join(fixtureRoot, "final-scheduling-window.result");
+const schedulingMutatorScript = path.join(fixtureRoot, "final-scheduling-window-mutator.cjs");
 const redirectRoot = path.join(fixtureRoot, "hostile-redirect");
 const hostileConfig = path.join(fixtureRoot, "hostile.gitconfig");
 const hostileGlobalConfig = path.join(fixtureRoot, "hostile-global.gitconfig");
@@ -38,6 +53,8 @@ const hostileTrace = path.join(fixtureRoot, "hostile-trace.log");
 const hostileTrace2 = path.join(fixtureRoot, "hostile-trace2.log");
 const hostileTracePerformance = path.join(fixtureRoot, "hostile-trace-performance.log");
 const hostileTracePacket = path.join(fixtureRoot, "hostile-trace-packet.log");
+
+console.log("AUTHORITY: MISSION_CORRECTIONS.md COR-001 DEC-001/DEC-003; MISSION_ANCHOR.md A002 Laws 001/002/004/005/007/008/009/010/011/012/013/015; MISSION_PLAN.md P002 TASK-006R1 AP-011/AP-012.");
 
 function gitEnv() {
   const env = { ...process.env };
@@ -120,6 +137,19 @@ async function pathState(root, relativePath) {
   }
   if (info.isDirectory()) return { kind: "directory", mode: info.mode & 0o7777 };
   return { kind: "other", mode: info.mode & 0o7777 };
+}
+
+async function rawFileSnapshot(filePath) {
+  const stat = await lstat(filePath);
+  const bytes = await readFile(filePath);
+  return {
+    device: stat.dev,
+    inode: stat.ino,
+    mode: stat.mode & 0o7777,
+    size: stat.size,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    bytes
+  };
 }
 
 async function repositorySnapshot(root, paths) {
@@ -370,6 +400,9 @@ try {
     mkdir(targetHooks, { recursive: true }),
     mkdir(failureRoot, { recursive: true }),
     mkdir(failureHooks, { recursive: true }),
+    mkdir(nonCooperativeRoot, { recursive: true }),
+    mkdir(nonCooperativeHooks, { recursive: true }),
+    mkdir(schedulingRoot, { recursive: true }),
     mkdir(redirectRoot, { recursive: true })
   ]);
   await writeFile(hostileConfig, "[user]\n\tname = Hostile Config\n\temail = hostile-config@example.invalid\n", "utf8");
@@ -429,11 +462,164 @@ try {
   await chmod(failureHook, 0o700);
   directGit(failureRoot, ["config", "core.hooksPath", failureHooks]);
 
+  // The mutator is deliberately outside Git and RepoConnect locking. It
+  // waits for a tool-owned recovery candidate, moves that original inode to
+  // a foreign sentinel, and installs a replacement at the old pathname.
+  // This is a same-UID environmental-boundary producer, not product logic.
+  await writeFile(nonCooperativeMutatorScript, `
+const fs = require("node:fs");
+const path = require("node:path");
+const candidateDir = process.argv[2];
+const foreignSentinel = process.argv[3];
+const markerPath = process.argv[4];
+const replacement = Buffer.from(process.argv[5], "base64");
+const sleep = new Int32Array(new SharedArrayBuffer(4));
+const deadline = Date.now() + 5000;
+while (Date.now() < deadline) {
+  let names;
+  try {
+    names = fs.readdirSync(candidateDir).filter((name) => /^\\.codexpro-index-.*\\.tmp$/u.test(name));
+  } catch {
+    names = [];
+  }
+  for (const name of names) {
+    const candidate = path.join(candidateDir, name);
+    try {
+      const original = fs.readFileSync(candidate);
+      if (original.length === 0) {
+        Atomics.wait(sleep, 0, 0, 2);
+        continue;
+      }
+      const confirmed = fs.readFileSync(candidate);
+      if (confirmed.length !== original.length || !confirmed.equals(original)) {
+        Atomics.wait(sleep, 0, 0, 2);
+        continue;
+      }
+      const originalSha256 = require("node:crypto").createHash("sha256").update(original).digest("hex");
+      fs.renameSync(candidate, foreignSentinel);
+      fs.writeFileSync(candidate, replacement, { mode: 0o600 });
+      const replacedAt = Date.now();
+      // Keep the foreign inode/content observable while the product performs
+      // its remaining ownership checks. This removes scheduler luck from the
+      // falsifier without ever touching the real index pathname.
+      while (Date.now() < replacedAt + 1000) {
+        try {
+          fs.writeFileSync(candidate, replacement, { mode: 0o600 });
+        } catch {
+          // A missing candidate remains recovery truth; do not recreate it.
+        }
+        Atomics.wait(sleep, 0, 0, 2);
+      }
+      fs.writeFileSync(markerPath, JSON.stringify({
+        pid: process.pid,
+        uid: typeof process.getuid === "function" ? process.getuid() : null,
+        candidate,
+        foreignSentinel,
+        originalSize: original.length,
+        originalSha256,
+        replacedAt,
+        doneAt: Date.now()
+      }) + "\\n");
+      process.exit(0);
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "EEXIST") throw error;
+    }
+  }
+  Atomics.wait(sleep, 0, 0, 2);
+}
+fs.writeFileSync(markerPath, JSON.stringify({ pid: process.pid, uid: typeof process.getuid === "function" ? process.getuid() : null, timeout: true }) + "\\n");
+process.exit(2);
+`, "utf8");
+  await chmod(nonCooperativeMutatorScript, 0o700);
+
+  initRepo(nonCooperativeRoot, "TASK006 Non Cooperative");
+  await writeFile(path.join(nonCooperativeRoot, "base.txt"), "base\n", "utf8");
+  await writeFile(path.join(nonCooperativeRoot, "unrelated-staged.txt"), "unrelated staged baseline\n", "utf8");
+  await writeFile(path.join(nonCooperativeRoot, "unrelated-unstaged.txt"), "unrelated unstaged baseline\n", "utf8");
+  const nonCooperativeHead = commitFixture(nonCooperativeRoot, "task006 non-cooperative baseline");
+  await writeFile(path.join(nonCooperativeRoot, "selected-untracked.txt"), "selected untracked\n", "utf8");
+  await writeFile(path.join(nonCooperativeRoot, "unrelated-staged.txt"), "unrelated staged\n", "utf8");
+  directGit(nonCooperativeRoot, ["add", "--", "unrelated-staged.txt"]);
+  await writeFile(path.join(nonCooperativeRoot, "unrelated-unstaged.txt"), "unrelated unstaged\n", "utf8");
+  await writeFile(path.join(nonCooperativeRoot, "unrelated-untracked.txt"), "unrelated untracked\n", "utf8");
+  const nonCooperativeIndexPath = gitText(nonCooperativeRoot, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+  const nonCooperativeHook = path.join(nonCooperativeHooks, "pre-commit");
+  await writeFile(nonCooperativeHook, [
+    "#!/bin/sh",
+    "set -eu",
+    `printf 'invoked\\n' > ${quoteShell(nonCooperativeHookLog)}`,
+    `${quoteShell(process.execPath)} ${quoteShell(nonCooperativeMutatorScript)} ${quoteShell(path.dirname(nonCooperativeIndexPath))} ${quoteShell(nonCooperativeForeignSentinel)} ${quoteShell(nonCooperativeReplacementMarker)} ${quoteShell(nonCooperativeReplacementBytes.toString("base64"))} >/dev/null 2>&1 &`,
+    // Give the detached child time to enter its raw polling loop. The
+    // candidate does not exist until this hook returns and cleanup begins.
+    "sleep 0.05",
+    "exit 1",
+    ""
+  ].join("\n"), { encoding: "utf8", mode: 0o700 });
+  await chmod(nonCooperativeHook, 0o700);
+  directGit(nonCooperativeRoot, ["config", "core.hooksPath", nonCooperativeHooks]);
+
+  // Direct scheduling-window boundary demonstration. The child waits until
+  // the parent has completed the identity check, then replaces the pathname
+  // before any parent cleanup mutation is attempted.
+  await writeFile(schedulingPath, "owned baseline\n", "utf8");
+  await writeFile(schedulingMutatorScript, `
+const fs = require("node:fs");
+const path = require("node:path");
+const ownedPath = process.argv[2];
+const foreignPath = process.argv[3];
+const gatePath = process.argv[4];
+const resultPath = process.argv[5];
+while (!fs.existsSync(gatePath)) {
+  const sleep = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(sleep, 0, 0, 2);
+}
+const gate = JSON.parse(fs.readFileSync(gatePath, "utf8"));
+fs.renameSync(ownedPath, foreignPath);
+fs.writeFileSync(ownedPath, "replacement after identity check\\n", { mode: 0o600 });
+fs.writeFileSync(resultPath, JSON.stringify({
+  pid: process.pid,
+  uid: typeof process.getuid === "function" ? process.getuid() : null,
+  checkedAt: gate.checkedAt,
+  replacedAt: Date.now(),
+  ownedPath,
+  foreignPath
+}) + "\\n");
+`, "utf8");
+  await chmod(schedulingMutatorScript, 0o700);
+  const schedulingChild = spawn(process.execPath, [schedulingMutatorScript, schedulingPath, schedulingForeignSentinel, schedulingGate, schedulingResult], {
+    stdio: "ignore"
+  });
+  const schedulingChildDone = waitForExit(schedulingChild);
+  const schedulingBefore = await rawFileSnapshot(schedulingPath);
+  const schedulingCheckedAt = Date.now();
+  await writeFile(schedulingGate, JSON.stringify({
+    checkedAt: schedulingCheckedAt,
+    inode: schedulingBefore.inode,
+    sha256: schedulingBefore.sha256
+  }) + "\n", "utf8");
+  const schedulingMarkerText = await waitForText(schedulingResult, /"replacedAt"/u);
+  const schedulingMarker = JSON.parse(schedulingMarkerText);
+  const schedulingAfter = await rawFileSnapshot(schedulingPath);
+  const schedulingForeign = await rawFileSnapshot(schedulingForeignSentinel);
+  const schedulingExit = await schedulingChildDone;
+  assert.equal(schedulingExit.code, 0);
+  assert.equal(schedulingMarker.uid, typeof process.getuid === "function" ? process.getuid() : null);
+  assert.ok(schedulingMarker.replacedAt >= schedulingMarker.checkedAt);
+  assert.notEqual(schedulingAfter.inode, schedulingBefore.inode);
+  assert.notEqual(schedulingAfter.sha256, schedulingBefore.sha256);
+  assert.equal(schedulingAfter.bytes.toString("utf8"), "replacement after identity check\n");
+  assert.deepEqual(schedulingForeign.bytes, schedulingBefore.bytes);
+  console.log(`RAW_WINDOW_OBSERVATION: same-UID raw child pid=${schedulingMarker.pid} uid=${schedulingMarker.uid} replaced ${schedulingPath} after checkedAt=${schedulingMarker.checkedAt}; original inode=${schedulingBefore.inode} now=${schedulingAfter.inode}; original object remains at ${schedulingForeignSentinel}.`);
+  console.log("PREDICATE: TRUE — direct process/path observations prove a pathname changed after identity check and before any parent cleanup mutation.");
+  console.log("SANITY_VERDICT: MATCH — this is expected final-scheduling-window boundary evidence only; it is not a product failure and makes no product restoration claim.");
+
   const defaultCanonicalRoot = await realpath(defaultRoot);
   const targetCanonicalRoot = await realpath(targetRoot);
   const failureCanonicalRoot = await realpath(failureRoot);
+  const nonCooperativeCanonicalRoot = await realpath(nonCooperativeRoot);
   const targetWorkspaceId = workspaceIdForRoot(targetCanonicalRoot);
   const failureWorkspaceId = workspaceIdForRoot(failureCanonicalRoot);
+  const nonCooperativeWorkspaceId = workspaceIdForRoot(nonCooperativeCanonicalRoot);
   const targetPaths = ["selected-a.txt", "selected-b.txt", "unrelated-staged.txt", "unrelated-unstaged.txt", "untracked.txt"];
 
   // PASS 1: direct native facts and the accepted authority precede all MCP/test labels.
@@ -446,7 +632,6 @@ try {
   assert.equal(targetBefore.paths["selected-a.txt"].kind, "file");
   assert.equal(targetBefore.paths["selected-b.txt"].kind, "file");
   assert.equal(targetBefore.paths["untracked.txt"].kind, "file");
-  console.log("AUTHORITY: MISSION_ANCHOR.md A001 Laws 001/002/004/005/007/008/009/010/012/013/015 and MISSION_PLAN.md P001 TASK-006 AP-011/AP-012.");
   console.log(`TARGET_PRODUCER_ROUTE: real MCP HTTP JSON-RPC -> WorkspaceManager -> gitCommit -> ordinary native Git; target=${targetCanonicalRoot}; default=${defaultCanonicalRoot}.`);
   console.log("TARGET_EVIDENCE: direct refs/parents/tree/index/worktree/hook/remote facts plus complete JSON-RPC envelopes; MCP classifications are supporting only.");
   console.log(`RAW_OBSERVATION: target attached branch=${targetBefore.branch} HEAD=${targetBefore.head}; default HEAD=${defaultBefore.head}; target paths include two changed candidates, staged+unstaged unrelated work, and one untracked file.`);
@@ -454,7 +639,7 @@ try {
 
   await withHttpServer({
     defaultRoot,
-    allowedRoots: [defaultCanonicalRoot, path.dirname(targetCanonicalRoot), path.dirname(failureCanonicalRoot)],
+    allowedRoots: [defaultCanonicalRoot, path.dirname(targetCanonicalRoot), path.dirname(failureCanonicalRoot), path.dirname(nonCooperativeCanonicalRoot)],
     extraEnv: {
       GIT_DIR: path.join(redirectRoot, ".git"),
       GIT_WORK_TREE: redirectRoot,
@@ -529,6 +714,14 @@ try {
     assert.equal(gitText(targetRoot, ["diff", "--cached", "--name-only"]), "unrelated-staged.txt");
     assert.deepEqual(gitText(targetRoot, ["diff", "--name-only"]).split("\n").filter(Boolean).sort(), ["selected-b.txt", "unrelated-unstaged.txt"]);
     assert.equal(gitText(targetRoot, ["ls-files", "--others", "--exclude-standard"]), "untracked.txt");
+    const settledSelectedAObject = gitText(targetRoot, ["rev-parse", `${targetAfterRace.head}:selected-a.txt`]);
+    assert.equal(
+      directGit(targetRoot, ["ls-files", "--stage", "-z", "--", "selected-a.txt"]).toString("utf8"),
+      `100644 ${settledSelectedAObject} 0\tselected-a.txt\u0000`
+    );
+    assert.equal(directGit(targetRoot, ["diff", "--name-only", "--", "selected-a.txt"]).toString("utf8"), "");
+    assert.equal(directGit(targetRoot, ["diff", "--cached", "--name-only", "--", "selected-a.txt"]).toString("utf8"), "");
+    assert.equal(directGit(targetRoot, ["ls-files", "--others", "--exclude-standard", "--", "selected-a.txt"]).toString("utf8"), "");
     assert.deepEqual(await readFile(hostileTrace).catch(() => null), hostileTraceBeforeRace, "public mutation added inherited GIT_TRACE output");
     assert.deepEqual(await readFile(hostileTrace2).catch(() => null), hostileTrace2BeforeRace, "public mutation added inherited GIT_TRACE2 output");
     assert.deepEqual(await readFile(hostileTracePerformance).catch(() => null), hostileTracePerformanceBeforeRace, "public mutation added inherited GIT_TRACE_PERFORMANCE output");
@@ -537,7 +730,7 @@ try {
     assert.ok(raceB.startedAt < hookEndEvent.timeMs, "public request B did not overlap hook execution");
     assert.ok(raceB.endedAt >= hookEndEvent.timeMs, "loser completed before the winner released the serialized mutation");
     console.log(`RAW_OBSERVATION: concurrent public calls started while hook was blocked; hook events=${hookEvents.map((event) => event.event).join("->")}; raw target HEAD advanced ${targetHead} -> ${targetAfterRace.head}; parent=${raceCommit.parents[0]}; raw changed paths=${JSON.stringify(raceChanged)}.`);
-    console.log(`RAW_OBSERVATION: selected-b, staged/unstaged unrelated files, untracked file, and remote refs matched their exact pre-race bytes/records; hostile redirect/trace artifacts did not gain mutation-time output.`);
+    console.log(`RAW_OBSERVATION: selected-a settled to tree object ${settledSelectedAObject} with matching stage-0 index entry and no selected-path worktree/index/untracked diff; selected-b, staged/unstaged unrelated files, untracked file, and remote refs matched their exact pre-race bytes/records; hostile redirect/trace artifacts did not gain mutation-time output.`);
     console.log("PREDICATE: TRUE — direct hook start/end timing independently proves both public requests overlapped one held mutation window; the second completed only after release.");
     console.log("SANITY_VERDICT: MATCH — raw Git shows exactly one ordinary child commit with the first selected path and no clobber/residue before MCP outcomes are classified.");
     console.log("EVIDENCE_CONFLICT: NONE — direct raw target facts and public transport timing agree.");
@@ -634,7 +827,84 @@ try {
     console.log("SANITY_VERDICT: MATCH — direct hook producer and raw repository restoration facts establish the hostile failure before envelope interpretation.");
     console.log("PASS hostile public hook envelope: the secret emitted by a real configured hook was absent from every serialized JSON-RPC error-envelope surface.");
 
-    console.log("COVERAGE_MAP: existing git-commit-smoke covers selected states, path/blocked/directory/gitlink/ignored/detached/in-progress/unmerged rejection, preservation, no-change, environment, and remote falsifiers; task004 smoke covers stale/mid-commit race, hooks/policy, identity/signing, and restoration; git-commit-mcp smoke covers mode/write boundaries, explicit fresh-session identity, stale/wrong/missing IDs, and complete hostile envelopes; TASK-006 script adds public lock race, public M001/M002 review, public hostile-hook redaction, and hostile inherited redirect/trace checks.");
+    // COR-001 boundary falsifier: a same-UID background process bypasses both
+    // Git and RepoConnect locks and replaces the tool-owned recovery candidate.
+    // Establish the raw interference predicate first; only then interpret the
+    // MCP failure and its bounded recovery truth.
+    const nonCooperativePaths = [
+      "selected-untracked.txt",
+      "unrelated-staged.txt",
+      "unrelated-unstaged.txt",
+      "unrelated-untracked.txt",
+      "foreign-sentinel.bin"
+    ];
+    const nonCooperativeBefore = await repositorySnapshot(nonCooperativeRoot, nonCooperativePaths);
+    assert.equal(nonCooperativeBefore.head, nonCooperativeHead);
+    assert.equal(nonCooperativeBefore.paths["foreign-sentinel.bin"].kind, "missing");
+    assert.equal(nonCooperativeBefore.paths["selected-untracked.txt"].kind, "file");
+    assert.equal(nonCooperativeBefore.paths["unrelated-staged.txt"].kind, "file");
+    const nonCooperativeUnrelatedIndexBefore = directGit(nonCooperativeRoot, ["ls-files", "--stage", "-z", "--", "unrelated-staged.txt"]).toString("base64");
+    const nonCooperativeOpened = expectSuccess(
+      await callTool(sessionA, "open_workspace", { path: nonCooperativeCanonicalRoot, include_tree: false }),
+      "open non-cooperative target"
+    );
+    assert.equal(nonCooperativeOpened.structuredContent.workspace_id, nonCooperativeWorkspaceId);
+    const nonCooperativeOutput = await callTool(sessionA, "git_commit", {
+      workspace_id: nonCooperativeWorkspaceId,
+      paths: ["selected-untracked.txt"],
+      message: "task006 non-cooperative interference",
+      expected_head: nonCooperativeHead
+    });
+    const nonCooperativeMarkerText = await waitForText(nonCooperativeReplacementMarker, /"doneAt"/u);
+    const nonCooperativeMarker = JSON.parse(nonCooperativeMarkerText);
+    const nonCooperativeAfter = await repositorySnapshot(nonCooperativeRoot, nonCooperativePaths);
+    const nonCooperativeCandidateRelative = path.relative(nonCooperativeRoot, nonCooperativeMarker.candidate);
+    const nonCooperativeCandidate = await pathState(nonCooperativeRoot, nonCooperativeCandidateRelative);
+
+    // PASS 1: raw child/process/path facts prove the trigger before checking
+    // whether the public route reported success, failure, or a classification.
+    assert.equal(nonCooperativeMarker.uid, typeof process.getuid === "function" ? process.getuid() : null);
+    assert.equal(await exists(nonCooperativeForeignSentinel), true);
+    assert.equal(nonCooperativeAfter.paths["foreign-sentinel.bin"].kind, "file");
+    assert.equal(
+      createHash("sha256").update(Buffer.from(nonCooperativeAfter.paths["foreign-sentinel.bin"].bytes, "base64")).digest("hex"),
+      nonCooperativeMarker.originalSha256,
+      "foreign sentinel content changed after the raw replacement"
+    );
+    assert.equal(
+      Buffer.from(nonCooperativeAfter.paths["foreign-sentinel.bin"].bytes, "base64").length,
+      nonCooperativeMarker.originalSize,
+      "foreign sentinel size changed after the raw replacement"
+    );
+    assert.equal(nonCooperativeCandidate.kind, "file");
+    assert.equal(
+      Buffer.from(nonCooperativeCandidate.bytes, "base64").equals(nonCooperativeReplacementBytes),
+      true,
+      "foreign replacement pathname was deleted or its content was changed"
+    );
+    assert.equal(nonCooperativeAfter.head, nonCooperativeBefore.head);
+    assert.equal(nonCooperativeAfter.refs, nonCooperativeBefore.refs);
+    assert.equal(nonCooperativeAfter.remoteRefs, nonCooperativeBefore.remoteRefs);
+    assert.equal(directGit(nonCooperativeRoot, ["ls-files", "--stage", "-z", "--", "unrelated-staged.txt"]).toString("base64"), nonCooperativeUnrelatedIndexBefore);
+    assert.equal(gitText(nonCooperativeRoot, ["diff", "--cached", "--name-only"]), "unrelated-staged.txt");
+    assert.match(gitText(nonCooperativeRoot, ["diff", "--name-only"]), /unrelated-unstaged\.txt/u);
+    assert.match(gitText(nonCooperativeRoot, ["ls-files", "--others", "--exclude-standard"]), /unrelated-untracked\.txt/u);
+    for (const relativePath of ["selected-untracked.txt", "unrelated-staged.txt", "unrelated-unstaged.txt", "unrelated-untracked.txt"]) {
+      assert.deepEqual(nonCooperativeAfter.paths[relativePath], nonCooperativeBefore.paths[relativePath], `${relativePath} changed during non-cooperative interference`);
+    }
+    console.log(`RAW_OBSERVATION: same-UID background mutator pid=${nonCooperativeMarker.pid} replaced candidate ${nonCooperativeMarker.candidate}; foreign sentinel remained present with original bytes and replacement pathname retained ${nonCooperativeReplacementBytes.length} bytes; HEAD/ref/remote and all worktree unrelated paths remained unchanged.`);
+    console.log("PREDICATE: TRUE — independent raw process UID, rename, sentinel, replacement inode/content, and unchanged unrelated state prove NON_COOPERATIVE_LOCAL_INTERFERENCE before MCP-result interpretation.");
+    console.log("SANITY_VERDICT: MATCH — raw disposable Git/filesystem facts show ownership loss before cleanup pathname mutation; this boundary case must not be treated as an atomic-restoration success.");
+
+    const nonCooperativeEnvelopeText = serialized(nonCooperativeOutput.rawEnvelope) + nonCooperativeOutput.rawBody + serialized(nonCooperativeOutput.result) + serialized(nonCooperativeOutput.error);
+    expectError(nonCooperativeOutput, "non-cooperative interference");
+    assert.match(nonCooperativeEnvelopeText, /recovery-required|manual recovery/iu);
+    assert.doesNotMatch(nonCooperativeEnvelopeText, /restor(?:ed|ation)|success/iu);
+    assert.equal(nonCooperativeOutput.result?.isError, true, "non-cooperative interference was not returned as an MCP error");
+    assert.equal(nonCooperativeOutput.result?.structuredContent?.error?.includes?.("manual recovery"), true, "non-cooperative error lacked bounded recovery wording");
+    console.log("PASS NON_COOPERATIVE_LOCAL_INTERFERENCE: public route returned bounded recovery-required truth, no success/restoration claim, no broad cleanup, no foreign sentinel deletion, and unrelated state remained intact.");
+
+    console.log("COVERAGE_MAP: A002/P002 existing git-commit-smoke covers selected states, path/blocked/directory/gitlink/ignored/detached/in-progress/unmerged rejection, preservation, no-change, ordinary external writer-before/after-lock falsifiers, selected settlement, environment, and remote falsifiers; task004 smoke covers stale/mid-commit exact-head race, synchronous hooks/policy, identity/signing, and cooperative restoration; git-commit-mcp smoke covers mode/write/schema boundaries, explicit fresh-session identity, stale/wrong/missing IDs, and complete hostile message/path envelopes; TASK-006R1 adds public RepoConnect serialization, public M001/M002 review, public hostile-hook redaction, inherited redirect/trace checks, NON_COOPERATIVE_LOCAL_INTERFERENCE recovery truth, and the final scheduling-window boundary demonstration.");
     console.log("GIT_COMMIT_TASK006_SMOKE: PASS (hostile public proof only; no final acceptance claim).");
   });
 } finally {

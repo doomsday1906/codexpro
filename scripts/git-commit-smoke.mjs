@@ -619,6 +619,20 @@ const runMatrixCommit = async (paths, expectedPaths, verify) => {
   assert.equal(result.requested_path_count, paths.length);
   await assertMatrixUnrelated(unrelatedBaseline);
   assert.equal(matrixRemoteRefs(), beforeRemoteRefs);
+  // Raw selected-path settlement: every requested path is either represented
+  // by its exact new-tree stage-0 entry or absent for a deletion, and no
+  // selected worktree/index/untracked diff remains after success. This proves
+  // the post-success settlement rather than trusting the returned path list.
+  for (const relativePath of paths) {
+    const treeEntry = matrixTreeEntry(newHead, relativePath);
+    const indexEntry = matrixIndexEntry(relativePath);
+    if (treeEntry === undefined) assert.equal(indexEntry, "", `${relativePath} remained in the index after deletion`);
+    else assert.equal(indexEntry, `${treeEntry.mode} ${treeEntry.objectId} 0\t${relativePath}\u0000`, `${relativePath} index did not settle to the new tree entry`);
+    assert.equal(mustGit(matrixRoot, ["diff", "--name-only", "--", relativePath]).toString("utf8"), "", `${relativePath} retained an unstaged diff after success`);
+    assert.equal(mustGit(matrixRoot, ["diff", "--cached", "--name-only", "--", relativePath]).toString("utf8"), "", `${relativePath} retained a staged diff after success`);
+    assert.equal(mustGit(matrixRoot, ["ls-files", "--others", "--exclude-standard", "--", relativePath]).toString("utf8"), "", `${relativePath} retained an untracked record after success`);
+  }
+  console.log(`RAW_SETTLEMENT: selected paths ${paths.join(",")} have exact post-success tree/index settlement and no selected worktree, staged, or untracked diff.`);
   if (verify) await verify(oldHead, newHead, result);
   console.log(`PASS AP-005/AP-006 selected=${paths.join(",")} committed=${result.committed_paths.join(",")}`);
   return result;
@@ -1170,6 +1184,51 @@ assert.equal(linkedResult.new_head, linkedNewHead);
 assert.equal(mustGit(linkedWorktreeRoot, ["show", `${linkedNewHead}:linked-selected.txt`]).toString("utf8"), "linked current\n");
 console.log("PASS TASK-006 linked worktree private index resolved and selected commit verified");
 
+// Ordinary external Git writer-before-lock: a separate native Git process
+// stages an unrelated file before RepoConnect enters its mutation lock. The
+// raw staged entry is established by that process first, then the product's
+// --only commit must preserve it exactly.
+const writerBeforeRoot = path.join(fixtureRoot, "task006-writer-before-lock");
+await mkdir(writerBeforeRoot);
+initRepo(writerBeforeRoot, "TASK-006 Writer Before Lock");
+await writeFile(path.join(writerBeforeRoot, "writer-before-base.txt"), "base\n");
+const writerBeforeHead = commitAll(writerBeforeRoot, "writer-before-lock base");
+await writeFile(path.join(writerBeforeRoot, "writer-before-selected.txt"), "selected current\n");
+await writeFile(path.join(writerBeforeRoot, "writer-before-unrelated.txt"), "external staged current\n");
+const writerBeforeEnv = { ...process.env };
+for (const key of Object.keys(writerBeforeEnv)) if (/^GIT_/iu.test(key)) delete writerBeforeEnv[key];
+Object.assign(writerBeforeEnv, { GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", LC_ALL: "C", LANG: "C" });
+const writerBeforeProcess = spawn(realGit, ["add", "--", "writer-before-unrelated.txt"], {
+  cwd: writerBeforeRoot,
+  env: writerBeforeEnv,
+  stdio: ["ignore", "ignore", "ignore"]
+});
+const writerBeforeExit = await waitForChild(writerBeforeProcess);
+assert.equal(writerBeforeExit.code, 0, "ordinary external writer-before-lock did not complete");
+const writerBeforeIndex = mustGit(writerBeforeRoot, ["ls-files", "--stage", "-z", "--", "writer-before-unrelated.txt"]);
+const writerBeforeStatus = mustGit(writerBeforeRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
+assert.notEqual(writerBeforeIndex.length, 0, "ordinary external writer did not produce an index entry");
+assert.match(writerBeforeStatus.toString("utf8"), /writer-before-unrelated\.txt/u);
+console.log(`RAW_WRITER_BEFORE_PREDICATE: native Git writer exited 0 before product invocation; unrelated index entry bytes=${writerBeforeIndex.length}, status bytes=${writerBeforeStatus.length}.`);
+console.log("PREDICATE: TRUE — independent external Git process and raw index/status observations prove cooperative writer-before-lock state before RepoConnect mutation.");
+const writerBeforeWorkspace = { id: "ws_task006_writer_before_lock", root: writerBeforeRoot, openedAt: new Date().toISOString() };
+const writerBeforeResult = await gitCommit(config, matrixGuard, writerBeforeWorkspace, {
+  workspace_id: writerBeforeWorkspace.id,
+  paths: ["writer-before-selected.txt"],
+  message: "task006 preserve writer-before-lock state",
+  expected_head: writerBeforeHead
+});
+const writerBeforeAfterHead = gitTrimmed(writerBeforeRoot, ["rev-parse", "HEAD"]);
+assert.equal(writerBeforeResult.old_head, writerBeforeHead);
+assert.equal(writerBeforeResult.new_head, writerBeforeAfterHead);
+assert.deepEqual(writerBeforeResult.committed_paths, ["writer-before-selected.txt"]);
+assert.deepEqual(mustGit(writerBeforeRoot, ["ls-files", "--stage", "-z", "--", "writer-before-unrelated.txt"]), writerBeforeIndex);
+assert.equal(mustGit(writerBeforeRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]).toString("utf8").includes("writer-before-unrelated.txt"), true);
+assert.equal(gitTrimmed(writerBeforeRoot, ["diff", "--cached", "--name-only"]), "writer-before-unrelated.txt");
+assert.equal((await readFile(path.join(writerBeforeRoot, "writer-before-unrelated.txt"))).toString("utf8"), "external staged current\n");
+console.log("RAW_WRITER_BEFORE_RESULT: selected commit advanced HEAD while the exact external staged index entry, worktree bytes, and staged pathname remained intact.");
+console.log("PASS TASK-006 ordinary external Git writer-before-lock cooperation preserved unrelated staged state");
+
 // Split-index mode must retain its index extension/permissions across the
 // candidate transaction and restore the main index exactly on a hook failure.
 const splitRoot = path.join(fixtureRoot, "task006-split-index");
@@ -1239,31 +1298,37 @@ const lockedWriterIndex = gitTrimmed(lockedWriterRoot, ["rev-parse", "--path-for
 const lockedWriterDir = path.dirname(lockedWriterIndex);
 const lockedWriterLock = `${lockedWriterIndex}.lock`;
 const lockedWriterResult = path.join(fixtureRoot, "task006-writer-after-index-lock.result");
+const lockedWriterIndexBefore = mustGit(lockedWriterRoot, ["ls-files", "--stage", "-z"]);
 const lockedWriterScript = `
 const fs = require("node:fs");
-const directory = process.argv[1];
-const lockPath = process.argv[2];
-const resultPath = process.argv[3];
+const root = process.argv[1];
+const directory = process.argv[2];
+const lockPath = process.argv[3];
+const resultPath = process.argv[4];
 const sleeper = new Int32Array(new SharedArrayBuffer(4));
 const deadline = Date.now() + 5000;
 while (Date.now() < deadline) {
   const candidateSeen = fs.readdirSync(directory).some((name) => name.startsWith(".codexpro-index-") && name.endsWith(".tmp"));
   if (candidateSeen) {
-    try {
-      const fd = fs.openSync(lockPath, "wx", 0o600);
-      fs.closeSync(fd);
-      fs.writeFileSync(resultPath, "WON");
-    } catch (error) {
-      fs.writeFileSync(resultPath, error.code || "ERROR");
-    }
+    const env = { ...process.env };
+    for (const key of Object.keys(env)) if (/^GIT_/u.test(key)) delete env[key];
+    Object.assign(env, { GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", LC_ALL: "C", LANG: "C" });
+    const lockPresentBefore = fs.existsSync(lockPath);
+    const attempt = require("node:child_process").spawnSync("git", ["add", "--", "writer-selected.txt"], {
+      cwd: root,
+      env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    fs.writeFileSync(resultPath, JSON.stringify({ lockPresentBefore, status: attempt.status, signal: attempt.signal, stderr: attempt.stderr }));
     process.exit(0);
   }
   Atomics.wait(sleeper, 0, 0, 2);
 }
-fs.writeFileSync(resultPath, "NOT_OBSERVED");
+fs.writeFileSync(resultPath, JSON.stringify({ observed: false }));
 process.exit(2);
 `;
-const lockedWriter = spawn(process.execPath, ["-e", lockedWriterScript, lockedWriterDir, lockedWriterLock, lockedWriterResult], {
+const lockedWriter = spawn(process.execPath, ["-e", lockedWriterScript, lockedWriterRoot, lockedWriterDir, lockedWriterLock, lockedWriterResult], {
   stdio: "ignore"
 });
 const lockedWriterDone = waitForChild(lockedWriter);
@@ -1281,13 +1346,19 @@ try {
   const writerExit = await lockedWriterDone;
   assert.equal(writerExit.code, 0);
 }
-assert.equal((await readFile(lockedWriterResult)).toString("utf8"), "EEXIST");
+const lockedWriterObservation = JSON.parse((await readFile(lockedWriterResult)).toString("utf8"));
+assert.equal(lockedWriterObservation.lockPresentBefore, true, "ordinary external Git writer did not observe the product index.lock");
+assert.notEqual(lockedWriterObservation.status, 0, "ordinary external Git writer unexpectedly succeeded after the product lock");
+assert.match(lockedWriterObservation.stderr, /index\.lock|locked/iu, "ordinary external Git writer did not report the held Git lock");
 assert.equal(await exists(lockedWriterLock), false);
 const lockedWriterArtifacts = await readdir(lockedWriterDir);
 assert.equal(lockedWriterArtifacts.some((name) => name.startsWith(".codexpro-index-") && name.endsWith(".tmp")), false);
 assert.equal(gitTrimmed(lockedWriterRoot, ["rev-parse", "HEAD"]), lockedWriterHead);
+assert.deepEqual(mustGit(lockedWriterRoot, ["ls-files", "--stage", "-z"]), lockedWriterIndexBefore);
 assert.equal(mustGit(lockedWriterRoot, ["ls-files", "--stage", "-z", "--", "writer-selected.txt"]).length, 0);
-console.log("PASS TASK-006 writer after actual index lock received EEXIST; owned candidate/index lock cleanup and exact plain-untracked restoration completed");
+console.log(`RAW_WRITER_AFTER_PREDICATE: ordinary native Git writer observed product index.lock=${lockedWriterObservation.lockPresentBefore} and exited status=${lockedWriterObservation.status} with lock diagnostic; main index bytes remained exact.`);
+console.log("PREDICATE: TRUE — independent child Git process and raw lock/status/index observations prove cooperative writer-after-lock exclusion before effect interpretation.");
+console.log("PASS TASK-006 ordinary external Git writer-after-lock was rejected by Git's lock convention; owned candidate/index lock cleanup and exact plain-untracked restoration completed");
 
 // A pre-existing actual index.lock must never be adopted or removed by the
 // plain-untracked preparation route. Git's required lock acquisition rejects
