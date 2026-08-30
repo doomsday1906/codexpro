@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, readlink, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { loadConfig } from "../dist/config.js";
+import { createCodexProServer } from "../dist/server.js";
 
 // This proof owns only disposable test fixtures and public-behavior assertions.
 // The accepted outcome is MISSION_ANCHOR A001 LAW-001/LAW-016/LAW-017 and
@@ -34,8 +38,9 @@ const matrixSecrets = [
 ];
 
 const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "codexpro-git-diff-range-mcp-"));
-// Both real stdio server processes intentionally share this one disposable
-// persistence home. It is never the ambient developer ~/.codexpro home.
+// Raw child sessions intentionally share this one disposable CODEXPRO_HOME so
+// the process-death falsifier can prove that no disk identity registry exists.
+// It is never the ambient developer ~/.codexpro home.
 const profileHome = path.join(fixtureRoot, "codexpro-home");
 const defaultRoot = path.join(fixtureRoot, "default-repo");
 const targetParent = path.join(fixtureRoot, "allowed-parent");
@@ -517,6 +522,47 @@ async function fileDigest(filePath) {
   }
 }
 
+async function directorySnapshot(root) {
+  const snapshot = { exists: false, entries: [] };
+  const walk = async (directory, relativeDirectory = ".") => {
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === "ENOENT" && relativeDirectory === ".") return;
+      throw error;
+    }
+    snapshot.exists = true;
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const relativePath = path.join(relativeDirectory, entry.name);
+      const absolutePath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        snapshot.entries.push({ path: relativePath, type: "directory" });
+        await walk(absolutePath, relativePath);
+      } else if (entry.isFile()) {
+        snapshot.entries.push({ path: relativePath, type: "file", digest: await fileDigest(absolutePath) });
+      } else if (entry.isSymbolicLink()) {
+        snapshot.entries.push({ path: relativePath, type: "symlink", target: await readlink(absolutePath) });
+      } else {
+        snapshot.entries.push({ path: relativePath, type: "other" });
+      }
+    }
+  };
+  await walk(root);
+  return snapshot;
+}
+
+function assertNoWorkspaceIdentityRegistry(snapshot, label) {
+  const registryPath = /(^|[\\/])(?:workspace[-_]?bindings?|workspace[-_]?identity|workspace[-_]?registry)(?:[\\/]|$)/iu;
+  assert.equal(snapshot.entries.some((entry) => registryPath.test(entry.path)), false, `${label} created a workspace identity registry`);
+}
+
+function assertProfileHomeUnchanged(before, after, label) {
+  assert.deepEqual(after, before, `${label} changed CODEXPRO_HOME/profile/runtime state`);
+  assertNoWorkspaceIdentityRegistry(after, label);
+}
+
 function bytesDigest(bytes) {
   const buffer = Buffer.from(bytes);
   return {
@@ -678,26 +724,33 @@ class RawStdioClient {
       "--tool-mode", mode
     ];
     for (const root of explicitAllowedRoots) launchArgs.splice(3, 0, "--allow-root", root);
+    const childEnvironment = {
+      ...process.env,
+      ...environment,
+      CODEXPRO_HOME: profileHome,
+      CODEXPRO_ROOT: defaultWorkspaceRoot,
+      CODEXPRO_ALLOWED_ROOTS: [defaultWorkspaceRoot, ...explicitAllowedRoots].join(path.delimiter),
+      CODEXPRO_TOOL_CARDS: "0",
+      CODEXPRO_CODEX_SESSIONS: "off",
+      CODEXPRO_BASH_MODE: "off",
+      CODEXPRO_WRITE_MODE: "off"
+    };
     this.launch = {
       defaultRoot: path.resolve(defaultWorkspaceRoot),
       allowedRoots: explicitAllowedRoots,
       profileHome,
-      args: launchArgs
+      args: launchArgs,
+      environment: {
+        CODEXPRO_HOME: profileHome,
+        CODEXPRO_ROOT: defaultWorkspaceRoot,
+        CODEXPRO_ALLOWED_ROOTS: [defaultWorkspaceRoot, ...explicitAllowedRoots].join(path.delimiter),
+        targetRootPresent: Object.values(childEnvironment).some((value) => typeof value === "string" && value.includes(targetRoot))
+      }
     };
     this.startedAt = Date.now();
     this.child = spawn(process.execPath, launchArgs, {
       cwd: path.resolve("."),
-      env: {
-        ...process.env,
-        ...environment,
-        CODEXPRO_HOME: profileHome,
-        CODEXPRO_ROOT: defaultWorkspaceRoot,
-        CODEXPRO_ALLOWED_ROOTS: [defaultWorkspaceRoot, ...explicitAllowedRoots].join(path.delimiter),
-        CODEXPRO_TOOL_CARDS: "0",
-        CODEXPRO_CODEX_SESSIONS: "off",
-        CODEXPRO_BASH_MODE: "off",
-        CODEXPRO_WRITE_MODE: "off"
-      },
+      env: childEnvironment,
       stdio: ["pipe", "pipe", "pipe"]
     });
     this.pid = this.child.pid;
@@ -770,6 +823,108 @@ class RawStdioClient {
   }
 }
 
+function fixtureConfig(defaultWorkspaceRoot, mode) {
+  const isolatedKeys = [
+    "CODEXPRO_ROOT",
+    "CODEBASE_BRIDGE_REPO_ROOT",
+    "CODEXPRO_ALLOWED_ROOTS",
+    "CODEBASE_BRIDGE_ALLOWED_ROOTS",
+    "CODEXPRO_ALLOW_HOME",
+    "CODEXPRO_TOOL_CARDS",
+    "CODEXPRO_BASH_MODE",
+    "CODEXPRO_WRITE_MODE",
+    "CODEXPRO_TOOL_MODE",
+    "CODEXPRO_CODEX_SESSIONS",
+    "CODEXPRO_CONNECTION_TEST",
+    "CODEXPRO_ANALYSIS"
+  ];
+  const saved = new Map(isolatedKeys.map((key) => [key, process.env[key]]));
+  try {
+    for (const key of isolatedKeys) delete process.env[key];
+    return loadConfig([
+      "--root", path.resolve(defaultWorkspaceRoot),
+      "--allow-root", path.resolve(targetParent),
+      "--bash", "off",
+      "--write", "off",
+      "--tool-mode", mode
+    ]);
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+class InMemoryMcpSession {
+  constructor(label, config, server, client, clientTransport, serverTransport) {
+    this.label = label;
+    this.config = config;
+    this.server = server;
+    this.client = client;
+    this.clientTransport = clientTransport;
+    this.serverTransport = serverTransport;
+    this.processId = process.pid;
+    this.serverObject = server;
+    this.sessionObject = client;
+    this.nextId = 1;
+    this.closed = false;
+    this.launch = {
+      defaultRoot: config.defaultRoot,
+      allowedRoots: [...config.allowedRoots],
+      profileHome,
+      args: ["in-memory-server", "--root", config.defaultRoot, "--allow-root", targetParent, "--bash", "off", "--write", "off", "--tool-mode", config.toolMode],
+      environment: {
+        CODEXPRO_HOME: profileHome,
+        CODEXPRO_ROOT: config.defaultRoot,
+        CODEXPRO_ALLOWED_ROOTS: config.allowedRoots.join(path.delimiter),
+        targetRootPresent: Object.values(process.env).some((value) => typeof value === "string" && value.includes(targetRoot))
+      }
+    };
+  }
+
+  async request(method, params) {
+    const id = this.nextId++;
+    try {
+      let result;
+      if (method === "tools/list") result = await this.client.listTools(params ?? {});
+      else if (method === "tools/call") result = await this.client.callTool(params ?? {});
+      else result = await this.client.request({ method, params });
+      const response = { jsonrpc: "2.0", id, result };
+      return { response, raw: serialized(response) };
+    } catch (error) {
+      const response = {
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: Number.isSafeInteger(error?.code) ? error.code : -32603,
+          message: error instanceof Error ? error.message : String(error)
+        }
+      };
+      if (error && typeof error === "object" && error.data !== undefined) response.error.data = error.data;
+      return { response, raw: serialized(response) };
+    }
+  }
+
+  async close() {
+    if (this.closed) return;
+    this.closed = true;
+    await this.client.close();
+    await this.server.close();
+    this.exitedAt = Date.now();
+  }
+}
+
+async function startInMemorySession(defaultWorkspaceRoot, mode, label) {
+  const config = fixtureConfig(defaultWorkspaceRoot, mode);
+  const server = createCodexProServer(config);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  const client = new Client({ name: "git-diff-range-mcp-smoke", version: "1.0.0" });
+  await client.connect(clientTransport);
+  return new InMemoryMcpSession(label, config, server, client, clientTransport, serverTransport);
+}
+
 async function startClient(defaultWorkspaceRoot, mode, environment = {}) {
   const client = new RawStdioClient(defaultWorkspaceRoot, [targetParent], mode, environment);
   const initialize = await client.request("initialize", {
@@ -814,7 +969,11 @@ async function main() {
   const attributeRoot = path.join(targetParent, "attribute-direction-target-repo");
   const overflowRoot = path.join(targetParent, "metadata-overflow-target-repo");
   const fragmentOverflowRoot = path.join(targetParent, "fragment-overflow-target-repo");
+  const previousCodexProHome = process.env.CODEXPRO_HOME;
+  process.env.CODEXPRO_HOME = profileHome;
   try {
+    await mkdir(path.join(profileHome, "profiles"), { recursive: true });
+    await writeFile(path.join(profileHome, "profiles", "fixture-keep.json"), '{"fixture":"keep"}\n', "utf8");
     await initRepo(defaultRoot);
     await initRepo(defaultRootB);
     await initRepo(targetRoot);
@@ -1095,31 +1254,82 @@ async function main() {
     assert.equal(expectedRedactedPatch.includes(CONTEXT_SECRET), false, "supporting redaction oracle retained context secret");
 
     // PASS 1: exact authority and raw observable facts precede MCP results.
-    console.log("AUTHORITY: MISSION_ANCHOR.md A001 LAW-001/L AW-016/L AW-017 and AC-007/AC-009; MISSION_PLAN.md P001 TASK-006 AP-011/AP-012.");
-    console.log("EXPECTED_RESULT_AUTHORITY: the accepted public contract above; scripts/redaction-policy.mjs is SUPPORTING_ORACLE only for deterministic redacted patch bytes.");
-    console.log(`TARGET_PRODUCER: direct local Git object database in nested target ${targetCanonicalRoot}; MCP route is disposable stdio only, with no TCP/8787 or production process access.`);
+    console.log("AUTHORITY: MISSION_LEDGER.md L011 TASK-007R1 HIGH-001 repair, MISSION_ANCHOR.md A001, and MISSION_PLAN.md P001 TASK-006 AP-011/AP-012.");
+    console.log("EXPECTED_RESULT_AUTHORITY: MISSION_ANCHOR.md A001 M002 public contract LAW-001/L AW-016/L AW-017 and MISSION_LEDGER.md L011 TASK-007R1; scripts/redaction-policy.mjs is SUPPORTING_ORACLE only for deterministic redacted patch bytes.");
+    console.log(`TARGET_PRODUCER: direct local Git object database in nested target ${targetCanonicalRoot}; A/B target route is same-process createCodexProServer + InMemoryTransport MCP, while stdio is used only for process-death C and adjacent hostile/public routes.`);
     console.log(`RAW_OBSERVATION: default-B HEAD=${defaultBHeadSha} (base=${defaultBBaseSha}) differs from target HEAD=${targetHeadSha} (base=${targetBaseSha}); target object format=${targetObjectFormat}.`);
     console.log(`RAW_OBSERVATION: direct target name-status=M target-range.txt; numstat additions=${numstatMatch[1]} deletions=${numstatMatch[2]}; raw patch bytes=${directTargetPatch.stdout.byteLength}, with distinct target sentinel and secret-bearing addition/deletion/context lines.`);
     console.log("TARGET_EVIDENCE: direct Git name-status/numstat/patch bytes and commit identities. SUPPORTING_ORACLE: accepted redaction-policy implementation computes expected public patch bytes.");
     console.log("SANITY_VERDICT: MATCH — raw target and default facts provide a direct workspace distinction and a secret-bearing patch whose expected public form is bounded and redacted.");
     console.log("PREDICATE: TRUE — direct target HEAD~1 and HEAD resolve to the recorded target base/head SHAs, and the target patch producer independently contains the required changed-file/sentinel facts.");
 
-    // Session A opens the nested target and then ends. Only its explicit ID is
-    // carried into the fresh B session.
-    ({ client: firstClient } = await startClient(defaultRoot, "full"));
-    const opened = await callTool(firstClient, "open_workspace", { path: targetRoot, include_tree: false });
+    // AP-010 identity proof: two fresh MCP server/session objects are created
+    // in this one Node process. A opens the nested target; B has a distinct
+    // WorkspaceManager/config and starts with only its own default selected.
+    // The process-scoped root map is the only route by which B can reconstruct
+    // the saved ID; CODEXPRO_HOME is snapshotted to prove it stays untouched.
+    const profileHomeBeforeSessions = await directorySnapshot(profileHome);
+    assertNoWorkspaceIdentityRegistry(profileHomeBeforeSessions, "initial CODEXPRO_HOME");
+    emitSnapshotEvidence("codexpro-home-before-process-scoped-identity", profileHomeBeforeSessions);
+
+    firstClient = await startInMemorySession(defaultRoot, "full", "A");
+    const sessionA = firstClient;
+    assert.equal(sessionA.processId, process.pid, "session A was not created in this Node process");
+    const aCurrentBefore = await directorySnapshot(profileHome);
+    const aCurrentCall = await callTool(sessionA, "open_current_workspace", { include_tree: false });
+    const aCurrentResult = successResult(aCurrentCall, "session A open_current_workspace");
+    assert.equal(aCurrentResult.structuredContent.root, await realpath(defaultRoot), "session A current workspace was not its configured default");
+    const aCurrentAfter = await directorySnapshot(profileHome);
+    assertProfileHomeUnchanged(aCurrentBefore, aCurrentAfter, "session A open_current_workspace");
+    emitSnapshotEvidence("codexpro-home-after-session-a-open-current", aCurrentAfter);
+
+    const aOpenBefore = await directorySnapshot(profileHome);
+    const opened = await callTool(sessionA, "open_workspace", { path: targetRoot, include_tree: false });
     const openedResult = successResult(opened, "session A open_workspace");
     const openedData = openedResult.structuredContent;
     const workspaceId = openedData.workspace_id;
     assert.match(workspaceId, /^ws_[a-f0-9]{24}$/u, "open_workspace did not return a deterministic workspace ID");
     assert.equal(openedData.root, targetCanonicalRoot, "session A opened the wrong root");
-    assert.deepEqual(firstClient.launch.allowedRoots, [await realpath(targetParent)], "session A received more than the allowed parent root");
-    assert.equal(firstClient.launch.args.includes(targetRoot), false, "session A CLI args contained the exact nested target");
-    await firstClient.close();
-    assert.ok(firstClient.exitedAt !== undefined, "session A did not record a server lifetime");
-    const sessionA = firstClient;
+    assert.deepEqual(sessionA.launch.allowedRoots, [await realpath(defaultRoot), await realpath(targetParent)], "session A config allowed roots drifted");
+    assert.equal(sessionA.launch.args.includes(targetRoot), false, "session A in-memory launch args contained the exact nested target");
+    const aOpenAfter = await directorySnapshot(profileHome);
+    assertProfileHomeUnchanged(aOpenBefore, aOpenAfter, "session A open_workspace");
+    emitSnapshotEvidence("codexpro-home-after-session-a-open", aOpenAfter);
+    await sessionA.close();
+    assert.ok(sessionA.exitedAt !== undefined, "session A did not record a server/session lifetime");
     firstClient = undefined;
-    console.log(`PASS session A: pid=${sessionA.pid}; nested target opened and saved explicit workspace_id ${workspaceId}; client/server ended before fresh session B.`);
+
+    secondClient = await startInMemorySession(defaultRootB, "full", "B");
+    const sessionB = secondClient;
+    assert.equal(sessionB.processId, process.pid, "session B was not created in this Node process");
+    assert.notEqual(sessionA.serverObject, sessionB.serverObject, "session A and B reused one MCP server object");
+    assert.notEqual(sessionA.sessionObject, sessionB.sessionObject, "session A and B reused one MCP client/session object");
+    assert.equal(sessionB.config.defaultRoot, defaultBCanonicalRoot, "session B config default root drifted");
+    assert.equal(sessionB.launch.profileHome, profileHome, "session B did not share the unique disposable CODEXPRO_HOME");
+    assert.equal(serialized(sessionB.launch.args).includes(targetRoot), false, "session B launch args contained the exact nested target");
+    assert.equal(serialized(sessionB.launch.environment).includes(targetRoot), false, "session B launch environment contained the exact nested target");
+    assert.equal(sessionB.launch.environment.targetRootPresent, false, "session B process environment contained the exact nested target");
+
+    const bCurrentBefore = await directorySnapshot(profileHome);
+    const bCurrentCall = await callTool(sessionB, "open_current_workspace", { include_tree: false });
+    const bCurrentResult = successResult(bCurrentCall, "session B open_current_workspace");
+    assert.equal(bCurrentResult.structuredContent.root, defaultBCanonicalRoot, "session B ambient root was not default-B");
+    assert.equal(serialized(bCurrentResult).includes(targetRoot), false, "session B ambient open exposed the nested target");
+    const bCurrentAfter = await directorySnapshot(profileHome);
+    assertProfileHomeUnchanged(bCurrentBefore, bCurrentAfter, "session B open_current_workspace");
+    emitSnapshotEvidence("codexpro-home-after-session-b-open-current", bCurrentAfter);
+
+    const bListBefore = await directorySnapshot(profileHome);
+    const bListCall = await callTool(sessionB, "list_workspaces", {});
+    const bListResult = successResult(bListCall, "session B list_workspaces before explicit lookup");
+    const bList = bListResult.structuredContent;
+    assert.equal(bList.selected_workspace_id, bCurrentResult.structuredContent.workspace_id, "session B list selected a non-default workspace");
+    assert.equal(bList.workspaces.some((workspace) => workspace.root === targetCanonicalRoot), false, "session B local list contained nested target before explicit lookup");
+    assert.equal(bList.workspaces.some((workspace) => workspace.root === defaultBCanonicalRoot), true, "session B local list omitted default-B");
+    const bListAfter = await directorySnapshot(profileHome);
+    assertProfileHomeUnchanged(bListBefore, bListAfter, "session B list_workspaces before explicit lookup");
+    emitSnapshotEvidence("codexpro-home-after-session-b-list", bListAfter);
+    console.log(`RAW_OBSERVATION: same Node process pid=${process.pid}; distinct server objects A=${sessionA.serverObject !== sessionB.serverObject}, client/session objects A!=B=${sessionA.sessionObject !== sessionB.sessionObject}; B ambient root=${defaultBCanonicalRoot}; B pre-lookup local list excludes nested target.`);
 
     // AP-009: full publication and standard/minimal omission.
     for (const mode of ["standard", "minimal"]) {
@@ -1132,14 +1342,8 @@ async function main() {
         await session.client.close();
       }
     }
-    secondClient = (await startClient(defaultRootB, "full")).client;
-    assert.notEqual(secondClient.pid, undefined, "session B did not expose a process ID");
-    assert.notEqual(secondClient.pid, sessionA.pid, "fresh session reused session A process identity");
-    assert.equal(secondClient.launch.profileHome, profileHome, "session B did not share the unique disposable CODEXPRO_HOME");
-    assert.equal(secondClient.launch.allowedRoots.includes(path.resolve(targetRoot)), false, "session B CLI allowed exact nested target");
-    assert.equal(secondClient.launch.args.includes(path.resolve(targetRoot)), false, "session B CLI args contained the exact nested target");
-    assert.ok(sessionA.exitedAt <= secondClient.startedAt, "session B started before session A had ended");
-    console.log(`RAW_OBSERVATION: stdio session lifetimes A(pid=${sessionA.pid},exit=${sessionA.exitedAt}) before B(pid=${secondClient.pid},start=${secondClient.startedAt}); shared CODEXPRO_HOME=${profileHome}; B default=${path.resolve(defaultRootB)} and allowed roots exclude nested target.`);
+    assert.equal(sessionB.launch.allowedRoots.includes(path.resolve(targetRoot)), false, "session B config allowed exact nested target");
+    console.log(`RAW_OBSERVATION: same-process A/B server/session objects are closed/reconstructed independently; shared CODEXPRO_HOME=${profileHome}; B default=${defaultBCanonicalRoot} and args/env/allowed roots exclude nested target.`);
     const fullListingCall = await secondClient.request("tools/list", {});
     const fullTools = fullListingCall.response.result?.tools ?? [];
     const rangeTools = fullTools.filter((tool) => tool.name === "git_diff_range");
@@ -1179,9 +1383,32 @@ async function main() {
     // The snapshot starts after session selection and before any target calls.
     const before = await repositorySnapshot(targetRoot);
     emitSnapshotEvidence("nested-target-before-public-calls", before);
+    const profileHomeBeforeExplicitReconstruction = await directorySnapshot(profileHome);
     const explicitCall = await callTool(secondClient, "git_diff_range", { workspace_id: workspaceId, base_ref: "HEAD~1", head_ref: "HEAD" });
     const explicitResult = successResult(explicitCall, "fresh-session explicit git_diff_range");
+    const profileHomeAfterExplicitReconstruction = await directorySnapshot(profileHome);
+    assertProfileHomeUnchanged(profileHomeBeforeExplicitReconstruction, profileHomeAfterExplicitReconstruction, "same-process explicit workspace reconstruction");
+    emitSnapshotEvidence("codexpro-home-after-same-process-reconstruction", profileHomeAfterExplicitReconstruction);
     const structured = explicitResult.structuredContent;
+    const profileHomeBeforePostLookupList = await directorySnapshot(profileHome);
+    const postLookupListCall = await callTool(secondClient, "list_workspaces", {});
+    const postLookupListResult = successResult(postLookupListCall, "session B list_workspaces after explicit lookup");
+    const postLookupList = postLookupListResult.structuredContent;
+    const postLookupDefault = postLookupList.workspaces.find((workspace) => workspace.id === bCurrentResult.structuredContent.workspace_id);
+    const postLookupTarget = postLookupList.workspaces.find((workspace) => workspace.id === workspaceId);
+    assert.equal(postLookupList.selected_workspace_id, bCurrentResult.structuredContent.workspace_id, "session B explicit lookup changed ambient selection from default-B");
+    assert.ok(postLookupDefault, "session B post-lookup list omitted default-B");
+    assert.equal(postLookupDefault.root, defaultBCanonicalRoot, "session B post-lookup selected workspace root was not default-B");
+    assert.ok(postLookupTarget, "session B post-lookup list omitted explicitly reconstructed target");
+    assert.equal(postLookupTarget.id, workspaceId, "session B post-lookup target workspace ID drifted");
+    assert.equal(postLookupTarget.root, targetCanonicalRoot, "session B post-lookup target root drifted");
+    assert.notEqual(postLookupList.selected_workspace_id, workspaceId, "session B explicit lookup selected the target workspace");
+    assert.equal(postLookupList.workspaces.filter((workspace) => workspace.root === targetCanonicalRoot).length, 1, "session B post-lookup list duplicated the target workspace");
+    const profileHomeAfterPostLookupList = await directorySnapshot(profileHome);
+    assertProfileHomeUnchanged(profileHomeBeforePostLookupList, profileHomeAfterPostLookupList, "same-process post-lookup list_workspaces");
+    emitSnapshotEvidence("codexpro-home-after-post-lookup-list", profileHomeAfterPostLookupList);
+    console.log(`RAW_OBSERVATION: B post-lookup list selected=${postLookupList.selected_workspace_id} default-B=${bCurrentResult.structuredContent.workspace_id}; target id=${postLookupTarget.id} root=${postLookupTarget.root} is present only as a non-selected local workspace.`);
+    console.log("PASS same-process post-lookup selection: explicit target reconstruction returned target truth while B list_workspaces retained default-B as selected and exposed the target only as a non-selected local entry.");
     const businessKeys = [
       "base_commit_sha", "base_ref_input", "blocked_files_omitted", "changed_file_count", "changed_files", "changed_files_truncated", "comparison_mode", "eligible_changed_file_count", "head_commit_sha", "head_ref_input", "object_format", "patch", "patch_bytes", "patch_files_included", "patch_files_omitted", "patch_included", "patch_limit", "patch_omission_counts", "patch_requested", "patch_truncated", "returned_file_count", "root", "schema_version", "warnings", "workspace_id"
     ];
@@ -1234,49 +1461,94 @@ async function main() {
     console.log(`RAW_ENVELOPE: fresh-session success=${serialized(explicitCall.response)}`);
     console.log("PASS fresh-session explicit target: B used only saved target workspace_id despite distinct default-B; exact refs/counts/file/patch truth matched direct Git and patch occurred only at structuredContent.patch with redaction.");
 
-    // The persisted binding is part of the target route. Every malformed,
-    // stale, symlinked, or root-mismatched variant must fail closed, and the
-    // original bytes are restored exactly before the next falsifier.
-    const bindingPath = path.join(profileHome, "workspace-bindings", "v1", `${workspaceId}.json`);
-    const originalBinding = await readFile(bindingPath);
-    const restoreBinding = async () => {
-      try {
-        await unlink(bindingPath);
-      } catch (error) {
-        if (error?.code !== "ENOENT") throw error;
-      }
-      await writeFile(bindingPath, originalBinding);
-    };
-    const bindingFalsifier = async (label, mutate) => {
+    const profileHomeBeforeReviewers = await directorySnapshot(profileHome);
+    const reviewerSnapshotCall = await callTool(secondClient, "workspace_snapshot", { workspace_id: workspaceId, max_depth: 1, max_files: 20 });
+    const reviewerSnapshotResult = successResult(reviewerSnapshotCall, "explicit workspace_snapshot reviewer call");
+    assert.equal(reviewerSnapshotResult.structuredContent.root, targetCanonicalRoot, "workspace_snapshot reviewer call used the wrong root");
+    assertNoResponseLiterals(reviewerSnapshotCall, [ADD_SECRET, DELETE_SECRET, CONTEXT_SECRET], "explicit workspace_snapshot reviewer call");
+    const reviewerChangesCall = await callTool(secondClient, "show_changes", { workspace_id: workspaceId, include_diff: false, mark_reviewed: true });
+    const reviewerChangesResult = successResult(reviewerChangesCall, "explicit show_changes reviewer call");
+    assert.equal(reviewerChangesResult.structuredContent.root, targetCanonicalRoot, "show_changes reviewer call used the wrong root");
+    assertNoResponseLiterals(reviewerChangesCall, [ADD_SECRET, DELETE_SECRET, CONTEXT_SECRET], "explicit show_changes reviewer call");
+    const profileHomeAfterReviewers = await directorySnapshot(profileHome);
+    assertProfileHomeUnchanged(profileHomeBeforeReviewers, profileHomeAfterReviewers, "explicit reviewer calls");
+    emitSnapshotEvidence("codexpro-home-after-explicit-reviewer-calls", profileHomeAfterReviewers);
+    console.log("PASS no-persistence reviewer calls: explicit workspace_snapshot and show_changes used the reconstructed target and left CODEXPRO_HOME/profile/runtime entries unchanged.");
+
+    // Nearby process-scoped falsifiers run against the live B manager before
+    // crossing the process boundary. They exercise root revalidation rather
+    // than any disk identity registry or synthetic stand-in.
+    const processFalsifier = async (label, mutate, restore, expectedPattern = /workspace|canonical|allowed|stale|invalid/iu) => {
       await mutate();
-      const call = await callTool(secondClient, "git_diff_range", { workspace_id: workspaceId, base_ref: targetBaseSha, head_ref: targetHeadSha, include_patch: false });
-      const result = errorResult(call, label);
-      assertNoResponseLiterals(call, [ADD_SECRET, DELETE_SECRET, CONTEXT_SECRET, TARGET_SENTINEL, DEFAULT_SENTINEL], label);
-      assert.match(serialized(result), /workspace|binding|canonical|unavailable|invalid/iu, `${label} was not a bounded binding rejection`);
-      console.log(`RAW_ENVELOPE: ${label}=${serialized(call.response)}`);
-      await restoreBinding();
-      return call;
+      try {
+        const call = await callTool(secondClient, "git_diff_range", { workspace_id: workspaceId, base_ref: targetBaseSha, head_ref: targetHeadSha, include_patch: false });
+        const result = errorResult(call, label);
+        assertNoResponseLiterals(call, [ADD_SECRET, DELETE_SECRET, CONTEXT_SECRET, TARGET_SENTINEL, DEFAULT_SENTINEL], label);
+        assert.match(serialized(result), expectedPattern, `${label} was not a bounded root revalidation rejection`);
+        console.log(`RAW_ENVELOPE: ${label}=${serialized(call.response)}`);
+        return call;
+      } finally {
+        await restore();
+      }
     };
     const staleId = "ws_000000000000000000000000";
     const staleCall = await callTool(secondClient, "git_diff_range", { workspace_id: staleId, base_ref: "HEAD~1", head_ref: "HEAD", include_patch: false });
-    const staleResult = errorResult(staleCall, "stale/unknown workspace binding");
-    assertNoResponseLiterals(staleCall, [ADD_SECRET, DELETE_SECRET, CONTEXT_SECRET, TARGET_SENTINEL, DEFAULT_SENTINEL], "stale/unknown workspace binding");
-    assert.match(serialized(staleResult), /unknown|workspace|binding/iu, "stale/unknown workspace binding was not bounded");
-    console.log(`RAW_ENVELOPE: stale-unknown=${serialized(staleCall.response)}`);
-    await bindingFalsifier("corrupt workspace binding", async () => { await writeFile(bindingPath, "{not-json\n", "utf8"); });
-    const symlinkTarget = path.join(fixtureRoot, "binding-shadow.json");
-    await bindingFalsifier("symlink workspace binding", async () => {
-      await writeFile(symlinkTarget, originalBinding);
-      await unlink(bindingPath);
-      await symlink(symlinkTarget, bindingPath);
+    const staleResult = errorResult(staleCall, "unknown workspace id in process");
+    assertNoResponseLiterals(staleCall, [ADD_SECRET, DELETE_SECRET, CONTEXT_SECRET, TARGET_SENTINEL, DEFAULT_SENTINEL], "unknown workspace id in process");
+    assert.match(serialized(staleResult), /unknown|workspace/iu, "unknown workspace id was not bounded");
+    console.log(`RAW_ENVELOPE: unknown-process-id=${serialized(staleCall.response)}`);
+    const movedTargetRoot = path.join(targetParent, "nested-target-moved");
+    await processFalsifier("symlink/path drift", async () => {
+      await rename(targetRoot, movedTargetRoot);
+      await symlink(movedTargetRoot, targetRoot);
+      assert.equal(await realpath(targetRoot), await realpath(movedTargetRoot), "fixture symlink drift target was not established");
+    }, async () => {
+      await unlink(targetRoot);
+      await rename(movedTargetRoot, targetRoot);
     });
-    await bindingFalsifier("mismatched workspace binding", async () => {
-      await writeFile(bindingPath, JSON.stringify({ version: 1, id: workspaceId, root: path.resolve(defaultRootB) }));
+    await processFalsifier("deleted canonical root", async () => {
+      await rename(targetRoot, movedTargetRoot);
+    }, async () => {
+      await rename(movedTargetRoot, targetRoot);
     });
-    await bindingFalsifier("stale-root workspace binding", async () => {
-      await writeFile(bindingPath, JSON.stringify({ version: 1, id: workspaceId, root: path.join(fixtureRoot, "removed-target") }));
+    const allowedRootsBeforeRevocation = [...sessionB.config.allowedRoots];
+    await processFalsifier("revoked allowed root", async () => {
+      sessionB.config.allowedRoots = [defaultBCanonicalRoot];
+    }, async () => {
+      sessionB.config.allowedRoots = allowedRootsBeforeRevocation;
     });
-    console.log("PASS persisted binding falsifiers: unknown, corrupt, symlink, mismatched-root, and stale-root bindings rejected without fallback or target/default source leakage; original binding bytes restored.");
+    console.log("PASS process-scoped revalidation falsifiers: unknown ID, symlink/path drift, deleted canonical root, and allowed-root revocation fail closed without disk identity registry or target/default leakage.");
+
+    // End both in-memory sessions before starting the child-process falsifier.
+    // Its fresh process has no module-level root map and must not reconstruct
+    // the nested ID from CODEXPRO_HOME or from setup arguments/environment.
+    const profileHomeBeforeProcessDeath = await directorySnapshot(profileHome);
+    await sessionB.close();
+    secondClient = undefined;
+    const sessionC = (await startClient(defaultRootB, "full")).client;
+    try {
+      assert.equal(serialized(sessionC.launch.args).includes(targetRoot), false, "process-death C launch args contained the exact nested target");
+      assert.equal(serialized(sessionC.launch.environment).includes(targetRoot), false, "process-death C launch environment contained the exact nested target");
+      assert.equal(sessionC.launch.environment.targetRootPresent, false, "process-death C effective environment contained the exact nested target");
+      const processDeathCall = await callTool(sessionC, "git_diff_range", {
+        workspace_id: workspaceId,
+        base_ref: targetBaseSha,
+        head_ref: targetHeadSha,
+        include_patch: false
+      });
+      const processDeathResult = errorResult(processDeathCall, "process-death unknown workspace id");
+      assertNoResponseLiterals(processDeathCall, [ADD_SECRET, DELETE_SECRET, CONTEXT_SECRET, TARGET_SENTINEL, DEFAULT_SENTINEL], "process-death unknown workspace id");
+      assert.match(serialized(processDeathResult), /unknown|workspace|open_workspace|reconstruct|unavailable/iu, "process-death call was not a bounded unknown/reconstruction failure");
+      assert.equal(serialized(processDeathResult).includes(targetCanonicalRoot), false, "process-death error exposed target root");
+      console.log(`RAW_OBSERVATION: process-death C pid=${sessionC.pid}; C had no prior open, default=${sessionC.launch.defaultRoot}, allowed=${sessionC.launch.allowedRoots.join(",")}, targetRootInArgs=false, targetRootInEnvironment=false; saved ID did not reconstruct.`);
+      console.log(`RAW_ENVELOPE: process-death unknown=${serialized(processDeathCall.response)}`);
+      console.log("PASS process-death falsifier: a fresh OS child with shared CODEXPRO_HOME and only default-B/allowed-parent setup rejected saved nested ID without target data.");
+    } finally {
+      await sessionC.close();
+    }
+    const profileHomeAfterProcessDeath = await directorySnapshot(profileHome);
+    assertProfileHomeUnchanged(profileHomeBeforeProcessDeath, profileHomeAfterProcessDeath, "process-death falsifier");
+    secondClient = (await startClient(defaultRootB, "full")).client;
 
     // Missing workspace_id must reject even though default-B has valid HEAD~1
     // and HEAD refs. This is the fallback falsifier and error-envelope proof.
@@ -1823,6 +2095,8 @@ async function main() {
   } finally {
     await firstClient?.close();
     await secondClient?.close();
+    if (previousCodexProHome === undefined) delete process.env.CODEXPRO_HOME;
+    else process.env.CODEXPRO_HOME = previousCodexProHome;
     await rm(fixtureRoot, { recursive: true, force: true });
   }
 }
