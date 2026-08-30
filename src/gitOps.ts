@@ -113,6 +113,15 @@ export interface GitReadOnlyOptions {
   readonly globalArgs?: readonly string[];
 }
 
+export interface GitMutationOptions {
+  /**
+   * Keep the fixed literal-pathspec global by default. `check-ignore` does
+   * not implement that Git global option, so its bounded internal caller may
+   * opt out after validating the path and placing it after `--`.
+   */
+  readonly literalPathspecs?: boolean;
+}
+
 function gitReviewerEnvironment(overrides?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // Git has a large and growing environment surface for repository routing,
   // object lookup, shallow history, pathspec behavior, tracing, credentials,
@@ -296,6 +305,113 @@ export async function runGitReadOnly(
       } else {
         resolve(result);
       }
+    });
+  });
+}
+
+/**
+ * Execute one bounded local Git operation for the mutation substrate.
+ *
+ * Unlike the reviewer runner above, this deliberately leaves Git's normal
+ * system/global/local configuration hierarchy enabled. The caller cannot
+ * supply environment or global-option overrides; every inherited GIT_* value
+ * is removed before the fixed direct-argv invocation starts.
+ */
+export async function runGitMutation(
+  config: Pick<CodexProConfig, "maxGitTimeoutMs" | "maxOutputBytes">,
+  workspace: Workspace,
+  args: readonly string[],
+  options?: GitMutationOptions
+): Promise<GitExecutionResult> {
+  const maxOutputBytes = Number.isFinite(config.maxOutputBytes) ? Math.max(1, Math.floor(config.maxOutputBytes)) : 1;
+  const timeoutMs = Number.isFinite(config.maxGitTimeoutMs)
+    ? Math.max(1, Math.min(300_000, Math.floor(config.maxGitTimeoutMs)))
+    : 60_000;
+  const stdout = new BoundedGitOutput(maxOutputBytes);
+  const stderr = new BoundedGitOutput(maxOutputBytes);
+  const environment: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!/^GIT_/iu.test(key) && value !== undefined) environment[key] = value;
+  }
+  Object.assign(environment, {
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_NO_LAZY_FETCH: "1",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_PAGER: "cat",
+    NO_COLOR: "1",
+    LC_ALL: "C",
+    LANG: "C"
+  });
+
+  // `--literal-pathspecs` is a fixed safety boundary for every command in
+  // this private substrate. It protects selected names from pathspec magic;
+  // callers still provide only the subcommand arguments below.
+  const globalArgs = [
+    "--no-replace-objects",
+    "--no-pager",
+    ...(options?.literalPathspecs === false ? [] : ["--literal-pathspecs"]),
+    "-c",
+    "color.ui=false"
+  ] as const;
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", [...globalArgs, ...args], {
+      cwd: workspace.root,
+      env: environment,
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: false,
+      detached: process.platform !== "win32",
+      windowsHide: true
+    });
+    let timedOut = false;
+    let closed = false;
+    let terminationStarted = false;
+    let escalationTimer: NodeJS.Timeout | undefined;
+    let spawnError: NodeJS.ErrnoException | undefined;
+
+    const terminateWithEscalation = () => {
+      if (closed || terminationStarted) return;
+      terminationStarted = true;
+      terminateGitProcess(child, "SIGTERM");
+      escalationTimer = setTimeout(() => {
+        if (!closed) terminateGitProcess(child, "SIGKILL");
+      }, 250);
+      escalationTimer.unref();
+    };
+
+    const timeoutTimer = setTimeout(() => {
+      if (closed) return;
+      timedOut = true;
+      terminateWithEscalation();
+    }, timeoutMs);
+    timeoutTimer.unref();
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      stdout.append(chunk);
+      if (stdout.overflow) terminateWithEscalation();
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderr.append(chunk);
+      if (stderr.overflow) terminateWithEscalation();
+    });
+    child.once("error", (error: Error) => {
+      spawnError = error as NodeJS.ErrnoException;
+    });
+    child.once("close", (exitCode: number | null, signal: NodeJS.Signals | null) => {
+      closed = true;
+      clearTimeout(timeoutTimer);
+      if (escalationTimer) clearTimeout(escalationTimer);
+      const result = new GitExecutionResult(
+        stdout.copyBytes(),
+        stderr.copyBytes(),
+        spawnError ? null : exitCode,
+        signal,
+        timedOut,
+        stdout.overflow,
+        stderr.overflow
+      );
+      const failure = gitExecutionFailure(result, spawnError);
+      if (failure) reject(new GitExecutionError(result, failure, spawnError?.code));
+      else resolve(result);
     });
   });
 }

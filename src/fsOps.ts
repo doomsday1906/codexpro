@@ -66,6 +66,16 @@ function normalizeLockKey(absPath: string): string {
 }
 
 async function canonicalWriteKey(absPath: string): Promise<string> {
+  // A selected symlink is a repository entry, not its target. Preserve that
+  // identity for the shared lock map while retaining canonical target locking
+  // for ordinary files and directories used by existing write tools.
+  try {
+    const linkStat = await fsp.lstat(absPath);
+    if (linkStat.isSymbolicLink()) {
+      return normalizeLockKey(path.join(await fsp.realpath(path.dirname(absPath)), path.basename(absPath)));
+    }
+  } catch {}
+
   try {
     return normalizeLockKey(await fsp.realpath(absPath));
   } catch {}
@@ -100,7 +110,13 @@ async function acquireFileWriteLock(absPath: string): Promise<() => void> {
 
 export async function withFileWriteLocks<T>(absPaths: string[], task: () => Promise<T> | T): Promise<T> {
   const releases: Array<() => void> = [];
-  const orderedPaths = [...new Set(absPaths)].sort((left, right) => left.localeCompare(right));
+  const keyedPaths = await Promise.all(
+    [...new Set(absPaths)].map(async (absPath) => ({ absPath, key: await canonicalWriteKey(absPath) }))
+  );
+  const orderedPaths = keyedPaths
+    .sort((left, right) => left.key.localeCompare(right.key))
+    .filter((entry, index, entries) => index === 0 || entry.key !== entries[index - 1].key)
+    .map((entry) => entry.absPath);
   try {
     for (const absPath of orderedPaths) {
       releases.push(await acquireFileWriteLock(absPath));
