@@ -86,7 +86,7 @@
     "search-evidence:smoke": "npm run build && node scripts/search-evidence-smoke.mjs",
     "analysis:cli-smoke": "npm run build && node scripts/analysis-cli-smoke.mjs",
     "git-review-runner:smoke": "node scripts/git-review-runner-smoke.mjs",
-    "git-diff-range:smoke": "npm run build && node scripts/git-diff-range-smoke.mjs",
+    "git-diff-range:smoke": "npm run build && node scripts/git-diff-range-smoke.mjs && node scripts/git-diff-range-mcp-smoke.mjs",
     "reviewer-surface:smoke": "node scripts/reviewer-surface-smoke.mjs",
     "doctor": "node scripts/codexpro.mjs doctor",
     "connect": "node scripts/codexpro.mjs",

@@ -14,6 +14,7 @@ import { importAttachmentFile } from "./importOps.js";
 import { searchWorkspace } from "./searchOps.js";
 import { runBash } from "./bashOps.js";
 import { gitDiff, gitDiffStatus, gitLog, gitStatus } from "./gitOps.js";
+import { gitDiffRange } from "./gitDiffRange.js";
 import { gitLogStructured, gitMergeBase, gitResolveRef, gitShowCommit } from "./gitHistoryOps.js";
 import { readAtRef } from "./gitHistoricalBlob.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
@@ -98,6 +99,80 @@ const GIT_SHOW_COMMIT_ARGUMENTS_SCHEMA = z.object({
   ref: REVIEW_REF_SCHEMA
 }).strict();
 
+const GIT_DIFF_RANGE_ARGUMENTS_SCHEMA = z.object({
+  workspace_id: REVIEW_WORKSPACE_ID_SCHEMA,
+  base_ref: REVIEW_REF_SCHEMA,
+  head_ref: REVIEW_REF_SCHEMA,
+  path: REVIEW_PATH_SCHEMA.optional(),
+  include_patch: z.boolean().default(true),
+  max_files: z.number().int().min(1).max(200).default(100),
+  max_patch_bytes: z.number().int().min(0).max(100_000).default(60_000),
+  context_lines: z.number().int().min(0).max(20).default(3)
+}).strict();
+
+const GIT_DIFF_RANGE_FIELD_NAMES = new Set([
+  "workspace_id",
+  "base_ref",
+  "head_ref",
+  "path",
+  "include_patch",
+  "max_files",
+  "max_patch_bytes",
+  "context_lines"
+]);
+
+function boundedGitDiffRangeValidationError(issues: readonly z.ZodIssue[]): z.ZodError {
+  const safeIssues: z.ZodIssue[] = [];
+  const seenMessages = new Set<string>();
+  for (const issue of issues) {
+    if (issue.code === "unrecognized_keys") {
+      if (!seenMessages.has("Unknown keys are not allowed.")) {
+        safeIssues.push({ code: "custom", path: [], message: "Unknown keys are not allowed." });
+        seenMessages.add("Unknown keys are not allowed.");
+      }
+      continue;
+    }
+
+    const field = issue.path.length === 1 && typeof issue.path[0] === "string" && GIT_DIFF_RANGE_FIELD_NAMES.has(issue.path[0])
+      ? issue.path[0]
+      : undefined;
+    const message = field === "workspace_id" && issue.code === "invalid_type" && issue.received === "undefined"
+      ? "Workspace id is required."
+      : field
+        ? "Invalid value."
+        : "Schema constraints were not satisfied.";
+    const path = field ? [field] : [];
+    const key = `${path.join(".")}:${message}`;
+    if (seenMessages.has(key)) continue;
+    seenMessages.add(key);
+    safeIssues.push({ code: "custom", path, message });
+  }
+
+  if (safeIssues.length === 0) {
+    safeIssues.push({ code: "custom", path: [], message: "Schema constraints were not satisfied." });
+  }
+  return new z.ZodError(safeIssues);
+}
+
+// Keep the strict schema for runtime rejection, but discard Zod's raw issue
+// payload before validateToolArgs can format a public diagnostic. In
+// particular, unrecognized_keys carries caller-controlled property names.
+const GIT_DIFF_RANGE_RUNTIME_SCHEMA = z.object(GIT_DIFF_RANGE_ARGUMENTS_SCHEMA.shape).strict();
+const rawGitDiffRangeSafeParse = GIT_DIFF_RANGE_RUNTIME_SCHEMA.safeParse.bind(GIT_DIFF_RANGE_RUNTIME_SCHEMA);
+GIT_DIFF_RANGE_RUNTIME_SCHEMA.safeParse = ((args: unknown) => {
+  const parsed = rawGitDiffRangeSafeParse(args);
+  return parsed.success
+    ? parsed
+    : { success: false, error: boundedGitDiffRangeValidationError(parsed.error.issues) };
+}) as typeof GIT_DIFF_RANGE_RUNTIME_SCHEMA.safeParse;
+const rawGitDiffRangeSafeParseAsync = GIT_DIFF_RANGE_RUNTIME_SCHEMA.safeParseAsync.bind(GIT_DIFF_RANGE_RUNTIME_SCHEMA);
+GIT_DIFF_RANGE_RUNTIME_SCHEMA.safeParseAsync = (async (args: unknown) => {
+  const parsed = await rawGitDiffRangeSafeParseAsync(args);
+  return parsed.success
+    ? parsed
+    : { success: false, error: boundedGitDiffRangeValidationError(parsed.error.issues) };
+}) as typeof GIT_DIFF_RANGE_RUNTIME_SCHEMA.safeParseAsync;
+
 // The MCP SDK uses the published Zod object for both tools/list conversion
 // and transport-level tools/call validation. Keep a bounded, permissive
 // envelope at that boundary so caller-controlled unknown key names cannot be
@@ -137,6 +212,20 @@ const GIT_SHOW_COMMIT_TRANSPORT_SCHEMA = z.object({
 const GIT_SHOW_COMMIT_PUBLIC_SCHEMA = z.object(GIT_SHOW_COMMIT_ARGUMENTS_SCHEMA.shape).strict();
 GIT_SHOW_COMMIT_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_SHOW_COMMIT_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_SHOW_COMMIT_PUBLIC_SCHEMA.safeParse;
 GIT_SHOW_COMMIT_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_SHOW_COMMIT_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_SHOW_COMMIT_PUBLIC_SCHEMA.safeParseAsync;
+
+const GIT_DIFF_RANGE_TRANSPORT_SCHEMA = z.object({
+  workspace_id: z.unknown().optional(),
+  base_ref: z.unknown().optional(),
+  head_ref: z.unknown().optional(),
+  path: z.unknown().optional(),
+  include_patch: z.unknown().optional(),
+  max_files: z.unknown().optional(),
+  max_patch_bytes: z.unknown().optional(),
+  context_lines: z.unknown().optional()
+}).passthrough();
+const GIT_DIFF_RANGE_PUBLIC_SCHEMA = z.object(GIT_DIFF_RANGE_ARGUMENTS_SCHEMA.shape).strict();
+GIT_DIFF_RANGE_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_DIFF_RANGE_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_DIFF_RANGE_PUBLIC_SCHEMA.safeParse;
+GIT_DIFF_RANGE_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_DIFF_RANGE_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_DIFF_RANGE_PUBLIC_SCHEMA.safeParseAsync;
 
 const READ_AT_REF_TRANSPORT_SCHEMA = z.object({
   workspace_id: z.unknown().optional(),
@@ -872,6 +961,7 @@ const FULL_TOOL_NAMES = [
   "git_log",
   "git_show_commit",
   "read_at_ref",
+  "git_diff_range",
   "git_status",
   "git_diff",
   "show_changes",
@@ -998,7 +1088,7 @@ function serverInstructions(config: CodexProConfig): string {
     "",
     "Preferred workflow:",
     "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects; session-selected workspace is reliable only when the client preserves the same MCP session.",
-    "2. For correctness-sensitive Git tools (git_resolve_ref, git_merge_base, git_log, git_show_commit, read_at_ref), always pass the explicit workspace_id returned by open_current_workspace/open_workspace.",
+    "2. For correctness-sensitive Git tools (git_resolve_ref, git_merge_base, git_log, git_show_commit, read_at_ref, git_diff_range), always pass the explicit workspace_id returned by open_current_workspace/open_workspace.",
     "3. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
     "4. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
     editInstruction,
@@ -3425,6 +3515,60 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         status_error: statusError || undefined,
         changed_files: changedFiles,
         changed: !statusError && changedFiles.length > 0
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "git_diff_range",
+    {
+      title: "Git Diff Range",
+      description: "Compare two exact local Git commit trees and return bounded changed-file metadata with redacted complete patch evidence.",
+      inputSchema: GIT_DIFF_RANGE_PUBLIC_SCHEMA,
+      runtimeInputSchema: GIT_DIFF_RANGE_RUNTIME_SCHEMA,
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Reading historical Git range...",
+        "openai/toolInvocation/invoked": "Historical Git range ready"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await gitDiffRange(config, guard, workspace, {
+        baseRef: args.base_ref,
+        headRef: args.head_ref,
+        path: args.path,
+        includePatch: args.include_patch,
+        maxFiles: args.max_files,
+        maxPatchBytes: args.max_patch_bytes,
+        contextLines: args.context_lines
+      });
+      const patchBody = publicSourceBody(result.patch);
+      const warningText = result.warnings.length > 0
+        ? result.warnings.map((warning) => `- ${warning}`).join("\n")
+        : "None";
+      const patchText = result.patch_requested
+        ? `${result.patch_included ? "included" : "empty"}; ${result.patch_bytes} bytes of ${result.patch_limit}; ${result.patch_files_included} files included, ${result.patch_files_omitted} omitted${result.patch_truncated ? "; truncated" : ""}`
+        : `disabled; ${result.patch_files_omitted} omitted`;
+      const text = [
+        "# Git Diff Range",
+        "",
+        `Workspace: ${workspace.root}`,
+        `Comparison: ${result.comparison_mode}`,
+        `Base: ${result.base_ref_input} (${result.base_commit_sha})`,
+        `Head: ${result.head_ref_input} (${result.head_commit_sha})`,
+        `Path: ${result.path ?? "all paths"}`,
+        `Changed files: ${result.changed_file_count} total, ${result.eligible_changed_file_count} eligible, ${result.returned_file_count} returned${result.changed_files_truncated ? " (truncated)" : ""}`,
+        `Blocked records omitted: ${result.blocked_files_omitted}`,
+        `Patch: ${patchText}`,
+        "",
+        "Warnings:",
+        warningText
+      ].join("\n");
+      return textResult(text, { ...result }, {}, {
+        sourceFields: [{ path: ["patch"], body: patchBody }]
       });
     }
   );
