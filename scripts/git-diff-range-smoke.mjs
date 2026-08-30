@@ -4,12 +4,23 @@ import { chmod, mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from 
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { TextDecoder } from "node:util";
 
 // This smoke owns test fixtures and test-side falsifiers only. The expected
 // metadata is derived from direct Git producers below; the compiled target is
 // loaded only after the raw-observation sanity pass.
 const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "codexpro-git-diff-range-"));
 const systemPath = process.env.PATH ?? "";
+const FORBIDDEN_PATCH_LITERALS = [
+  "ACTUAL_LITERAL_SECRET_7X9",
+  "DELETED_LITERAL_SECRET_8Y4",
+  "CONTEXT_LITERAL_SECRET_9Z5",
+  "RENAMED_LITERAL_SECRET_6Q2",
+  "COPIED_LITERAL_SECRET_5P1",
+  "BLOCKED_LITERAL_SECRET_4N8",
+  "BINARY_LITERAL_SECRET_3M7"
+];
+const OBSERVATION_UTF8_FATAL = new TextDecoder("utf-8", { fatal: true });
 const realGit = (() => {
   const result = spawnSync("which", ["git"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   if (result.status !== 0 || !result.stdout?.trim()) throw new Error("unable to locate Git for disposable fixtures");
@@ -217,6 +228,75 @@ function directMetadata(repoRoot, base, head, pathFilter) {
   return { nameBytes: name.stdout, numstatBytes: numstat.stdout, nameStderr: name.stderr, numstatStderr: numstat.stderr, records };
 }
 
+function directPatch(repoRoot, base, head, record, contextLines = 3) {
+  const pathValues = [...new Set([record.oldPath, record.newPath].filter((value) => value !== null))];
+  assert.ok(pathValues.length > 0, "raw patch producer received a pathless metadata record");
+  const args = [
+    "diff",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--patch",
+    `-U${contextLines}`,
+    "--find-renames=50%",
+    "--find-copies=50%",
+    "--diff-algorithm=myers",
+    "--no-indent-heuristic",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    base,
+    head,
+    "--",
+    ...pathValues.map((value) => `:(literal)${value}`)
+  ];
+  const result = directGit(repoRoot, args);
+  assert.equal(result.status, 0, `direct patch producer failed: ${result.stderr.toString("utf8")}`);
+  return { bytes: result.stdout, args };
+}
+
+function splitRawPatchFragments(bytes, label) {
+  let text;
+  try {
+    text = OBSERVATION_UTF8_FATAL.decode(bytes);
+  } catch {
+    assert.fail(`${label}: direct raw patch was not valid UTF-8`);
+  }
+  const starts = [];
+  const headerPattern = /^diff --git /gmu;
+  let match;
+  while ((match = headerPattern.exec(text)) !== null) starts.push(match.index);
+  assert.ok(starts.length > 0, `${label}: direct Git emitted no complete patch fragment`);
+  assert.equal(starts[0], 0, `${label}: direct Git emitted bytes before the first patch header`);
+  const fragments = starts.map((start, index) => text.slice(start, starts[index + 1] ?? text.length));
+  for (const fragment of fragments) {
+    assert.ok(fragment.startsWith("diff --git "), `${label}: fragment did not start at a diff header`);
+    assert.ok(fragment.endsWith("\n"), `${label}: direct fragment did not end on a complete line`);
+    assert.equal(/^(?:GIT binary patch|Binary files )/mu.test(fragment), false, `${label}: text record emitted binary payload`);
+  }
+  assert.equal(Buffer.byteLength(fragments.join(""), "utf8"), bytes.length, `${label}: raw fragments lost bytes`);
+  return fragments;
+}
+
+function rawFragmentHeaderMatchesRecord(fragment, record) {
+  const firstLine = fragment.slice(0, fragment.indexOf("\n")).replace(/\r$/u, "");
+  const oldPath = record.oldPath ?? record.newPath;
+  const newPath = record.newPath ?? record.oldPath;
+  return firstLine === `diff --git a/${oldPath} b/${newPath}`;
+}
+
+function rawPatchFragmentForRecord(bytes, record, label) {
+  const fragments = splitRawPatchFragments(bytes, label);
+  const matching = fragments.filter((fragment) => rawFragmentHeaderMatchesRecord(fragment, record));
+  assert.equal(matching.length, 1, `${label}: direct Git did not isolate exactly one requested record fragment`);
+  return { fragment: matching[0], fragments };
+}
+
+function directBlob(repoRoot, revision, relativePath) {
+  const result = directGit(repoRoot, ["show", `${revision}:${relativePath}`]);
+  assert.equal(result.status, 0, `direct blob producer failed for ${relativePath}: ${result.stderr.toString("utf8")}`);
+  return result.stdout;
+}
+
 async function fileDigest(filePath) {
   try {
     const bytes = await readFile(filePath);
@@ -388,6 +468,133 @@ async function makeDivergentFixture() {
   return { repoRoot, commonSha, leftSha, rightSha, mergeBase };
 }
 
+async function makePatchFixture() {
+  const repoRoot = path.join(fixtureRoot, "patch");
+  await initRepo(repoRoot);
+  await writeFixture(repoRoot, "context.py", [
+    "context line 0",
+    "context line 1",
+    "context line 2",
+    "context line 4",
+    "context line 5",
+    "context line 6",
+    "context line 7",
+    "context line 8",
+    "context line 9",
+    "context line 10",
+    "context line 11",
+    "context line 12",
+    "context line 13",
+    "password = \"CONTEXT_LITERAL_SECRET_9Z5\"",
+    "context line 14",
+    "old context target",
+    ...Array.from({ length: 14 }, (_, index) => `tail context ${index}`),
+    "context line final"
+  ].join("\n") + "\n");
+  await writeFixture(repoRoot, "delete.py", "token = \"DELETED_LITERAL_SECRET_8Y4\"\nkeep = True\n");
+  await writeFixture(repoRoot, "rename-source.py", [
+    ...Array.from({ length: 10 }, (_, index) => `rename line ${index}`),
+    "rename_token = \"RENAMED_LITERAL_SECRET_6Q2\"",
+    ...Array.from({ length: 10 }, (_, index) => `rename tail ${index}`)
+  ].join("\n") + "\n");
+  await writeFixture(repoRoot, "copy-source.py", [
+    ...Array.from({ length: 10 }, (_, index) => `copy line ${index}`),
+    "copy_token = \"COPIED_LITERAL_SECRET_5P1\"",
+    ...Array.from({ length: 10 }, (_, index) => `copy tail ${index}`)
+  ].join("\n") + "\n");
+  await writeFixture(repoRoot, "binary-secret.bin", Buffer.concat([
+    Buffer.from([0, 1, 2, 3]),
+    Buffer.from("BINARY_LITERAL_SECRET_3M7", "utf8"),
+    Buffer.from([0, 255, 8])
+  ]));
+  await writeFixture(repoRoot, "type-target", "type target bytes\n");
+  await symlink("type-target", path.join(repoRoot, "type-entry"));
+  const baseSha = await commitAll(repoRoot, "patch base");
+
+  await writeFixture(repoRoot, "added.py", [
+    "def added():",
+    "    token = \"ACTUAL_LITERAL_SECRET_7X9\"",
+    "    return token",
+    ""
+  ].join("\n"));
+  await unlink(path.join(repoRoot, "delete.py"));
+  await writeFixture(repoRoot, "context.py", [
+    "context line 0",
+    "context line 1",
+    "context line 2",
+    "context line 4",
+    "context line 5",
+    "context line 6",
+    "context line 7",
+    "context line 8",
+    "context line 9",
+    "context line 10",
+    "context line 11",
+    "context line 12",
+    "context line 13",
+    "password = \"CONTEXT_LITERAL_SECRET_9Z5\"",
+    "context line 14",
+    "new context target",
+    ...Array.from({ length: 14 }, (_, index) => `tail context ${index}`),
+    "context line final"
+  ].join("\n") + "\n");
+  await mustGit(repoRoot, ["mv", "rename-source.py", "rename-dest.py"]);
+  const renameLines = [
+    ...Array.from({ length: 10 }, (_, index) => `rename line ${index}`),
+    "rename_token = \"RENAMED_LITERAL_SECRET_6Q2\"",
+    "rename changed line",
+    ...Array.from({ length: 9 }, (_, index) => `rename tail ${index}`)
+  ];
+  await writeFixture(repoRoot, "rename-dest.py", renameLines.join("\n") + "\n");
+  await writeFixture(repoRoot, "copy-source.py", [
+    ...Array.from({ length: 10 }, (_, index) => `copy line ${index}`),
+    "copy_token = \"COPIED_LITERAL_SECRET_5P1\"",
+    "copy changed line",
+    ...Array.from({ length: 9 }, (_, index) => `copy tail ${index}`)
+  ].join("\n") + "\n");
+  await writeFixture(repoRoot, "copy-dest.py", [
+    ...Array.from({ length: 10 }, (_, index) => `copy line ${index}`),
+    "copy_token = \"COPIED_LITERAL_SECRET_5P1\"",
+    "copy changed line",
+    ...Array.from({ length: 9 }, (_, index) => `copy tail ${index}`)
+  ].join("\n") + "\n");
+  await writeFixture(repoRoot, "binary-secret.bin", Buffer.concat([
+    Buffer.from([0, 1, 2, 4]),
+    Buffer.from("BINARY_LITERAL_SECRET_3M7", "utf8"),
+    Buffer.from([0, 254, 9])
+  ]));
+  await unlink(path.join(repoRoot, "type-entry"));
+  await writeFixture(repoRoot, "type-entry", "type entry is regular now\n");
+  await writeFixture(repoRoot, ".env.patch", "blocked = \"BLOCKED_LITERAL_SECRET_4N8\"\n");
+  await writeFixture(repoRoot, "odd path/line\nname.py", "odd = harmless\n");
+  await writeFixture(repoRoot, "odd path/space name.py", "odd = harmless space\n");
+  const headSha = await commitAll(repoRoot, "patch changes");
+  await writeFixture(repoRoot, "untracked-patch-sentinel.txt", "must remain untracked\n");
+  return {
+    repoRoot,
+    baseSha,
+    headSha,
+    blockedPath: ".env.patch",
+    binaryPath: "binary-secret.bin",
+    relevantPaths: [
+      "context.py",
+      "delete.py",
+      "added.py",
+      "rename-source.py",
+      "rename-dest.py",
+      "copy-source.py",
+      "copy-dest.py",
+      "binary-secret.bin",
+      "type-entry",
+      "type-target",
+      ".env.patch",
+      "odd path/line\nname.py",
+      "odd path/space name.py",
+      "untracked-patch-sentinel.txt"
+    ]
+  };
+}
+
 function rawRecordKey(record) {
   return JSON.stringify(record);
 }
@@ -404,12 +611,60 @@ const matrix = await makeMatrixFixture();
 const blocked = await makeBlockedFixture();
 const invalidUtf8 = await makeInvalidUtf8Fixture();
 const divergent = await makeDivergentFixture();
+const patchFixture = await makePatchFixture();
 const matrixRaw = directMetadata(matrix.repoRoot, matrix.baseSha, matrix.headSha);
 const matrixRawSameSha = directMetadata(matrix.repoRoot, matrix.baseSha, matrix.baseSha);
 const matrixRawAddFilter = directMetadata(matrix.repoRoot, matrix.baseSha, matrix.headSha, "filter-add.txt");
 const matrixRawDeleteFilter = directMetadata(matrix.repoRoot, matrix.baseSha, matrix.headSha, "filter-delete.txt");
 const directDivergent = directMetadata(divergent.repoRoot, divergent.leftSha, divergent.rightSha);
 const directMergeBase = directMetadata(divergent.repoRoot, divergent.mergeBase, divergent.rightSha);
+const patchRaw = directMetadata(patchFixture.repoRoot, patchFixture.baseSha, patchFixture.headSha);
+const rawPatchFacts = new Map();
+for (const record of patchRaw.records.filter((entry) => !entry.binary && entry.status !== "T"
+  && !(entry.oldPath ?? entry.newPath ?? "").includes("\n"))) {
+  const raw = directPatch(patchFixture.repoRoot, patchFixture.baseSha, patchFixture.headSha, record, 3);
+  const selected = rawPatchFragmentForRecord(raw.bytes, record, `raw patch ${record.status}:${record.newPath ?? record.oldPath}`);
+  rawPatchFacts.set(rawRecordKey(record), {
+    rawBytes: raw.bytes,
+    rawText: OBSERVATION_UTF8_FATAL.decode(raw.bytes),
+    fragment: selected.fragment,
+    fragments: selected.fragments,
+    args: raw.args
+  });
+}
+const typeRecord = patchRaw.records.find((record) => record.status === "T");
+assert.ok(typeRecord, "direct patch fixture did not produce a type-change record");
+const rawTypePatch = directPatch(patchFixture.repoRoot, patchFixture.baseSha, patchFixture.headSha, typeRecord, 3);
+const rawTypeFragments = splitRawPatchFragments(rawTypePatch.bytes, "raw type-change patch");
+assert.ok(rawTypeFragments.length >= 1, "direct type-change patch did not produce a block");
+assert.ok(rawTypeFragments.every((fragment) => fragment.includes("type-entry")), "type-change blocks lost their path identity");
+assert.ok(rawTypeFragments.length >= 2, "direct type-change fixture did not produce adjacent delete/add blocks");
+assert.ok([...rawPatchFacts.values()].some((fact) => fact.fragments.length > 1), "direct Git did not produce an adjacent/extra block case");
+rawPatchFacts.set(rawRecordKey(typeRecord), {
+  rawBytes: rawTypePatch.bytes,
+  rawText: OBSERVATION_UTF8_FATAL.decode(rawTypePatch.bytes),
+  fragment: OBSERVATION_UTF8_FATAL.decode(rawTypePatch.bytes),
+  fragments: rawTypeFragments,
+  args: rawTypePatch.args
+});
+const blockedRawPatchRecord = patchRaw.records.find((record) => record.newPath === patchFixture.blockedPath);
+assert.ok(blockedRawPatchRecord, "direct patch fixture did not produce a blocked record");
+assert.ok(directBlob(patchFixture.repoRoot, patchFixture.headSha, patchFixture.blockedPath).toString("utf8").includes("BLOCKED_LITERAL_SECRET_4N8"));
+assert.ok(directBlob(patchFixture.repoRoot, patchFixture.baseSha, patchFixture.binaryPath).includes(Buffer.from("BINARY_LITERAL_SECRET_3M7")));
+const patchRawSecretChecks = [
+  ["addition", "added.py", "ACTUAL_LITERAL_SECRET_7X9"],
+  ["deletion", "delete.py", "DELETED_LITERAL_SECRET_8Y4"],
+  ["context", "context.py", "CONTEXT_LITERAL_SECRET_9Z5"],
+  ["rename", "rename-dest.py", "RENAMED_LITERAL_SECRET_6Q2"],
+  ["copy", "copy-dest.py", "COPIED_LITERAL_SECRET_5P1"]
+];
+for (const [kind, pathValue, literal] of patchRawSecretChecks) {
+  const record = patchRaw.records.find((entry) => entry.oldPath === pathValue || entry.newPath === pathValue);
+  assert.ok(record && !record.binary, `direct ${kind} metadata record missing`);
+  const fact = rawPatchFacts.get(rawRecordKey(record));
+  assert.ok(fact, `direct ${kind} patch fragment was not captured`);
+  assert.ok(fact.rawText.includes(literal), `direct ${kind} raw patch did not contain its secret-looking literal`);
+}
 const invalidRawName = directGit(invalidUtf8.repoRoot, [
   "diff",
   "--no-color",
@@ -431,14 +686,21 @@ console.log("TARGET_EVIDENCE: raw NUL-delimited Git bytes and independently deco
 console.log(`RAW_OBSERVATION: direct base ${matrix.baseSha} to head ${matrix.headSha} yielded ${matrixRaw.records.length} complete records; statuses=${matrixRaw.records.map((record) => record.status).join(",")}; odd paths were preserved as ${["space dir/space name.txt", "café/é name.txt", "-leading-dash.txt", "tab\tname.txt", "line\nname.txt"].map((value) => JSON.stringify(value)).join(", ")}.`);
 console.log(`RAW_OBSERVATION: direct same-SHA comparison yielded ${matrixRawSameSha.records.length} records; direct divergent comparison left ${divergent.leftSha} to right ${divergent.rightSha} yielded ${directDivergent.records.length}, while merge-base ${divergent.mergeBase} to right yielded ${directMergeBase.records.length}.`);
 console.log(`RAW_OBSERVATION: direct binary records have null additions/deletions and binary=true; invalid UTF-8 fixture contains raw byte 0x80 in the name-status producer.`);
+console.log(`RAW_OBSERVATION: direct patch producer yielded ${rawPatchFacts.size} complete target fragments; raw additions/deletions/context/rename/copy fragments contain their secret-looking literals, while blocked and binary source blobs independently contain secrets.`);
 console.log("SANITY_VERDICT: MATCH (direct Git facts establish the accepted metadata invariants before target diagnostics or test verdicts are consulted).");
 
-const [{ loadConfig }, { CodexProError, PathGuard, WorkspaceManager }, target] = await Promise.all([
+const [{ loadConfig }, { CodexProError, PathGuard, WorkspaceManager }, target, policy] = await Promise.all([
   import("../dist/config.js"),
   import("../dist/guard.js"),
-  import("../dist/gitDiffRange.js")
+  import("../dist/gitDiffRange.js"),
+  import("../scripts/redaction-policy.mjs")
 ]);
-const { collectGitDiffRangeMetadata, GitDiffRangeError } = target;
+const {
+  collectGitDiffRangeMetadata,
+  collectGitDiffRangePatch,
+  GitDiffRangeError
+} = target;
+const { redactUnifiedDiff: policyRedactUnifiedDiff } = policy;
 
 function targetContext(repoRoot, overrides = {}) {
   const loaded = loadConfig(["--root", repoRoot, "--allow-root", repoRoot, "--bash", "off", "--write", "off"]);
@@ -465,7 +727,18 @@ function assertTargetFailure(error, reason, label) {
   assert.equal(Object.hasOwn(error, "stdout"), false, `${label}: raw stdout escaped failure`);
   assert.equal(Object.hasOwn(error, "stderr"), false, `${label}: raw stderr escaped failure`);
   assert.equal(error.message.includes(".env"), false, `${label}: blocked path leaked in failure`);
+  const serialized = JSON.stringify(error);
+  for (const literal of FORBIDDEN_PATCH_LITERALS) {
+    assert.equal(serialized.includes(literal), false, `${label}: forbidden literal leaked in typed error`);
+  }
   return error;
+}
+
+function assertNoForbiddenPatchLiterals(value, label) {
+  const serialized = JSON.stringify(value);
+  for (const literal of FORBIDDEN_PATCH_LITERALS) {
+    assert.equal(serialized.includes(literal), false, `${label}: forbidden literal ${literal} leaked`);
+  }
 }
 
 async function expectTargetFailure(operation, reason, label) {
@@ -627,6 +900,10 @@ if (process.env.CODEXPRO_TAMPER === "path-order" && args.includes("--numstat")) 
     }
   }
 }
+if (process.env.CODEXPRO_TAMPER === "patch-header" && args.includes("--patch") && stdout.length > 0) {
+  const text = stdout.toString("utf8");
+  stdout = Buffer.from(text.replace(/^diff --git [^\\n]*$/mu, "diff --git a/wrong-target b/wrong-target"), "utf8");
+}
 process.stdout.write(stdout);
 process.stderr.write(child.stderr ?? Buffer.alloc(0));
 process.exit(child.status ?? 1);
@@ -722,5 +999,312 @@ console.log("RAW_PRODUCER_FACTS: malformed stream, cardinality, and path-order f
 console.log("EVIDENCE_CONFLICT: none; no direct raw artifact contradicted the accepted metadata outcomes.");
 console.log("CONCERNS: invalid UTF-8 coverage is host-dependent in general; this Linux host preserved 0x80 and exercised the fatal path-encoding branch.");
 console.log("PASS TASK-002 focused proof complete (task proof only; final mission acceptance remains with Execution Root).");
+
+async function withArmedGit(tamper, label, operation) {
+  const logPath = path.join(wrapperDir, `${label}.jsonl`);
+  await writeFile(logPath, "", "utf8");
+  const previousPath = process.env.PATH;
+  const previousLog = process.env.CODEXPRO_GIT_ARG_LOG;
+  const previousReal = process.env.CODEXPRO_REAL_GIT;
+  const previousTamper = process.env.CODEXPRO_TAMPER;
+  process.env.PATH = `${wrapperDir}${path.delimiter}${systemPath}`;
+  process.env.CODEXPRO_GIT_ARG_LOG = logPath;
+  process.env.CODEXPRO_REAL_GIT = realGit;
+  if (tamper === undefined) delete process.env.CODEXPRO_TAMPER;
+  else process.env.CODEXPRO_TAMPER = tamper;
+  try {
+    return await operation(logPath);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (previousLog === undefined) delete process.env.CODEXPRO_GIT_ARG_LOG;
+    else process.env.CODEXPRO_GIT_ARG_LOG = previousLog;
+    if (previousReal === undefined) delete process.env.CODEXPRO_REAL_GIT;
+    else process.env.CODEXPRO_REAL_GIT = previousReal;
+    if (previousTamper === undefined) delete process.env.CODEXPRO_TAMPER;
+    else process.env.CODEXPRO_TAMPER = previousTamper;
+  }
+}
+
+async function readLoggedArgs(logPath) {
+  return (await readFile(logPath, "utf8"))
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+function expectedRedactedRecord(record, contextLines = 3) {
+  const raw = directPatch(patchFixture.repoRoot, patchFixture.baseSha, patchFixture.headSha, record, contextLines);
+  const source = record.status === "T" || (record.oldPath ?? record.newPath ?? "").includes("\n")
+    ? OBSERVATION_UTF8_FATAL.decode(raw.bytes)
+    : rawPatchFragmentForRecord(raw.bytes, record, `expected redaction ${record.status}:${record.newPath ?? record.oldPath}`).fragment;
+  return {
+    rawBytes: raw.bytes.length,
+    redacted: policyRedactUnifiedDiff(source),
+    source
+  };
+}
+
+const patchContext = targetContext(patchFixture.repoRoot);
+const patchBefore = await repositoryState(patchFixture.repoRoot, patchFixture.relevantPaths);
+const patchMetadata = await collectGitDiffRangeMetadata(patchContext.config, patchContext.guard, patchContext.workspace, {
+  baseRef: patchFixture.baseSha,
+  headRef: patchFixture.headSha,
+  maxFiles: 200
+});
+const patchAfterMetadata = await repositoryState(patchFixture.repoRoot, patchFixture.relevantPaths);
+const patchRawEligible = patchRaw.records.filter((record) => record.oldPath !== patchFixture.blockedPath && record.newPath !== patchFixture.blockedPath);
+assert.deepEqual(patchMetadata.eligibleChangedFiles, patchRawEligible, "patch metadata diverged from direct raw producer");
+assert.equal(patchMetadata.changedFileCount, patchRaw.records.length);
+assert.equal(patchMetadata.eligibleChangedFileCount, patchRawEligible.length);
+assert.equal(patchMetadata.blockedFilesOmitted, patchRaw.records.length - patchRawEligible.length);
+assert.deepEqual(patchAfterMetadata, patchBefore, "metadata phase changed patch fixture state");
+
+const patchExpectedByKey = new Map();
+for (const record of patchRawEligible.filter((entry) => !entry.binary)) {
+  patchExpectedByKey.set(rawRecordKey(record), expectedRedactedRecord(record));
+}
+const patchExpectedTextRecords = patchMetadata.changedFiles.filter((record) => !record.binary);
+const patchExpectedText = patchExpectedTextRecords.map((record) => patchExpectedByKey.get(rawRecordKey(record)).redacted).join("");
+const patchResult = await collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+  baseRef: patchFixture.baseSha,
+  headRef: patchFixture.headSha,
+  maxFiles: 200,
+  includePatch: true
+});
+assert.equal(patchResult.patch, patchExpectedText, "target patch did not preserve the direct complete-fragment prefix");
+assert.equal(patchResult.patchBytes, Buffer.byteLength(patchExpectedText, "utf8"));
+assert.equal(patchResult.patchFilesIncluded, patchExpectedTextRecords.length);
+assert.equal(patchResult.patchFilesOmitted, patchRaw.records.length - patchExpectedTextRecords.length);
+assert.deepEqual(patchResult.patchOmissionCounts, {
+  blocked: patchRaw.records.length - patchRawEligible.length,
+  binary: patchRawEligible.filter((record) => record.binary).length,
+  budget: 0,
+  tooLarge: 0,
+  fileLimit: 0,
+  disabled: 0
+});
+assert.equal(patchResult.patchFilesIncluded + patchResult.patchFilesOmitted, patchResult.changedFileCount);
+assertNoForbiddenPatchLiterals(patchResult, "complete redacted patch result");
+assert.equal(JSON.stringify(patchResult).includes(patchFixture.blockedPath), false, "blocked path leaked from patch result");
+const patchAfter = await repositoryState(patchFixture.repoRoot, patchFixture.relevantPaths);
+assert.deepEqual(patchAfter, patchBefore, "patch operation changed HEAD/refs/index/worktree/config state");
+console.log("PASS AP-005 raw complete-fragment acquisition, redaction, deterministic order, binary/blocked omissions, and read-only state");
+
+const contextRecord = patchMetadata.changedFiles.find((record) => record.newPath === "context.py");
+assert.ok(contextRecord, "context fixture metadata record missing");
+const expectedContext0 = expectedRedactedRecord(contextRecord, 0);
+const expectedContext3 = expectedRedactedRecord(contextRecord, 3);
+const expectedContext20 = expectedRedactedRecord(contextRecord, 20);
+assert.notEqual(expectedContext0.redacted, expectedContext3.redacted, "context_lines 0 and 3 did not change direct raw evidence");
+assert.notEqual(expectedContext3.redacted, expectedContext20.redacted, "context_lines 3 and 20 did not change direct raw evidence");
+const context0 = await collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+  baseRef: patchFixture.baseSha,
+  headRef: patchFixture.headSha,
+  path: "context.py",
+  contextLines: 0
+});
+const contextDefault = await collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+  baseRef: patchFixture.baseSha,
+  headRef: patchFixture.headSha,
+  path: "context.py"
+});
+const context20 = await collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+  baseRef: patchFixture.baseSha,
+  headRef: patchFixture.headSha,
+  path: "context.py",
+  contextLines: 20
+});
+assert.equal(context0.patch, expectedContext0.redacted);
+assert.equal(contextDefault.patch, expectedContext3.redacted);
+assert.equal(context20.patch, expectedContext20.redacted);
+assert.equal(context0.patch.includes("CONTEXT_LITERAL_SECRET_9Z5"), false);
+assert.equal(contextDefault.patch.includes("CONTEXT_LITERAL_SECRET_9Z5"), false);
+assert.equal(context20.patch.includes("CONTEXT_LITERAL_SECRET_9Z5"), false);
+console.log("PASS context_lines 0/default 3/max 20 use explicit direct-Git context and preserve redaction");
+
+const addedRecord = patchMetadata.changedFiles.find((record) => record.newPath === "added.py");
+assert.ok(addedRecord, "added fixture metadata record missing");
+const addedExpected = expectedRedactedRecord(addedRecord);
+assert.notEqual(addedExpected.rawBytes, Buffer.byteLength(addedExpected.redacted, "utf8"), "redaction did not change fragment byte length");
+const exactFit = await collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+  baseRef: patchFixture.baseSha,
+  headRef: patchFixture.headSha,
+  path: "added.py",
+  maxPatchBytes: Buffer.byteLength(addedExpected.redacted, "utf8")
+});
+assert.equal(exactFit.patch, addedExpected.redacted);
+assert.equal(exactFit.patchBytes, Buffer.byteLength(addedExpected.redacted, "utf8"));
+assert.equal(exactFit.patchTruncated, false);
+const oneByteUnder = await collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+  baseRef: patchFixture.baseSha,
+  headRef: patchFixture.headSha,
+  path: "added.py",
+  maxPatchBytes: Math.max(0, Buffer.byteLength(addedExpected.redacted, "utf8") - 1)
+});
+assert.equal(oneByteUnder.patch, "");
+assert.equal(oneByteUnder.patchBytes, 0);
+assert.equal(oneByteUnder.patchTruncated, true);
+assert.equal(oneByteUnder.patchOmissionCounts.budget, 1);
+assert.equal(oneByteUnder.patchFilesIncluded, 0);
+assert.equal(oneByteUnder.patchFilesOmitted, 1);
+console.log("PASS exact whole-redacted-fragment fit, one-byte-under no partial emission, and final-redacted-byte budgeting");
+
+const firstTwoText = patchExpectedTextRecords.slice(0, 2);
+assert.equal(firstTwoText.length, 2, "patch fixture did not provide two text records for prefix budget proof");
+const firstTwoExpected = firstTwoText.map((record) => patchExpectedByKey.get(rawRecordKey(record)).redacted);
+const twoFilePrefix = await collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+  baseRef: patchFixture.baseSha,
+  headRef: patchFixture.headSha,
+  maxPatchBytes: Buffer.byteLength(firstTwoExpected[0], "utf8")
+});
+assert.equal(twoFilePrefix.patch, firstTwoExpected[0]);
+assert.equal(twoFilePrefix.patchFilesIncluded, 1);
+assert.equal(twoFilePrefix.patchOmissionCounts.budget, patchExpectedTextRecords.length - 1);
+assert.equal(twoFilePrefix.patchTruncated, true);
+assert.equal(twoFilePrefix.patchFilesIncluded + twoFilePrefix.patchFilesOmitted, twoFilePrefix.changedFileCount);
+console.log("PASS two-file budget returns exactly the first complete fragment and truthful budget suffix count");
+
+const limitedPatch = await collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+  baseRef: patchFixture.baseSha,
+  headRef: patchFixture.headSha,
+  maxFiles: 2
+});
+assert.equal(limitedPatch.changedFiles.length, 2);
+assert.equal(limitedPatch.changedFilesTruncated, true);
+assert.equal(limitedPatch.patchOmissionCounts.fileLimit, patchMetadata.eligibleChangedFileCount - 2);
+assert.equal(limitedPatch.patchFilesIncluded + limitedPatch.patchFilesOmitted, limitedPatch.changedFileCount);
+console.log("PASS max_files file-limit omission is mutually exhaustive with binary/blocked patch classifications");
+
+const disabledArmed = await withArmedGit(undefined, "patch-disabled", async (logPath) => {
+  const result = await collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+    baseRef: patchFixture.baseSha,
+    headRef: patchFixture.headSha,
+    includePatch: false
+  });
+  return { result, args: await readLoggedArgs(logPath) };
+});
+const disabledDiffArgs = disabledArmed.args.filter((args) => args.includes("diff"));
+assert.equal(disabledDiffArgs.some((args) => args.includes("--patch")), false, "include_patch=false armed a patch producer");
+assert.equal(disabledDiffArgs.length, 2, "include_patch=false did not run exactly the two metadata producers");
+assert.equal(disabledArmed.result.patch, "");
+assert.equal(disabledArmed.result.patchRequested, false);
+assert.equal(disabledArmed.result.patchIncluded, false);
+assert.equal(disabledArmed.result.patchOmissionCounts.disabled, patchExpectedTextRecords.length);
+assert.equal(disabledArmed.result.patchOmissionCounts.binary, patchRawEligible.filter((record) => record.binary).length);
+assert.equal(disabledArmed.result.patchOmissionCounts.blocked, patchRaw.records.length - patchRawEligible.length);
+assert.equal(disabledArmed.result.patchFilesOmitted, disabledArmed.result.changedFileCount);
+assertNoForbiddenPatchLiterals(disabledArmed.result, "disabled patch result");
+console.log("PASS AP-006 include_patch=false runs metadata producers only and truthfully classifies disabled/binary/blocked records");
+
+const tooLargeArmed = await withArmedGit(undefined, "patch-too-large", async (logPath) => {
+  const result = await collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+    baseRef: patchFixture.baseSha,
+    headRef: patchFixture.headSha,
+    patchFragmentMaxBytes: 1
+  });
+  return { result, args: await readLoggedArgs(logPath) };
+});
+const tooLargePatchArgs = tooLargeArmed.args.filter((args) => args.includes("--patch"));
+const tooLargeTextCount = patchExpectedTextRecords.length;
+assert.equal(tooLargePatchArgs.length, 1, "fragment acquisition overflow did not stop at the first text record");
+assert.equal(tooLargeArmed.result.patch, "");
+assert.equal(tooLargeArmed.result.patchBytes, 0);
+assert.equal(tooLargeArmed.result.patchTruncated, true);
+assert.equal(tooLargeArmed.result.patchOmissionCounts.tooLarge, tooLargeTextCount);
+assert.equal(tooLargeArmed.result.patchOmissionCounts.budget, 0);
+assert.equal(tooLargeArmed.result.patchFilesIncluded, 0);
+assert.equal(tooLargeArmed.result.patchFilesIncluded + tooLargeArmed.result.patchFilesOmitted, tooLargeArmed.result.changedFileCount);
+assertNoForbiddenPatchLiterals(tooLargeArmed.result, "too-large patch result");
+console.log("PASS fragment acquisition overflow emits no partial raw bytes and reports deterministic too_large suffix counts");
+
+const invalidPatchCases = [
+  ["invalid include_patch", "invalid-input", { includePatch: "yes" }],
+  ["invalid max_patch_bytes", "invalid-limit", { maxPatchBytes: 100_001 }],
+  ["invalid context_lines", "invalid-limit", { contextLines: 21 }],
+  ["invalid internal fragment ceiling", "invalid-limit", { patchFragmentMaxBytes: 64_001 }]
+];
+for (const [label, reason, options] of invalidPatchCases) {
+  const armed = await withArmedGit(undefined, `patch-${label.replaceAll(/[^a-z0-9]+/giu, "-")}`, async (logPath) => {
+    const error = await expectTargetFailure(
+      () => collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+        baseRef: patchFixture.baseSha,
+        headRef: patchFixture.headSha,
+        ...options
+      }),
+      reason,
+      label
+    );
+    return { error, args: await readLoggedArgs(logPath) };
+  });
+  assert.equal(armed.args.length, 0, `${label}: invalid patch options reached a Git producer`);
+  assertNoForbiddenPatchLiterals(armed.error, label);
+}
+console.log("PASS invalid include_patch/max_patch_bytes/context_lines/internal ceiling fail before any Git command");
+
+const mismatchError = await withArmedGit("patch-header", "patch-header-mismatch", async () => expectTargetFailure(
+  () => collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+    baseRef: patchFixture.baseSha,
+    headRef: patchFixture.headSha,
+    path: "added.py"
+  }),
+  "patch-fragment-mismatch",
+  "patch fragment header mismatch"
+));
+assertNoForbiddenPatchLiterals(mismatchError, "patch fragment header mismatch");
+console.log("PASS malformed requested-fragment header falsifier fails closed without raw diagnostics");
+
+const oddRecord = patchRaw.records.find((record) => {
+  const value = record.oldPath ?? record.newPath ?? "";
+  return value.includes(" ") && !value.includes("\n");
+});
+assert.ok(oddRecord, "odd path patch record missing");
+const oddExpected = expectedRedactedRecord(oddRecord);
+const oddResult = await collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+  baseRef: patchFixture.baseSha,
+  headRef: patchFixture.headSha,
+  path: oddRecord.newPath
+});
+assert.equal(oddResult.patch, oddExpected.redacted, "odd path fragment selection diverged from direct raw patch");
+assert.equal(oddResult.patchFilesIncluded, 1);
+assertNoForbiddenPatchLiterals(oddResult, "odd path patch result");
+console.log("PASS odd path fragment selection remains correlated with direct raw Git evidence");
+
+const armedFull = await withArmedGit(undefined, "patch-argv", async (logPath) => {
+  const result = await collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+    baseRef: patchFixture.baseSha,
+    headRef: patchFixture.headSha,
+    includePatch: true
+  });
+  return { result, args: await readLoggedArgs(logPath) };
+});
+const allDiffArgs = armedFull.args.filter((args) => args.includes("diff"));
+const allPatchArgs = allDiffArgs.filter((args) => args.includes("--patch"));
+assert.equal(allPatchArgs.length, patchExpectedTextRecords.length, "binary/blocked records triggered patch-content acquisition");
+for (const args of allDiffArgs) {
+  assert.ok(args.includes(patchFixture.baseSha), `diff producer did not use captured base SHA: ${JSON.stringify(args)}`);
+  assert.ok(args.includes(patchFixture.headSha), `diff producer did not use captured head SHA: ${JSON.stringify(args)}`);
+  assert.equal(args.includes("base-ref"), false);
+  assert.equal(args.includes("head-ref"), false);
+  assert.equal(args.includes(patchFixture.blockedPath), false, "blocked path was passed to a diff producer");
+  assert.equal(args.includes(patchFixture.binaryPath), false, "binary path was passed to a patch producer");
+  assert.ok(args.includes("--no-ext-diff"));
+  assert.ok(args.includes("--no-textconv"));
+  if (args.includes("--patch")) {
+    assert.ok(args.includes("--diff-algorithm=myers"));
+    assert.ok(args.includes("--no-indent-heuristic"));
+    assert.equal(args.includes("--binary"), false);
+  }
+}
+assertNoForbiddenPatchLiterals(armedFull.result, "armed full patch result");
+console.log("PASS deterministic metadata order, immutable SHA argv, and zero blocked/binary patch-content commands");
+
+console.log("TARGET_EVIDENCE: direct Git raw patch bytes/blob bytes from disposable repositories; SUPPORTING_ORACLE: accepted redaction policy computes expected public bytes, while target fragment extraction is independently challenged by raw header/fragment assertions.");
+console.log("SANITY_VERDICT: MATCH (raw complete fragments and secret-bearing source bytes were observed before target results; no target diagnostic was used as raw evidence).");
+console.log("PREDICATE: TRUE for blocked/binary non-generation; direct metadata and blob facts independently establish blocked/binary eligibility before checking zero patch commands.");
+console.log("EVIDENCE_CONFLICT: none.");
+console.log("DEFERRED_PUBLIC_ENVELOPE: MCP content/_meta/protocol error data are not physically produced by this internal engine leaf; full-envelope proof remains TASK-005/TASK-006.");
+console.log("PASS TASK-003 focused AP-005/AP-006 patch-engine proof complete (task proof only; final mission acceptance remains with Execution Root).");
 
 await rm(fixtureRoot, { recursive: true, force: true });
