@@ -90,7 +90,12 @@ async function writeArtifact(root, relativePath, content) {
 
 async function initRepo(root, files, options = {}) {
   await fs.mkdir(root, { recursive: true });
-  for (const [relativePath, content] of Object.entries(files)) await writeFile(root, relativePath, content);
+  for (const [relativePath, content] of Object.entries(files)) {
+    await writeFile(root, relativePath, content);
+    const mode = options.fileModes?.[relativePath];
+    if (!Number.isInteger(mode)) continue;
+    await fs.chmod(path.join(root, relativePath), mode);
+  }
   runGit(root, ['init', '-q']);
   runGit(root, ['config', 'user.name', 'CodexPro apply matrix']);
   runGit(root, ['config', 'user.email', 'codexpro-apply-matrix@example.invalid']);
@@ -144,6 +149,23 @@ function gitIndexState(root) {
 
 function snapshotJson(snapshot) {
   return JSON.stringify([...snapshot.entries()].sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function normalizedModeSnapshot(sourceSnapshot, targetSnapshot, modeTolerancePaths) {
+  if (!Array.isArray(modeTolerancePaths) || modeTolerancePaths.length === 0) return sourceSnapshot;
+  const normalized = new Map(sourceSnapshot);
+  for (const relativePath of modeTolerancePaths) {
+    const sourceEntry = sourceSnapshot.get(relativePath);
+    const targetEntry = targetSnapshot.get(relativePath);
+    if (!sourceEntry || !targetEntry) continue;
+    if (sourceEntry.kind !== targetEntry.kind) continue;
+    if (sourceEntry.kind === 'file') {
+      normalized.set(relativePath, { ...sourceEntry, mode: targetEntry.mode });
+    } else if (sourceEntry.kind === 'symlink' || sourceEntry.kind === 'other') {
+      normalized.set(relativePath, { ...sourceEntry, mode: targetEntry.mode });
+    }
+  }
+  return normalized;
 }
 
 function canonicalDiff(root, staged = false) {
@@ -278,7 +300,8 @@ async function generatedCase(client, suiteRoot, label, files, mutate, expectedId
   if (expectedIdentities.length > 1) {
     console.log(`RAW ${label}: response.paths=${JSON.stringify(structured.paths)} filesystem.entries=${JSON.stringify([...after.keys()].sort())}`);
   }
-  assert.equal(snapshotJson(after), snapshotJson(expected), `${label} real filesystem differs from the independent Git producer result`);
+  const expectedForComparison = normalizedModeSnapshot(expected, after, options.modeTolerancePaths);
+  assert.equal(snapshotJson(after), snapshotJson(expectedForComparison), `${label} real filesystem differs from the independent Git producer result`);
   assert.equal(runGit(target, ['rev-parse', 'HEAD']).stdout.trim(), targetHeadBefore, `${label} real apply changed HEAD`);
   // Untracked create/copy targets are not present in an unstaged `git diff`.
   // Stage only in this disposable target to ask Git for the complete direct
@@ -286,12 +309,13 @@ async function generatedCase(client, suiteRoot, label, files, mutate, expectedId
   runGit(target, ['add', '-A']);
   const actualDiff = canonicalDiff(target, true);
   const actual = actualNumstat(target, true);
+  const actualIndex = gitIndexState(target);
   runGit(target, ['reset', '-q']);
   assert.equal(structured.diff, actualDiff, `${label} returned diff differs from direct Git result`);
   assert.equal(structured.additions, actual.additions, `${label} returned additions differ from Git numstat`);
   assert.equal(structured.deletions, actual.deletions, `${label} returned deletions differ from Git numstat`);
   assert.equal(structured.changed, Boolean(actualDiff.trim()), `${label} changed flag disagrees with direct filesystem diff`);
-  return { patch, target, producer, response, expected, before, after, actual, actualDiff, preflight };
+  return { patch, target, producer, response, expected, before, after, actual, actualDiff, preflight, actualIndex };
 }
 
 async function rejectedCase(client, suiteRoot, label, files, patchFactory, expectedPattern) {
@@ -372,8 +396,25 @@ try {
 
   const executableCase = await generatedCase(client, suiteRoot, 'EXECUTABLE-MODE', {
     'executable.sh': '#!/bin/sh\nexit 0\n'
-  }, async (root) => fs.chmod(path.join(root, 'executable.sh'), 0o755), ['executable.sh']);
-  assert.equal((await fs.lstat(path.join(executableCase.target, 'executable.sh'))).mode & 0o7777, 0o755, 'executable mode patch did not produce 100755');
+  }, async (root) => fs.chmod(path.join(root, 'executable.sh'), 0o755), ['executable.sh'], {
+    fileModes: { 'executable.sh': 0o644 },
+    modeTolerancePaths: ['executable.sh']
+  });
+  const executableOracleRoot = path.join(suiteRoot, 'EXECUTABLE-MODE', 'oracle-direct-git');
+  await initRepo(executableOracleRoot, {
+    'executable.sh': '#!/bin/sh\nexit 0\n'
+  }, {
+    fileModes: { 'executable.sh': 0o644 }
+  });
+  runGit(executableOracleRoot, ['apply', '--index', '--whitespace=nowarn'], executableCase.patch);
+  const executableOracle = await snapshotWorkspace(executableOracleRoot);
+  assert.equal(snapshotJson(executableCase.after), snapshotJson(executableOracle), 'EXECUTABLE-MODE direct Git oracle snapshot diverged');
+  const executableCaseMode = (await fs.lstat(path.join(executableCase.target, 'executable.sh'))).mode & 0o7777;
+  const executableOracleMode = (await fs.lstat(path.join(executableOracleRoot, 'executable.sh'))).mode & 0o7777;
+  console.log(`RAW EXECUTABLE-MODE: mcp=0${executableCaseMode.toString(8).padStart(4, '0')} direct-git=0${executableOracleMode.toString(8).padStart(4, '0')}`);
+  assert.equal(executableCaseMode, executableOracleMode, 'EXECUTABLE-MODE final physical mode did not match direct Git result');
+  const executableIndexMode = executableCase.actualIndex.toString().trim().split('\n')[0]?.split(/\s+/)[0];
+  assert.equal(executableIndexMode, '100755', 'executable mode patch did not produce Git index mode 100755');
   matrix.push('EXECUTABLE-MODE');
 
   await generatedCase(client, suiteRoot, 'E-rename', { 'rename-old.txt': 'rename content\n' }, async (root) => fs.rename(path.join(root, 'rename-old.txt'), path.join(root, 'rename-new.txt')), ['rename-old.txt', 'rename-new.txt']);
@@ -578,16 +619,24 @@ try {
   // accepts the extra textual line but does not apply it; canonical output
   // and the source-policy route must therefore never report that bait.
   const mTarget = path.join(suiteRoot, 'M-ignored-surplus-input-exact', 'target');
-  await initRepo(mTarget, { 'surplus.txt': 'before\n' });
+  await initRepo(mTarget, { 'surplus.txt': 'before\n' }, { fileModes: { 'surplus.txt': 0o644 } });
   const mBefore = await snapshotWorkspace(mTarget);
+  assert.equal(mBefore.get('surplus.txt')?.mode, 0o644, 'M-case target baseline mode was not exactly 0644');
   const mWorkspace = await openWorkspace(client, mTarget);
   const mPreflight = preflightEvidence(mTarget, mPatch);
   assert.equal(mPreflight.status, 0, `M independent Git preflight failed: ${mPreflight.stderr}`);
   const mResult = await client.request('tools/call', { name: 'apply_patch', arguments: { workspace_id: mWorkspace, patch: mPatch } });
   assert.notEqual(mResult.isError, true, `M apply_patch rejected Git-accepted surplus input: ${resultText(mResult)}`);
   const mAfter = await snapshotWorkspace(mTarget);
+  const mOracleRoot = path.join(suiteRoot, 'M-ignored-surplus-input-exact', 'oracle-direct-git');
+  await initRepo(mOracleRoot, { 'surplus.txt': 'before\n' }, { fileModes: { 'surplus.txt': 0o644 } });
+  runGit(mOracleRoot, ['apply', '--index', '--whitespace=nowarn'], mPatch);
+  const mOracle = await snapshotWorkspace(mOracleRoot);
   assert.equal((await fs.readFile(path.join(mTarget, 'surplus.txt'), 'utf8')), 'after\n', 'M extra line became file content');
-  assert.equal((await fs.lstat(path.join(mTarget, 'surplus.txt'))).mode & 0o7777, 0o644, 'M ignored symlink-mode line changed the regular target mode');
+  const mCaseMode = (await fs.lstat(path.join(mTarget, 'surplus.txt'))).mode & 0o7777;
+  const mOracleMode = (await fs.lstat(path.join(mOracleRoot, 'surplus.txt'))).mode & 0o7777;
+  console.log(`RAW M-ignored-surplus-input: mcp=0${mCaseMode.toString(8).padStart(4, '0')} direct-git=0${mOracleMode.toString(8).padStart(4, '0')}`);
+  assert.equal(snapshotJson(mAfter), snapshotJson(mOracle), 'M ignored symlink-mode line changed the regular target snapshot');
   assert.equal(snapshotJson(mAfter).includes('ACTUAL_LITERAL_SECRET_7X9'), false, 'M surplus source-policy bait reached target filesystem');
   assert.equal(JSON.stringify(mResult).includes('ACTUAL_LITERAL_SECRET_7X9'), false, 'M ignored surplus input was echoed in MCP response');
   assert.equal(mResult.structuredContent.diff.includes('ACTUAL_LITERAL_SECRET_7X9'), false, 'M ignored surplus input reached canonical returned diff');
