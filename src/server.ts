@@ -900,6 +900,11 @@ function registerToolCardResource(server: McpServer, config: CodexProConfig): vo
 type CodexToolHandler = (args: any) => Promise<any> | any;
 
 const SUPERTOOL_NAME = "codexpro";
+// Mutation tools with their own strict public contract must not be reachable
+// through the loose, general-purpose supertool wrapper. Keep the explicit
+// registration visible to mode/configuration reporting while excluding it
+// from wrapper actions and the wrapper handler map.
+const SUPERTOOL_EXCLUDED_ACTIONS = new Set<string>(["git_commit"]);
 const SUPERTOOL_ACTION_ALIASES: Record<string, string> = {
   actions: "list_actions",
   config: "server_config",
@@ -1161,7 +1166,7 @@ function registerCodexTool(
   const validatedHandler: CodexToolHandler = (args) => handler(validateToolArgs(name, options, args));
   registerToolCompat(server, name, descriptorOptionsForConfig(config, name, options), validatedHandler);
   rememberRegisteredTool(server, name);
-  rememberRegisteredToolHandler(server, name, validatedHandler);
+  if (!SUPERTOOL_EXCLUDED_ACTIONS.has(name)) rememberRegisteredToolHandler(server, name, validatedHandler);
 }
 
 function serverInstructions(config: CodexProConfig): string {
@@ -2098,7 +2103,9 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     },
     async (args) => {
       const action = normalizeSupertoolAction(args.action);
-      const names = registeredToolNames(server).filter((name) => name !== SUPERTOOL_NAME);
+      const names = registeredToolNames(server).filter(
+        (name) => name !== SUPERTOOL_NAME && !SUPERTOOL_EXCLUDED_ACTIONS.has(name)
+      );
       if (action === "list_actions" || action === "help") {
         const text = [
           "# CodexPro Supertool",
@@ -2127,6 +2134,10 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
 
       if (action === SUPERTOOL_NAME) {
         throw new CodexProError("codexpro cannot call itself. Use action=list_actions to inspect available wrapped actions.");
+      }
+
+      if (SUPERTOOL_EXCLUDED_ACTIONS.has(action)) {
+        throw new CodexProError("This action is available only through its explicit public tool, not the general wrapper.");
       }
 
       const handler = registeredToolHandler(server, action);

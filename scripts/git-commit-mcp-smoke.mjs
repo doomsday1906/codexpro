@@ -384,6 +384,31 @@ try {
     const hostileGitTraceBeforeCommit = await readFile(hostileGitTracePath).catch(() => null);
     const hostileGitTrace2BeforeCommit = await readFile(hostileGitTrace2Path).catch(() => null);
 
+    const wrapperActions = expectSuccess(
+      await callTool(sessionB, "codexpro", { action: "list_actions" }),
+      "full supertool action listing"
+    );
+    assert.equal(wrapperActions.structuredContent.actions.includes("git_commit"), false, "codexpro advertised git_commit as a wrapper action");
+    const wrapperTargetBefore = await repositorySnapshot(targetRoot);
+    const wrapperDefaultBefore = await repositorySnapshot(defaultRoot);
+    const wrapperAttempt = expectError(await callTool(sessionB, "codexpro", {
+      action: "git_commit",
+      args: {
+        workspace_id: targetWorkspaceId,
+        paths: ["selected.txt"],
+        message: "wrapper must not invoke strict mutation",
+        expected_head: targetHead,
+        [HOSTILE_KEY]: HOSTILE_VALUE
+      }
+    }), "codexpro git_commit wrapper attempt");
+    assert.match(resultText(wrapperAttempt), /explicit public tool|general wrapper|not available/iu, "wrapper rejection omitted its bounded reason");
+    assertNoRawLiterals(wrapperAttempt, [HOSTILE_KEY, HOSTILE_VALUE], "codexpro wrapper complete error envelope");
+    assert.deepEqual(await repositorySnapshot(targetRoot), wrapperTargetBefore, "codexpro wrapper changed the explicit target repository");
+    assert.deepEqual(await repositorySnapshot(defaultRoot), wrapperDefaultBefore, "codexpro wrapper changed the ambient default repository");
+    console.log("RAW_OBSERVATION: full-mode codexpro list_actions omitted git_commit and its hostile wrapper call returned a complete error envelope with both target/default refs unchanged.");
+    console.log("SANITY_VERDICT: MATCH — the strict mutation remained directly listed while the general wrapper neither advertised nor invoked it.");
+    console.log("PREDICATE: TRUE — wrapper action identity and independent pre-call repository snapshots establish the no-wrapper-mutation condition before judging the rejection.");
+
     const commit = await callTool(sessionB, "git_commit", {
       workspace_id: targetWorkspaceId,
       paths: ["selected.txt"],
@@ -508,6 +533,11 @@ try {
         const listing = await session.client.listTools();
         const names = listing.tools.map((tool) => tool.name);
         assert.equal(names.includes("git_commit"), false, `${boundary.label} mode exposed git_commit: ${names.join(", ")}`);
+        const actions = expectSuccess(
+          await callTool(session, "codexpro", { action: "list_actions" }),
+          `${boundary.label} supertool action listing`
+        );
+        assert.equal(actions.structuredContent.actions.includes("git_commit"), false, `${boundary.label} supertool advertised git_commit`);
         const unavailableBefore = await repositorySnapshot(targetRoot);
         const unavailable = await callTool(session, "git_commit", {
           workspace_id: targetWorkspaceId,
@@ -523,7 +553,7 @@ try {
       }
     });
   }
-  console.log("PASS AP-009: full+workspace-write exposes exactly one strict git_commit with false/false/false annotations and no card/template; standard/minimal/write-off/non-workspace omit or reject it.");
+  console.log("PASS AP-009: full+workspace-write exposes exactly one strict direct git_commit with false/false/false annotations and no card/template; the general wrapper omits/rejects it, and standard/minimal/write-off/non-workspace omit or reject it.");
   console.log("PASS AP-010: persistent real HTTP session churn targeted only the saved process-known workspace ID, preserved the ambient default selection, enforced missing/wrong ID and stale HEAD, and kept hostile complete envelopes clean.");
   console.log("GIT_COMMIT_MCP_SMOKE: PASS (AP-009/AP-010 focused public-surface proof).");
 } finally {
