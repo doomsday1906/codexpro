@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -84,6 +84,8 @@ export interface GitIndexEntry {
   readonly objectId: string;
   readonly stage: number;
   readonly path: string;
+  /** Raw hexadecimal index visibility flags from Git's debug producer. */
+  readonly flags: string;
 }
 
 export type GitWorktreeEntryKind = "missing" | "file" | "symlink" | "directory" | "other";
@@ -106,6 +108,7 @@ export interface GitCommitPathPreflight {
   readonly absPath: string;
   readonly status: string;
   readonly indexEntries: readonly GitIndexEntry[];
+  readonly headEntry: GitTreeEntry | undefined;
   readonly worktree: GitWorktreeEntryState;
 }
 
@@ -271,9 +274,31 @@ function parseObjectId(value: string, format: "sha1" | "sha256"): string {
   return normalized;
 }
 
-async function runGitChecked(config: GitCommitConfig, workspace: Workspace, args: readonly string[]): Promise<GitExecutionResult> {
+/** Internal-only derived index scope; callers never supply arbitrary Git env. */
+interface GitIndexScope {
+  readonly indexFile: string;
+}
+
+/** Fixed internal modes that disable a configured fsmonitor helper. */
+type GitCheckedMode = "passive-observation" | "intent-preparation";
+
+const PASSIVE_OBSERVATION_GIT_ARGS = ["-c", "core.fsmonitor=false"] as const;
+
+async function runGitChecked(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  args: readonly string[],
+  indexScope?: GitIndexScope,
+  mode?: GitCheckedMode
+): Promise<GitExecutionResult> {
   try {
-    return await runGitMutation(config, workspace, args);
+    const checkedArgs = mode === undefined ? args : [...PASSIVE_OBSERVATION_GIT_ARGS, ...args];
+    return await runGitMutation(
+      config,
+      workspace,
+      checkedArgs,
+      indexScope === undefined ? undefined : { indexFile: indexScope.indexFile }
+    );
   } catch (error) {
     if (error instanceof GitCommitError) throw error;
     if (error instanceof GitExecutionError) return fail("execution");
@@ -297,31 +322,56 @@ async function runGitAllowExit(
   }
 }
 
-function parseIndexEntries(
+function parseDebugIndexEntries(
   bytes: Buffer,
   format: "sha1" | "sha256",
   selected?: ReadonlySet<string>
 ): Map<string, GitIndexEntry[]> {
+  const text = decodeGitUtf8(bytes);
+  if (text.length === 0) return new Map();
   const entries = new Map<string, GitIndexEntry[]>();
-  for (const field of nulFields(bytes)) {
-    const tab = field.indexOf(0x09);
-    if (tab <= 0) return fail("malformed-output");
-    const header = decodeGitUtf8(field.subarray(0, tab));
-    const entryPath = decodeGitUtf8(field.subarray(tab + 1));
-    if ((selected !== undefined && !selected.has(entryPath)) || CONTROL_CHARACTER_PATTERN.test(entryPath)) {
+  const headerPattern = /^(\d{6}) ([0-9a-f]+) ([0-3])\t(.+)$/iu;
+  const debugFlagsPattern = /(?:^|\n)[^\n]*\bflags:\s*([0-9a-f]+)\s*(?:\n|$)/giu;
+  let cursor = 0;
+  while (cursor < text.length) {
+    const separator = text.indexOf("\u0000", cursor);
+    if (separator <= cursor) return fail("malformed-output");
+    const header = text.slice(cursor, separator);
+    const match = headerPattern.exec(header);
+    if (
+      !match ||
+      !objectIdPattern(format).test(match[2]) ||
+      CONTROL_CHARACTER_PATTERN.test(match[4]) ||
+      (selected !== undefined && !selected.has(match[4]))
+    ) {
       return fail("malformed-output");
     }
-    const match = /^(\d{6}) ([0-9a-f]+) ([0-3])$/iu.exec(header);
-    if (!match || !objectIdPattern(format).test(match[2])) return fail("malformed-output");
+
+    const debugStart = separator + 1;
+    const nextHeader = text.slice(debugStart).search(/\n(?=\d{6} [0-9a-f]+ [0-3]\t)/iu);
+    const debugEnd = nextHeader < 0 ? text.length : debugStart + nextHeader + 1;
+    const debug = text.slice(debugStart, debugEnd);
+    const flagMatches = [...debug.matchAll(debugFlagsPattern)];
+    if (flagMatches.length !== 1) return fail("malformed-output");
+    const flags = flagMatches[0][1].toLowerCase();
+    try {
+      BigInt(`0x${flags}`);
+    } catch {
+      return fail("malformed-output");
+    }
+
     const entry: GitIndexEntry = {
       mode: match[1],
       objectId: match[2].toLowerCase(),
       stage: Number(match[3]),
-      path: entryPath
+      path: match[4],
+      flags
     };
-    const prior = entries.get(entryPath) ?? [];
+    const prior = entries.get(entry.path) ?? [];
     prior.push(entry);
-    entries.set(entryPath, prior);
+    entries.set(entry.path, prior);
+    if (nextHeader < 0) break;
+    cursor = debugEnd;
   }
   for (const values of entries.values()) values.sort((left, right) => left.stage - right.stage);
   return entries;
@@ -374,10 +424,23 @@ function parseStatusPaths(bytes: Buffer): Map<string, string> {
   return statuses;
 }
 
+function nulPathList(bytes: Buffer): string[] {
+  const paths: string[] = [];
+  for (const field of nulFields(bytes)) {
+    const relativePath = decodeGitUtf8(field);
+    if (!relativePath || CONTROL_CHARACTER_PATTERN.test(relativePath)) return fail("malformed-output");
+    paths.push(relativePath);
+  }
+  return paths;
+}
+
 interface GitRepositorySnapshot {
   readonly index: Map<string, GitIndexEntry[]>;
   readonly statuses: Map<string, string>;
   readonly worktree: Map<string, GitWorktreeEntryState>;
+  /** Complete local ref and repository-local config snapshots, base64 encoded. */
+  readonly localRefs: string;
+  readonly localConfig: string;
 }
 
 interface GitBranchState {
@@ -412,8 +475,58 @@ function sameIndexEntries(left: readonly GitIndexEntry[], right: readonly GitInd
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+// Git's split-index writer may move an unchanged entry into or out of the
+// shared-index base while rewriting the index for an intent-to-add entry. The
+// producer exposes that storage marker as 0x08000000. It is not one of the
+// visibility bits (assume-unchanged/skip-worktree) that controls whether a
+// hidden tracked change can be observed, so preserve comparisons ignore only
+// this representation detail and retain every other raw flag.
+const SPLIT_INDEX_BASE_FLAG = 0x08000000n;
+
+function preservedIndexFlags(flags: string): string {
+  try {
+    return (BigInt(`0x${flags}`) & ~SPLIT_INDEX_BASE_FLAG).toString(16);
+  } catch {
+    return flags;
+  }
+}
+
+function samePreservedIndexEntries(left: readonly GitIndexEntry[], right: readonly GitIndexEntry[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every(
+    (entry, index) => {
+      const other = right[index];
+      return (
+        other !== undefined &&
+        entry.mode === other.mode &&
+        entry.objectId === other.objectId &&
+        entry.stage === other.stage &&
+        entry.path === other.path &&
+        preservedIndexFlags(entry.flags) === preservedIndexFlags(other.flags)
+      );
+    }
+  );
+}
+
 function sameWorktreeState(left: GitWorktreeEntryState | undefined, right: GitWorktreeEntryState | undefined): boolean {
   return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+}
+
+function sameRawWorktreeState(left: GitWorktreeEntryState | undefined, right: GitWorktreeEntryState | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return JSON.stringify({
+    kind: left.kind,
+    mode: left.mode,
+    size: left.size,
+    rawContentHash: left.rawContentHash,
+    linkTarget: left.linkTarget
+  }) === JSON.stringify({
+    kind: right.kind,
+    mode: right.mode,
+    size: right.size,
+    rawContentHash: right.rawContentHash,
+    linkTarget: right.linkTarget
+  });
 }
 
 function mapKeys(...maps: ReadonlyMap<string, unknown>[]): Set<string> {
@@ -431,28 +544,127 @@ function assertUnselectedSnapshotPreserved(
 ): boolean {
   for (const relativePath of mapKeys(before.index, after.index, before.statuses, after.statuses, before.worktree, after.worktree)) {
     if (selected.has(relativePath)) continue;
-    if (!sameIndexEntries(before.index.get(relativePath) ?? [], after.index.get(relativePath) ?? [])) return false;
+    if (!samePreservedIndexEntries(before.index.get(relativePath) ?? [], after.index.get(relativePath) ?? [])) return false;
     if ((before.statuses.get(relativePath) ?? "") !== (after.statuses.get(relativePath) ?? "")) return false;
     if (!sameWorktreeState(before.worktree.get(relativePath), after.worktree.get(relativePath))) return false;
   }
   return true;
 }
 
+function sameSnapshotMetadata(left: GitRepositorySnapshot, right: GitRepositorySnapshot): boolean {
+  return left.localRefs === right.localRefs && left.localConfig === right.localConfig;
+}
+
+function assertPreparedSnapshotPreserved(
+  before: GitRepositorySnapshot,
+  after: GitRepositorySnapshot,
+  preflight: GitCommitPreflight,
+  receipts: readonly GitIntentReceipt[]
+): boolean {
+  if (!sameSnapshotMetadata(before, after)) return false;
+  const owned = new Map(receipts.map((receipt) => [receipt.path, receipt]));
+  if (!assertUnselectedSnapshotPreserved(before, after, new Set(owned.keys()))) return false;
+  for (const selected of preflight.selected) {
+    const receipt = owned.get(selected.path);
+    const afterEntries = after.index.get(selected.path) ?? [];
+    const afterStatus = after.statuses.get(selected.path) ?? "";
+    if (receipt === undefined) {
+      if (
+        !sameIndexEntries(selected.indexEntries, afterEntries) ||
+        selected.status !== afterStatus ||
+        !sameRawWorktreeState(selected.worktree, after.worktree.get(selected.path))
+      ) {
+        return false;
+      }
+      continue;
+    }
+    if (
+      !sameIndexEntries(receipt.indexEntries, afterEntries) ||
+      receipt.status !== afterStatus ||
+      !sameRawWorktreeState(selected.worktree, after.worktree.get(selected.path))
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Before a ref advance, an ordinary failure may leave selected-path drift
+ * attributable to the caller/helper. Unselected physical state and repository
+ * metadata, however, must still be unchanged; otherwise the failure is
+ * recovery truth rather than an ordinary execution/preflight result.
+ */
+async function assertPreAdvanceStatePreserved(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  preflight: GitCommitPreflight,
+  baseline: GitRepositorySnapshot,
+  baselineRemoteRefs: string
+): Promise<void> {
+  try {
+    const current = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+    if (
+      !sameSnapshotMetadata(baseline, current) ||
+      !assertUnselectedSnapshotPreserved(baseline, current, new Set(preflight.request.paths)) ||
+      (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs
+    ) {
+      return fail("recovery-required");
+    }
+  } catch (error) {
+    if (error instanceof GitCommitError && error.reason === "recovery-required") throw error;
+    return fail("recovery-required");
+  }
+}
+
 async function captureRepositorySnapshot(
   config: GitCommitConfig,
   workspace: Workspace,
-  format: "sha1" | "sha256"
+  format: "sha1" | "sha256",
+  indexScope?: GitIndexScope
 ): Promise<GitRepositorySnapshot> {
-  const indexResult = await runGitChecked(config, workspace, ["ls-files", "--stage", "-z"]);
-  const statusResult = await runGitChecked(config, workspace, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
-  const index = parseIndexEntries(indexResult.copyStdoutBytes(), format);
+  // Keep the census readers ordered. Git's split-index implementation can
+  // materialize/normalize index metadata while a reader is starting; sibling
+  // readers would otherwise race and make a stable raw index appear to drift.
+  const indexResult = await runGitChecked(
+    config,
+    workspace,
+    ["ls-files", "--debug", "--stage", "-z"],
+    indexScope,
+    "passive-observation"
+  );
+  const statusResult = await runGitChecked(
+    config,
+    workspace,
+    ["status", "--porcelain=v2", "-z", "--ignored=matching", "--untracked-files=all"],
+    indexScope,
+    "passive-observation"
+  );
+  const ignoredResult = await runGitChecked(
+    config,
+    workspace,
+    ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    indexScope,
+    "passive-observation"
+  );
+  const refsResult = await runGitChecked(config, workspace, ["for-each-ref", "--format=%(refname)=%(objectname)"], indexScope);
+  const configResult = await runGitChecked(config, workspace, ["config", "--local", "--null", "--list"], indexScope);
+  const index = parseDebugIndexEntries(indexResult.copyStdoutBytes(), format);
   const statuses = parseStatusPaths(statusResult.copyStdoutBytes());
+  const ignoredFiles = nulPathList(ignoredResult.copyStdoutBytes());
+  const allPaths = mapKeys(index, statuses, new Map(ignoredFiles.map((relativePath) => [relativePath, true])));
   const worktree = new Map<string, GitWorktreeEntryState>();
-  for (const relativePath of statuses.keys()) {
-    const inspected = await inspectWorktreeState(config, workspace, relativePath, format);
+  for (const relativePath of allPaths) {
+    const inspected = await inspectWorktreeState(config, workspace, relativePath, format, false);
     worktree.set(relativePath, inspected.state);
   }
-  return { index, statuses, worktree };
+  return {
+    index,
+    statuses,
+    worktree,
+    localRefs: refsResult.copyStdoutBytes().toString("base64"),
+    localConfig: configResult.copyStdoutBytes().toString("base64")
+  };
 }
 
 function parseRawDiffEntries(
@@ -587,7 +799,8 @@ async function stableRegularFileState(
   workspace: Workspace,
   absPath: string,
   relativePath: string,
-  format: "sha1" | "sha256"
+  format: "sha1" | "sha256",
+  includeGitIdentity: boolean
 ): Promise<GitWorktreeEntryState> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let before: Awaited<ReturnType<typeof fsp.lstat>>;
@@ -606,17 +819,21 @@ async function stableRegularFileState(
     }
     if (!before.isFile()) return fail("unsupported-path");
     let rawContentHash: string;
-    let contentHash: string;
-    let gitBlobId: string;
+    let contentHash: string | null = null;
+    let gitBlobId: string | null = null;
     try {
-      const [rawContentHashResult, hashResult, cleanResult] = await Promise.all([
-        hashFileBytes(absPath),
-        runGitChecked(config, workspace, ["hash-object", "--no-filters", "--", relativePath]),
-        runGitChecked(config, workspace, ["hash-object", `--path=${relativePath}`, "--", relativePath])
-      ]);
-      rawContentHash = rawContentHashResult;
-      contentHash = parseObjectId(oneLine(hashResult), format);
-      gitBlobId = parseObjectId(oneLine(cleanResult), format);
+      if (includeGitIdentity) {
+        const [rawContentHashResult, hashResult, cleanResult] = await Promise.all([
+          hashFileBytes(absPath),
+          runGitChecked(config, workspace, ["hash-object", "--no-filters", "--", relativePath]),
+          runGitChecked(config, workspace, ["hash-object", `--path=${relativePath}`, "--", relativePath])
+        ]);
+        rawContentHash = rawContentHashResult;
+        contentHash = parseObjectId(oneLine(hashResult), format);
+        gitBlobId = parseObjectId(oneLine(cleanResult), format);
+      } else {
+        rawContentHash = await hashFileBytes(absPath);
+      }
     } catch (error) {
       if (error instanceof GitCommitError) throw error;
       return fail("execution");
@@ -633,7 +850,7 @@ async function stableRegularFileState(
       modeBits(after.mode) === modeBits(before.mode) &&
       after.mtimeMs === before.mtimeMs &&
       after.ctimeMs === before.ctimeMs &&
-      contentHash.length === (format === "sha1" ? 40 : 64)
+      (contentHash === null || contentHash.length === (format === "sha1" ? 40 : 64))
     ) {
       return {
         kind: "file",
@@ -653,7 +870,8 @@ async function inspectWorktreeState(
   config: GitCommitConfig,
   workspace: Workspace,
   relativePath: string,
-  format: "sha1" | "sha256"
+  format: "sha1" | "sha256",
+  includeGitIdentity = false
 ): Promise<{ readonly absPath: string; readonly state: GitWorktreeEntryState }> {
   const absPath = path.resolve(workspace.root, ...relativePath.split("/"));
   if (!isSubpath(absPath, workspace.root)) return fail("invalid-path");
@@ -700,21 +918,25 @@ async function inspectWorktreeState(
     } catch {
       return fail("invalid-path");
     }
+    const linkBytes = Buffer.from(target, "utf8");
     return {
       absPath,
       state: {
         kind: "symlink",
         mode: modeBits(stat.mode),
-        size: Buffer.byteLength(target, "utf8"),
-        rawContentHash: hashBytes(Buffer.from(target, "utf8")),
-        contentHash: gitBlobIdForBytes(Buffer.from(target, "utf8"), format),
-        gitBlobId: gitBlobIdForBytes(Buffer.from(target, "utf8"), format),
+        size: linkBytes.length,
+        rawContentHash: hashBytes(linkBytes),
+        contentHash: includeGitIdentity ? gitBlobIdForBytes(linkBytes, format) : null,
+        gitBlobId: includeGitIdentity ? gitBlobIdForBytes(linkBytes, format) : null,
         linkTarget: target
       }
     };
   }
   if (stat.isFile()) {
-    return { absPath, state: await stableRegularFileState(config, workspace, absPath, relativePath, format) };
+    return {
+      absPath,
+      state: await stableRegularFileState(config, workspace, absPath, relativePath, format, includeGitIdentity)
+    };
   }
   return {
     absPath,
@@ -832,27 +1054,48 @@ export async function preflightGitCommit(
   if (head !== request.expected_head) return fail("head-mismatch");
   await assertNoHistoryOperation(config, workspace);
 
-  const unmerged = await runGitChecked(config, workspace, ["ls-files", "--unmerged", "-z"]);
+  const unmerged = await runGitChecked(
+    config,
+    workspace,
+    ["ls-files", "--unmerged", "-z"],
+    undefined,
+    "passive-observation"
+  );
   if (nulFields(unmerged.copyStdoutBytes()).length > 0) return fail("unmerged");
 
   const selected = new Set(request.paths);
   for (const relativePath of request.paths) {
     if (guard.isBlockedRelativePath(relativePath)) return fail("blocked-path");
   }
-  const indexOutput = await runGitChecked(config, workspace, ["ls-files", "--stage", "-z", "--", ...request.paths]);
-  const indexEntries = parseIndexEntries(indexOutput.copyStdoutBytes(), objectFormat, selected);
-  const statusOutput = await runGitChecked(config, workspace, ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--", ...request.paths]);
+  const indexOutput = await runGitChecked(
+    config,
+    workspace,
+    ["ls-files", "--debug", "--stage", "-z", "--", ...request.paths],
+    undefined,
+    "passive-observation"
+  );
+  const indexEntries = parseDebugIndexEntries(indexOutput.copyStdoutBytes(), objectFormat, selected);
+  const statusOutput = await runGitChecked(
+    config,
+    workspace,
+    ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--", ...request.paths],
+    undefined,
+    "passive-observation"
+  );
   const statuses = parseStatusPaths(statusOutput.copyStdoutBytes());
+  const headEntries = await treeEntries(config, workspace, head, request.paths, objectFormat);
 
   const pathStates: GitCommitPathPreflight[] = [];
   for (const relativePath of request.paths) {
     const entries = indexEntries.get(relativePath) ?? [];
+    const headEntry = headEntries.get(relativePath);
+    if (headEntry?.mode === "160000" || headEntry?.type === "commit") return fail("gitlink");
     if (entries.some((entry) => entry.mode === "160000")) return fail("gitlink");
     const inspected = await inspectWorktreeState(config, workspace, relativePath, objectFormat);
     if (inspected.state.kind === "directory") return fail("directory");
     if (inspected.state.kind === "other") return fail("unsupported-path");
-    if (entries.length === 0 && await isIgnored(config, workspace, relativePath)) return fail("ignored");
-    if (entries.length === 0 && inspected.state.kind === "missing") {
+    if (entries.length === 0 && headEntry === undefined && await isIgnored(config, workspace, relativePath)) return fail("ignored");
+    if (entries.length === 0 && inspected.state.kind === "missing" && headEntry === undefined) {
       return fail("missing-path");
     }
     pathStates.push({
@@ -860,6 +1103,7 @@ export async function preflightGitCommit(
       absPath: inspected.absPath,
       status: statusForPath(statuses, relativePath),
       indexEntries: entries,
+      headEntry,
       worktree: inspected.state
     });
   }
@@ -949,12 +1193,51 @@ export interface GitCommitResult {
 }
 
 function sameRepositorySnapshot(left: GitRepositorySnapshot, right: GitRepositorySnapshot): boolean {
+  if (!sameSnapshotMetadata(left, right)) return false;
   for (const relativePath of mapKeys(left.index, right.index, left.statuses, right.statuses, left.worktree, right.worktree)) {
-    if (!sameIndexEntries(left.index.get(relativePath) ?? [], right.index.get(relativePath) ?? [])) return false;
+    if (!samePreservedIndexEntries(left.index.get(relativePath) ?? [], right.index.get(relativePath) ?? [])) return false;
     if ((left.statuses.get(relativePath) ?? "") !== (right.statuses.get(relativePath) ?? "")) return false;
     if (!sameWorktreeState(left.worktree.get(relativePath), right.worktree.get(relativePath))) return false;
   }
   return true;
+}
+
+function parseRefSnapshot(encoded: string): Map<string, string> | undefined {
+  let text: string;
+  try {
+    text = Buffer.from(encoded, "base64").toString("utf8");
+  } catch {
+    return undefined;
+  }
+  const refs = new Map<string, string>();
+  for (const line of text.split("\n")) {
+    if (line === "") continue;
+    const separator = line.indexOf("=");
+    if (separator <= 0 || refs.has(line.slice(0, separator))) return undefined;
+    refs.set(line.slice(0, separator), line.slice(separator + 1));
+  }
+  return refs;
+}
+
+function localRefsChangedOnlyForBranch(
+  before: GitRepositorySnapshot,
+  after: GitRepositorySnapshot,
+  branchRef: string,
+  oldHead: string,
+  newHead: string
+): boolean {
+  const beforeRefs = parseRefSnapshot(before.localRefs);
+  const afterRefs = parseRefSnapshot(after.localRefs);
+  if (beforeRefs === undefined || afterRefs === undefined) return false;
+  const keys = mapKeys(beforeRefs, afterRefs);
+  for (const ref of keys) {
+    if (ref === branchRef) {
+      if (beforeRefs.get(ref) !== oldHead || afterRefs.get(ref) !== newHead) return false;
+    } else if (beforeRefs.get(ref) !== afterRefs.get(ref)) {
+      return false;
+    }
+  }
+  return beforeRefs.get(branchRef) === oldHead && afterRefs.get(branchRef) === newHead;
 }
 
 async function currentBranchState(
@@ -995,11 +1278,32 @@ async function selectedWorktreeStates(
   return states;
 }
 
+/** Resolve Git clean/filter identities only after the passive baseline exists. */
+async function selectedGitIdentityStates(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  preflight: GitCommitPreflight
+): Promise<Map<string, GitWorktreeEntryState>> {
+  const states = new Map<string, GitWorktreeEntryState>();
+  for (const selected of preflight.selected) {
+    const inspected = await inspectWorktreeState(config, workspace, selected.path, preflight.objectFormat, true);
+    states.set(selected.path, inspected.state);
+  }
+  return states;
+}
+
 function selectedWorktreeStatesMatch(
   preflight: GitCommitPreflight,
   states: ReadonlyMap<string, GitWorktreeEntryState>
 ): boolean {
   return preflight.selected.every((selected) => sameWorktreeState(selected.worktree, states.get(selected.path)));
+}
+
+function selectedRawWorktreeStatesMatch(
+  preflight: GitCommitPreflight,
+  states: ReadonlyMap<string, GitWorktreeEntryState>
+): boolean {
+  return preflight.selected.every((selected) => sameRawWorktreeState(selected.worktree, states.get(selected.path)));
 }
 
 function selectedSnapshotMatchesPreflight(
@@ -1015,49 +1319,30 @@ function selectedSnapshotMatchesPreflight(
   );
 }
 
-function selectedStateMap(preflight: GitCommitPreflight): Map<string, GitCommitPathPreflight> {
-  return new Map(preflight.selected.map((selected) => [selected.path, selected]));
+function worktreeDiffersFromHead(
+  selected: GitCommitPathPreflight,
+  state: GitWorktreeEntryState
+): boolean {
+  const head = selected.headEntry;
+  if (head === undefined) return state.kind !== "missing";
+  if (state.kind === "missing") return true;
+  if (state.kind !== "file" && state.kind !== "symlink") return true;
+  const mode = state.kind === "symlink" ? "120000" : (state.mode !== null && (state.mode & 0o111) !== 0 ? "100755" : "100644");
+  return head.type !== "blob" || head.mode !== mode || state.gitBlobId === null || head.objectId !== state.gitBlobId;
 }
 
-function parseIntentDebugFlags(bytes: Buffer, expectedPath: string): string | undefined {
-  if (bytes.length === 0) return undefined;
-  const separator = bytes.indexOf(0);
-  if (separator <= 0) return fail("malformed-output");
-  const header = decodeGitUtf8(bytes.subarray(0, separator));
-  const pathSeparator = header.indexOf("\t");
-  if (pathSeparator <= 0 || header.slice(pathSeparator + 1) !== expectedPath) {
-    return fail("malformed-output");
-  }
-  const debug = decodeGitUtf8(bytes.subarray(separator + 1));
-  const matches = [...debug.matchAll(/(?:^|\n)[^\n]*\bflags:\s*([0-9a-f]+)\s*(?:\n|$)/giu)];
-  if (matches.length !== 1) return fail("malformed-output");
-  const flags = matches[0][1].toLowerCase();
+function isIntentToAddFlags(flags: string): boolean {
   try {
-    if ((BigInt(`0x${flags}`) & 0x20000000n) === 0n) return fail("malformed-output");
+    return (BigInt(`0x${flags}`) & 0x20000000n) !== 0n;
   } catch {
-    return fail("malformed-output");
+    return false;
   }
-  return flags;
-}
-
-async function intentDebugFlags(
-  config: GitCommitConfig,
-  workspace: Workspace,
-  paths: readonly string[]
-): Promise<Map<string, string | undefined>> {
-  const flags = new Map<string, string | undefined>();
-  for (const relativePath of paths) {
-    const result = await runGitChecked(config, workspace, ["ls-files", "--debug", "--stage", "-z", "--", relativePath]);
-    flags.set(relativePath, parseIntentDebugFlags(result.copyStdoutBytes(), relativePath));
-  }
-  return flags;
 }
 
 function collectIntentReceipts(
   preflight: GitCommitPreflight,
   baseline: GitRepositorySnapshot,
-  current: GitRepositorySnapshot,
-  intentFlags: ReadonlyMap<string, string | undefined>
+  current: GitRepositorySnapshot
 ): GitIntentReceipt[] | undefined {
   const receipts: GitIntentReceipt[] = [];
   const emptyBlobId = gitBlobIdForBytes(Buffer.alloc(0), preflight.objectFormat);
@@ -1068,7 +1353,6 @@ function collectIntentReceipts(
     if (currentEntries.length === 0) {
       if (
         currentStatus !== (baseline.statuses.get(selected.path) ?? "") ||
-        intentFlags.get(selected.path) !== undefined ||
         !sameWorktreeState(selected.worktree, current.worktree.get(selected.path))
       ) {
         return undefined;
@@ -1080,7 +1364,7 @@ function collectIntentReceipts(
       currentEntries[0].stage !== 0 ||
       currentEntries[0].objectId !== emptyBlobId ||
       currentStatus !== ".A" ||
-      intentFlags.get(selected.path) === undefined ||
+      !isIntentToAddFlags(currentEntries[0].flags) ||
       !sameWorktreeState(selected.worktree, current.worktree.get(selected.path))
     ) {
       return undefined;
@@ -1089,10 +1373,252 @@ function collectIntentReceipts(
       path: selected.path,
       indexEntries: currentEntries,
       status: currentStatus,
-      intentFlags: intentFlags.get(selected.path) as string
+      intentFlags: currentEntries[0].flags
     });
   }
   return receipts;
+}
+
+interface GitFileIdentity {
+  readonly device: number;
+  readonly inode: number;
+  readonly mode: number;
+}
+
+interface GitIndexSnapshot {
+  readonly identity: GitFileIdentity;
+  readonly contentHash: string;
+  readonly mode: number;
+}
+
+interface GitIndexBaseline extends GitIndexSnapshot {
+  /** Exact main-index bytes captured before selected intent preparation. */
+  readonly bytes: Buffer;
+  readonly path: string;
+}
+
+interface OwnedIndexCandidate {
+  readonly path: string;
+  readonly identity: GitFileIdentity;
+}
+
+function fileIdentity(stat: import("node:fs").Stats): GitFileIdentity {
+  return { device: stat.dev, inode: stat.ino, mode: modeBits(stat.mode) };
+}
+
+function sameFileIdentity(left: GitFileIdentity, right: GitFileIdentity): boolean {
+  return left.device === right.device && left.inode === right.inode && left.mode === right.mode;
+}
+
+async function readIndexSnapshot(indexPath: string): Promise<GitIndexSnapshot> {
+  try {
+    const stat = await fsp.lstat(indexPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) return fail("recovery-required");
+    return {
+      identity: fileIdentity(stat),
+      contentHash: await hashFileBytes(indexPath),
+      mode: modeBits(stat.mode)
+    };
+  } catch (error) {
+    if (error instanceof GitCommitError) throw error;
+    return fail("recovery-required");
+  }
+}
+
+async function readIndexBaseline(indexPath: string): Promise<GitIndexBaseline> {
+  try {
+    const bytes = await fsp.readFile(indexPath);
+    const snapshot = await readIndexSnapshot(indexPath);
+    if (hashBytes(bytes) !== snapshot.contentHash) return fail("recovery-required");
+    return { ...snapshot, bytes, path: indexPath };
+  } catch (error) {
+    if (error instanceof GitCommitError) throw error;
+    return fail("recovery-required");
+  }
+}
+
+async function syncFile(filePath: string): Promise<void> {
+  let handle: Awaited<ReturnType<typeof fsp.open>> | undefined;
+  try {
+    // fsync does not require write access. Opening read-only also permits
+    // restoring an index whose call-entry mode intentionally denies writes;
+    // the candidate is written while owned and writable, then chmoded to the
+    // sealed baseline mode before rename.
+    handle = await fsp.open(filePath, "r");
+    await handle.sync();
+  } catch {
+    return fail("recovery-required");
+  } finally {
+    try {
+      await handle?.close();
+    } catch {
+      // A failed close is surfaced as recovery truth by the caller's next
+      // identity check; never broaden cleanup to another path.
+    }
+  }
+}
+
+async function syncDirectory(directoryPath: string): Promise<void> {
+  let handle: Awaited<ReturnType<typeof fsp.open>> | undefined;
+  try {
+    handle = await fsp.open(directoryPath, "r");
+    await handle.sync();
+  } catch {
+    return fail("recovery-required");
+  } finally {
+    try {
+      await handle?.close();
+    } catch {
+      // Keep the bounded recovery verdict; do not attempt alternate cleanup.
+    }
+  }
+}
+
+async function actualGitIndexPath(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  preflight: GitCommitPreflight
+): Promise<string> {
+  try {
+    const raw = oneLine(await runGitChecked(config, workspace, ["rev-parse", "--path-format=absolute", "--git-path", "index"]));
+    if (!raw || !path.isAbsolute(raw) || CONTROL_CHARACTER_PATTERN.test(raw) || path.basename(raw) !== "index") {
+      return fail("recovery-required");
+    }
+    const indexPath = path.normalize(raw);
+    const gitDir = await fsp.realpath(preflight.gitDir);
+    const parent = await fsp.realpath(path.dirname(indexPath));
+    if (!isSubpath(parent, gitDir)) return fail("recovery-required");
+    return indexPath;
+  } catch (error) {
+    if (error instanceof GitCommitError) throw error;
+    return fail("recovery-required");
+  }
+}
+
+interface OwnedIndexLock {
+  readonly path: string;
+  readonly handle: Awaited<ReturnType<typeof fsp.open>>;
+  readonly identity: GitFileIdentity;
+}
+
+async function acquireActualIndexLock(indexPath: string): Promise<OwnedIndexLock> {
+  const lockPath = `${indexPath}.lock`;
+  let handle: Awaited<ReturnType<typeof fsp.open>> | undefined;
+  try {
+    // wx maps to O_CREAT|O_EXCL. A pre-existing lock is never adopted or
+    // removed, regardless of its apparent contents.
+    handle = await fsp.open(lockPath, "wx", 0o600);
+    const stat = await handle.stat();
+    const onDisk = await fsp.lstat(lockPath);
+    const identity = fileIdentity(stat);
+    if (!sameFileIdentity(identity, fileIdentity(onDisk))) return fail("recovery-required");
+    return { path: lockPath, handle, identity };
+  } catch (error) {
+    try {
+      await handle?.close();
+    } catch {
+      // The lock identity remains unknown; report recovery rather than
+      // guessing at ownership.
+    }
+    if (error instanceof GitCommitError) throw error;
+    return fail("recovery-required");
+  }
+}
+
+async function removeOwnedIndexLock(lock: OwnedIndexLock): Promise<void> {
+  let sameIdentity = false;
+  try {
+    const stat = await fsp.lstat(lock.path);
+    sameIdentity = sameFileIdentity(lock.identity, fileIdentity(stat));
+  } catch {
+    // A missing or unreadable lock is not proof that this invocation still
+    // owns the path. Close our descriptor, then surface recovery truth.
+  }
+  try {
+    await lock.handle.close();
+  } catch {
+    return fail("recovery-required");
+  }
+  if (!sameIdentity) return fail("recovery-required");
+  try {
+    await fsp.unlink(lock.path);
+  } catch {
+    return fail("recovery-required");
+  }
+}
+
+async function createOwnedIndexCandidate(indexPath: string, source: GitIndexSnapshot): Promise<OwnedIndexCandidate> {
+  const directory = path.dirname(indexPath);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const candidate = path.join(
+      directory,
+      `.codexpro-index-${process.pid}-${randomBytes(12).toString("hex")}.tmp`
+    );
+    let createdCandidate: OwnedIndexCandidate | undefined;
+    try {
+      const handle = await fsp.open(candidate, "wx", 0o600);
+      const createdStat = await handle.stat();
+      createdCandidate = { path: candidate, identity: fileIdentity(createdStat) };
+      await handle.close();
+      await fsp.copyFile(indexPath, candidate);
+      await fsp.chmod(candidate, 0o600);
+      await syncFile(candidate);
+      const copied = await readIndexSnapshot(candidate);
+      if (copied.contentHash !== source.contentHash) return fail("recovery-required");
+      return { path: candidate, identity: copied.identity };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+      if (createdCandidate !== undefined) {
+        // The candidate path was created O_EXCL by this invocation. Verify
+        // its inode before retiring it; a replacement or disappearance is
+        // recovery truth, never permission to unlink by pathname alone.
+        await removeOwnedCandidate(createdCandidate);
+      }
+      if (error instanceof GitCommitError) throw error;
+      return fail("recovery-required");
+    }
+  }
+  return fail("recovery-required");
+}
+
+async function removeOwnedCandidate(candidate: OwnedIndexCandidate): Promise<void> {
+  let stat: Awaited<ReturnType<typeof fsp.lstat>>;
+  try {
+    stat = await fsp.lstat(candidate.path);
+  } catch (error) {
+    // A deleted candidate is not proof that our owned artifact was safely
+    // retired. Leave recovery to the caller instead of guessing.
+    return fail("recovery-required");
+  }
+  if (!sameFileIdentity(candidate.identity, fileIdentity(stat))) return fail("recovery-required");
+  try {
+    await fsp.unlink(candidate.path);
+  } catch {
+    return fail("recovery-required");
+  }
+}
+
+async function assertPreparedIntentState(
+  config: GitCommitConfig,
+  workspace: Workspace,
+  preflight: GitCommitPreflight,
+  baseline: GitRepositorySnapshot,
+  baselineRemoteRefs: string,
+  current: GitRepositorySnapshot,
+  receipts: readonly GitIntentReceipt[]
+): Promise<void> {
+  const branch = await currentBranchState(config, workspace, preflight.objectFormat);
+  const states = await selectedWorktreeStates(config, workspace, preflight);
+  if (
+    branch === undefined ||
+    branch.ref !== `refs/heads/${preflight.branch}` ||
+    branch.head !== preflight.head ||
+    (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs ||
+    !assertPreparedSnapshotPreserved(baseline, current, preflight, receipts) ||
+    !selectedWorktreeStatesMatch(preflight, states)
+  ) {
+    return fail("recovery-required");
+  }
 }
 
 async function restoreOwnedIntentEntries(
@@ -1101,44 +1627,175 @@ async function restoreOwnedIntentEntries(
   preflight: GitCommitPreflight,
   baseline: GitRepositorySnapshot,
   baselineRemoteRefs: string,
+  baselineIndex: GitIndexBaseline,
   receipts: readonly GitIntentReceipt[]
 ): Promise<void> {
   if (receipts.length === 0) return;
+
+  let lock: OwnedIndexLock | undefined;
+  let candidate: OwnedIndexCandidate | undefined;
+  let candidateLockPath: string | undefined;
+  let renamed = false;
   try {
-    const owned = new Set(receipts.map((receipt) => receipt.path));
-    const current = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
-    const currentIntentFlags = await intentDebugFlags(config, workspace, receipts.map((receipt) => receipt.path));
-    const states = await selectedWorktreeStates(config, workspace, preflight);
-    const branch = await currentBranchState(config, workspace, preflight.objectFormat);
+    // This passive check closes the common writer-before-lock window. The
+    // actual lock and receipt revalidation below remain authoritative.
+    const beforeLock = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+    await assertPreparedIntentState(config, workspace, preflight, baseline, baselineRemoteRefs, beforeLock, receipts);
+
+    const indexPath = await actualGitIndexPath(config, workspace, preflight);
+    if (indexPath !== baselineIndex.path) return fail("recovery-required");
+    const source = await readIndexSnapshot(indexPath);
+    lock = await acquireActualIndexLock(indexPath);
+    const lockedSource = await readIndexSnapshot(indexPath);
     if (
-      branch === undefined ||
-      branch.ref !== `refs/heads/${preflight.branch}` ||
-      branch.head !== preflight.head ||
-      (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs ||
-      !assertUnselectedSnapshotPreserved(baseline, current, owned) ||
-      !selectedWorktreeStatesMatch(preflight, states)
+      !sameFileIdentity(source.identity, lockedSource.identity) ||
+      source.contentHash !== lockedSource.contentHash
     ) {
       return fail("recovery-required");
     }
-    for (const receipt of receipts) {
-      if (
-        !sameIndexEntries(receipt.indexEntries, current.index.get(receipt.path) ?? []) ||
-        receipt.status !== (current.statuses.get(receipt.path) ?? "") ||
-        currentIntentFlags.get(receipt.path) !== receipt.intentFlags
-      ) {
-        return fail("recovery-required");
-      }
+
+    candidate = await createOwnedIndexCandidate(indexPath, source);
+    candidateLockPath = `${candidate.path}.lock`;
+    await syncDirectory(path.dirname(indexPath));
+    try {
+      await fsp.lstat(candidateLockPath);
+      return fail("recovery-required");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return fail("recovery-required");
     }
 
-    await runGitChecked(config, workspace, ["update-index", "--force-remove", "--", ...receipts.map((receipt) => receipt.path)]);
-    const restored = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
-    const restoredStates = await selectedWorktreeStates(config, workspace, preflight);
-    if (!sameRepositorySnapshot(baseline, restored) || !selectedWorktreeStatesMatch(preflight, restoredStates)) {
+    const candidateScope: GitIndexScope = { indexFile: candidate.path };
+    const candidateBefore = await captureRepositorySnapshot(config, workspace, preflight.objectFormat, candidateScope);
+    if (!sameRepositorySnapshot(beforeLock, candidateBefore)) return fail("recovery-required");
+    await assertPreparedIntentState(config, workspace, preflight, baseline, baselineRemoteRefs, candidateBefore, receipts);
+
+    let updateError: unknown;
+    try {
+      await runGitMutation(
+        config,
+        workspace,
+        ["update-index", "--force-remove", "--", ...receipts.map((receipt) => receipt.path)],
+        { indexFile: candidate.path }
+      );
+    } catch (error) {
+      updateError = error;
+    }
+
+    if (updateError !== undefined) {
+      // A normally exiting Git child may leave its own candidate lock on an
+      // ordinary command failure; a signal/timeout is ambiguous and leaves
+      // the exact artifact for manual recovery.
+      if (updateError instanceof GitExecutionError && updateError.failure !== "exit") {
+        return fail("recovery-required");
+      }
       return fail("recovery-required");
     }
+    // Git normally replaces the candidate with its own candidate.lock. Track
+    // the resulting inode before any later validation so cleanup can still
+    // prove ownership of the exact path without deleting a replacement.
+    candidate = { ...candidate, identity: (await readIndexSnapshot(candidate.path)).identity };
+    try {
+      await fsp.lstat(candidateLockPath);
+      return fail("recovery-required");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return fail("recovery-required");
+    }
+
+    const candidateAfter = await captureRepositorySnapshot(config, workspace, preflight.objectFormat, candidateScope);
+    const candidateStates = await selectedWorktreeStates(config, workspace, preflight);
+    if (
+      !sameRepositorySnapshot(baseline, candidateAfter) ||
+      !selectedWorktreeStatesMatch(preflight, candidateStates) ||
+      (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs
+    ) {
+      return fail("recovery-required");
+    }
+
+    // A split-index rewrite may move unchanged entries between the main and
+    // shared index, changing only Git's storage marker. Once the candidate
+    // has passed the narrow receipt/semantic proof, restore the exact
+    // call-entry index bytes into that owned candidate so the live main index
+    // retains its original representation and permissions.
+    const candidateBeforeExact = await readIndexSnapshot(candidate.path);
+    if (!sameFileIdentity(candidate.identity, candidateBeforeExact.identity)) return fail("recovery-required");
+    if (candidateBeforeExact.contentHash !== baselineIndex.contentHash) {
+      await fsp.writeFile(candidate.path, baselineIndex.bytes, { mode: baselineIndex.mode });
+      await syncFile(candidate.path);
+    }
+    const candidateExact = await readIndexSnapshot(candidate.path);
+    if (
+      !sameFileIdentity(candidate.identity, candidateExact.identity) ||
+      candidateExact.contentHash !== baselineIndex.contentHash
+    ) {
+      return fail("recovery-required");
+    }
+    const candidateExactSnapshot = await captureRepositorySnapshot(config, workspace, preflight.objectFormat, candidateScope);
+    if (!sameRepositorySnapshot(baseline, candidateExactSnapshot)) return fail("recovery-required");
+
+    const mainBeforeRename = await readIndexSnapshot(indexPath);
+    if (
+      !sameFileIdentity(source.identity, mainBeforeRename.identity) ||
+      source.contentHash !== mainBeforeRename.contentHash
+    ) {
+      return fail("recovery-required");
+    }
+    const candidateBeforeRename = await readIndexSnapshot(candidate.path);
+    if (
+      !sameFileIdentity(candidate.identity, candidateBeforeRename.identity) ||
+      candidateBeforeRename.contentHash !== baselineIndex.contentHash
+    ) {
+      return fail("recovery-required");
+    }
+    await fsp.chmod(candidate.path, baselineIndex.mode);
+    await syncFile(candidate.path);
+    const candidateAfterMode = await readIndexSnapshot(candidate.path);
+    if (
+      candidate.identity.device !== candidateAfterMode.identity.device ||
+      candidate.identity.inode !== candidateAfterMode.identity.inode ||
+      candidateAfterMode.contentHash !== baselineIndex.contentHash ||
+      candidateAfterMode.mode !== baselineIndex.mode
+    ) {
+      return fail("recovery-required");
+    }
+    await syncDirectory(path.dirname(indexPath));
+    await fsp.rename(candidate.path, indexPath);
+    candidate = undefined;
+    renamed = true;
+    await syncDirectory(path.dirname(indexPath));
   } catch (error) {
     if (error instanceof GitCommitError && error.reason === "recovery-required") throw error;
     return fail("recovery-required");
+  } finally {
+    let cleanupError: unknown;
+    if (!renamed && candidate !== undefined) {
+      // The candidate path was created O_EXCL by this invocation. A leftover
+      // candidate lock is ambiguous (for example after a killed child), so
+      // leave both exact artifacts for recovery rather than guessing.
+      let candidateLockExists = false;
+      if (candidateLockPath !== undefined) {
+        try {
+          await fsp.lstat(candidateLockPath);
+          candidateLockExists = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") candidateLockExists = true;
+        }
+      }
+      if (!candidateLockExists) {
+        try {
+          await removeOwnedCandidate(candidate);
+        } catch (error) {
+          cleanupError = error;
+        }
+      }
+    }
+    if (lock !== undefined) {
+      try {
+        await removeOwnedIndexLock(lock);
+      } catch (error) {
+        cleanupError ??= error;
+      }
+    }
+    if (cleanupError !== undefined) throw cleanupError;
   }
 }
 
@@ -1147,7 +1804,8 @@ async function prepareIntentEntries(
   workspace: Workspace,
   preflight: GitCommitPreflight,
   baseline: GitRepositorySnapshot,
-  baselineRemoteRefs: string
+  baselineRemoteRefs: string,
+  baselineIndex: GitIndexBaseline
 ): Promise<GitIntentReceipt[]> {
   const candidates = preflight.selected.filter(
     (selected) => selected.indexEntries.length === 0 && selected.worktree.kind !== "missing"
@@ -1156,7 +1814,13 @@ async function prepareIntentEntries(
 
   let commandError: unknown;
   try {
-    await runGitChecked(config, workspace, ["add", "-N", "--", ...candidates.map((candidate) => candidate.path)]);
+    await runGitChecked(
+      config,
+      workspace,
+      ["add", "-N", "--", ...candidates.map((candidate) => candidate.path)],
+      undefined,
+      "intent-preparation"
+    );
   } catch (error) {
     commandError = error;
   }
@@ -1167,20 +1831,14 @@ async function prepareIntentEntries(
   } catch {
     return fail("recovery-required");
   }
-  let intentFlags: Map<string, string | undefined>;
-  try {
-    intentFlags = await intentDebugFlags(config, workspace, candidates.map((candidate) => candidate.path));
-  } catch {
-    return fail("recovery-required");
-  }
-  const receipts = collectIntentReceipts(preflight, baseline, current, intentFlags);
+  const receipts = collectIntentReceipts(preflight, baseline, current);
   const owned = new Set((receipts ?? []).map((receipt) => receipt.path));
   if (receipts === undefined || !assertUnselectedSnapshotPreserved(baseline, current, owned)) {
     return fail("recovery-required");
   }
   if (commandError !== undefined || receipts.length !== candidates.length) {
     if (receipts.length > 0) {
-      await restoreOwnedIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs, receipts);
+      await restoreOwnedIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs, baselineIndex, receipts);
     }
     if (commandError instanceof GitCommitError) throw commandError;
     return fail("execution");
@@ -1191,7 +1849,8 @@ async function prepareIntentEntries(
 async function expectedTreeChanges(
   config: GitCommitConfig,
   workspace: Workspace,
-  preflight: GitCommitPreflight
+  preflight: GitCommitPreflight,
+  selectedStates: ReadonlyMap<string, GitWorktreeEntryState>
 ): Promise<Map<string, GitRawDiffEntry>> {
   const selected = new Set(preflight.request.paths);
   const diff = await runGitChecked(config, workspace, [
@@ -1205,23 +1864,32 @@ async function expectedTreeChanges(
     preflight.head,
     "--",
     ...preflight.request.paths
-  ]);
+  ], undefined, "passive-observation");
   const entries = parseRawDiffEntries(diff.copyStdoutBytes(), preflight.objectFormat, selected);
-  const states = selectedStateMap(preflight);
   for (const entry of entries.values()) {
-    const selectedState = states.get(entry.path);
+    const selectedState = selectedStates.get(entry.path);
     if (selectedState === undefined) return fail("malformed-output");
     if (entry.newMode === "000000") {
-      if (selectedState.worktree.kind !== "missing") return fail("preflight-changed");
+      if (selectedState.kind !== "missing") return fail("preflight-changed");
       continue;
     }
-    if (selectedState.worktree.kind !== "file" && selectedState.worktree.kind !== "symlink") {
+    if (selectedState.kind !== "file" && selectedState.kind !== "symlink") {
       return fail("preflight-changed");
     }
-    const expectedBlobId = selectedState.worktree.gitBlobId;
+    const expectedBlobId = selectedState.gitBlobId;
     if (expectedBlobId === null) return fail("preflight-changed");
     if (entry.newBlobId !== null && entry.newBlobId !== expectedBlobId) return fail("preflight-changed");
     entries.set(entry.path, { ...entry, newBlobId: expectedBlobId });
+  }
+  // Git's assume-unchanged/skip-worktree flags can hide a raw worktree change
+  // from `diff HEAD`. Refuse that ambiguous state instead of reporting a
+  // false no-change result or silently committing stale index content.
+  for (const selectedPath of preflight.selected) {
+    const state = selectedStates.get(selectedPath.path);
+    if (state === undefined) return fail("malformed-output");
+    if (worktreeDiffersFromHead(selectedPath, state) && !entries.has(selectedPath.path)) {
+      return fail("preflight-changed");
+    }
   }
   return entries;
 }
@@ -1262,6 +1930,7 @@ async function commitFailureRestoration(
   preflight: GitCommitPreflight,
   baseline: GitRepositorySnapshot,
   baselineRemoteRefs: string,
+  baselineIndex: GitIndexBaseline,
   receipts: readonly GitIntentReceipt[]
 ): Promise<void> {
   try {
@@ -1272,7 +1941,8 @@ async function commitFailureRestoration(
       branch === undefined ||
       branch.ref !== `refs/heads/${preflight.branch}` ||
       branch.head !== preflight.head ||
-      (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs
+      (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs ||
+      !sameSnapshotMetadata(baseline, current)
     ) {
       return fail("recovery-required");
     }
@@ -1282,7 +1952,7 @@ async function commitFailureRestoration(
       }
       return;
     }
-    await restoreOwnedIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs, receipts);
+    await restoreOwnedIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs, baselineIndex, receipts);
   } catch (error) {
     if (error instanceof GitCommitError && error.reason === "recovery-required") throw error;
     return fail("recovery-required");
@@ -1348,7 +2018,28 @@ async function verifyCommitPostconditions(
     if (
       !assertUnselectedSnapshotPreserved(baseline, after, selectedPaths) ||
       [...after.statuses.keys()].some((relativePath) => selectedPaths.has(relativePath)) ||
-      (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs
+      (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs ||
+      after.localConfig !== baseline.localConfig ||
+      !localRefsChangedOnlyForBranch(
+        baseline,
+        after,
+        `refs/heads/${preflight.branch}`,
+        preflight.head,
+        branch.head
+      )
+    ) {
+      return fail("postcondition");
+    }
+    if (
+      preflight.selected.some(
+        (selected) => {
+          const afterState = after.worktree.get(selected.path);
+          if (selected.worktree.kind === "missing") {
+            return afterState !== undefined && afterState.kind !== "missing";
+          }
+          return !sameRawWorktreeState(selected.worktree, afterState);
+        }
+      )
     ) {
       return fail("postcondition");
     }
@@ -1396,6 +2087,8 @@ export async function gitCommit(
 ): Promise<GitCommitResult> {
   return withGitCommitLocks(config, guard, workspace, rawInput, async (preflight) => {
     const baseline = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+    const baselineIndexPath = await actualGitIndexPath(config, workspace, preflight);
+    const baselineIndex = await readIndexBaseline(baselineIndexPath);
     const baselineRemoteRefs = await remoteRefsSnapshot(config, workspace);
     const baselineBranch = await currentBranchState(config, workspace, preflight.objectFormat);
     const initialStates = await selectedWorktreeStates(config, workspace, preflight);
@@ -1411,19 +2104,30 @@ export async function gitCommit(
     let receipts: GitIntentReceipt[] = [];
     let commitAttempted = false;
     try {
-      receipts = await prepareIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs);
+      receipts = await prepareIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs, baselineIndex);
       const selectedAfterPreparation = await selectedWorktreeStates(config, workspace, preflight);
       const preparedSnapshot = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
       if (
         !selectedWorktreeStatesMatch(preflight, selectedAfterPreparation) ||
-        !assertUnselectedSnapshotPreserved(baseline, preparedSnapshot, new Set(receipts.map((receipt) => receipt.path)))
+        !assertPreparedSnapshotPreserved(baseline, preparedSnapshot, preflight, receipts) ||
+        (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs
       ) {
         return fail("preflight-changed");
       }
 
-      const expectedChanges = await expectedTreeChanges(config, workspace, preflight);
+      const selectedIdentityStates = await selectedGitIdentityStates(config, workspace, preflight);
+      const afterIdentityResolution = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+      if (
+        !selectedRawWorktreeStatesMatch(preflight, selectedIdentityStates) ||
+        !assertPreparedSnapshotPreserved(baseline, afterIdentityResolution, preflight, receipts) ||
+        (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs
+      ) {
+        return fail("postcondition");
+      }
+
+      const expectedChanges = await expectedTreeChanges(config, workspace, preflight, selectedIdentityStates);
       if (expectedChanges.size === 0) {
-        await restoreOwnedIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs, receipts);
+        await restoreOwnedIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs, baselineIndex, receipts);
         receipts = [];
         return fail("no-changes");
       }
@@ -1448,14 +2152,17 @@ export async function gitCommit(
           ...preflight.request.paths
         ]);
       } catch (error) {
-        await commitFailureRestoration(config, workspace, preflight, baseline, baselineRemoteRefs, receipts);
+        await commitFailureRestoration(config, workspace, preflight, baseline, baselineRemoteRefs, baselineIndex, receipts);
         if (error instanceof GitCommitError) throw error;
         return fail("execution");
       }
       return await verifyCommitPostconditions(config, workspace, preflight, baseline, baselineRemoteRefs, expectedChanges);
     } catch (error) {
       if (!commitAttempted && receipts.length > 0) {
-        await restoreOwnedIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs, receipts);
+        await restoreOwnedIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs, baselineIndex, receipts);
+      }
+      if (!commitAttempted) {
+        await assertPreAdvanceStatePreserved(config, workspace, preflight, baseline, baselineRemoteRefs);
       }
       throw error;
     }

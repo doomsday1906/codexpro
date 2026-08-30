@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { access, chmod, lstat, mkdtemp, readFile, readlink, rm, symlink, unlink, writeFile, mkdir } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { access, chmod, lstat, mkdtemp, readFile, readlink, readdir, rm, symlink, unlink, writeFile, mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -74,6 +74,13 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function waitForChild(child) {
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+}
+
 async function expectReason(operation, reason) {
   try {
     await operation();
@@ -81,6 +88,18 @@ async function expectReason(operation, reason) {
   } catch (error) {
     assert.equal(error?.name, "GitCommitError", `expected bounded GitCommitError, got ${error?.constructor?.name ?? typeof error}`);
     assert.equal(error.reason, reason);
+    assert.ok(!error.message.includes("HOSTILE"), "failure echoed hostile input");
+    return error;
+  }
+}
+
+async function expectReasonOneOf(operation, reasons) {
+  try {
+    await operation();
+    assert.fail(`expected GitCommitError(${reasons.join("|")})`);
+  } catch (error) {
+    assert.equal(error?.name, "GitCommitError", `expected bounded GitCommitError, got ${error?.constructor?.name ?? typeof error}`);
+    assert.ok(reasons.includes(error.reason), `unexpected GitCommitError(${error.reason})`);
     assert.ok(!error.message.includes("HOSTILE"), "failure echoed hostile input");
     return error;
   }
@@ -830,6 +849,471 @@ assert.equal(gitTrimmed(filterRoot, ["rev-parse", `${normalizedNewHead}:normaliz
 assert.deepEqual(mustGit(filterRoot, ["show", `${normalizedNewHead}:normalized.txt`]), Buffer.from("line one\nline two\n", "utf8"));
 assert.deepEqual(mustGit(filterRoot, ["diff-tree", "-r", "--no-commit-id", "--name-status", "-z", "--no-renames", normalizedHead, normalizedNewHead]), Buffer.from("A\u0000normalized.txt\u0000", "utf8"));
 console.log("PASS AP-005 built-in text/eol clean result matches native Git while raw CRLF worktree bytes/mode remain unchanged");
+
+// A staged tracked deletion has no current index/worktree entry, but the
+// expected HEAD tree still proves that the selected identity is a lawful
+// deletion. This is distinct from a plain missing path.
+const stagedDeleteRoot = path.join(fixtureRoot, "task006-staged-delete");
+await mkdir(stagedDeleteRoot);
+initRepo(stagedDeleteRoot, "TASK-006 Staged Delete");
+await writeFile(path.join(stagedDeleteRoot, "staged-delete.txt"), "delete me\n");
+const stagedDeleteHead = commitAll(stagedDeleteRoot, "staged delete base");
+await unlink(path.join(stagedDeleteRoot, "staged-delete.txt"));
+mustGit(stagedDeleteRoot, ["add", "-u", "--", "staged-delete.txt"]);
+assert.equal(mustGit(stagedDeleteRoot, ["ls-files", "--stage", "-z", "--", "staged-delete.txt"]).length, 0);
+const stagedDeleteWorkspace = { id: "ws_task006_staged_delete", root: stagedDeleteRoot, openedAt: new Date().toISOString() };
+const stagedDeleteResult = await gitCommit(config, matrixGuard, stagedDeleteWorkspace, {
+  workspace_id: stagedDeleteWorkspace.id,
+  paths: ["staged-delete.txt"],
+  message: "task006 staged deletion",
+  expected_head: stagedDeleteHead
+});
+const stagedDeleteNewHead = gitTrimmed(stagedDeleteRoot, ["rev-parse", "HEAD"]);
+assert.equal(stagedDeleteResult.new_head, stagedDeleteNewHead);
+assert.equal(mustGit(stagedDeleteRoot, ["ls-tree", "-z", stagedDeleteNewHead, "--", "staged-delete.txt"]).length, 0);
+assert.equal(mustGit(stagedDeleteRoot, ["ls-files", "--stage", "-z", "--", "staged-delete.txt"]).length, 0);
+console.log("PASS TASK-006 staged tracked deletion accepted from expected HEAD truth with absent index/worktree");
+
+// A current ordinary file must not replace a HEAD gitlink identity. Build the
+// gitlink only through real Git index/tree producers, then replace its current
+// index entry with an ordinary blob before preflight.
+const headGitlinkRoot = path.join(fixtureRoot, "task006-head-gitlink");
+const headGitlinkNested = path.join(fixtureRoot, "task006-head-gitlink-nested");
+await mkdir(headGitlinkRoot);
+await mkdir(headGitlinkNested);
+initRepo(headGitlinkRoot, "TASK-006 HEAD Gitlink");
+initRepo(headGitlinkNested, "TASK-006 Nested");
+await writeFile(path.join(headGitlinkNested, "nested.txt"), "nested\n");
+const nestedHead = commitAll(headGitlinkNested, "nested base");
+mustGit(headGitlinkRoot, ["update-index", "--add", "--cacheinfo", `160000,${nestedHead},gitlink-entry`]);
+await writeFile(path.join(headGitlinkRoot, "head-base.txt"), "base\n");
+mustGit(headGitlinkRoot, ["add", "--", "head-base.txt"]);
+mustGit(headGitlinkRoot, ["commit", "--quiet", "-m", "HEAD gitlink base"]);
+const headGitlinkHead = gitTrimmed(headGitlinkRoot, ["rev-parse", "HEAD"]);
+const ordinaryBlob = gitTrimmed(headGitlinkRoot, ["hash-object", "-w", "--stdin"], { input: Buffer.from("ordinary\n") });
+await writeFile(path.join(headGitlinkRoot, "gitlink-entry"), "ordinary\n");
+mustGit(headGitlinkRoot, ["update-index", "--add", "--cacheinfo", `100644,${ordinaryBlob},gitlink-entry`]);
+const headGitlinkWorkspace = { id: "ws_task006_head_gitlink", root: headGitlinkRoot, openedAt: new Date().toISOString() };
+await expectReason(
+  () => preflightGitCommit(config, matrixGuard, headGitlinkWorkspace, {
+    workspace_id: headGitlinkWorkspace.id,
+    paths: ["gitlink-entry"],
+    message: "task006 reject HEAD gitlink replacement",
+    expected_head: headGitlinkHead
+  }),
+  "gitlink"
+);
+console.log("PASS TASK-006 HEAD gitlink remains prohibited even when current index/worktree presents an ordinary file");
+
+// Extended index visibility flags must not hide a changed selected worktree.
+// Both markers are established by native Git, then the ordinary commit route
+// is asked to consume the complete current bytes.
+const hiddenStateRoot = path.join(fixtureRoot, "task006-hidden-index-state");
+await mkdir(hiddenStateRoot);
+initRepo(hiddenStateRoot, "TASK-006 Hidden Index State");
+await writeFile(path.join(hiddenStateRoot, "assume-marker.txt"), "assume base\n");
+await writeFile(path.join(hiddenStateRoot, "skip-marker.txt"), "skip base\n");
+await writeFile(path.join(hiddenStateRoot, "selected.txt"), "selected base\n");
+const hiddenStateHead = commitAll(hiddenStateRoot, "hidden marker base");
+mustGit(hiddenStateRoot, ["update-index", "--assume-unchanged", "--", "assume-marker.txt"]);
+mustGit(hiddenStateRoot, ["update-index", "--skip-worktree", "--", "skip-marker.txt"]);
+await writeFile(path.join(hiddenStateRoot, "assume-marker.txt"), "assume current\n");
+await writeFile(path.join(hiddenStateRoot, "skip-marker.txt"), "skip current\n");
+await writeFile(path.join(hiddenStateRoot, "selected.txt"), "selected current\n");
+const hiddenAssumeIndexBefore = mustGit(hiddenStateRoot, ["ls-files", "--debug", "--stage", "-z", "--", "assume-marker.txt"]);
+const hiddenSkipIndexBefore = mustGit(hiddenStateRoot, ["ls-files", "--debug", "--stage", "-z", "--", "skip-marker.txt"]);
+const hiddenStateWorkspace = { id: "ws_task006_hidden_index_state", root: hiddenStateRoot, openedAt: new Date().toISOString() };
+const hiddenStateResult = await gitCommit(config, matrixGuard, hiddenStateWorkspace, {
+  workspace_id: hiddenStateWorkspace.id,
+  paths: ["selected.txt"],
+  message: "task006 hidden marker current content",
+  expected_head: hiddenStateHead
+});
+const hiddenStateNewHead = gitTrimmed(hiddenStateRoot, ["rev-parse", "HEAD"]);
+assert.equal(hiddenStateResult.new_head, hiddenStateNewHead);
+assert.equal(mustGit(hiddenStateRoot, ["show", `${hiddenStateNewHead}:selected.txt`]).toString("utf8"), "selected current\n");
+assert.equal((await readFile(path.join(hiddenStateRoot, "assume-marker.txt"))).toString("utf8"), "assume current\n");
+assert.equal((await readFile(path.join(hiddenStateRoot, "skip-marker.txt"))).toString("utf8"), "skip current\n");
+assert.deepEqual(mustGit(hiddenStateRoot, ["ls-files", "--debug", "--stage", "-z", "--", "assume-marker.txt"]), hiddenAssumeIndexBefore);
+assert.deepEqual(mustGit(hiddenStateRoot, ["ls-files", "--debug", "--stage", "-z", "--", "skip-marker.txt"]), hiddenSkipIndexBefore);
+console.log("PASS TASK-006 assume-unchanged/skip-worktree unrelated changes and flags remained exact while selected content committed");
+
+// Ignored worktree paths are part of the physical preservation baseline. A
+// successful hook that mutates existing/created ignored files must not be
+// mistaken for a clean success after the ref advances; a failing hook must
+// surface recovery truth and retain those side effects.
+const ignoredHookRoot = path.join(fixtureRoot, "task006-ignored-hook");
+const ignoredHookDir = path.join(fixtureRoot, "task006-ignored-hooks");
+await mkdir(ignoredHookRoot);
+await mkdir(ignoredHookDir);
+initRepo(ignoredHookRoot, "TASK-006 Ignored Hook");
+await writeFile(path.join(ignoredHookRoot, ".gitignore"), "*.ignored\n");
+await writeFile(path.join(ignoredHookRoot, "base.txt"), "base\n");
+const ignoredHookHead = commitAll(ignoredHookRoot, "ignored hook base");
+const ignoredExisting = path.join(ignoredHookRoot, "existing.ignored");
+const ignoredCreated = path.join(ignoredHookRoot, "created.ignored");
+await writeFile(ignoredExisting, "existing baseline\n");
+await writeFile(path.join(ignoredHookRoot, "selected-success.txt"), "selected success\n");
+const ignoredHook = path.join(ignoredHookDir, "pre-commit");
+await writeFile(ignoredHook, [
+  "#!/bin/sh",
+  `printf 'existing changed\\n' > '${ignoredExisting}'`,
+  `printf 'created by success hook\\n' > '${ignoredCreated}'`,
+  "exit 0",
+  ""
+].join("\n"));
+await chmod(ignoredHook, 0o755);
+mustGit(ignoredHookRoot, ["config", "core.hooksPath", ignoredHookDir]);
+const ignoredHookWorkspace = { id: "ws_task006_ignored_hook", root: ignoredHookRoot, openedAt: new Date().toISOString() };
+await expectReason(
+  () => gitCommit(config, matrixGuard, ignoredHookWorkspace, {
+    workspace_id: ignoredHookWorkspace.id,
+    paths: ["selected-success.txt"],
+    message: "task006 successful ignored side effects",
+    expected_head: ignoredHookHead
+  }),
+  "postcondition"
+);
+const ignoredSuccessHead = gitTrimmed(ignoredHookRoot, ["rev-parse", "HEAD"]);
+assert.notEqual(ignoredSuccessHead, ignoredHookHead);
+assert.equal((await readFile(ignoredExisting)).toString("utf8"), "existing changed\n");
+assert.equal((await readFile(ignoredCreated)).toString("utf8"), "created by success hook\n");
+console.log("RAW_OBSERVATION: successful hook changed existing and created ignored files after ref advance");
+console.log("PASS TASK-006 successful ignored hook side effects rejected as postcondition truth");
+
+await writeFile(path.join(ignoredHookRoot, "selected-failure.txt"), "selected failure\n");
+const ignoredFailureExistingBefore = (await readFile(ignoredExisting)).toString("utf8");
+const ignoredFailureCreated = path.join(ignoredHookRoot, "failed-created.ignored");
+await writeFile(ignoredHook, [
+  "#!/bin/sh",
+  `printf 'existing changed by failing hook\\n' > '${ignoredExisting}'`,
+  `printf 'created by failing hook\\n' > '${ignoredFailureCreated}'`,
+  "exit 1",
+  ""
+].join("\n"));
+await chmod(ignoredHook, 0o755);
+const ignoredFailureHead = gitTrimmed(ignoredHookRoot, ["rev-parse", "HEAD"]);
+await expectReason(
+  () => gitCommit(config, matrixGuard, ignoredHookWorkspace, {
+    workspace_id: ignoredHookWorkspace.id,
+    paths: ["selected-failure.txt"],
+    message: "task006 failing ignored side effects",
+    expected_head: ignoredFailureHead
+  }),
+  "recovery-required"
+);
+assert.equal(gitTrimmed(ignoredHookRoot, ["rev-parse", "HEAD"]), ignoredFailureHead);
+assert.equal((await readFile(ignoredExisting)).toString("utf8"), "existing changed by failing hook\n");
+assert.equal((await readFile(ignoredFailureCreated)).toString("utf8"), "created by failing hook\n");
+assert.notEqual((await readFile(ignoredExisting)).toString("utf8"), ignoredFailureExistingBefore);
+console.log("RAW_OBSERVATION: failing hook changed existing and created ignored files while branch stayed at its prior HEAD");
+console.log("PASS TASK-006 failing ignored hook side effects surfaced as recovery-required and were preserved");
+
+await writeFile(path.join(ignoredHookRoot, "selected-ref.txt"), "selected ref side effect\n");
+await writeFile(ignoredHook, [
+  "#!/bin/sh",
+  `git tag -f task006-hook-tag HEAD >/dev/null 2>&1`,
+  "git config --local task006.hook-side-effect true",
+  "exit 0",
+  ""
+].join("\n"));
+await chmod(ignoredHook, 0o755);
+const refConfigHead = gitTrimmed(ignoredHookRoot, ["rev-parse", "HEAD"]);
+await expectReason(
+  () => gitCommit(config, matrixGuard, ignoredHookWorkspace, {
+    workspace_id: ignoredHookWorkspace.id,
+    paths: ["selected-ref.txt"],
+    message: "task006 local ref and config side effects",
+    expected_head: refConfigHead
+  }),
+  "postcondition"
+);
+assert.notEqual(gitTrimmed(ignoredHookRoot, ["rev-parse", "HEAD"]), refConfigHead);
+assert.equal(gitTrimmed(ignoredHookRoot, ["rev-parse", "refs/tags/task006-hook-tag"]), refConfigHead);
+assert.equal(gitTrimmed(ignoredHookRoot, ["config", "--local", "--get", "task006.hook-side-effect"]), "true");
+console.log("RAW_OBSERVATION: successful hook changed a local tag and repository config while the branch advanced");
+console.log("PASS TASK-006 local ref/tag/config side effects rejected as postcondition truth");
+
+// A configured clean filter is an ordinary helper, not a passive baseline
+// producer. Its side effect is intentionally activated only after the
+// baseline, proving that the helper route cannot create unrelated state and
+// then have the baseline adopt it.
+const filterSideRoot = path.join(fixtureRoot, "task006-filter-side-effect");
+const filterSideTrigger = path.join(fixtureRoot, "task006-filter-side-trigger");
+const filterSideScript = path.join(fixtureRoot, "task006-filter-side-clean");
+await mkdir(filterSideRoot);
+initRepo(filterSideRoot, "TASK-006 Filter Side Effect");
+await writeFile(path.join(filterSideRoot, ".gitignore"), "filter-side-effect.ignored\n");
+await writeFile(path.join(filterSideRoot, ".gitattributes"), "selected-filter.txt filter=side\n");
+await writeFile(path.join(filterSideRoot, "selected-filter.txt"), "filter base\n");
+await writeFile(path.join(filterSideRoot, "filter-base.txt"), "base\n");
+await writeFile(filterSideScript, [
+  "#!/bin/sh",
+  "cat",
+  `if [ -f '${filterSideTrigger}' ]; then printf 'created by clean filter\\n' > '${path.join(filterSideRoot, "filter-side-effect.ignored")}'; fi`,
+  ""
+].join("\n"));
+await chmod(filterSideScript, 0o755);
+const filterSideHead = commitAll(filterSideRoot, "filter side baseline");
+mustGit(filterSideRoot, ["config", "filter.side.clean", `${filterSideScript} %f`]);
+mustGit(filterSideRoot, ["config", "filter.side.smudge", "cat"]);
+await writeFile(filterSideTrigger, "activate\n");
+await writeFile(path.join(filterSideRoot, "selected-filter.txt"), "filter current\n");
+const filterSideWorkspace = { id: "ws_task006_filter_side_effect", root: filterSideRoot, openedAt: new Date().toISOString() };
+await expectReasonOneOf(
+  () => gitCommit(config, matrixGuard, filterSideWorkspace, {
+    workspace_id: filterSideWorkspace.id,
+    paths: ["selected-filter.txt"],
+    message: "task006 clean filter side effect",
+    expected_head: filterSideHead
+  }),
+  ["postcondition", "recovery-required"]
+);
+assert.equal(gitTrimmed(filterSideRoot, ["rev-parse", "HEAD"]), filterSideHead);
+assert.equal((await readFile(path.join(filterSideRoot, "filter-side-effect.ignored"))).toString("utf8"), "created by clean filter\n");
+console.log("RAW_OBSERVATION: configured clean filter created an ignored artifact after the passive baseline");
+console.log("PASS TASK-006 clean-filter side effect was detected without adopting it into the baseline");
+
+// A configured fsmonitor helper is another real Git producer. First establish
+// directly that native `git status` invokes the helper and that its side effect
+// is observable as an ignored path; then reset only this disposable fixture so
+// the product's earliest preflight/snapshot path is the next invocation.
+const fsmonitorRoot = path.join(fixtureRoot, "task006-fsmonitor-side-effect");
+const fsmonitorHelper = path.join(fixtureRoot, "task006-fsmonitor-helper");
+const fsmonitorCalls = path.join(fixtureRoot, "task006-fsmonitor-calls");
+const fsmonitorArtifact = path.join(fsmonitorRoot, "fsmonitor-side-effect.ignored");
+await mkdir(fsmonitorRoot);
+initRepo(fsmonitorRoot, "TASK-006 Fsmonitor");
+await writeFile(path.join(fsmonitorRoot, ".gitignore"), "fsmonitor-side-effect.ignored\n");
+await writeFile(path.join(fsmonitorRoot, "fsmonitor-base.txt"), "base\n");
+const fsmonitorHead = commitAll(fsmonitorRoot, "fsmonitor base");
+await writeFile(path.join(fsmonitorRoot, "fsmonitor-selected.txt"), "selected current\n");
+await writeFile(fsmonitorHelper, [
+  "#!/bin/sh",
+  `printf 'invoked\\n' >> '${fsmonitorCalls}'`,
+  `if [ ! -f '${fsmonitorArtifact}' ]; then printf 'created by fsmonitor helper\\n' > '${fsmonitorArtifact}'; fi`,
+  "printf 'fsmonitor-token\\0'",
+  ""
+].join("\n"));
+await chmod(fsmonitorHelper, 0o755);
+mustGit(fsmonitorRoot, ["config", "core.fsmonitor", fsmonitorHelper]);
+const directFsmonitorProbe = directGit(fsmonitorRoot, ["status", "--short", "--ignored=matching"]);
+assert.equal(directFsmonitorProbe.status, 0, directFsmonitorProbe.stderr.toString("utf8"));
+assert.equal(await exists(fsmonitorArtifact), true);
+assert.equal(await exists(fsmonitorCalls), true);
+assert.match((await readFile(fsmonitorCalls)).toString("utf8"), /invoked/u);
+assert.match(directFsmonitorProbe.stdout.toString("utf8"), /fsmonitor-side-effect\.ignored/u);
+console.log("RAW_OBSERVATION: native git status invoked configured fsmonitor helper and exposed its ignored artifact");
+await unlink(fsmonitorArtifact);
+await unlink(fsmonitorCalls);
+const fsmonitorWorkspace = { id: "ws_task006_fsmonitor", root: fsmonitorRoot, openedAt: new Date().toISOString() };
+const fsmonitorProductHead = gitTrimmed(fsmonitorRoot, ["rev-parse", "HEAD"]);
+let fsmonitorProductResult;
+let fsmonitorProductError;
+try {
+  fsmonitorProductResult = await gitCommit(config, matrixGuard, fsmonitorWorkspace, {
+    workspace_id: fsmonitorWorkspace.id,
+    paths: ["fsmonitor-selected.txt"],
+    message: "task006 fsmonitor side effect",
+    expected_head: fsmonitorProductHead
+  });
+} catch (error) {
+  fsmonitorProductError = error;
+}
+const fsmonitorAfterHead = gitTrimmed(fsmonitorRoot, ["rev-parse", "HEAD"]);
+const fsmonitorCallsPresent = await exists(fsmonitorCalls);
+const fsmonitorArtifactPresent = await exists(fsmonitorArtifact);
+const fsmonitorCallCount = fsmonitorCallsPresent
+  ? (await readFile(fsmonitorCalls)).toString("utf8").trim().split(/\s+/u).filter(Boolean).length
+  : 0;
+console.log(`RAW_OBSERVATION: fsmonitor helper calls=${fsmonitorCallCount}, artifact-present=${fsmonitorArtifactPresent}, HEAD-advanced=${fsmonitorAfterHead !== fsmonitorProductHead}`);
+if (fsmonitorProductResult === undefined) {
+  // The normal commit route retains the configured helper. Its side effect is
+  // therefore allowed to surface after the protected baseline, but it must
+  // prevent a false success and leave the ref movement visible for recovery.
+  assert.ok(fsmonitorProductError?.name === "GitCommitError");
+  assert.ok(["postcondition", "recovery-required"].includes(fsmonitorProductError.reason));
+  assert.notEqual(fsmonitorAfterHead, fsmonitorProductHead);
+  assert.equal(fsmonitorCallsPresent, true);
+  assert.ok(fsmonitorCallCount >= 1, "configured fsmonitor marker was not attributable to the ordinary commit route");
+  assert.equal(fsmonitorArtifactPresent, true);
+  assert.equal((await readFile(fsmonitorArtifact)).toString("utf8"), "created by fsmonitor helper\n");
+  console.log("PASS TASK-006 passive observations skipped fsmonitor; ordinary commit helper side effect was detected after baseline");
+} else {
+  assert.equal(fsmonitorProductError, undefined, `fsmonitor-safe commit failed: ${fsmonitorProductError?.message ?? fsmonitorProductError}`);
+  assert.equal(fsmonitorProductResult.new_head, fsmonitorAfterHead);
+  assert.notEqual(fsmonitorAfterHead, fsmonitorProductHead);
+  assert.equal(fsmonitorCallsPresent, false, "product invoked configured fsmonitor before or during the commit");
+  assert.equal(fsmonitorArtifactPresent, false, "product adopted configured fsmonitor side effect into baseline");
+  console.log("PASS TASK-006 configured fsmonitor was directly reachable but product never invoked or adopted it");
+}
+
+// Linked worktrees resolve their private index through Git's worktree git-dir;
+// commit the selected path there and prove the linked branch/tree directly.
+const linkedMainRoot = path.join(fixtureRoot, "task006-linked-main");
+const linkedWorktreeRoot = path.join(fixtureRoot, "task006-linked-worktree");
+await mkdir(linkedMainRoot);
+initRepo(linkedMainRoot, "TASK-006 Linked Main");
+await writeFile(path.join(linkedMainRoot, "base.txt"), "base\n");
+const linkedBaseHead = commitAll(linkedMainRoot, "linked base");
+mustGit(linkedMainRoot, ["worktree", "add", "--quiet", "-b", "task006-linked", linkedWorktreeRoot, linkedBaseHead]);
+await writeFile(path.join(linkedWorktreeRoot, "linked-selected.txt"), "linked current\n");
+const linkedWorkspace = { id: "ws_task006_linked", root: linkedWorktreeRoot, openedAt: new Date().toISOString() };
+const linkedResult = await gitCommit(config, matrixGuard, linkedWorkspace, {
+  workspace_id: linkedWorkspace.id,
+  paths: ["linked-selected.txt"],
+  message: "task006 linked worktree commit",
+  expected_head: linkedBaseHead
+});
+const linkedNewHead = gitTrimmed(linkedWorktreeRoot, ["rev-parse", "HEAD"]);
+assert.equal(linkedResult.new_head, linkedNewHead);
+assert.equal(mustGit(linkedWorktreeRoot, ["show", `${linkedNewHead}:linked-selected.txt`]).toString("utf8"), "linked current\n");
+console.log("PASS TASK-006 linked worktree private index resolved and selected commit verified");
+
+// Split-index mode must retain its index extension/permissions across the
+// candidate transaction and restore the main index exactly on a hook failure.
+const splitRoot = path.join(fixtureRoot, "task006-split-index");
+const splitHooks = path.join(fixtureRoot, "task006-split-hooks");
+await mkdir(splitRoot);
+await mkdir(splitHooks);
+initRepo(splitRoot, "TASK-006 Split Index");
+await writeFile(path.join(splitRoot, "split-base.txt"), "base\n");
+const splitBaseHead = commitAll(splitRoot, "split index base");
+mustGit(splitRoot, ["config", "core.splitIndex", "true"]);
+mustGit(splitRoot, ["update-index", "--split-index"]);
+await writeFile(path.join(splitRoot, "split-selected.txt"), "split current\n");
+const splitWorkspace = { id: "ws_task006_split", root: splitRoot, openedAt: new Date().toISOString() };
+const splitSuccess = await gitCommit(config, matrixGuard, splitWorkspace, {
+  workspace_id: splitWorkspace.id,
+  paths: ["split-selected.txt"],
+  message: "task006 split index success",
+  expected_head: splitBaseHead
+});
+const splitSuccessHead = gitTrimmed(splitRoot, ["rev-parse", "HEAD"]);
+assert.equal(splitSuccess.new_head, splitSuccessHead);
+assert.equal(gitTrimmed(splitRoot, ["config", "--get", "core.splitIndex"]), "true");
+assert.equal(mustGit(splitRoot, ["show", `${splitSuccessHead}:split-selected.txt`]).toString("utf8"), "split current\n");
+await writeFile(path.join(splitRoot, "split-failing.txt"), "split failing\n");
+const splitFailingHook = path.join(splitHooks, "pre-commit");
+await writeFile(splitFailingHook, "#!/bin/sh\nexit 1\n");
+await chmod(splitFailingHook, 0o755);
+mustGit(splitRoot, ["config", "core.hooksPath", splitHooks]);
+const splitFailHead = gitTrimmed(splitRoot, ["rev-parse", "HEAD"]);
+const splitIndexPath = gitTrimmed(splitRoot, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+const splitIndexBefore = mustGit(splitRoot, ["ls-files", "--debug", "--stage", "-z"]);
+const splitIndexModeBefore = (await lstat(splitIndexPath)).mode & 0o7777;
+await expectReason(
+  () => gitCommit(config, matrixGuard, splitWorkspace, {
+    workspace_id: splitWorkspace.id,
+    paths: ["split-failing.txt"],
+    message: "task006 split index failure",
+    expected_head: splitFailHead
+  }),
+  "execution"
+);
+assert.equal(gitTrimmed(splitRoot, ["rev-parse", "HEAD"]), splitFailHead);
+assert.deepEqual(mustGit(splitRoot, ["ls-files", "--debug", "--stage", "-z"]), splitIndexBefore);
+assert.equal((await lstat(splitIndexPath)).mode & 0o7777, splitIndexModeBefore);
+assert.equal(await exists(`${splitIndexPath}.lock`), false);
+assert.equal(mustGit(splitRoot, ["ls-files", "--stage", "-z", "--", "split-failing.txt"]).length, 0);
+console.log("PASS TASK-006 split-index success and pre-advance failure preserve exact main index and lock state");
+
+// A cooperative external writer that waits until the product has created its
+// private recovery candidate necessarily observes the outer actual-index lock
+// already held. Its O_EXCL attempt must lose to that lock; the product then
+// completes the narrow receipt restoration and removes only its own artifacts.
+const lockedWriterRoot = path.join(fixtureRoot, "task006-writer-after-index-lock");
+const lockedWriterHooks = path.join(fixtureRoot, "task006-writer-after-index-lock-hooks");
+await mkdir(lockedWriterRoot);
+await mkdir(lockedWriterHooks);
+initRepo(lockedWriterRoot, "TASK-006 Writer After Index Lock");
+await writeFile(path.join(lockedWriterRoot, "writer-base.txt"), "base\n");
+const lockedWriterHead = commitAll(lockedWriterRoot, "writer-after-lock base");
+const lockedWriterSelected = path.join(lockedWriterRoot, "writer-selected.txt");
+await writeFile(lockedWriterSelected, "selected\n");
+const lockedWriterHook = path.join(lockedWriterHooks, "pre-commit");
+await writeFile(lockedWriterHook, "#!/bin/sh\nexit 1\n");
+await chmod(lockedWriterHook, 0o755);
+mustGit(lockedWriterRoot, ["config", "core.hooksPath", lockedWriterHooks]);
+const lockedWriterIndex = gitTrimmed(lockedWriterRoot, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+const lockedWriterDir = path.dirname(lockedWriterIndex);
+const lockedWriterLock = `${lockedWriterIndex}.lock`;
+const lockedWriterResult = path.join(fixtureRoot, "task006-writer-after-index-lock.result");
+const lockedWriterScript = `
+const fs = require("node:fs");
+const directory = process.argv[1];
+const lockPath = process.argv[2];
+const resultPath = process.argv[3];
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+const deadline = Date.now() + 5000;
+while (Date.now() < deadline) {
+  const candidateSeen = fs.readdirSync(directory).some((name) => name.startsWith(".codexpro-index-") && name.endsWith(".tmp"));
+  if (candidateSeen) {
+    try {
+      const fd = fs.openSync(lockPath, "wx", 0o600);
+      fs.closeSync(fd);
+      fs.writeFileSync(resultPath, "WON");
+    } catch (error) {
+      fs.writeFileSync(resultPath, error.code || "ERROR");
+    }
+    process.exit(0);
+  }
+  Atomics.wait(sleeper, 0, 0, 2);
+}
+fs.writeFileSync(resultPath, "NOT_OBSERVED");
+process.exit(2);
+`;
+const lockedWriter = spawn(process.execPath, ["-e", lockedWriterScript, lockedWriterDir, lockedWriterLock, lockedWriterResult], {
+  stdio: "ignore"
+});
+const lockedWriterDone = waitForChild(lockedWriter);
+try {
+  await expectReason(
+    () => gitCommit(config, matrixGuard, { id: "ws_task006_writer_after_index_lock", root: lockedWriterRoot, openedAt: new Date().toISOString() }, {
+      workspace_id: "ws_task006_writer_after_index_lock",
+      paths: ["writer-selected.txt"],
+      message: "task006 writer after actual index lock",
+      expected_head: lockedWriterHead
+    }),
+    "execution"
+  );
+} finally {
+  const writerExit = await lockedWriterDone;
+  assert.equal(writerExit.code, 0);
+}
+assert.equal((await readFile(lockedWriterResult)).toString("utf8"), "EEXIST");
+assert.equal(await exists(lockedWriterLock), false);
+const lockedWriterArtifacts = await readdir(lockedWriterDir);
+assert.equal(lockedWriterArtifacts.some((name) => name.startsWith(".codexpro-index-") && name.endsWith(".tmp")), false);
+assert.equal(gitTrimmed(lockedWriterRoot, ["rev-parse", "HEAD"]), lockedWriterHead);
+assert.equal(mustGit(lockedWriterRoot, ["ls-files", "--stage", "-z", "--", "writer-selected.txt"]).length, 0);
+console.log("PASS TASK-006 writer after actual index lock received EEXIST; owned candidate/index lock cleanup and exact plain-untracked restoration completed");
+
+// A pre-existing actual index.lock must never be adopted or removed by the
+// plain-untracked preparation route. Git's required lock acquisition rejects
+// before intent preparation, and the exact lock artifact remains in place.
+const preexistingLockRoot = path.join(fixtureRoot, "task006-preexisting-index-lock");
+await mkdir(preexistingLockRoot);
+initRepo(preexistingLockRoot, "TASK-006 Preexisting Index Lock");
+await writeFile(path.join(preexistingLockRoot, "lock-base.txt"), "base\n");
+const preexistingLockHead = commitAll(preexistingLockRoot, "preexisting lock base");
+await writeFile(path.join(preexistingLockRoot, "lock-selected.txt"), "selected\n");
+const preexistingLockPath = gitTrimmed(preexistingLockRoot, ["rev-parse", "--path-format=absolute", "--git-path", "index.lock"]);
+await writeFile(preexistingLockPath, "pre-existing lock\n");
+const preexistingLockWorkspace = { id: "ws_task006_preexisting_index_lock", root: preexistingLockRoot, openedAt: new Date().toISOString() };
+await expectReason(
+  () => gitCommit(config, matrixGuard, preexistingLockWorkspace, {
+    workspace_id: preexistingLockWorkspace.id,
+    paths: ["lock-selected.txt"],
+    message: "task006 preexisting index lock",
+    expected_head: preexistingLockHead
+  }),
+  "execution"
+);
+assert.equal(await exists(preexistingLockPath), true);
+assert.equal(gitTrimmed(preexistingLockRoot, ["rev-parse", "HEAD"]), preexistingLockHead);
+assert.equal(mustGit(preexistingLockRoot, ["ls-files", "--stage", "-z", "--", "lock-selected.txt"]).length, 0);
+console.log("PASS TASK-006 pre-existing actual index.lock was preserved and rejected before intent preparation");
 
 const commitSource = await readFile(new URL("../src/gitCommit.ts", import.meta.url), "utf8");
 for (const forbiddenArg of [

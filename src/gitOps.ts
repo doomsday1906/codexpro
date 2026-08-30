@@ -113,13 +113,18 @@ export interface GitReadOnlyOptions {
   readonly globalArgs?: readonly string[];
 }
 
-export interface GitMutationOptions {
+interface GitMutationOptions {
   /**
    * Keep the fixed literal-pathspec global by default. `check-ignore` does
    * not implement that Git global option, so its bounded internal caller may
    * opt out after validating the path and placing it after `--`.
    */
   readonly literalPathspecs?: boolean;
+  /**
+   * @internal Derived candidate index path for the local Git-commit recovery
+   * transaction. This is deliberately not a general environment override.
+   */
+  readonly indexFile?: string;
 }
 
 function gitReviewerEnvironment(overrides?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -336,12 +341,22 @@ export async function runGitMutation(
   Object.assign(environment, {
     GIT_NO_REPLACE_OBJECTS: "1",
     GIT_NO_LAZY_FETCH: "1",
+    // Snapshot/proof readers must not opportunistically rewrite a split index
+    // while sibling readers are observing the same locked repository state.
+    // Required mutation locks (including commit/update-index) remain active.
+    GIT_OPTIONAL_LOCKS: "0",
     GIT_TERMINAL_PROMPT: "0",
     GIT_PAGER: "cat",
     NO_COLOR: "1",
     LC_ALL: "C",
     LANG: "C"
   });
+  if (options?.indexFile !== undefined) {
+    if (!path.isAbsolute(options.indexFile) || /[\u0000-\u001f\u007f]/u.test(options.indexFile)) {
+      throw new CodexProError("Git mutation index scope is invalid.");
+    }
+    environment.GIT_INDEX_FILE = options.indexFile;
+  }
 
   // `--literal-pathspecs` is a fixed safety boundary for every command in
   // this private substrate. It protects selected names from pathspec magic;
