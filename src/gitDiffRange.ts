@@ -1,6 +1,6 @@
 import { TextDecoder } from "node:util";
 import type { CodexProConfig } from "./config.js";
-import { GitExecutionError, runGitReadOnly } from "./gitOps.js";
+import { createGitReadOnlyContext, GitExecutionError, runGitReadOnly, type GitReadOnlyContext } from "./gitOps.js";
 import { CodexProError, type PathGuard, type Workspace } from "./guard.js";
 import { validateHistoricalPath } from "./historicalPath.js";
 import { GitRefResolutionError, resolveGitRef, type GitObjectFormat, type GitReviewRef } from "./gitReviewRef.js";
@@ -534,7 +534,7 @@ function hasRenameCopyWarning(bytes: Buffer): boolean {
   );
 }
 
-function metadataDiffArgs(identity: GitDiffRangeIdentity, format: "name-status" | "numstat"): string[] {
+function metadataDiffArgs(identity: GitDiffRangeIdentity, format: "name-status" | "numstat", orderFile: string): string[] {
   const args = [
     "diff",
     "--no-color",
@@ -542,6 +542,10 @@ function metadataDiffArgs(identity: GitDiffRangeIdentity, format: "name-status" 
     "--no-textconv",
     "--find-renames=50%",
     "--find-copies=50%",
+    "-l1000",
+    `-O${orderFile}`,
+    "--diff-algorithm=myers",
+    "--no-indent-heuristic",
     "-z",
     format === "name-status" ? "--name-status" : "--numstat",
     identity.base.fullSha,
@@ -654,7 +658,8 @@ function patchPathspecs(record: GitChangedFileMetadata): readonly string[] {
 function patchDiffArgs(
   identity: GitDiffRangeIdentity,
   record: GitChangedFileMetadata,
-  contextLines: number
+  contextLines: number,
+  orderFile: string
 ): string[] {
   const args = [
     "diff",
@@ -665,6 +670,8 @@ function patchDiffArgs(
     `-U${contextLines}`,
     "--find-renames=50%",
     "--find-copies=50%",
+    "-l1000",
+    `-O${orderFile}`,
     "--diff-algorithm=myers",
     "--no-indent-heuristic",
     "--src-prefix=a/",
@@ -683,7 +690,7 @@ function patchDiffArgs(
 function missingObject(error: GitExecutionError): boolean {
   if (error.failure !== "exit") return false;
   const stderr = error.result.copyStderrBytes().toString("utf8").toLowerCase();
-  return /(?:bad object|not a valid object|unknown revision|ambiguous argument|missing object|object .* not found|does not exist)/u.test(
+  return /(?:bad object|bad --attr-source|not a valid object|unknown revision|ambiguous argument|missing object|object .* not found|does not exist)/u.test(
     stderr
   );
 }
@@ -705,12 +712,16 @@ function mapMetadataExecutionFailure(error: unknown): GitDiffRangeError {
 
 async function runMetadataProducer(
   config: GitDiffRangeConfig,
-  workspace: Workspace,
+  context: GitReadOnlyContext,
   args: readonly string[],
   captureLimit: number
 ): Promise<{ readonly bytes: Buffer; readonly stderr: Buffer }> {
   try {
-    const result = await runGitReadOnly(config, workspace, args, { stdoutMaxBytes: captureLimit });
+    const result = await runGitReadOnly(config, context.workspace, args, {
+      stdoutMaxBytes: captureLimit,
+      environment: context.environment,
+      globalArgs: context.globalArgs
+    });
     return { bytes: result.copyStdoutBytes(), stderr: result.copyStderrBytes() };
   } catch (error) {
     throw mapMetadataExecutionFailure(error);
@@ -724,14 +735,18 @@ interface PatchProducerResult {
 
 async function runPatchProducer(
   config: GitDiffRangeConfig,
-  workspace: Workspace,
+  context: GitReadOnlyContext,
   args: readonly string[],
   captureLimit: number,
   recordIndex: number
 ): Promise<PatchProducerResult> {
   let result: Awaited<ReturnType<typeof runGitReadOnly>>;
   try {
-    result = await runGitReadOnly(config, workspace, args, { stdoutMaxBytes: captureLimit });
+    result = await runGitReadOnly(config, context.workspace, args, {
+      stdoutMaxBytes: captureLimit,
+      environment: context.environment,
+      globalArgs: context.globalArgs
+    });
   } catch (error) {
     if (error instanceof GitExecutionError) {
       const facts = {
@@ -942,10 +957,37 @@ export async function collectGitDiffRangeMetadata(
   const captureLimit = metadataCaptureLimit(config, options.metadataMaxBytes);
   const identity = await resolveGitDiffRangeIdentity(config, guard, workspace, options);
 
-  const [nameStatusProducer, numstatProducer] = await Promise.all([
-    runMetadataProducer(config, workspace, metadataDiffArgs(identity, "name-status"), captureLimit),
-    runMetadataProducer(config, workspace, metadataDiffArgs(identity, "numstat"), captureLimit)
+  let context: GitReadOnlyContext;
+  try {
+    context = await createGitReadOnlyContext(config, workspace, identity.objectFormat, identity.head.fullSha);
+  } catch {
+    throw operationError("execution");
+  }
+
+  const settled = await Promise.allSettled([
+    runMetadataProducer(config, context, metadataDiffArgs(identity, "name-status", context.orderFile), captureLimit),
+    runMetadataProducer(config, context, metadataDiffArgs(identity, "numstat", context.orderFile), captureLimit)
   ]);
+  let cleanupFailed = false;
+  try {
+    await context.cleanup();
+  } catch {
+    cleanupFailed = true;
+  }
+
+  const nameStatusSettled = settled[0];
+  const numstatSettled = settled[1];
+  if (nameStatusSettled.status === "rejected") {
+    if (nameStatusSettled.reason instanceof GitDiffRangeError) throw nameStatusSettled.reason;
+    throw operationError("execution");
+  }
+  if (numstatSettled.status === "rejected") {
+    if (numstatSettled.reason instanceof GitDiffRangeError) throw numstatSettled.reason;
+    throw operationError("execution");
+  }
+  if (cleanupFailed) throw operationError("execution");
+  const nameStatusProducer = nameStatusSettled.value;
+  const numstatProducer = numstatSettled.value;
   const nameStatus = parseNameStatus(nameStatusProducer.bytes);
   const numstat = parseNumstat(numstatProducer.bytes);
   const completeRecords = correlateMetadata(nameStatus, numstat, {
@@ -1035,61 +1077,93 @@ export async function collectGitDiffRangePatchForMetadata(
   let stopped: "budget" | "tooLarge" | undefined;
 
   const changedFiles = metadata.changedFiles;
-  for (let index = 0; index < changedFiles.length; index += 1) {
-    const record = changedFiles[index];
-    if (record.binary) {
-      counts.binary += 1;
-      continue;
+  const needsPatchContext = validated.includePatch
+    && validated.maxPatchBytes > 0
+    && changedFiles.some((record) => !record.binary);
+  let context: GitReadOnlyContext | undefined;
+  if (needsPatchContext) {
+    try {
+      context = await createGitReadOnlyContext(config, workspace, metadata.identity.objectFormat, metadata.identity.head.fullSha);
+    } catch {
+      throw operationError("execution");
     }
-
-    if (!validated.includePatch) {
-      counts.disabled += 1;
-      continue;
-    }
-
-    if (stopped !== undefined) {
-      counts[stopped] += 1;
-      continue;
-    }
-
-    const remaining = validated.maxPatchBytes - Buffer.byteLength(patch, "utf8");
-    if (remaining <= 0) {
-      counts.budget += 1;
-      patchTruncated = true;
-      stopped = "budget";
-      continue;
-    }
-
-    const producer = await runPatchProducer(
-      config,
-      workspace,
-      patchDiffArgs(metadata.identity, record, validated.contextLines),
-      validated.patchFragmentMaxBytes,
-      index
-    );
-    if (producer.tooLarge) {
-      // Prefix semantics: once one complete fragment cannot be acquired, no
-      // later fragment is probed. Every remaining text record is classified
-      // under the same bounded stop reason, while binaries remain binary.
-      counts.tooLarge += 1;
-      patchTruncated = true;
-      stopped = "tooLarge";
-      continue;
-    }
-
-    const fragment = selectPatchFragment(producer.text ?? "", record, index);
-    const redacted = redactCompletePatchFragment(fragment, index);
-    const redactedBytes = Buffer.byteLength(redacted, "utf8");
-    if (redactedBytes > remaining) {
-      counts.budget += 1;
-      patchTruncated = true;
-      stopped = "budget";
-      continue;
-    }
-
-    patch += redacted;
-    patchFilesIncluded += 1;
   }
+
+  let patchFailure: unknown;
+  try {
+    for (let index = 0; index < changedFiles.length; index += 1) {
+      const record = changedFiles[index];
+      if (record.binary) {
+        counts.binary += 1;
+        continue;
+      }
+
+      if (!validated.includePatch) {
+        counts.disabled += 1;
+        continue;
+      }
+
+      if (stopped !== undefined) {
+        counts[stopped] += 1;
+        continue;
+      }
+
+      const remaining = validated.maxPatchBytes - Buffer.byteLength(patch, "utf8");
+      if (remaining <= 0) {
+        counts.budget += 1;
+        patchTruncated = true;
+        stopped = "budget";
+        continue;
+      }
+
+      if (context === undefined) throw operationError("execution");
+      const producer = await runPatchProducer(
+        config,
+        context,
+        patchDiffArgs(metadata.identity, record, validated.contextLines, context.orderFile),
+        validated.patchFragmentMaxBytes,
+        index
+      );
+      if (producer.tooLarge) {
+        // Prefix semantics: once one complete fragment cannot be acquired, no
+        // later fragment is probed. Every remaining text record is classified
+        // under the same bounded stop reason, while binaries remain binary.
+        counts.tooLarge += 1;
+        patchTruncated = true;
+        stopped = "tooLarge";
+        continue;
+      }
+
+      const fragment = selectPatchFragment(producer.text ?? "", record, index);
+      const redacted = redactCompletePatchFragment(fragment, index);
+      const redactedBytes = Buffer.byteLength(redacted, "utf8");
+      if (redactedBytes > remaining) {
+        counts.budget += 1;
+        patchTruncated = true;
+        stopped = "budget";
+        continue;
+      }
+
+      patch += redacted;
+      patchFilesIncluded += 1;
+    }
+  } catch (error) {
+    patchFailure = error;
+  }
+
+  let cleanupFailed = false;
+  if (context !== undefined) {
+    try {
+      await context.cleanup();
+    } catch {
+      cleanupFailed = true;
+    }
+  }
+  if (patchFailure !== undefined) {
+    if (patchFailure instanceof GitDiffRangeError) throw patchFailure;
+    throw operationError("execution");
+  }
+  if (cleanupFailed) throw operationError("execution");
 
   const patchBytes = Buffer.byteLength(patch, "utf8");
   const patchOmissionCounts: GitDiffRangePatchOmissionCounts = { ...counts };

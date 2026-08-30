@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -33,6 +34,9 @@ const matrixSecrets = [
 ];
 
 const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "codexpro-git-diff-range-mcp-"));
+// Both real stdio server processes intentionally share this one disposable
+// persistence home. It is never the ambient developer ~/.codexpro home.
+const profileHome = path.join(fixtureRoot, "codexpro-home");
 const defaultRoot = path.join(fixtureRoot, "default-repo");
 const targetParent = path.join(fixtureRoot, "allowed-parent");
 const targetRoot = path.join(targetParent, "nested-target-repo");
@@ -60,6 +64,23 @@ function gitEnv() {
 
 function directGit(root, args, input) {
   const result = spawnSync("git", args, {
+    cwd: root,
+    env: gitEnv(),
+    input,
+    encoding: "buffer",
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  return {
+    stdout: Buffer.from(result.stdout ?? ""),
+    stderr: Buffer.from(result.stderr ?? ""),
+    status: result.status,
+    signal: result.signal,
+    error: result.error
+  };
+}
+
+function directGitWithGlobalArgs(root, globalArgs, args, input) {
+  const result = spawnSync("git", [...globalArgs, ...args], {
     cwd: root,
     env: gitEnv(),
     input,
@@ -208,6 +229,68 @@ function directPatch(root, baseRef, headRef, records, contextLines = 3) {
   const result = directGit(root, args);
   assert.equal(result.status, 0, `direct patch failed: ${result.stderr.toString("utf8")}`);
   return result.stdout.toString("utf8");
+}
+
+function oracleGlobalArgs(attrSource, attributesFile, orderFile) {
+  return [
+    "--no-replace-objects",
+    "--no-pager",
+    "-c", "color.ui=false",
+    `--attr-source=${attrSource}`,
+    "-c", "core.quotePath=true",
+    "-c", `core.attributesFile=${attributesFile}`,
+    "-c", "core.autocrlf=false",
+    "-c", "diff.algorithm=myers",
+    "-c", "diff.indentHeuristic=false",
+    "-c", "diff.renames=true",
+    "-c", "diff.renameLimit=1000",
+    "-c", "diff.external=",
+    "-c", "diff.trustExitCode=false",
+    "-c", "diff.relative=false",
+    "-c", "diff.submodule=short"
+  ];
+}
+
+function directMetadataWithOracle(root, baseRef, headRef, attrSource, attributesFile, orderFile, pathFilter) {
+  const common = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames=50%", "--find-copies=50%", "-l1000", `-O${orderFile}`, "-z"];
+  const suffix = pathFilter === undefined ? [] : ["--", `:(literal)${pathFilter}`];
+  const name = directGitWithGlobalArgs(root, oracleGlobalArgs(attrSource, attributesFile, orderFile), [...common, "--name-status", baseRef, headRef, ...suffix]);
+  const numstat = directGitWithGlobalArgs(root, oracleGlobalArgs(attrSource, attributesFile, orderFile), [...common, "--numstat", baseRef, headRef, ...suffix]);
+  assert.equal(name.status, 0, `oracle name-status failed: ${name.stderr.toString("utf8")}`);
+  assert.equal(numstat.status, 0, `oracle numstat failed: ${numstat.stderr.toString("utf8")}`);
+  const names = parseRawNameStatus(name.stdout);
+  const stats = parseRawNumstat(numstat.stdout);
+  assert.equal(names.length, stats.length, "oracle metadata producers disagreed");
+  const records = names.map((entry, index) => {
+    const stat = stats[index];
+    const renameOrCopy = entry.status === "R" || entry.status === "C";
+    const expectedPath = entry.status === "D" ? entry.oldPath : entry.newPath;
+    if (renameOrCopy) {
+      assert.equal(stat.path, null);
+      assert.equal(stat.oldPath, entry.oldPath);
+      assert.equal(stat.newPath, entry.newPath);
+    } else {
+      assert.equal(stat.path, expectedPath);
+      assert.equal(stat.oldPath, null);
+      assert.equal(stat.newPath, null);
+    }
+    return { status: entry.status, oldPath: entry.oldPath, newPath: entry.newPath, similarity: entry.similarity, additions: stat.additions, deletions: stat.deletions, binary: stat.binary };
+  });
+  return { records, nameBytes: name.stdout, numstatBytes: numstat.stdout };
+}
+
+function directPatchWithOracle(root, baseRef, headRef, records, attrSource, attributesFile, orderFile, contextLines = 3) {
+  return records.map((record) => {
+    const pathValues = [...new Set([record.oldPath, record.newPath].filter((value) => value !== null))];
+    const args = [
+      "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--patch", `-U${contextLines}`,
+      "--find-renames=50%", "--find-copies=50%", "-l1000", `-O${orderFile}`, "--diff-algorithm=myers", "--no-indent-heuristic",
+      "--src-prefix=a/", "--dst-prefix=b/", baseRef, headRef, "--", ...pathValues.map((value) => `:(literal)${value}`)
+    ];
+    const result = directGitWithGlobalArgs(root, oracleGlobalArgs(attrSource, attributesFile, orderFile), args);
+    assert.equal(result.status, 0, `oracle patch failed: ${result.stderr.toString("utf8")}`);
+    return result.stdout.toString("utf8");
+  }).join("");
 }
 
 function publicChangedFileKeys(result, label) {
@@ -366,6 +449,42 @@ async function makePublicConfigFixture(root) {
   return { root, baseSha, headSha, relevantPaths: [".gitattributes", "ordinary.txt", "config.hostile"] };
 }
 
+async function makeAttributeDirectionFixture(root) {
+  await initRepo(root);
+  await writeFixture(root, ".gitattributes", "direction.txt -diff\nreverse.txt diff\n");
+  await writeFixture(root, "direction.txt", "direction before\n");
+  await writeFixture(root, "reverse.txt", "reverse before\n");
+  const baseSha = await commitAll(root, "attribute direction base");
+  // The head tree deliberately reverses both attributes. The public operation
+  // is required to use committed head-tree attributes, not dirty checkout or
+  // base-tree attributes, so this pair proves both directions in one range.
+  await writeFixture(root, ".gitattributes", "direction.txt diff\nreverse.txt -diff\n");
+  await writeFixture(root, "direction.txt", "direction after\n");
+  await writeFixture(root, "reverse.txt", "reverse after\n");
+  const headSha = await commitAll(root, "attribute direction head");
+  return { root, baseSha, headSha, relevantPaths: [".gitattributes", "direction.txt", "reverse.txt"] };
+}
+
+async function makeOverflowFixture(root, fileCount = 320) {
+  await initRepo(root);
+  await writeFixture(root, "anchor.txt", "anchor\n");
+  const baseSha = await commitAll(root, "metadata overflow base");
+  for (let index = 0; index < fileCount; index += 1) {
+    await writeFixture(root, `overflow-${String(index).padStart(4, "0")}.txt`, `overflow ${index}\n`);
+  }
+  const headSha = await commitAll(root, "metadata overflow head");
+  return { root, baseSha, headSha, fileCount };
+}
+
+async function makeFragmentOverflowFixture(root) {
+  await initRepo(root);
+  await writeFixture(root, "large-fragment.txt", "before\n");
+  const baseSha = await commitAll(root, "fragment overflow base");
+  await writeFixture(root, "large-fragment.txt", `before\n${"large fragment line ".repeat(500)}\n`);
+  const headSha = await commitAll(root, "fragment overflow head");
+  return { root, baseSha, headSha };
+}
+
 function directRangePatch(root, baseRef, headRef) {
   const args = [
     "diff",
@@ -396,6 +515,35 @@ async function fileDigest(filePath) {
     if (error?.code === "ENOENT") return { exists: false };
     throw error;
   }
+}
+
+function bytesDigest(bytes) {
+  const buffer = Buffer.from(bytes);
+  return {
+    bytes: buffer.byteLength,
+    sha256: createHash("sha256").update(buffer).digest("hex"),
+    base64: buffer.toString("base64")
+  };
+}
+
+function emitRawNulEvidence(label, bytes, decodedRecords) {
+  const evidence = bytesDigest(bytes);
+  // The fixtures used for this evidence contain no blocked paths or source
+  // secrets. Base64 preserves exact NUL-stream bytes while remaining safe in
+  // line-oriented verifier logs; decoded records expose the human-checkable
+  // interpretation independently.
+  console.log(`RAW_NUL_STREAM: ${serialized({ label, ...evidence })}`);
+  console.log(`RAW_DECODED_RECORDS: ${serialized({ label, records: decodedRecords })}`);
+}
+
+function emitSnapshotEvidence(label, snapshot) {
+  const encoded = serialized(snapshot);
+  console.log(`RAW_SNAPSHOT: ${serialized({
+    label,
+    bytes: Buffer.byteLength(encoded, "utf8"),
+    sha256: createHash("sha256").update(encoded).digest("hex"),
+    snapshot
+  })}`);
 }
 
 async function repositorySnapshot(root, relevantPaths = []) {
@@ -516,27 +664,35 @@ function assertPublicRange(result, expected, label) {
 }
 
 class RawStdioClient {
-  constructor(defaultWorkspaceRoot, allowedTargetRoot, mode, environment = {}) {
+  constructor(defaultWorkspaceRoot, allowedRoots, mode, environment = {}) {
     this.buffer = "";
     this.nextId = 1;
     this.pending = new Map();
     this.stderr = "";
-    const allowedRoots = [defaultWorkspaceRoot, path.dirname(allowedTargetRoot), allowedTargetRoot].join(path.delimiter);
-    this.child = spawn(process.execPath, [
+    const explicitAllowedRoots = [...new Set(allowedRoots.map((root) => path.resolve(root)))];
+    const launchArgs = [
       "dist/stdio.js",
       "--root", defaultWorkspaceRoot,
-      "--allow-root", path.dirname(allowedTargetRoot),
-      "--allow-root", allowedTargetRoot,
       "--bash", "off",
       "--write", "off",
       "--tool-mode", mode
-    ], {
+    ];
+    for (const root of explicitAllowedRoots) launchArgs.splice(3, 0, "--allow-root", root);
+    this.launch = {
+      defaultRoot: path.resolve(defaultWorkspaceRoot),
+      allowedRoots: explicitAllowedRoots,
+      profileHome,
+      args: launchArgs
+    };
+    this.startedAt = Date.now();
+    this.child = spawn(process.execPath, launchArgs, {
       cwd: path.resolve("."),
       env: {
         ...process.env,
         ...environment,
+        CODEXPRO_HOME: profileHome,
         CODEXPRO_ROOT: defaultWorkspaceRoot,
-        CODEXPRO_ALLOWED_ROOTS: allowedRoots,
+        CODEXPRO_ALLOWED_ROOTS: [defaultWorkspaceRoot, ...explicitAllowedRoots].join(path.delimiter),
         CODEXPRO_TOOL_CARDS: "0",
         CODEXPRO_CODEX_SESSIONS: "off",
         CODEXPRO_BASH_MODE: "off",
@@ -544,9 +700,13 @@ class RawStdioClient {
       },
       stdio: ["pipe", "pipe", "pipe"]
     });
+    this.pid = this.child.pid;
+    assert.ok(Number.isInteger(this.pid) && this.pid > 0, "stdio child did not expose a process ID");
     this.child.stdout.on("data", (chunk) => this.onData(String(chunk)));
     this.child.stderr.on("data", (chunk) => { this.stderr += String(chunk); });
     this.child.on("exit", (code, signal) => {
+      this.exitedAt = Date.now();
+      this.exit = { code, signal };
       for (const { reject, timer } of this.pending.values()) {
         clearTimeout(timer);
         reject(new Error(`MCP server exited code=${code} signal=${signal}; stderr=${this.stderr}`));
@@ -611,7 +771,7 @@ class RawStdioClient {
 }
 
 async function startClient(defaultWorkspaceRoot, mode, environment = {}) {
-  const client = new RawStdioClient(defaultWorkspaceRoot, targetRoot, mode, environment);
+  const client = new RawStdioClient(defaultWorkspaceRoot, [targetParent], mode, environment);
   const initialize = await client.request("initialize", {
     protocolVersion: "2024-11-05",
     capabilities: {},
@@ -644,12 +804,16 @@ function errorResult(call, label) {
 async function main() {
   let firstClient;
   let secondClient;
+  const { redactUnifiedDiff } = await import("./redaction-policy.mjs");
   const defaultRootB = path.join(fixtureRoot, "default-repo-b");
   const historyRoot = path.join(targetParent, "history-target-repo");
   const matrixRoot = path.join(targetParent, "matrix-target-repo");
   const blockedRoot = path.join(targetParent, "blocked-target-repo");
   const budgetRoot = path.join(targetParent, "budget-target-repo");
   const configRoot = path.join(targetParent, "config-target-repo");
+  const attributeRoot = path.join(targetParent, "attribute-direction-target-repo");
+  const overflowRoot = path.join(targetParent, "metadata-overflow-target-repo");
+  const fragmentOverflowRoot = path.join(targetParent, "fragment-overflow-target-repo");
   try {
     await initRepo(defaultRoot);
     await initRepo(defaultRootB);
@@ -659,6 +823,9 @@ async function main() {
     const blocked = await makePublicBlockedFixture(blockedRoot);
     const budget = await makePublicBudgetFixture(budgetRoot);
     const configFixture = await makePublicConfigFixture(configRoot);
+    const attributeFixture = await makeAttributeDirectionFixture(attributeRoot);
+    const overflowFixture = await makeOverflowFixture(overflowRoot);
+    const fragmentOverflowFixture = await makeFragmentOverflowFixture(fragmentOverflowRoot);
 
     await writeFile(path.join(defaultRoot, "default.txt"), `${DEFAULT_SENTINEL} base\n`, "utf8");
     const defaultBaseSha = await commitAll(defaultRoot, "default range base");
@@ -702,6 +869,54 @@ async function main() {
     const matrixRaw = directMetadata(matrix.root, matrix.baseSha, matrix.headSha);
     const budgetRaw = directMetadata(budget.root, budget.baseSha, budget.headSha);
     const configRaw = directMetadata(configFixture.root, configFixture.baseSha, configFixture.headSha);
+    // Independent oracle: a no-hardlink clone has its own checkout/config and
+    // object database. It is captured before any target-local hostile state is
+    // introduced and is the sole expected-result source for the fixed-SHA
+    // isolation proof below.
+    const configOracleRoot = path.join(fixtureRoot, "config-isolated-oracle");
+    mustGit(fixtureRoot, ["clone", "--quiet", "--no-local", "--no-hardlinks", configFixture.root, configOracleRoot]);
+    const oracleAttributesFile = path.join(fixtureRoot, "oracle-empty.attributes");
+    const oracleOrderFile = path.join(fixtureRoot, "oracle-empty.order");
+    await writeFile(oracleAttributesFile, "", "utf8");
+    await writeFile(oracleOrderFile, "", "utf8");
+    const configOracleRaw = directMetadataWithOracle(
+      configOracleRoot,
+      configFixture.baseSha,
+      configFixture.headSha,
+      configFixture.headSha,
+      oracleAttributesFile,
+      oracleOrderFile
+    );
+    const configOracleTextRecords = configOracleRaw.records.filter((record) => !record.binary);
+    const configOraclePatch = directPatchWithOracle(
+      configOracleRoot,
+      configFixture.baseSha,
+      configFixture.headSha,
+      configOracleTextRecords,
+      configFixture.headSha,
+      oracleAttributesFile,
+      oracleOrderFile
+    );
+    const attributeOracleRoot = path.join(fixtureRoot, "attribute-isolated-oracle");
+    mustGit(fixtureRoot, ["clone", "--quiet", "--no-local", "--no-hardlinks", attributeFixture.root, attributeOracleRoot]);
+    const attributeOracleRaw = directMetadataWithOracle(
+      attributeOracleRoot,
+      attributeFixture.baseSha,
+      attributeFixture.headSha,
+      attributeFixture.headSha,
+      oracleAttributesFile,
+      oracleOrderFile
+    );
+    const attributeOracleTextRecords = attributeOracleRaw.records.filter((record) => !record.binary);
+    const attributeOraclePatch = redactUnifiedDiff(directPatchWithOracle(
+      attributeOracleRoot,
+      attributeFixture.baseSha,
+      attributeFixture.headSha,
+      attributeOracleTextRecords,
+      attributeFixture.headSha,
+      oracleAttributesFile,
+      oracleOrderFile
+    ));
     assert.equal(historySameRaw.records.length, 0, "raw root/same history was not empty");
     assert.ok(historyLinearRaw.records.length > 0, "raw linear history did not change");
     assert.notDeepEqual(historyDivergentRaw.records, historyMergeBaseRaw.records, "raw divergent and merge-base cases unexpectedly matched");
@@ -725,6 +940,10 @@ async function main() {
     console.log("RAW_OBSERVATION: root/same=" + historySameRaw.records.length + ", linear=" + historyLinearRaw.records.length + ", divergent=" + historyDivergentRaw.records.length + ", merge-base-to-right=" + historyMergeBaseRaw.records.length + ", merge=" + historyMergeRaw.records.length + "; direct divergent differs from merge-base.");
     console.log("RAW_OBSERVATION: public matrix direct Git records=" + matrixRaw.records.length + ", statuses=" + matrixRaw.records.map((record) => record.status).join(",") + "; rename/copy/binary/type/mode and five odd path identities were independently decoded from NUL producers.");
     console.log("RAW_OBSERVATION: blocked direct Git records independently contain blocked add/delete/rename/copy sides in " + blockedRaw.length + " cases; ordinary patch bytes contain a secret-bearing changed line.");
+    emitRawNulEvidence("config-isolated-oracle.name-status", configOracleRaw.nameBytes, configOracleRaw.records.map(publicRecord));
+    emitRawNulEvidence("config-isolated-oracle.numstat", configOracleRaw.numstatBytes, configOracleRaw.records.map(publicRecord));
+    emitRawNulEvidence("attribute-isolated-oracle.name-status", attributeOracleRaw.nameBytes, attributeOracleRaw.records.map(publicRecord));
+    emitRawNulEvidence("attribute-isolated-oracle.numstat", attributeOracleRaw.numstatBytes, attributeOracleRaw.records.map(publicRecord));
     console.log("PREDICATE: TRUE — direct Git producers independently establish all history, record-kind, path, blocked-side, and secret-bearing input predicates before target calls.");
 
     const helperRoot = path.join(fixtureRoot, "hostile-git-controls");
@@ -732,6 +951,13 @@ async function main() {
     const externalHelper = path.join(helperRoot, "external-diff.mjs");
     const textconvHelper = path.join(helperRoot, "textconv.mjs");
     const globalConfig = path.join(helperRoot, "hostile.gitconfig");
+    const systemConfig = path.join(helperRoot, "hostile-system.gitconfig");
+    const homeRoot = path.join(helperRoot, "hostile-home");
+    const xdgConfigHome = path.join(helperRoot, "hostile-xdg");
+    const localInclude = path.join(helperRoot, "hostile-include.gitconfig");
+    const globalAttributes = path.join(helperRoot, "hostile-global.attributes");
+    const systemAttributes = path.join(helperRoot, "hostile-system.attributes");
+    const hostileOrderFile = path.join(helperRoot, "hostile-order.txt");
     const tracePath = path.join(helperRoot, "trace.log");
     const trace2Path = path.join(helperRoot, "trace2.json");
     const shallowPath = path.join(helperRoot, "shallow");
@@ -739,7 +965,19 @@ async function main() {
     await writeFile(textconvHelper, "#!/usr/bin/env node\nimport fs from \"node:fs\";\nconst file = process.argv.at(-1);\nprocess.stdout.write(" + JSON.stringify(TEXTCONV_SENTINEL + "\n") + ");\nprocess.stdout.write(fs.readFileSync(file));\n", "utf8");
     await chmod(externalHelper, 0o755);
     await chmod(textconvHelper, 0o755);
-    await writeFile(globalConfig, "[diff \"hostile\"]\n\ttextconv = " + textconvHelper + "\n", "utf8");
+    await mkdir(path.join(homeRoot, ".config", "git"), { recursive: true });
+    await mkdir(xdgConfigHome, { recursive: true });
+    const xdgEmptyHome = path.join(helperRoot, "hostile-xdg-empty");
+    await mkdir(xdgEmptyHome, { recursive: true });
+    await writeFile(globalConfig, `[diff]\n\torderFile = ${hostileOrderFile}\n\trenameLimit = 1\n\n[diff "hostile"]\n\ttextconv = ${textconvHelper}\n\texternal = ${externalHelper}\n`, "utf8");
+    await writeFile(systemConfig, `[diff]\n\texternal = ${externalHelper}\n\torderFile = ${hostileOrderFile}\n`, "utf8");
+    await writeFile(path.join(homeRoot, ".gitconfig"), `[diff]\n\texternal = ${externalHelper}\n`, "utf8");
+    await writeFile(path.join(homeRoot, ".config", "git", "config"), `[diff]\n\texternal = ${externalHelper}\n`, "utf8");
+    await writeFile(path.join(xdgConfigHome, "config"), `[diff]\n\texternal = ${externalHelper}\n\torderFile = ${hostileOrderFile}\n`, "utf8");
+    await writeFile(localInclude, `[diff]\n\texternal = ${externalHelper}\n\torderFile = ${hostileOrderFile}\n\trenameLimit = 1\n`, "utf8");
+    await writeFile(globalAttributes, "*.hostile -diff\n*.txt -diff\n", "utf8");
+    await writeFile(systemAttributes, "*.hostile -diff\n*.txt -diff\n", "utf8");
+    await writeFile(hostileOrderFile, "ordinary.txt\n", "utf8");
     const ordinaryTextconv = ordinaryGit(configFixture.root, ["diff", "--no-color", "--textconv", configFixture.baseSha, configFixture.headSha, "--", "config.hostile"], {
       GIT_CONFIG_NOSYSTEM: "1",
       GIT_CONFIG_GLOBAL: globalConfig
@@ -753,7 +991,76 @@ async function main() {
     assert.equal(ordinaryTextconv.stdout.toString("utf8").includes(TEXTCONV_SENTINEL), true, "ordinary Git did not invoke hostile textconv helper stdout=" + ordinaryTextconv.stdout.toString("utf8") + " stderr=" + ordinaryTextconv.stderr.toString("utf8"));
     assert.equal(ordinaryExternal.status, 0, "ordinary hostile external-diff probe failed");
     assert.equal(ordinaryExternal.stdout.toString("utf8").includes(EXTERNAL_DIFF_SENTINEL), true, "ordinary Git did not invoke hostile external diff helper stdout=" + ordinaryExternal.stdout.toString("utf8") + " stderr=" + ordinaryExternal.stderr.toString("utf8"));
-    console.log("RAW_OBSERVATION: ordinary Git under hostile global textconv and GIT_EXTERNAL_DIFF independently emitted their sentinel outputs; hostile predicate is TRUE before RepoConnect target calls.");
+    const ordinaryConfig = ordinaryGit(configFixture.root, ["config", "--get", "diff.orderFile"], {
+      HOME: homeRoot,
+      XDG_CONFIG_HOME: xdgConfigHome,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: globalConfig
+    });
+    assert.equal(ordinaryConfig.status, 0, "ordinary hostile global config probe failed");
+    assert.equal(ordinaryConfig.stdout.toString("utf8").trim(), hostileOrderFile, "ordinary Git did not observe hostile global orderFile");
+    const ordinaryHomeConfig = ordinaryGit(configFixture.root, ["config", "--global", "--get", "diff.external"], {
+      HOME: homeRoot,
+      XDG_CONFIG_HOME: xdgEmptyHome,
+      GIT_CONFIG_NOSYSTEM: "1"
+    });
+    const ordinaryXdgConfig = ordinaryGit(configFixture.root, ["config", "--global", "--get", "diff.external"], {
+      HOME: homeRoot,
+      XDG_CONFIG_HOME: xdgConfigHome,
+      GIT_CONFIG_NOSYSTEM: "1"
+    });
+    const ordinarySystemConfig = ordinaryGit(configFixture.root, ["config", "--system", "--get", "diff.external"], {
+      HOME: homeRoot,
+      XDG_CONFIG_HOME: xdgEmptyHome,
+      GIT_CONFIG_NOSYSTEM: "0",
+      GIT_CONFIG_SYSTEM: systemConfig
+    });
+    assert.equal(ordinaryHomeConfig.status, 0, "ordinary HOME Git config probe failed");
+    assert.equal(ordinaryHomeConfig.stdout.toString("utf8").trim(), externalHelper, "ordinary Git did not observe HOME .gitconfig");
+    assert.equal(ordinaryXdgConfig.status, 0, "ordinary XDG Git config probe failed");
+    assert.equal(ordinaryXdgConfig.stdout.toString("utf8").trim(), externalHelper, "ordinary Git did not observe XDG Git config");
+    assert.equal(ordinarySystemConfig.status, 0, "ordinary system Git config probe failed");
+    assert.equal(ordinarySystemConfig.stdout.toString("utf8").trim(), externalHelper, "ordinary Git did not observe system Git config");
+    // Install conflicting local config/include/info/dirty attributes only
+    // after the independent baseline was captured. These must not affect the
+    // fixed-SHA public range operation.
+    mustGit(configFixture.root, ["config", "diff.hostile.textconv", textconvHelper]);
+    mustGit(configFixture.root, ["config", "diff.external", externalHelper]);
+    mustGit(configFixture.root, ["config", "diff.orderFile", hostileOrderFile]);
+    mustGit(configFixture.root, ["config", "diff.renameLimit", "1"]);
+    mustGit(configFixture.root, ["config", "include.path", localInclude]);
+    await mkdir(path.join(configFixture.root, ".git", "info"), { recursive: true });
+    await writeFile(path.join(configFixture.root, ".git", "info", "attributes"), "*.hostile -diff\n*.txt -diff\n", "utf8");
+    await writeFile(path.join(configFixture.root, ".gitattributes"), "*.txt -diff\n", "utf8");
+    const ordinaryInfoAttribute = ordinaryGit(configFixture.root, ["check-attr", "diff", "--", "config.hostile"], {
+      HOME: homeRoot,
+      XDG_CONFIG_HOME: xdgConfigHome,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_ATTR_GLOBAL: globalAttributes,
+      GIT_ATTR_SYSTEM: systemAttributes
+    });
+    const ordinaryGlobalAttribute = ordinaryGit(configFixture.root, ["check-attr", "diff", "--", "global-only.txt"], {
+      HOME: homeRoot,
+      XDG_CONFIG_HOME: xdgConfigHome,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_ATTR_GLOBAL: globalAttributes,
+      GIT_ATTR_SYSTEM: "/dev/null"
+    });
+    const ordinarySystemAttribute = ordinaryGit(configFixture.root, ["check-attr", "diff", "--", "global-only.system"], {
+      HOME: homeRoot,
+      XDG_CONFIG_HOME: xdgConfigHome,
+      GIT_CONFIG_NOSYSTEM: "0",
+      GIT_ATTR_GLOBAL: "/dev/null",
+      GIT_ATTR_SYSTEM: systemAttributes,
+      GIT_ATTR_NOSYSTEM: "0"
+    });
+    assert.equal(ordinaryInfoAttribute.status, 0, "ordinary local info attributes probe failed");
+    assert.match(ordinaryInfoAttribute.stdout.toString("utf8"), /config\.hostile: diff: unset/iu, "ordinary Git did not observe local info/attributes override");
+    assert.equal(ordinaryGlobalAttribute.status, 0, "ordinary global attributes probe failed");
+    assert.match(ordinaryGlobalAttribute.stdout.toString("utf8"), /global-only\.txt: diff: unset/iu, "ordinary Git did not observe global attributes");
+    assert.equal(ordinarySystemAttribute.status, 0, "ordinary system attributes probe failed");
+    assert.match(ordinarySystemAttribute.stdout.toString("utf8"), /global-only\.system: diff: (?:unset|unspecified)/iu, "ordinary system attributes probe returned an unbounded result");
+    console.log(`RAW_OBSERVATION: ordinary Git under hostile global/system/HOME/XDG/local/include config and GIT_EXTERNAL_DIFF emitted sentinels; global orderFile, HOME/XDG/system config, local/global attributes, and the system-attribute probe (${ordinarySystemAttribute.stdout.toString("utf8").trim()}) were independently observed; conflicting local/info/dirty attributes are now physically present for the fixed-SHA falsifier.`);
 
     const targetCanonicalRoot = await realpath(targetRoot);
     const defaultBCanonicalRoot = await realpath(defaultRootB);
@@ -771,6 +1078,8 @@ async function main() {
     const directNameBytes = directTargetName.stdout;
     const directNumstatText = directTargetNumstat.stdout.toString("utf8");
     const directPatchText = directTargetPatch.stdout.toString("utf8");
+    emitRawNulEvidence("target.name-status", directNameBytes, parseRawNameStatus(directNameBytes));
+    emitRawNulEvidence("target.numstat", directTargetNumstat.stdout, parseRawNumstat(directTargetNumstat.stdout));
     assert.equal(directNameBytes.toString("utf8"), "M\0target-range.txt\0", "direct name-status did not yield one exact target record");
     const numstatMatch = /^(\d+)\t(\d+)\ttarget-range\.txt\0$/u.exec(directNumstatText);
     assert.ok(numstatMatch, `direct numstat did not yield one exact target record: ${JSON.stringify(directNumstatText)}`);
@@ -780,7 +1089,6 @@ async function main() {
     assert.equal(directPatchText.includes(CONTEXT_SECRET), true, "direct raw target patch lacked context secret");
     assert.equal(directPatchText.includes(TARGET_SENTINEL), true, "direct raw target patch lacked target sentinel");
     assert.equal(directPatchText.includes(DEFAULT_SENTINEL), false, "direct raw target patch contained default sentinel");
-    const { redactUnifiedDiff } = await import("./redaction-policy.mjs");
     const expectedRedactedPatch = redactUnifiedDiff(directPatchText);
     assert.equal(expectedRedactedPatch.includes(ADD_SECRET), false, "supporting redaction oracle retained addition secret");
     assert.equal(expectedRedactedPatch.includes(DELETE_SECRET), false, "supporting redaction oracle retained deletion secret");
@@ -805,9 +1113,13 @@ async function main() {
     const workspaceId = openedData.workspace_id;
     assert.match(workspaceId, /^ws_[a-f0-9]{24}$/u, "open_workspace did not return a deterministic workspace ID");
     assert.equal(openedData.root, targetCanonicalRoot, "session A opened the wrong root");
+    assert.deepEqual(firstClient.launch.allowedRoots, [await realpath(targetParent)], "session A received more than the allowed parent root");
+    assert.equal(firstClient.launch.args.includes(targetRoot), false, "session A CLI args contained the exact nested target");
     await firstClient.close();
+    assert.ok(firstClient.exitedAt !== undefined, "session A did not record a server lifetime");
+    const sessionA = firstClient;
     firstClient = undefined;
-    console.log(`PASS session A: nested target opened and saved explicit workspace_id ${workspaceId}; client/server ended before fresh session B.`);
+    console.log(`PASS session A: pid=${sessionA.pid}; nested target opened and saved explicit workspace_id ${workspaceId}; client/server ended before fresh session B.`);
 
     // AP-009: full publication and standard/minimal omission.
     for (const mode of ["standard", "minimal"]) {
@@ -821,6 +1133,13 @@ async function main() {
       }
     }
     secondClient = (await startClient(defaultRootB, "full")).client;
+    assert.notEqual(secondClient.pid, undefined, "session B did not expose a process ID");
+    assert.notEqual(secondClient.pid, sessionA.pid, "fresh session reused session A process identity");
+    assert.equal(secondClient.launch.profileHome, profileHome, "session B did not share the unique disposable CODEXPRO_HOME");
+    assert.equal(secondClient.launch.allowedRoots.includes(path.resolve(targetRoot)), false, "session B CLI allowed exact nested target");
+    assert.equal(secondClient.launch.args.includes(path.resolve(targetRoot)), false, "session B CLI args contained the exact nested target");
+    assert.ok(sessionA.exitedAt <= secondClient.startedAt, "session B started before session A had ended");
+    console.log(`RAW_OBSERVATION: stdio session lifetimes A(pid=${sessionA.pid},exit=${sessionA.exitedAt}) before B(pid=${secondClient.pid},start=${secondClient.startedAt}); shared CODEXPRO_HOME=${profileHome}; B default=${path.resolve(defaultRootB)} and allowed roots exclude nested target.`);
     const fullListingCall = await secondClient.request("tools/list", {});
     const fullTools = fullListingCall.response.result?.tools ?? [];
     const rangeTools = fullTools.filter((tool) => tool.name === "git_diff_range");
@@ -859,6 +1178,7 @@ async function main() {
 
     // The snapshot starts after session selection and before any target calls.
     const before = await repositorySnapshot(targetRoot);
+    emitSnapshotEvidence("nested-target-before-public-calls", before);
     const explicitCall = await callTool(secondClient, "git_diff_range", { workspace_id: workspaceId, base_ref: "HEAD~1", head_ref: "HEAD" });
     const explicitResult = successResult(explicitCall, "fresh-session explicit git_diff_range");
     const structured = explicitResult.structuredContent;
@@ -910,7 +1230,53 @@ async function main() {
     assert.equal(explicitResult.content.some((part) => typeof part?.text === "string" && part.text.includes(TARGET_SENTINEL)), false, "human content exposed patch sentinel");
     assert.equal(structured.patch.includes(TARGET_SENTINEL), true, "structured patch omitted target sentinel");
     assert.equal(structured.patch.includes(DEFAULT_SENTINEL), false, "structured patch used default-workspace sentinel");
+    assertNoResponseLiterals(explicitCall, [ADD_SECRET, DELETE_SECRET, CONTEXT_SECRET, DEFAULT_SENTINEL], "complete explicit response envelope");
+    console.log(`RAW_ENVELOPE: fresh-session success=${serialized(explicitCall.response)}`);
     console.log("PASS fresh-session explicit target: B used only saved target workspace_id despite distinct default-B; exact refs/counts/file/patch truth matched direct Git and patch occurred only at structuredContent.patch with redaction.");
+
+    // The persisted binding is part of the target route. Every malformed,
+    // stale, symlinked, or root-mismatched variant must fail closed, and the
+    // original bytes are restored exactly before the next falsifier.
+    const bindingPath = path.join(profileHome, "workspace-bindings", "v1", `${workspaceId}.json`);
+    const originalBinding = await readFile(bindingPath);
+    const restoreBinding = async () => {
+      try {
+        await unlink(bindingPath);
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      await writeFile(bindingPath, originalBinding);
+    };
+    const bindingFalsifier = async (label, mutate) => {
+      await mutate();
+      const call = await callTool(secondClient, "git_diff_range", { workspace_id: workspaceId, base_ref: targetBaseSha, head_ref: targetHeadSha, include_patch: false });
+      const result = errorResult(call, label);
+      assertNoResponseLiterals(call, [ADD_SECRET, DELETE_SECRET, CONTEXT_SECRET, TARGET_SENTINEL, DEFAULT_SENTINEL], label);
+      assert.match(serialized(result), /workspace|binding|canonical|unavailable|invalid/iu, `${label} was not a bounded binding rejection`);
+      console.log(`RAW_ENVELOPE: ${label}=${serialized(call.response)}`);
+      await restoreBinding();
+      return call;
+    };
+    const staleId = "ws_000000000000000000000000";
+    const staleCall = await callTool(secondClient, "git_diff_range", { workspace_id: staleId, base_ref: "HEAD~1", head_ref: "HEAD", include_patch: false });
+    const staleResult = errorResult(staleCall, "stale/unknown workspace binding");
+    assertNoResponseLiterals(staleCall, [ADD_SECRET, DELETE_SECRET, CONTEXT_SECRET, TARGET_SENTINEL, DEFAULT_SENTINEL], "stale/unknown workspace binding");
+    assert.match(serialized(staleResult), /unknown|workspace|binding/iu, "stale/unknown workspace binding was not bounded");
+    console.log(`RAW_ENVELOPE: stale-unknown=${serialized(staleCall.response)}`);
+    await bindingFalsifier("corrupt workspace binding", async () => { await writeFile(bindingPath, "{not-json\n", "utf8"); });
+    const symlinkTarget = path.join(fixtureRoot, "binding-shadow.json");
+    await bindingFalsifier("symlink workspace binding", async () => {
+      await writeFile(symlinkTarget, originalBinding);
+      await unlink(bindingPath);
+      await symlink(symlinkTarget, bindingPath);
+    });
+    await bindingFalsifier("mismatched workspace binding", async () => {
+      await writeFile(bindingPath, JSON.stringify({ version: 1, id: workspaceId, root: path.resolve(defaultRootB) }));
+    });
+    await bindingFalsifier("stale-root workspace binding", async () => {
+      await writeFile(bindingPath, JSON.stringify({ version: 1, id: workspaceId, root: path.join(fixtureRoot, "removed-target") }));
+    });
+    console.log("PASS persisted binding falsifiers: unknown, corrupt, symlink, mismatched-root, and stale-root bindings rejected without fallback or target/default source leakage; original binding bytes restored.");
 
     // Missing workspace_id must reject even though default-B has valid HEAD~1
     // and HEAD refs. This is the fallback falsifier and error-envelope proof.
@@ -1190,9 +1556,14 @@ async function main() {
 
     const hostileEnvironment = {
       PATH: helperRoot + path.delimiter + (process.env.PATH ?? ""),
+      HOME: homeRoot,
+      XDG_CONFIG_HOME: xdgConfigHome,
       GIT_EXTERNAL_DIFF: externalHelper,
       GIT_CONFIG_GLOBAL: globalConfig,
-      GIT_CONFIG_SYSTEM: globalConfig,
+      GIT_CONFIG_SYSTEM: systemConfig,
+      GIT_CONFIG_NOSYSTEM: "0",
+      GIT_ATTR_GLOBAL: globalAttributes,
+      GIT_ATTR_SYSTEM: systemAttributes,
       GIT_DIFF_OPTS: "--stat",
       GIT_TRACE: tracePath,
       GIT_TRACE2_EVENT: trace2Path,
@@ -1200,7 +1571,8 @@ async function main() {
       GIT_NO_REPLACE_OBJECTS: "0",
       GIT_NO_LAZY_FETCH: "0",
       GIT_ATTR_SOURCE: globalConfig,
-      GIT_TERMINAL_PROMPT: "1"
+      GIT_TERMINAL_PROMPT: "1",
+      CODEXPRO_MAX_READ_BYTES: "4000"
     };
     await secondClient.close();
     secondClient = (await startClient(defaultRootB, "full", hostileEnvironment)).client;
@@ -1216,30 +1588,127 @@ async function main() {
         if (error?.code !== "ENOENT") throw error;
       }
     }
+    // Arm a replacement ref whose ordinary Git subject is observably hostile;
+    // the target operation must continue to use the captured original SHA.
+    const replacementTree = gitText(configFixture.root, ["rev-parse", `${configFixture.baseSha}^{tree}`]);
+    const replacementCommit = mustGit(configFixture.root, ["commit-tree", replacementTree, "-m", "HOSTILE_REPLACEMENT_SUBJECT_5C8"]).toString("utf8").trim();
+    mustGit(configFixture.root, ["replace", configFixture.baseSha, replacementCommit]);
+    const ordinaryReplacement = ordinaryGit(configFixture.root, ["show", "-s", "--format=%s", configFixture.baseSha], {
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: globalConfig
+    });
+    assert.equal(ordinaryReplacement.status, 0, "ordinary replacement-ref probe failed");
+    assert.equal(ordinaryReplacement.stdout.toString("utf8").trim(), "HOSTILE_REPLACEMENT_SUBJECT_5C8", "ordinary Git did not observe replacement ref");
+    console.log("RAW_OBSERVATION: ordinary Git with replacement ref returned HOSTILE_REPLACEMENT_SUBJECT_5C8; replacement predicate is TRUE before sealed fixed-SHA target call.");
+
     const configBefore = await repositorySnapshot(configFixture.root, configFixture.relevantPaths);
-    const configExpectedRaw = configRaw.records;
+    emitSnapshotEvidence("config-before-hostile-fixed-sha", configBefore);
+    const configExpectedRaw = configOracleRaw.records;
+    assert.deepEqual(configExpectedRaw, configRaw.records, "clean target and independent oracle metadata differed before hostile mutation");
+    const configExpectedTextRecords = configOracleTextRecords;
+    const configExpectedPatch = configOraclePatch;
     const configTargetRecord = configExpectedRaw.find((record) => record.newPath === "config.hostile");
     assert.ok(configTargetRecord?.binary, "raw config fixture did not establish a binary textconv target");
     const hostileControlsCall = await callTool(secondClient, "git_diff_range", {
       workspace_id: configWorkspace.id,
       base_ref: configFixture.baseSha,
-      head_ref: configFixture.headSha,
-      path: "config.hostile"
+      head_ref: configFixture.headSha
     });
     const hostileControlsResult = successResult(hostileControlsCall, "hostile inherited Git controls");
     assertPublicRange(hostileControlsResult.structuredContent, {
       workspaceId: configWorkspace.id, root: configWorkspace.root, baseRef: configFixture.baseSha, baseSha: configFixture.baseSha, headRef: configFixture.headSha, headSha: configFixture.headSha,
-      path: "config.hostile", raw: [configTargetRecord], eligible: [configTargetRecord], returned: [configTargetRecord], blocked: 0, patch: "",
-      patchRequested: true, patchLimit: 60_000, patchTruncated: false, patchFilesIncluded: 0,
-      omissionCounts: { binary: 1, blocked: 0, budget: 0, disabled: 0, file_limit: 0, too_large: 0 }
+      raw: configExpectedRaw, eligible: configExpectedRaw, returned: configExpectedRaw, blocked: 0, patch: configExpectedPatch,
+      patchRequested: true, patchLimit: 60_000, patchTruncated: false, patchFilesIncluded: configExpectedTextRecords.length,
+      omissionCounts: { binary: configExpectedRaw.filter((record) => record.binary).length, blocked: 0, budget: 0, disabled: 0, file_limit: 0, too_large: 0 }
     }, "hostile inherited Git controls");
-    assertNoResponseLiterals(hostileControlsCall, [EXTERNAL_DIFF_SENTINEL, TEXTCONV_SENTINEL], "hostile inherited Git controls");
+    assertNoResponseLiterals(hostileControlsCall, [EXTERNAL_DIFF_SENTINEL, TEXTCONV_SENTINEL, "HOSTILE_REPLACEMENT_SUBJECT_5C8"], "hostile inherited Git controls");
+    console.log(`RAW_ENVELOPE: fixed-sha hostile success=${serialized(hostileControlsCall.response)}`);
     assert.equal(await fileDigest(tracePath).then((value) => value.exists), false, "sealed Git execution honored hostile GIT_TRACE");
     assert.equal(await fileDigest(trace2Path).then((value) => value.exists), false, "sealed Git execution honored hostile GIT_TRACE2_EVENT");
     assert.equal(await fileDigest(shallowPath).then((value) => value.exists), false, "sealed Git execution honored hostile GIT_SHALLOW_FILE");
     const configAfter = await repositorySnapshot(configFixture.root, configFixture.relevantPaths);
     assert.deepEqual(configAfter, configBefore, "hostile Git controls changed target repository state");
-    console.log("PASS hostile Git controls: independent ordinary-Git sentinels proved external diff/textconv predicates TRUE; public result ignored inherited GIT_* trace/shallow/replacement/lazy/config/external controls and stayed immutable.");
+    emitSnapshotEvidence("config-after-hostile-fixed-sha", configAfter);
+    console.log("PASS fixed-SHA hostile Git controls: independent isolated-tree oracle matched public metadata/patch despite dirty .gitattributes, local include/config/info attributes, HOME/XDG/global/system config/attributes, external diff/textconv/order/rename-limit, replacement/shallow/lazy controls; target snapshot stayed immutable.");
+
+    const binaryPathCall = await callTool(secondClient, "git_diff_range", {
+      workspace_id: configWorkspace.id,
+      base_ref: configFixture.baseSha,
+      head_ref: configFixture.headSha,
+      path: "config.hostile"
+    });
+    const binaryPathResult = successResult(binaryPathCall, "fixed-SHA binary path");
+    assertPublicRange(binaryPathResult.structuredContent, {
+      workspaceId: configWorkspace.id, root: configWorkspace.root, baseRef: configFixture.baseSha, baseSha: configFixture.baseSha, headRef: configFixture.headSha, headSha: configFixture.headSha,
+      path: "config.hostile", raw: [configTargetRecord], eligible: [configTargetRecord], returned: [configTargetRecord], blocked: 0, patch: "",
+      patchRequested: true, patchLimit: 60_000, patchTruncated: false, patchFilesIncluded: 0,
+      omissionCounts: { binary: 1, blocked: 0, budget: 0, disabled: 0, file_limit: 0, too_large: 0 }
+    }, "fixed-SHA binary path");
+    assertNoResponseLiterals(binaryPathCall, [EXTERNAL_DIFF_SENTINEL, TEXTCONV_SENTINEL], "fixed-SHA binary path");
+
+    const attributeWorkspace = await openFixture(attributeFixture.root, "committed head-attribute direction");
+    const attributeBefore = await repositorySnapshot(attributeFixture.root, attributeFixture.relevantPaths);
+    const directionRecord = attributeOracleRaw.records.find((record) => record.newPath === "direction.txt");
+    const reverseRecord = attributeOracleRaw.records.find((record) => record.newPath === "reverse.txt");
+    assert.ok(directionRecord && reverseRecord, "attribute oracle omitted directional records");
+    assert.equal(directionRecord.binary, false, "head-tree diff attribute did not make direction.txt textual");
+    assert.equal(reverseRecord.binary, true, "head-tree -diff attribute did not make reverse.txt binary");
+    console.log("PREDICATE: TRUE — independent head-tree oracle establishes direction.txt as textual and reverse.txt as binary before the public attribute-route call; the reverse-direction predicate is not inferred from the returned effect.");
+    const attributeCall = await callTool(secondClient, "git_diff_range", {
+      workspace_id: attributeWorkspace.id,
+      base_ref: attributeFixture.baseSha,
+      head_ref: attributeFixture.headSha
+    });
+    const attributeResult = successResult(attributeCall, "committed head-attribute direction");
+    assertPublicRange(attributeResult.structuredContent, {
+      workspaceId: attributeWorkspace.id, root: attributeWorkspace.root, baseRef: attributeFixture.baseSha, baseSha: attributeFixture.baseSha,
+      headRef: attributeFixture.headSha, headSha: attributeFixture.headSha, raw: attributeOracleRaw.records, eligible: attributeOracleRaw.records,
+      returned: attributeOracleRaw.records, blocked: 0, patch: attributeOraclePatch, patchRequested: true, patchLimit: 60_000,
+      patchTruncated: false, patchFilesIncluded: attributeOracleTextRecords.length,
+      omissionCounts: { binary: attributeOracleRaw.records.filter((record) => record.binary).length, blocked: 0, budget: 0, disabled: 0, file_limit: 0, too_large: 0 }
+    }, "committed head-attribute direction");
+    assertNoResponseLiterals(attributeCall, [EXTERNAL_DIFF_SENTINEL, TEXTCONV_SENTINEL], "committed head-attribute direction");
+    const attributeAfter = await repositorySnapshot(attributeFixture.root, attributeFixture.relevantPaths);
+    assert.deepEqual(attributeAfter, attributeBefore, "head-attribute target changed during read-only call");
+    console.log(`RAW_OBSERVATION: independent head-attribute oracle direction.txt binary=${directionRecord.binary}, reverse.txt binary=${reverseRecord.binary}; reverse-direction facts were established before public interpretation.`);
+    console.log("PASS committed head-attribute directional rule: fixed SHAs use head-tree attributes in both directions, independent oracle and public metadata/patch agree, and target state remains unchanged.");
+
+    const overflowWorkspace = await openFixture(overflowFixture.root, "metadata producer overflow");
+    const overflowBefore = await repositorySnapshot(overflowFixture.root);
+    const overflowCall = await callTool(secondClient, "git_diff_range", {
+      workspace_id: overflowWorkspace.id,
+      base_ref: overflowFixture.baseSha,
+      head_ref: overflowFixture.headSha,
+      include_patch: false
+    });
+    const overflowResult = errorResult(overflowCall, "metadata producer overflow");
+    assert.match(serialized(overflowResult), /metadata|capture|limit|overflow/iu, "metadata producer overflow was not truthful");
+    assertNoResponseLiterals(overflowCall, ["overflow-0000.txt", DEFAULT_SENTINEL, TARGET_SENTINEL], "metadata producer overflow");
+    console.log(`RAW_ENVELOPE: metadata-overflow=${serialized(overflowCall.response)}`);
+    const overflowAfter = await repositorySnapshot(overflowFixture.root);
+    assert.deepEqual(overflowAfter, overflowBefore, "metadata overflow changed target repository state");
+    console.log("PASS metadata producer overflow: bounded 4 KiB capture failed closed without partial records, source path leakage, or target mutation.");
+
+    const fragmentWorkspace = await openFixture(fragmentOverflowFixture.root, "patch fragment overflow");
+    const fragmentRaw = directMetadata(fragmentOverflowFixture.root, fragmentOverflowFixture.baseSha, fragmentOverflowFixture.headSha);
+    assert.equal(fragmentRaw.records.length, 1, "fragment overflow raw oracle did not establish one changed record");
+    const fragmentBefore = await repositorySnapshot(fragmentOverflowFixture.root);
+    const fragmentCall = await callTool(secondClient, "git_diff_range", {
+      workspace_id: fragmentWorkspace.id,
+      base_ref: fragmentOverflowFixture.baseSha,
+      head_ref: fragmentOverflowFixture.headSha
+    });
+    const fragmentResult = successResult(fragmentCall, "patch fragment overflow");
+    assertPublicRange(fragmentResult.structuredContent, {
+      workspaceId: fragmentWorkspace.id, root: fragmentWorkspace.root, baseRef: fragmentOverflowFixture.baseSha, baseSha: fragmentOverflowFixture.baseSha,
+      headRef: fragmentOverflowFixture.headSha, headSha: fragmentOverflowFixture.headSha, raw: fragmentRaw.records, eligible: fragmentRaw.records,
+      returned: fragmentRaw.records, blocked: 0, patch: "", patchRequested: true, patchLimit: 60_000, patchTruncated: true,
+      patchFilesIncluded: 0, omissionCounts: { binary: 0, blocked: 0, budget: 0, disabled: 0, file_limit: 0, too_large: 1 }
+    }, "patch fragment overflow");
+    assertNoResponseLiterals(fragmentCall, ["large fragment line"], "patch fragment overflow");
+    const fragmentAfter = await repositorySnapshot(fragmentOverflowFixture.root);
+    assert.deepEqual(fragmentAfter, fragmentBefore, "patch fragment overflow changed target repository state");
+    console.log("PASS patch-fragment overflow: complete fragment acquisition exceeded the bounded ceiling, was omitted truthfully, and did not expose partial patch bytes.");
 
     const movingRef = "refs/heads/public-moving-head";
     const movingRefInput = "public-moving-head";
@@ -1301,6 +1770,8 @@ async function main() {
     const resolutionIndex = movingEntries.findIndex((args) => args.includes(movingRefInput + "^{commit}"));
     const diffIndices = movingEntries.map((args, index) => args.includes("diff") ? index : -1).filter((index) => index >= 0);
     assert.ok(resolutionIndex >= 0 && diffIndices.length >= 2 && diffIndices.every((index) => index > resolutionIndex), "moving-ref wrapper did not observe resolution before downstream diff producers");
+    const downstreamEntries = movingEntries.filter((args, index) => index >= resolutionIndex && (index === resolutionIndex || args.includes("diff")));
+    console.log(`RAW_DOWNSTREAM_ARGV: ${serialized({ resolution_index: resolutionIndex, entries: downstreamEntries })}`);
     mustGit(history.root, ["update-ref", movingRef, history.rightSha]);
     const movingAfter = await repositorySnapshot(history.root, history.relevantPaths);
     assert.deepEqual(movingAfter, movingBefore, "public moving-ref call changed history state after restoring deliberate ref mutation");
@@ -1344,6 +1815,7 @@ async function main() {
     assert.deepEqual(matrixFinal, matrixBefore, "public error/boundary calls changed dirty target state");
     const after = await repositorySnapshot(targetRoot);
     assert.deepEqual(after, before, "fresh-session public calls changed target repository state");
+    emitSnapshotEvidence("nested-target-after-public-calls", after);
     console.log("RAW_OBSERVATION: target HEAD/branch, refs, reflogs, index, staged/unstaged/untracked state, relevant bytes, local config/remotes, and worktree registrations matched before/after public calls.");
     console.log("SANITY_VERDICT: MATCH — direct target facts remain physically unchanged and the fresh public result retains target identity rather than default-B identity.");
     console.log("EVIDENCE_CONFLICT: none observed between raw Git target evidence and public MCP result.");

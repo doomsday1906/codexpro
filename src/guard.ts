@@ -6,6 +6,12 @@ import path from "node:path";
 import { minimatch } from "minimatch";
 import type { CodexProConfig } from "./config.js";
 import { expandHome } from "./config.js";
+import {
+  readWorkspaceBinding,
+  saveWorkspaceBinding,
+  WorkspaceBindingError,
+  type WorkspaceBinding
+} from "./profileStore.js";
 
 export interface Workspace {
   id: string;
@@ -40,18 +46,93 @@ function workspaceIdForRoot(realRoot: string): string {
   return `ws_${createHash("sha256").update(realRoot).digest("hex").slice(0, 24)}`;
 }
 
-// Workspace ids are process-scoped identities, while selection remains local to
-// each WorkspaceManager/MCP session. Store only canonical roots here; callers
-// must still pass them through openWorkspace so the current allowed-root and
-// filesystem checks are applied before a workspace is reconstructed.
-const processWorkspaceRoots = new Map<string, string>();
+const WORKSPACE_ID_PATTERN = /^ws_[0-9a-f]{24}$/u;
 
-function rememberWorkspaceRoot(id: string, realRoot: string): void {
-  const existingRoot = processWorkspaceRoots.get(id);
-  if (existingRoot && existingRoot !== realRoot) {
-    throw new CodexProError(`Workspace id collision: ${id} identifies both ${existingRoot} and ${realRoot}.`);
+function isWorkspaceId(id: string): boolean {
+  return WORKSPACE_ID_PATTERN.test(id);
+}
+
+function workspaceIdError(id: string, detail: "unknown" | "invalid" = "unknown"): CodexProError {
+  if (detail === "invalid" || !isWorkspaceId(id)) {
+    return new CodexProError("Unknown workspace_id. Call open_workspace first.");
   }
-  processWorkspaceRoots.set(id, realRoot);
+  return new CodexProError(`Unknown workspace_id: ${id}. Call open_workspace first.`);
+}
+
+function bindingErrorForId(id: string, error: unknown): CodexProError {
+  if (error instanceof WorkspaceBindingError && error.code === "collision") {
+    return new CodexProError(`Workspace id collision: ${id}.`);
+  }
+  if (error instanceof WorkspaceBindingError && error.code === "invalid") {
+    return new CodexProError(`Workspace id binding is invalid: ${id}. Call open_workspace again.`);
+  }
+  return new CodexProError(`Workspace id binding is unavailable: ${id}. Call open_workspace again.`);
+}
+
+function currentAllowedRoot(config: CodexProConfig, realRoot: string): boolean {
+  return config.allowedRoots.some((allowedRoot) => {
+    try {
+      const stat = fs.lstatSync(allowedRoot);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+      const currentAllowedRoot = fs.realpathSync.native(allowedRoot);
+      if (currentAllowedRoot !== allowedRoot) return false;
+      return isSubpath(realRoot, currentAllowedRoot);
+    } catch {
+      return false;
+    }
+  });
+}
+
+function canonicalDirectoryRoot(rootInput: string, options: { rejectSymlink?: boolean } = {}): string {
+  const resolved = path.resolve(rootInput);
+  let stat: fs.Stats;
+  try {
+    const linkStat = fs.lstatSync(resolved);
+    if (options.rejectSymlink && linkStat.isSymbolicLink()) {
+      throw new CodexProError("Workspace identity is stale.");
+    }
+    stat = fs.statSync(resolved);
+  } catch (error) {
+    if (error instanceof CodexProError) throw error;
+    throw new CodexProError("Workspace root is unavailable.");
+  }
+  if (!stat.isDirectory()) throw new CodexProError("Workspace root is not a directory.");
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    throw new CodexProError("Workspace root is unavailable.");
+  }
+}
+
+function validatePersistedRoot(config: CodexProConfig, id: string, binding: WorkspaceBinding): string {
+  const expected = binding.root;
+  let realRoot: string;
+  try {
+    realRoot = canonicalDirectoryRoot(expected, { rejectSymlink: true });
+  } catch {
+    throw new CodexProError(`Workspace id no longer matches its canonical root: ${id}. Call open_workspace again.`);
+  }
+  if (realRoot !== expected || workspaceIdForRoot(realRoot) !== id || !currentAllowedRoot(config, realRoot)) {
+    throw new CodexProError(`Workspace id no longer matches its canonical root: ${id}. Call open_workspace again.`);
+  }
+  return realRoot;
+}
+
+function validateExistingWorkspace(config: CodexProConfig, workspace: Workspace): Workspace {
+  let binding: WorkspaceBinding | undefined;
+  try {
+    binding = readWorkspaceBinding(workspace.id);
+  } catch (error) {
+    throw bindingErrorForId(workspace.id, error);
+  }
+  if (!binding) {
+    throw new CodexProError(`Workspace id binding is unavailable: ${workspace.id}. Call open_workspace again.`);
+  }
+  const realRoot = validatePersistedRoot(config, workspace.id, binding);
+  if (realRoot !== workspace.root) {
+    throw new CodexProError(`Workspace id no longer matches its canonical root: ${workspace.id}. Call open_workspace again.`);
+  }
+  return workspace;
 }
 
 function maybeRealpath(existingPath: string): string | undefined {
@@ -80,7 +161,7 @@ export class WorkspaceManager {
 
   defaultWorkspace(): Workspace {
     const existing = [...this.workspaces.values()].find((workspace) => workspace.root === this.config.defaultRoot);
-    return existing ?? this.openWorkspace(this.config.defaultRoot, { select: false });
+    return existing ? validateExistingWorkspace(this.config, existing) : this.openWorkspace(this.config.defaultRoot, { select: false });
   }
 
   selectDefaultWorkspace(): Workspace {
@@ -99,22 +180,30 @@ export class WorkspaceManager {
     if (!stat.isDirectory()) {
       throw new CodexProError(`Workspace root is not a directory: ${resolved}`);
     }
-    const realRoot = fs.realpathSync.native(resolved);
-    const allowed = this.config.allowedRoots.some((allowedRoot) => isSubpath(realRoot, allowedRoot));
-    if (!allowed) {
+    let realRoot: string;
+    try {
+      realRoot = fs.realpathSync.native(resolved);
+    } catch {
+      throw new CodexProError(`Workspace root does not exist: ${resolved}`);
+    }
+    if (!currentAllowedRoot(this.config, realRoot)) {
       throw new CodexProError(
         `Workspace root is outside allowed roots: ${realRoot}\nAllowed roots:\n${this.config.allowedRoots.map((r) => `- ${r}`).join("\n")}`
       );
     }
 
     const existing = [...this.workspaces.values()].find((workspace) => workspace.root === realRoot);
+    const id = workspaceIdForRoot(realRoot);
+    try {
+      saveWorkspaceBinding(id, realRoot);
+    } catch (error) {
+      throw bindingErrorForId(id, error);
+    }
     if (existing) {
       if (options.select !== false) this.selectedWorkspaceId = existing.id;
       return existing;
     }
 
-    const id = workspaceIdForRoot(realRoot);
-    rememberWorkspaceRoot(id, realRoot);
     const workspace = { id, root: realRoot, openedAt: new Date().toISOString() };
     this.workspaces.set(id, workspace);
     if (options.select !== false) this.selectedWorkspaceId = id;
@@ -125,38 +214,55 @@ export class WorkspaceManager {
     if (!id) {
       if (this.selectedWorkspaceId) {
         const selected = this.workspaces.get(this.selectedWorkspaceId);
-        if (selected) return selected;
+        if (selected) return validateExistingWorkspace(this.config, selected);
       }
       return this.selectDefaultWorkspace();
     }
     const workspace = this.workspaces.get(id);
-    if (!workspace) {
-      const rememberedRoot = processWorkspaceRoots.get(id);
-      if (rememberedRoot) {
-        const reconstructed = this.openWorkspace(rememberedRoot, { select: false });
-        if (reconstructed.id !== id) {
-          throw new CodexProError(`Workspace id no longer matches its canonical root: ${id}. Call open_workspace again.`);
-        }
-        return reconstructed;
-      }
+    if (workspace) {
+      return validateExistingWorkspace(this.config, workspace);
+    }
+    if (!isWorkspaceId(id)) {
+      throw workspaceIdError(id, "invalid");
+    }
 
-      const configuredRoot = this.config.allowedRoots.find((allowedRoot) => workspaceIdForRoot(allowedRoot) === id);
-      if (configuredRoot) {
-        const reconstructed = this.openWorkspace(configuredRoot, { select: false });
-        if (reconstructed.id !== id) {
-          throw new CodexProError(`Workspace id no longer matches its canonical root: ${id}. Call open_workspace again.`);
-        }
-        return reconstructed;
+    let binding: WorkspaceBinding | undefined;
+    try {
+      binding = readWorkspaceBinding(id);
+    } catch (error) {
+      throw bindingErrorForId(id, error);
+    }
+    if (binding) {
+      const realRoot = validatePersistedRoot(this.config, id, binding);
+      const reconstructed = { id, root: realRoot, openedAt: new Date().toISOString() };
+      this.workspaces.set(id, reconstructed);
+      return reconstructed;
+    }
+
+    // Preserve the historical convenience where a configured allowed root can
+    // be addressed by its deterministic id before any prior session opened it.
+    // Nested roots use the persisted binding above; this path never scans the
+    // filesystem or widens the configured allowed-root set.
+    const configuredRoot = this.config.allowedRoots.find((allowedRoot) => workspaceIdForRoot(allowedRoot) === id);
+    if (configuredRoot) {
+      const reconstructed = this.openWorkspace(configuredRoot, { select: false });
+      if (reconstructed.id !== id) {
+        throw new CodexProError(`Workspace id no longer matches its canonical root: ${id}. Call open_workspace again.`);
       }
+      return reconstructed;
     }
-    if (!workspace) {
-      throw new CodexProError(`Unknown workspace_id: ${id}. Call open_workspace first.`);
-    }
-    return workspace;
+    throw workspaceIdError(id);
   }
 
   listWorkspaces(): Workspace[] {
-    return [...this.workspaces.values()];
+    return [...this.workspaces.values()].filter((workspace) => {
+      try {
+        validateExistingWorkspace(this.config, workspace);
+        return true;
+      } catch {
+        return false;
+      }
+    });
   }
 
   currentWorkspaceId(): string {

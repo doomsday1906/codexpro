@@ -1,7 +1,11 @@
+import { randomBytes } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
-import { CodexProError, PathGuard } from "./guard.js";
+import { CodexProError, isSubpath, PathGuard } from "./guard.js";
 import { redactDiagnosticText, redactSensitiveText, redactUnifiedDiff, sourceLanguageForPath, type SourceLanguage } from "./redact.js";
 
 export interface GitExecutionResultSummary {
@@ -94,8 +98,22 @@ export class GitExecutionError extends CodexProError {
 }
 
 const GIT_REVIEWER_GLOBAL_ARGS = ["--no-replace-objects", "--no-pager", "-c", "color.ui=false"] as const;
+const GIT_ISOLATION_MARKER = ".codexpro-git-isolation.json";
+const GIT_ISOLATION_MARKER_KIND = "codexpro-git-isolation";
+const GIT_ISOLATION_VERSION = 1;
+const GIT_MIN_ATTR_SOURCE_MAJOR = 2;
+const GIT_MIN_ATTR_SOURCE_MINOR = 41;
+const GIT_NULL_CONFIG_PATH = process.platform === "win32" ? "NUL" : "/dev/null";
 
-function gitReviewerEnvironment(): NodeJS.ProcessEnv {
+export interface GitReadOnlyOptions {
+  readonly stdoutMaxBytes?: number;
+  /** Controlled environment additions used by the private bare context. */
+  readonly environment?: NodeJS.ProcessEnv;
+  /** Controlled global arguments placed before the Git subcommand. */
+  readonly globalArgs?: readonly string[];
+}
+
+function gitReviewerEnvironment(overrides?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // Git has a large and growing environment surface for repository routing,
   // object lookup, shallow history, pathspec behavior, tracing, credentials,
   // and external helpers. Preserve PATH and other non-Git process essentials,
@@ -110,11 +128,20 @@ function gitReviewerEnvironment(): NodeJS.ProcessEnv {
     GIT_OPTIONAL_LOCKS: "0",
     GIT_TERMINAL_PROMPT: "0",
     GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: GIT_NULL_CONFIG_PATH,
+    GIT_CONFIG_SYSTEM: GIT_NULL_CONFIG_PATH,
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_ATTR_GLOBAL: GIT_NULL_CONFIG_PATH,
+    GIT_ATTR_SYSTEM: GIT_NULL_CONFIG_PATH,
     GIT_PAGER: "cat",
     NO_COLOR: "1",
     LC_ALL: "C",
     LANG: "C"
   });
+  for (const [key, value] of Object.entries(overrides ?? {})) {
+    if (value === undefined) delete environment[key];
+    else environment[key] = value;
+  }
   return environment;
 }
 
@@ -194,7 +221,7 @@ export async function runGitReadOnly(
     Partial<Pick<CodexProConfig, "maxReadBytes">>,
   workspace: Workspace,
   args: readonly string[],
-  options?: { readonly stdoutMaxBytes?: number }
+  options?: GitReadOnlyOptions
 ): Promise<GitExecutionResult> {
   const maxOutputBytes = Number.isFinite(config.maxOutputBytes) ? Math.max(1, Math.floor(config.maxOutputBytes)) : 1;
   const maxReadBytes = Number.isFinite(config.maxReadBytes) ? Math.max(0, Math.floor(config.maxReadBytes as number)) : undefined;
@@ -205,11 +232,12 @@ export async function runGitReadOnly(
     : 60_000;
   const stdout = new BoundedGitOutput(stdoutMaxBytes);
   const stderr = new BoundedGitOutput(maxOutputBytes);
+  const globalArgs = [...GIT_REVIEWER_GLOBAL_ARGS, ...(options?.globalArgs ?? [])];
 
   return new Promise((resolve, reject) => {
-    const child = spawn("git", [...GIT_REVIEWER_GLOBAL_ARGS, ...args], {
+    const child = spawn("git", [...globalArgs, ...args], {
       cwd: workspace.root,
-      env: gitReviewerEnvironment(),
+      env: gitReviewerEnvironment(options?.environment),
       stdio: ["ignore", "pipe", "pipe"],
       shell: false,
       detached: process.platform !== "win32",
@@ -270,6 +298,320 @@ export async function runGitReadOnly(
       }
     });
   });
+}
+
+interface GitRepositoryLayout {
+  readonly commonGitDir: string;
+  readonly objectDir: string;
+}
+
+interface GitIsolationMarker {
+  readonly kind: typeof GIT_ISOLATION_MARKER_KIND;
+  readonly version: typeof GIT_ISOLATION_VERSION;
+  readonly token: string;
+}
+
+export interface GitReadOnlyContext {
+  readonly workspace: Workspace;
+  readonly environment: NodeJS.ProcessEnv;
+  /** Global Git options, including the captured head attribute source. */
+  readonly globalArgs: readonly string[];
+  /** Empty order file used by every direct two-tree diff producer. */
+  readonly orderFile: string;
+  cleanup(): Promise<void>;
+}
+
+function isDirectoryStat(stat: import("node:fs").Stats | undefined): boolean {
+  return stat?.isDirectory() === true;
+}
+
+async function statOrUndefined(filePath: string): Promise<import("node:fs").Stats | undefined> {
+  try {
+    return await fsp.stat(filePath);
+  } catch {
+    return undefined;
+  }
+}
+
+async function commonGitDirFromWorktreeGitDir(gitDir: string): Promise<string> {
+  const commondirPath = path.join(gitDir, "commondir");
+  const commondirStat = await statOrUndefined(commondirPath);
+  if (!commondirStat?.isFile()) return fsp.realpath(gitDir);
+  const content = (await fsp.readFile(commondirPath, "utf8")).trim();
+  if (!content || /[\u0000\r\n]/u.test(content)) throw new Error("invalid Git common-dir metadata");
+  return fsp.realpath(path.resolve(gitDir, content));
+}
+
+async function gitDirFromDotGit(dotGitPath: string): Promise<string | undefined> {
+  const stat = await statOrUndefined(dotGitPath);
+  if (!stat) return undefined;
+  if (stat.isDirectory()) return commonGitDirFromWorktreeGitDir(await fsp.realpath(dotGitPath));
+  if (!stat.isFile()) return undefined;
+
+  const content = await fsp.readFile(dotGitPath, "utf8");
+  const match = /^gitdir:\s*(\S(?:.*\S)?)\s*$/mu.exec(content);
+  if (!match) throw new Error("invalid Git directory pointer");
+  const gitDir = await fsp.realpath(path.resolve(path.dirname(dotGitPath), match[1]));
+  return commonGitDirFromWorktreeGitDir(gitDir);
+}
+
+async function isBareGitDir(candidate: string): Promise<boolean> {
+  const [head, config, objects] = await Promise.all([
+    statOrUndefined(path.join(candidate, "HEAD")),
+    statOrUndefined(path.join(candidate, "config")),
+    statOrUndefined(path.join(candidate, "objects"))
+  ]);
+  return Boolean(head?.isFile() && config?.isFile() && isDirectoryStat(objects));
+}
+
+async function locateGitRepositoryLayout(workspace: Workspace): Promise<GitRepositoryLayout> {
+  let current = await fsp.realpath(workspace.root);
+  while (true) {
+    const dotGitPath = path.join(current, ".git");
+    const dotGitStat = await statOrUndefined(dotGitPath);
+    let commonGitDir: string | undefined;
+    if (dotGitStat) {
+      commonGitDir = await gitDirFromDotGit(dotGitPath);
+    } else if (await isBareGitDir(current)) {
+      commonGitDir = current;
+    }
+    if (commonGitDir !== undefined) {
+      const objectDir = path.join(commonGitDir, "objects");
+      const objectStat = await statOrUndefined(objectDir);
+      if (!isDirectoryStat(objectStat)) throw new Error("Git object database is unavailable");
+      return { commonGitDir, objectDir: await fsp.realpath(objectDir) };
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  throw new Error("Git repository is unavailable");
+}
+
+function parseGitVersion(stdout: string): { readonly major: number; readonly minor: number; readonly patch: number } | undefined {
+  const match = /^git version (\d+)\.(\d+)(?:\.(\d+))?/mu.exec(stdout.trim());
+  if (!match) return undefined;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3] ?? 0)
+  };
+}
+
+function supportsAttrSource(version: { readonly major: number; readonly minor: number }): boolean {
+  return version.major > GIT_MIN_ATTR_SOURCE_MAJOR
+    || (version.major === GIT_MIN_ATTR_SOURCE_MAJOR && version.minor >= GIT_MIN_ATTR_SOURCE_MINOR);
+}
+
+function fullObjectId(value: string, objectFormat: "sha1" | "sha256"): boolean {
+  const length = objectFormat === "sha1" ? 40 : 64;
+  return value.length === length && new RegExp(`^[0-9a-f]{${length}}$`, "u").test(value);
+}
+
+function encodeGitAlternatePath(value: string): string {
+  // GIT_ALTERNATE_OBJECT_DIRECTORIES uses Git's C-style quoted path syntax,
+  // not a plain platform path list. Quote every path so spaces, colons, and
+  // backslashes cannot alter the object-directory boundary.
+  let encoded = '"';
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (character === '"') encoded += '\\\"';
+    else if (character === "\\") encoded += "\\\\";
+    else if (codePoint < 0x20 || codePoint === 0x7f) encoded += `\\${codePoint.toString(8).padStart(3, "0")}`;
+    else encoded += character;
+  }
+  return `${encoded}"`;
+}
+
+async function writeEmptyFile(filePath: string): Promise<void> {
+  await fsp.writeFile(filePath, "", { encoding: "utf8", mode: 0o600 });
+}
+
+async function safeGitIsolationCleanup(root: string, token: string): Promise<void> {
+  if (!path.basename(root).startsWith("codexpro-git-range-")) {
+    throw new CodexProError("Git reviewer isolation cleanup was not authorized.");
+  }
+  const markerPath = path.join(root, GIT_ISOLATION_MARKER);
+  let marker: GitIsolationMarker;
+  try {
+    const parsed = JSON.parse(await fsp.readFile(markerPath, "utf8")) as Partial<GitIsolationMarker>;
+    if (parsed.kind !== GIT_ISOLATION_MARKER_KIND || parsed.version !== GIT_ISOLATION_VERSION || parsed.token !== token) {
+      throw new Error("Git isolation marker mismatch");
+    }
+    marker = parsed as GitIsolationMarker;
+  } catch {
+    throw new CodexProError("Git reviewer isolation cleanup was not authorized.");
+  }
+  void marker;
+
+  let stat: import("node:fs").Stats;
+  try {
+    stat = await fsp.lstat(root);
+  } catch {
+    return;
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new CodexProError("Git reviewer isolation cleanup was not authorized.");
+  }
+  try {
+    await fsp.rm(root, { recursive: true, force: true });
+  } catch {
+    throw new CodexProError("Git reviewer isolation cleanup failed.");
+  }
+}
+
+/**
+ * Build a disposable bare repository used only for direct two-tree reads.
+ * The target checkout contributes its canonical object database through a
+ * read-only alternate; refs, index, worktree, and info attributes are never
+ * copied into the context.
+ */
+export async function createGitReadOnlyContext(
+  config: Pick<CodexProConfig, "maxGitTimeoutMs" | "maxOutputBytes"> & Partial<Pick<CodexProConfig, "maxReadBytes">>,
+  workspace: Workspace,
+  objectFormat: "sha1" | "sha256",
+  attrSource: string
+): Promise<GitReadOnlyContext> {
+  if (!fullObjectId(attrSource, objectFormat)) throw new CodexProError("Git reviewer attribute source is invalid.");
+
+  let versionResult: GitExecutionResult;
+  try {
+    versionResult = await runGitReadOnly(config, workspace, ["--version"]);
+  } catch {
+    throw new CodexProError("Git reviewer attribute source support is unavailable.");
+  }
+  const version = parseGitVersion(versionResult.stdout);
+  if (!version || !supportsAttrSource(version)) {
+    throw new CodexProError("Git reviewer attribute source support is unavailable.");
+  }
+
+  let layout: GitRepositoryLayout;
+  try {
+    layout = await locateGitRepositoryLayout(workspace);
+  } catch {
+    throw new CodexProError("Git reviewer repository isolation is unavailable.");
+  }
+
+  let tempBase: string;
+  let targetRoot: string;
+  try {
+    tempBase = await fsp.realpath(path.resolve(os.tmpdir()));
+    targetRoot = await fsp.realpath(workspace.root);
+  } catch {
+    throw new CodexProError("Git reviewer isolation directory is unavailable.");
+  }
+  if (isSubpath(tempBase, targetRoot)) {
+    throw new CodexProError("Git reviewer isolation directory is not outside the target repository.");
+  }
+
+  let root: string;
+  try {
+    root = await fsp.mkdtemp(path.join(tempBase, "codexpro-git-range-"));
+  } catch {
+    throw new CodexProError("Git reviewer isolation directory is unavailable.");
+  }
+  let markerWritten = false;
+  const token = randomBytes(16).toString("hex");
+  const marker: GitIsolationMarker = {
+    kind: GIT_ISOLATION_MARKER_KIND,
+    version: GIT_ISOLATION_VERSION,
+    token
+  };
+  try {
+    const canonicalRoot = await fsp.realpath(root);
+    await fsp.writeFile(path.join(root, GIT_ISOLATION_MARKER), `${JSON.stringify(marker)}\n`, { encoding: "utf8", mode: 0o600 });
+    markerWritten = true;
+    if (isSubpath(canonicalRoot, targetRoot)) throw new CodexProError("Git reviewer isolation directory is not outside the target repository.");
+
+    const home = path.join(root, "home");
+    const xdg = path.join(root, "xdg");
+    const template = path.join(root, "template");
+    const globalConfig = path.join(root, "global.gitconfig");
+    const systemConfig = path.join(root, "system.gitconfig");
+    const globalAttributes = path.join(root, "global.attributes");
+    const systemAttributes = path.join(root, "system.attributes");
+    const orderFile = path.join(root, "empty.order");
+    await Promise.all([
+      fsp.mkdir(home, { recursive: true, mode: 0o700 }),
+      fsp.mkdir(xdg, { recursive: true, mode: 0o700 }),
+      fsp.mkdir(template, { recursive: true, mode: 0o700 }),
+      writeEmptyFile(globalConfig),
+      writeEmptyFile(systemConfig),
+      writeEmptyFile(globalAttributes),
+      writeEmptyFile(systemAttributes),
+      writeEmptyFile(orderFile)
+    ]);
+
+    const contextParent = path.dirname(root);
+    const initEnvironment = gitReviewerEnvironment({
+      HOME: home,
+      XDG_CONFIG_HOME: xdg,
+      GIT_TEMPLATE_DIR: template,
+      GIT_CONFIG_GLOBAL: globalConfig,
+      GIT_CONFIG_SYSTEM: systemConfig,
+      GIT_ATTR_GLOBAL: globalAttributes,
+      GIT_ATTR_SYSTEM: systemAttributes
+    });
+    const initWorkspace: Workspace = {
+      id: `${workspace.id}:git-init`,
+      root: contextParent,
+      openedAt: new Date().toISOString()
+    };
+    await runGitReadOnly(
+      config,
+      initWorkspace,
+      ["init", "--bare", `--object-format=${objectFormat}`, root],
+      { environment: initEnvironment }
+    );
+
+    const environment = gitReviewerEnvironment({
+      HOME: home,
+      XDG_CONFIG_HOME: xdg,
+      GIT_TEMPLATE_DIR: template,
+      GIT_CONFIG_GLOBAL: globalConfig,
+      GIT_CONFIG_SYSTEM: systemConfig,
+      GIT_ATTR_GLOBAL: globalAttributes,
+      GIT_ATTR_SYSTEM: systemAttributes,
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: encodeGitAlternatePath(layout.objectDir),
+      GIT_ATTR_SOURCE: attrSource
+    });
+    const globalArgs = [
+      `--attr-source=${attrSource}`,
+      "-c", "core.quotePath=true",
+      "-c", `core.attributesFile=${globalAttributes}`,
+      "-c", "core.autocrlf=false",
+      "-c", "diff.algorithm=myers",
+      "-c", "diff.indentHeuristic=false",
+      "-c", "diff.renames=true",
+      "-c", "diff.renameLimit=1000",
+      "-c", "diff.external=",
+      "-c", "diff.trustExitCode=false",
+      "-c", "diff.relative=false",
+      "-c", "diff.submodule=short"
+    ] as const;
+    const contextWorkspace: Workspace = {
+      id: `${workspace.id}:git-context:${token.slice(0, 12)}`,
+      root,
+      openedAt: new Date().toISOString()
+    };
+    let cleaned = false;
+    return {
+      workspace: contextWorkspace,
+      environment,
+      globalArgs,
+      orderFile,
+      async cleanup(): Promise<void> {
+        if (cleaned) return;
+        cleaned = true;
+        await safeGitIsolationCleanup(root, token);
+      }
+    };
+  } catch (error) {
+    if (markerWritten) await safeGitIsolationCleanup(root, token).catch(() => undefined);
+    if (error instanceof CodexProError && !(error instanceof GitExecutionError)) throw error;
+    throw new CodexProError("Git reviewer repository isolation failed.");
+  }
 }
 
 function stdoutLimit(
