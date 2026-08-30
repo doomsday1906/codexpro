@@ -17,6 +17,7 @@ import { gitDiff, gitDiffStatus, gitLog, gitStatus } from "./gitOps.js";
 import { gitDiffRange } from "./gitDiffRange.js";
 import { gitLogStructured, gitMergeBase, gitResolveRef, gitShowCommit } from "./gitHistoryOps.js";
 import { readAtRef } from "./gitHistoricalBlob.js";
+import { GIT_COMMIT_MAX_MESSAGE_BYTES, GIT_COMMIT_MAX_PATH_BYTES, GIT_COMMIT_MAX_PATHS, gitCommit } from "./gitCommit.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
@@ -226,6 +227,97 @@ const GIT_DIFF_RANGE_TRANSPORT_SCHEMA = z.object({
 const GIT_DIFF_RANGE_PUBLIC_SCHEMA = z.object(GIT_DIFF_RANGE_ARGUMENTS_SCHEMA.shape).strict();
 GIT_DIFF_RANGE_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_DIFF_RANGE_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_DIFF_RANGE_PUBLIC_SCHEMA.safeParse;
 GIT_DIFF_RANGE_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_DIFF_RANGE_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_DIFF_RANGE_PUBLIC_SCHEMA.safeParseAsync;
+
+const GIT_COMMIT_PATH_SCHEMA = z.string()
+  .min(1)
+  .max(GIT_COMMIT_MAX_PATH_BYTES)
+  .refine(
+    (value) => Buffer.byteLength(value, "utf8") <= GIT_COMMIT_MAX_PATH_BYTES,
+    `path must be at most ${GIT_COMMIT_MAX_PATH_BYTES} UTF-8 bytes.`
+  );
+
+const GIT_COMMIT_ARGUMENTS_SCHEMA = z.object({
+  workspace_id: REVIEW_WORKSPACE_ID_SCHEMA,
+  paths: z.array(GIT_COMMIT_PATH_SCHEMA)
+    .min(1)
+    .max(GIT_COMMIT_MAX_PATHS)
+    .describe(`One to ${GIT_COMMIT_MAX_PATHS} explicit repository-relative file or symlink identities.`),
+  message: z.string()
+    .min(1)
+    .max(GIT_COMMIT_MAX_MESSAGE_BYTES)
+    .refine(
+      (value) => Buffer.byteLength(value, "utf8") <= GIT_COMMIT_MAX_MESSAGE_BYTES,
+      `message must be at most ${GIT_COMMIT_MAX_MESSAGE_BYTES} UTF-8 bytes.`
+    )
+    .refine((value) => value.trim().length > 0, "message must not be empty.")
+    .refine((value) => !value.includes("\u0000"), "message must not contain NUL."),
+  expected_head: z.string()
+    .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu, "expected_head must be a full commit SHA.")
+    .describe("Exact full current commit SHA; ref names and abbreviated SHAs are rejected.")
+}).strict();
+
+const GIT_COMMIT_FIELD_NAMES = new Set(["workspace_id", "paths", "message", "expected_head"]);
+
+function boundedGitCommitValidationError(issues: readonly z.ZodIssue[]): z.ZodError {
+  const safeIssues: z.ZodIssue[] = [];
+  const seenMessages = new Set<string>();
+  for (const issue of issues) {
+    if (issue.code === "unrecognized_keys") {
+      if (!seenMessages.has("Unknown keys are not allowed.")) {
+        safeIssues.push({ code: "custom", path: [], message: "Unknown keys are not allowed." });
+        seenMessages.add("Unknown keys are not allowed.");
+      }
+      continue;
+    }
+
+    const field = issue.path.length > 0 && typeof issue.path[0] === "string" && GIT_COMMIT_FIELD_NAMES.has(issue.path[0])
+      ? issue.path[0]
+      : undefined;
+    const message = field === "workspace_id" && issue.code === "invalid_type" && issue.received === "undefined"
+      ? "Workspace id is required."
+      : field
+        ? "Invalid value."
+        : "Schema constraints were not satisfied.";
+    const path = field ? [field] : [];
+    const key = `${path.join(".")}:${message}`;
+    if (seenMessages.has(key)) continue;
+    seenMessages.add(key);
+    safeIssues.push({ code: "custom", path, message });
+  }
+
+  if (safeIssues.length === 0) {
+    safeIssues.push({ code: "custom", path: [], message: "Schema constraints were not satisfied." });
+  }
+  return new z.ZodError(safeIssues);
+}
+
+// The SDK uses the published Zod object for both tools/list conversion and
+// transport-level tools/call validation. Keep this boundary permissive so
+// hostile unknown key names/values never enter an SDK-generated error; the
+// strict runtime schema above remains the source of truth in the handler.
+const GIT_COMMIT_TRANSPORT_SCHEMA = z.object({
+  workspace_id: z.unknown().optional(),
+  paths: z.unknown().optional(),
+  message: z.unknown().optional(),
+  expected_head: z.unknown().optional()
+}).passthrough();
+const GIT_COMMIT_PUBLIC_SCHEMA = z.object(GIT_COMMIT_ARGUMENTS_SCHEMA.shape).strict();
+const rawGitCommitSafeParse = GIT_COMMIT_ARGUMENTS_SCHEMA.safeParse.bind(GIT_COMMIT_ARGUMENTS_SCHEMA);
+GIT_COMMIT_ARGUMENTS_SCHEMA.safeParse = ((args: unknown) => {
+  const parsed = rawGitCommitSafeParse(args);
+  return parsed.success
+    ? parsed
+    : { success: false, error: boundedGitCommitValidationError(parsed.error.issues) };
+}) as typeof GIT_COMMIT_ARGUMENTS_SCHEMA.safeParse;
+const rawGitCommitSafeParseAsync = GIT_COMMIT_ARGUMENTS_SCHEMA.safeParseAsync.bind(GIT_COMMIT_ARGUMENTS_SCHEMA);
+GIT_COMMIT_ARGUMENTS_SCHEMA.safeParseAsync = (async (args: unknown) => {
+  const parsed = await rawGitCommitSafeParseAsync(args);
+  return parsed.success
+    ? parsed
+    : { success: false, error: boundedGitCommitValidationError(parsed.error.issues) };
+}) as typeof GIT_COMMIT_ARGUMENTS_SCHEMA.safeParseAsync;
+GIT_COMMIT_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_COMMIT_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_COMMIT_PUBLIC_SCHEMA.safeParse;
+GIT_COMMIT_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_COMMIT_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_COMMIT_PUBLIC_SCHEMA.safeParseAsync;
 
 const READ_AT_REF_TRANSPORT_SCHEMA = z.object({
   workspace_id: z.unknown().optional(),
@@ -962,6 +1054,7 @@ const FULL_TOOL_NAMES = [
   "git_show_commit",
   "read_at_ref",
   "git_diff_range",
+  "git_commit",
   "git_status",
   "git_diff",
   "show_changes",
@@ -980,6 +1073,7 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "edit",
   "apply_patch",
   "import_file",
+  "git_commit",
   "bash",
   "export_pro_context",
   "handoff_to_agent",
@@ -1005,7 +1099,7 @@ function toolNamesForMode(config: CodexProConfig): string[] {
     if (bashIndex !== -1) names.splice(bashIndex, 1);
   }
   if (config.writeMode !== "workspace") {
-    for (const writeTool of ["write", "edit", "apply_patch", "import_file"]) {
+    for (const writeTool of ["write", "edit", "apply_patch", "import_file", "git_commit"]) {
       const toolIndex = names.indexOf(writeTool);
       if (toolIndex !== -1) names.splice(toolIndex, 1);
     }
@@ -1046,6 +1140,7 @@ function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
   if (config.connectionTest && CONNECTION_TEST_HIDDEN_TOOLS.has(name)) return false;
   if (name === "bash" && config.bashMode === "off") return false;
   if ((name === "write" || name === "edit" || name === "apply_patch" || name === "import_file") && config.writeMode !== "workspace") return false;
+  if (name === "git_commit" && (config.toolMode !== "full" || config.writeMode !== "workspace")) return false;
   if (name === "codex_sessions") return config.codexSessions !== "off";
   if (name === "read_codex_session") return config.codexSessions === "read";
   if (name === "inspect_workspace" && !config.analysisEnabled) return false;
@@ -1088,7 +1183,7 @@ function serverInstructions(config: CodexProConfig): string {
     "",
     "Preferred workflow:",
     "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects; session-selected workspace is reliable only when the client preserves the same MCP session.",
-    "2. For correctness-sensitive Git tools (git_resolve_ref, git_merge_base, git_log, git_show_commit, read_at_ref, git_diff_range), always pass the explicit workspace_id returned by open_current_workspace/open_workspace.",
+    "2. For correctness-sensitive Git tools (git_commit, git_resolve_ref, git_merge_base, git_log, git_show_commit, read_at_ref, git_diff_range), always pass the explicit workspace_id returned by open_current_workspace/open_workspace.",
     "3. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
     "4. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
     editInstruction,
@@ -1863,6 +1958,7 @@ async function writeAgentHandoff(
 const READ_ONLY_ANNOTATIONS = { readOnlyHint: true, openWorldHint: false, destructiveHint: false };
 const SESSION_READ_ANNOTATIONS = { readOnlyHint: true, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 const LOCAL_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false };
+const GIT_COMMIT_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false };
 const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
 const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 
@@ -3218,6 +3314,37 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       });
       const text = bashTextResult(config, result);
       return diagnosticTextResult(text, { workspace_id: workspace.id, root: workspace.root, ...result, bash_session_id: result.bashSessionId ?? null });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "git_commit",
+    {
+      title: "Git Commit",
+      description: `Create one ordinary local commit for exactly the named file or symlink identities in an explicitly supplied workspace, only when expected_head is the exact current full commit SHA. Unrelated staged, unstaged, and untracked work is preserved; hooks and configured Git policy remain enabled; no remote operations are performed. Available only in full tool mode with CODEXPRO_WRITE_MODE=workspace.`,
+      inputSchema: GIT_COMMIT_PUBLIC_SCHEMA,
+      runtimeInputSchema: GIT_COMMIT_ARGUMENTS_SCHEMA,
+      annotations: GIT_COMMIT_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Creating local Git commit...",
+        "openai/toolInvocation/invoked": "Local Git commit created"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await gitCommit(config, guard, workspace, args);
+      const text = [
+        "# Git Commit",
+        "",
+        `Workspace: ${result.root}`,
+        `Branch: ${result.branch}`,
+        `Old HEAD: ${result.old_head}`,
+        `New HEAD: ${result.new_head}`,
+        `Paths committed: ${result.committed_path_count}/${result.requested_path_count}`
+      ].join("\n");
+      return textResult(text, { ...result });
     }
   );
 
