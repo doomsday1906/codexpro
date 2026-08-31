@@ -6,7 +6,13 @@ import { spawnSync } from "node:child_process";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { CodexProConfig } from "./config.js";
-import { WorkspaceManager, PathGuard, CodexProError, type Workspace } from "./guard.js";
+import {
+  WorkspaceManager,
+  PathGuard,
+  CodexProError,
+  type Workspace,
+  type WorkspaceDiagnosticReader
+} from "./guard.js";
 import { processIsAlive, readRuntimeConnection, readRuntimeFailure } from "./profileStore.js";
 import { repoTree, readPublicTextFile, readTextFile, writeTextFile, editTextFile, ensureAiBridge, withFileWriteLocks, type ReadFileResult } from "./fsOps.js";
 import { viewWorkspaceImage } from "./imageOps.js";
@@ -2077,7 +2083,18 @@ function runtimeStatusPayload(config: CodexProConfig): Record<string, unknown> {
 
 export interface CodexProServerOptions {
   readonly diagnosticContext?: CodexProDiagnosticContext;
+  /** Internal observer for the read-only workspace state of this server/session. */
+  readonly onWorkspaceDiagnosticReader?: (reader: Readonly<WorkspaceDiagnosticReader>) => void;
 }
+
+export type {
+  WorkspaceDiagnosticClassification,
+  WorkspaceDiagnosticDescriptor,
+  WorkspaceDiagnosticProcessKnownCounts,
+  WorkspaceDiagnosticReader,
+  WorkspaceDiagnosticRequestedWorkspace,
+  WorkspaceDiagnosticSnapshot
+} from "./guard.js";
 
 export function createCodexProServer(config: CodexProConfig, options: CodexProServerOptions = {}): McpServer {
   const workspaces = new WorkspaceManager(config);
@@ -2085,6 +2102,10 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
   const guard = new PathGuard(config);
   const readAtRefSchemas = readAtRefPublicSchemas(config.maxReadBytes);
   const diagnosticContext = options.diagnosticContext ?? createDiagnosticContext({ transportKind: "stdio" });
+  const workspaceDiagnosticReader: WorkspaceDiagnosticReader = Object.freeze({
+    getSnapshot: (workspaceId?: string) => workspaces.diagnosticSnapshot(workspaceId)
+  });
+  options.onWorkspaceDiagnosticReader?.(workspaceDiagnosticReader);
   const server = new McpServer({ name: "CodexPro", version: "0.30.0" }, { instructions: serverInstructions(config) });
   registeredToolNamesByServer.set(server as object, []);
   registerToolCardResource(server, config);

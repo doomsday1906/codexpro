@@ -13,6 +13,56 @@ export interface Workspace {
   openedAt: string;
 }
 
+/**
+ * The bounded truth classes exposed by the read-only workspace diagnostic
+ * path. These describe where an exact id can currently be resolved from;
+ * they do not create or register a workspace.
+ */
+export type WorkspaceDiagnosticClassification =
+  | "selected_session_workspace"
+  | "session_opened"
+  | "process_known_reconstructible"
+  | "configured_allowed_root_reconstructible"
+  | "stale_or_revoked"
+  | "unknown_or_invalid";
+
+export interface WorkspaceDiagnosticDescriptor {
+  readonly id: string;
+  readonly root: string;
+  readonly openedAt: string | null;
+}
+
+export interface WorkspaceDiagnosticProcessKnownCounts {
+  readonly valid: number;
+  readonly stale: number;
+}
+
+export interface WorkspaceDiagnosticRequestedWorkspace {
+  readonly id: string;
+  readonly classification: WorkspaceDiagnosticClassification;
+  /** A root is returned only for an explicitly requested id that validates. */
+  readonly root: string | null;
+}
+
+export interface WorkspaceDiagnosticSnapshot {
+  /** The configured default is descriptive only; it is never selected here. */
+  readonly configuredDefault: WorkspaceDiagnosticDescriptor | null;
+  readonly selected: WorkspaceDiagnosticDescriptor | null;
+  /** Only this manager's currently valid opened/reconstructed entries. */
+  readonly sessionOpened: readonly WorkspaceDiagnosticDescriptor[];
+  /** Process registry counts are aggregate-only; no other-session ids/roots. */
+  readonly processKnown: WorkspaceDiagnosticProcessKnownCounts;
+  readonly requestedWorkspace?: WorkspaceDiagnosticRequestedWorkspace;
+}
+
+/**
+ * Minimal internal observation seam for real server/session tests. The
+ * manager itself and its mutable maps are intentionally not exposed.
+ */
+export interface WorkspaceDiagnosticReader {
+  readonly getSnapshot: (workspaceId?: string) => WorkspaceDiagnosticSnapshot;
+}
+
 export class CodexProError extends Error {
   constructor(message: string) {
     super(message);
@@ -41,6 +91,7 @@ function workspaceIdForRoot(realRoot: string): string {
 }
 
 const WORKSPACE_ID_PATTERN = /^ws_[0-9a-f]{24}$/u;
+const DIAGNOSTIC_WORKSPACE_ID_MAX_CHARS = 128;
 
 function isWorkspaceId(id: string): boolean {
   return WORKSPACE_ID_PATTERN.test(id);
@@ -126,6 +177,44 @@ function validateExistingWorkspace(config: CodexProConfig, workspace: Workspace)
     throw new CodexProError(`Workspace id no longer matches its canonical root: ${workspace.id}. Call open_workspace again.`);
   }
   return workspace;
+}
+
+function diagnosticDescriptor(workspace: Workspace, openedAt: string | null = workspace.openedAt): WorkspaceDiagnosticDescriptor {
+  return Object.freeze({
+    id: workspace.id,
+    root: workspace.root,
+    openedAt
+  });
+}
+
+function diagnosticRootDescriptor(id: string, root: string): WorkspaceDiagnosticDescriptor {
+  return Object.freeze({ id, root, openedAt: null });
+}
+
+function validateConfiguredWorkspaceRoot(config: CodexProConfig, id: string, configuredRoot: string): string {
+  let realRoot: string;
+  try {
+    realRoot = canonicalDirectoryRoot(configuredRoot, { rejectSymlink: true });
+  } catch {
+    throw new CodexProError(`Workspace id no longer matches its configured canonical root: ${id}. Call open_workspace again.`);
+  }
+  if (realRoot !== configuredRoot || workspaceIdForRoot(realRoot) !== id || !currentAllowedRoot(config, realRoot)) {
+    throw new CodexProError(`Workspace id no longer matches its configured canonical root: ${id}. Call open_workspace again.`);
+  }
+  return realRoot;
+}
+
+function validRememberedRoot(config: CodexProConfig, id: string, rememberedRoot: string): string | undefined {
+  try {
+    return validateRememberedRoot(config, id, rememberedRoot);
+  } catch {
+    return undefined;
+  }
+}
+
+function validSessionWorkspace(config: CodexProConfig, workspace: Workspace): boolean {
+  const rememberedRoot = processWorkspaceRoots.get(workspace.id);
+  return rememberedRoot !== undefined && validRememberedRoot(config, workspace.id, rememberedRoot) === workspace.root;
 }
 
 function maybeRealpath(existingPath: string): string | undefined {
@@ -248,6 +337,100 @@ export class WorkspaceManager {
         return false;
       }
     });
+  }
+
+  /**
+   * Read the workspace state already held by this manager and the process
+   * registry without selecting, opening, reconstructing, or remembering
+   * anything. Filesystem/allowed-root checks are deliberately read-only.
+   */
+  diagnosticSnapshot(workspaceId?: string): WorkspaceDiagnosticSnapshot {
+    const configuredDefault = this.readConfiguredDefaultDiagnostic();
+    const selectedWorkspace = this.selectedWorkspaceId
+      ? this.workspaces.get(this.selectedWorkspaceId)
+      : undefined;
+    const selected = selectedWorkspace && validSessionWorkspace(this.config, selectedWorkspace)
+      ? diagnosticDescriptor(selectedWorkspace)
+      : null;
+
+    const sessionOpened: WorkspaceDiagnosticDescriptor[] = [];
+    for (const workspace of this.workspaces.values()) {
+      if (!validSessionWorkspace(this.config, workspace)) continue;
+      sessionOpened.push(diagnosticDescriptor(workspace));
+    }
+
+    let validProcessKnown = 0;
+    let staleProcessKnown = 0;
+    for (const [id, rememberedRoot] of processWorkspaceRoots) {
+      if (validRememberedRoot(this.config, id, rememberedRoot)) validProcessKnown += 1;
+      else staleProcessKnown += 1;
+    }
+
+    const snapshot: WorkspaceDiagnosticSnapshot = {
+      configuredDefault,
+      selected,
+      sessionOpened: Object.freeze(sessionOpened),
+      processKnown: Object.freeze({ valid: validProcessKnown, stale: staleProcessKnown }),
+      ...(workspaceId !== undefined
+        ? { requestedWorkspace: Object.freeze(this.classifyRequestedWorkspace(workspaceId)) }
+        : {})
+    };
+    return Object.freeze(snapshot);
+  }
+
+  private readConfiguredDefaultDiagnostic(): WorkspaceDiagnosticDescriptor | null {
+    const id = workspaceIdForRoot(this.config.defaultRoot);
+    try {
+      const realRoot = validateConfiguredWorkspaceRoot(this.config, id, this.config.defaultRoot);
+      return diagnosticRootDescriptor(id, realRoot);
+    } catch {
+      return null;
+    }
+  }
+
+  private classifyRequestedWorkspace(id: string): WorkspaceDiagnosticRequestedWorkspace {
+    const reportedId = id.slice(0, DIAGNOSTIC_WORKSPACE_ID_MAX_CHARS);
+    if (!isWorkspaceId(id)) {
+      return { id: reportedId, classification: "unknown_or_invalid", root: null };
+    }
+
+    const localWorkspace = this.workspaces.get(id);
+    if (localWorkspace) {
+      const rememberedRoot = processWorkspaceRoots.get(id);
+      const localRoot = rememberedRoot === undefined
+        ? undefined
+        : validRememberedRoot(this.config, id, rememberedRoot);
+      if (!localRoot || localRoot !== localWorkspace.root) {
+        return { id: reportedId, classification: "stale_or_revoked", root: null };
+      }
+      return {
+        id: reportedId,
+        classification: this.selectedWorkspaceId === id
+          ? "selected_session_workspace"
+          : "session_opened",
+        root: localRoot
+      };
+    }
+
+    const rememberedRoot = processWorkspaceRoots.get(id);
+    if (rememberedRoot !== undefined) {
+      const processRoot = validRememberedRoot(this.config, id, rememberedRoot);
+      return processRoot
+        ? { id: reportedId, classification: "process_known_reconstructible", root: processRoot }
+        : { id: reportedId, classification: "stale_or_revoked", root: null };
+    }
+
+    const configuredRoot = this.config.allowedRoots.find((allowedRoot) => workspaceIdForRoot(allowedRoot) === id);
+    if (configuredRoot !== undefined) {
+      try {
+        const configuredCanonicalRoot = validateConfiguredWorkspaceRoot(this.config, id, configuredRoot);
+        return { id: reportedId, classification: "configured_allowed_root_reconstructible", root: configuredCanonicalRoot };
+      } catch {
+        return { id: reportedId, classification: "stale_or_revoked", root: null };
+      }
+    }
+
+    return { id: reportedId, classification: "unknown_or_invalid", root: null };
   }
 
   currentWorkspaceId(): string {

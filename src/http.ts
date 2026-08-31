@@ -21,11 +21,14 @@ import {
 } from "./profileStore.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
 import { createDiagnosticContext, type CodexProDiagnosticContext, type HttpDiagnosticSnapshot } from "./diagnosticContext.js";
+import type { WorkspaceDiagnosticReader } from "./guard.js";
 import { createCodexProServer } from "./server.js";
 
 export interface CodexProHttpAppOptions {
   /** Internal observer for the real server instances created by HTTP sessions. */
   readonly onDiagnosticContext?: (context: Readonly<CodexProDiagnosticContext>) => void;
+  /** Internal observer for each session's read-only workspace diagnostic reader. */
+  readonly onWorkspaceDiagnosticReader?: (reader: Readonly<WorkspaceDiagnosticReader>) => void;
 }
 
 function escapeHtml(value: unknown): string {
@@ -1743,7 +1746,10 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
           transportKind: "http",
           getHttpSnapshot: () => httpDiagnosticSnapshot(currentRecord)
         });
-        const server = createCodexProServer(config, { diagnosticContext });
+        const server = createCodexProServer(config, {
+          diagnosticContext,
+          onWorkspaceDiagnosticReader: options.onWorkspaceDiagnosticReader
+        });
         options.onDiagnosticContext?.(diagnosticContext);
         await server.connect(transport);
       } else {
