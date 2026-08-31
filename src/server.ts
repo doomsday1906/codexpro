@@ -36,6 +36,8 @@ export type { CodexProDiagnosticContext, DiagnosticContextOptions, DiagnosticTra
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 const RUNTIME_STATUS_FAILURE_DETAIL_MAX_BYTES = 2_048;
+const CODEXPRO_SERVER_NAME = "CodexPro";
+const CODEXPRO_SERVER_VERSION = "0.30.0";
 // read_many owns a smaller aggregate response contract than the single-read
 // path. maxOutputBytes is not a universal read cap, but it remains the outer
 // configured ceiling when it is lower than this tool's own maximum.
@@ -57,6 +59,67 @@ const REVIEW_WORKSPACE_ID_SCHEMA = z.string()
   .max(128)
   .refine((value) => value.trim() === value, "workspace_id must not have surrounding whitespace.")
   .describe("Explicit workspace id from open_current_workspace or open_workspace.");
+
+const SESSION_WORKSPACE_DIAGNOSTICS_FIELD_NAMES = new Set(["workspace_id"]);
+
+function boundedSessionWorkspaceDiagnosticsValidationError(issues: readonly z.ZodIssue[]): z.ZodError {
+  const safeIssues: z.ZodIssue[] = [];
+  const seenMessages = new Set<string>();
+  for (const issue of issues) {
+    if (issue.code === "unrecognized_keys") {
+      if (!seenMessages.has("Unknown keys are not allowed.")) {
+        safeIssues.push({ code: "custom", path: [], message: "Unknown keys are not allowed." });
+        seenMessages.add("Unknown keys are not allowed.");
+      }
+      continue;
+    }
+
+    const field = issue.path.length === 1 && typeof issue.path[0] === "string" && SESSION_WORKSPACE_DIAGNOSTICS_FIELD_NAMES.has(issue.path[0])
+      ? issue.path[0]
+      : undefined;
+    const message = field ? "Invalid value." : "Schema constraints were not satisfied.";
+    const path = field ? [field] : [];
+    const key = `${path.join(".")}:${message}`;
+    if (seenMessages.has(key)) continue;
+    seenMessages.add(key);
+    safeIssues.push({ code: "custom", path, message });
+  }
+
+  if (safeIssues.length === 0) {
+    safeIssues.push({ code: "custom", path: [], message: "Schema constraints were not satisfied." });
+  }
+  return new z.ZodError(safeIssues);
+}
+
+// Publish the exact object shape while keeping the MCP SDK's transport
+// envelope permissive. The strict runtime parser below owns rejection and
+// emits only bounded, caller-key-safe errors for hostile unknown properties.
+const SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA = z.object({
+  workspace_id: REVIEW_WORKSPACE_ID_SCHEMA.optional()
+}).strict();
+const rawSessionWorkspaceDiagnosticsSafeParse = SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA.safeParse.bind(SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA);
+SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA.safeParse = ((args: unknown) => {
+  const parsed = rawSessionWorkspaceDiagnosticsSafeParse(args);
+  return parsed.success
+    ? parsed
+    : { success: false, error: boundedSessionWorkspaceDiagnosticsValidationError(parsed.error.issues) };
+}) as typeof SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA.safeParse;
+const rawSessionWorkspaceDiagnosticsSafeParseAsync = SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA.safeParseAsync.bind(SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA);
+SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA.safeParseAsync = (async (args: unknown) => {
+  const parsed = await rawSessionWorkspaceDiagnosticsSafeParseAsync(args);
+  return parsed.success
+    ? parsed
+    : { success: false, error: boundedSessionWorkspaceDiagnosticsValidationError(parsed.error.issues) };
+}) as typeof SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA.safeParseAsync;
+
+const SESSION_WORKSPACE_DIAGNOSTICS_TRANSPORT_SCHEMA = z.object({
+  workspace_id: z.unknown().optional()
+}).passthrough();
+const SESSION_WORKSPACE_DIAGNOSTICS_PUBLIC_SCHEMA = z.object(SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA.shape).strict();
+SESSION_WORKSPACE_DIAGNOSTICS_PUBLIC_SCHEMA.safeParse = ((args: unknown) =>
+  SESSION_WORKSPACE_DIAGNOSTICS_TRANSPORT_SCHEMA.safeParse(args)) as typeof SESSION_WORKSPACE_DIAGNOSTICS_PUBLIC_SCHEMA.safeParse;
+SESSION_WORKSPACE_DIAGNOSTICS_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) =>
+  SESSION_WORKSPACE_DIAGNOSTICS_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof SESSION_WORKSPACE_DIAGNOSTICS_PUBLIC_SCHEMA.safeParseAsync;
 
 const REVIEW_REF_SCHEMA = z.string()
   .min(1)
@@ -1043,6 +1106,11 @@ const FULL_TOOL_NAMES = [
   SUPERTOOL_NAME,
   "server_config",
   "runtime_status",
+  // Intentional wrapper policy: full-mode diagnostics are also available
+  // through the stable codexpro wrapper used for connector catalog caching.
+  // Standard/minimal modes omit this name and therefore cannot expose it via
+  // their wrapper surface.
+  "session_workspace_diagnostics",
   "codexpro_self_test",
   "codexpro_inventory",
   "load_skill",
@@ -1195,20 +1263,21 @@ function serverInstructions(config: CodexProConfig): string {
     "CodexPro connects ChatGPT to explicitly allowed local development workspaces.",
     "",
     "Preferred workflow:",
-    "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects; session-selected workspace is reliable only when the client preserves the same MCP session.",
-    "2. For correctness-sensitive Git tools (git_commit, git_resolve_ref, git_merge_base, git_log, git_show_commit, read_at_ref, git_diff_range), always pass the explicit workspace_id returned by open_current_workspace/open_workspace.",
-    "3. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
-    "4. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
-    editInstruction,
-    bashInstruction,
-    "7. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad inspection calls.",
+    "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects. A transport or MCP session change can lose the prior session selection; ChatGPT is not required to preserve one connection, and diagnostics cannot force client transport reuse or refresh a stale direct tool catalog.",
+    "2. list_workspaces is session-local, not a process-global workspace directory. When continuity is unclear, call session_workspace_diagnostics; it reports runtime/session/catalog truth and can classify an explicit workspace_id without selecting or opening it. A valid explicit-ID recovery targets that workspace without changing ambient or global selection.",
+    "3. For correctness-sensitive Git tools (git_commit, git_resolve_ref, git_merge_base, git_log, git_show_commit, read_at_ref, git_diff_range), always pass the explicit workspace_id returned by open_current_workspace/open_workspace. Harmless reads may omit it when ambient selection is clear.",
+    "4. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
+    "5. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
+    editInstruction.replace(/^5\./u, "6."),
+    bashInstruction.replace(/^6\./u, "7."),
+    "8. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad inspection calls.",
     config.codexSessions !== "off"
-      ? `8. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
+      ? `9. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
     config.requireBashSession && config.bashSessionId
-      ? `9. Bash session guard is enabled. Every bash call must include session_id="${config.bashSessionId}".`
+      ? `10. Bash session guard is enabled. Every bash call must include session_id="${config.bashSessionId}".`
       : config.bashSessionId
-        ? `9. Bash session label for this server is "${config.bashSessionId}".`
+        ? `10. Bash session label for this server is "${config.bashSessionId}".`
         : "",
     "",
     `Current modes: tool=${config.toolMode}, bash=${config.bashMode}, write=${config.writeMode}.`
@@ -2081,6 +2150,43 @@ function runtimeStatusPayload(config: CodexProConfig): Record<string, unknown> {
   };
 }
 
+function serverCatalogFingerprint(config: CodexProConfig, server: McpServer): string {
+  const registeredTools = registeredToolNames(server).sort();
+  const canonicalInputs = {
+    server_name: CODEXPRO_SERVER_NAME,
+    server_version: CODEXPRO_SERVER_VERSION,
+    tool_mode: config.toolMode,
+    bash_mode: config.bashMode,
+    write_mode: config.writeMode,
+    codex_sessions: config.codexSessions,
+    connection_test: config.connectionTest,
+    analysis_enabled: config.analysisEnabled,
+    tool_cards: config.toolCards,
+    registered_tools: registeredTools
+  };
+  return `cat_${createHash("sha256").update(JSON.stringify(canonicalInputs)).digest("hex").slice(0, 32)}`;
+}
+
+function publicWorkspaceDiagnosticDescriptor(descriptor: {
+  readonly id: string;
+  readonly root: string;
+  readonly openedAt: string | null;
+}): Record<string, unknown> {
+  return {
+    id: descriptor.id,
+    root: descriptor.root,
+    opened_at: descriptor.openedAt
+  };
+}
+
+function ageMilliseconds(timestamp: number, now: number): number {
+  return Math.max(0, now - timestamp);
+}
+
+function publicDiagnosticTimestamp(timestamp: number): string {
+  return new Date(timestamp).toISOString();
+}
+
 export interface CodexProServerOptions {
   readonly diagnosticContext?: CodexProDiagnosticContext;
   /** Internal observer for the read-only workspace state of this server/session. */
@@ -2106,7 +2212,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     getSnapshot: (workspaceId?: string) => workspaces.diagnosticSnapshot(workspaceId)
   });
   options.onWorkspaceDiagnosticReader?.(workspaceDiagnosticReader);
-  const server = new McpServer({ name: "CodexPro", version: "0.30.0" }, { instructions: serverInstructions(config) });
+  const server = new McpServer({ name: CODEXPRO_SERVER_NAME, version: CODEXPRO_SERVER_VERSION }, { instructions: serverInstructions(config) });
   registeredToolNamesByServer.set(server as object, []);
   registerToolCardResource(server, config);
 
@@ -2280,6 +2386,115 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         status.last_failure ? JSON.stringify(status.last_failure, null, 2) : "No durable failure record."
       ].join("\n");
       return textResult(text, status);
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "session_workspace_diagnostics",
+    {
+      title: "Session and Workspace Diagnostics",
+      description:
+        "Read-only full-mode diagnostics for the current runtime, MCP session, HTTP lifecycle, tool catalog generation, and session-local workspace continuity. An optional workspace_id is classified without selecting or opening it.",
+      inputSchema: SESSION_WORKSPACE_DIAGNOSTICS_PUBLIC_SCHEMA,
+      runtimeInputSchema: SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA,
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Reading session and workspace diagnostics...",
+        "openai/toolInvocation/invoked": "Session and workspace diagnostics ready"
+      }
+    },
+    async (args) => {
+      const now = Date.now();
+      const runtime = runtimeStatusPayload(config);
+      const catalogTools = registeredToolNames(server).sort();
+      const serverCatalog = {
+        name: CODEXPRO_SERVER_NAME,
+        version: CODEXPRO_SERVER_VERSION,
+        tool_mode: config.toolMode,
+        catalog_fingerprint: serverCatalogFingerprint(config, server),
+        registered_tool_count: catalogTools.length
+      };
+
+      const session = {
+        fingerprint: diagnosticContext.fingerprint,
+        generation: diagnosticContext.generation,
+        transport: diagnosticContext.transportKind,
+        created_at: publicDiagnosticTimestamp(diagnosticContext.createdAt),
+        age_ms: ageMilliseconds(diagnosticContext.createdAt, now)
+      };
+
+      const httpSnapshot = diagnosticContext.getHttpSnapshot?.() ?? null;
+      const httpSessions = httpSnapshot
+        ? {
+            active: httpSnapshot.active,
+            max: httpSnapshot.max,
+            ttl_ms: httpSnapshot.ttlMs,
+            total_initialized: httpSnapshot.totalInitialized,
+            total_closed: httpSnapshot.totalClosed,
+            total_expired: httpSnapshot.totalExpired,
+            total_capacity_evicted: httpSnapshot.totalCapacityEvicted,
+            current_session: httpSnapshot.currentSession
+              ? {
+                  created_at: publicDiagnosticTimestamp(httpSnapshot.currentSession.createdAt),
+                  created_age_ms: ageMilliseconds(httpSnapshot.currentSession.createdAt, now),
+                  last_seen_at: publicDiagnosticTimestamp(httpSnapshot.currentSession.lastSeenAt),
+                  last_seen_age_ms: ageMilliseconds(httpSnapshot.currentSession.lastSeenAt, now)
+                }
+              : null
+          }
+        : null;
+
+      const workspaceSnapshot = workspaceDiagnosticReader.getSnapshot(args.workspace_id);
+      const workspace = {
+        configured_default: workspaceSnapshot.configuredDefault
+          ? publicWorkspaceDiagnosticDescriptor(workspaceSnapshot.configuredDefault)
+          : null,
+        selected: workspaceSnapshot.selected
+          ? publicWorkspaceDiagnosticDescriptor(workspaceSnapshot.selected)
+          : null,
+        session_opened: workspaceSnapshot.sessionOpened.map(publicWorkspaceDiagnosticDescriptor),
+        process_known: workspaceSnapshot.processKnown
+      };
+      const requestedWorkspace = workspaceSnapshot.requestedWorkspace
+        ? {
+            id: workspaceSnapshot.requestedWorkspace.id,
+            classification: workspaceSnapshot.requestedWorkspace.classification,
+            root: workspaceSnapshot.requestedWorkspace.root
+          }
+        : undefined;
+
+      const structured: Record<string, unknown> = {
+        schema_version: 1,
+        runtime,
+        server: serverCatalog,
+        session,
+        http_sessions: httpSessions,
+        workspace,
+        ...(requestedWorkspace ? { requested_workspace: requestedWorkspace } : {})
+      };
+      const selectedId = workspace.selected && typeof workspace.selected.id === "string" ? workspace.selected.id : "none";
+      const defaultId = workspace.configured_default && typeof workspace.configured_default.id === "string"
+        ? workspace.configured_default.id
+        : "unavailable";
+      const runtimeHealth = typeof runtime.health === "string" ? runtime.health : "unknown";
+      const runtimeRun = typeof runtime.run_id === "string" && runtime.run_id ? runtime.run_id : "unknown";
+      const text = [
+        "# Session / Workspace Diagnostics",
+        "",
+        `Runtime: ${runtimeHealth}; run ${runtimeRun}.`,
+        `Server: ${serverCatalog.name} ${serverCatalog.version}; catalog ${serverCatalog.catalog_fingerprint}; ${serverCatalog.registered_tool_count} registered tools in ${serverCatalog.tool_mode} mode.`,
+        `Session: ${session.transport}, generation ${session.generation}, fingerprint ${session.fingerprint}, age ${session.age_ms} ms.`,
+        httpSessions
+          ? `HTTP sessions: ${httpSessions.active}/${httpSessions.max} active; TTL ${httpSessions.ttl_ms} ms; initialized ${httpSessions.total_initialized}; closed ${httpSessions.total_closed}; expired ${httpSessions.total_expired}; capacity evicted ${httpSessions.total_capacity_evicted}.`
+          : "HTTP sessions: not applicable for this transport.",
+        `Workspace: default ${defaultId}; selected ${selectedId}; session-opened ${workspace.session_opened.length}; process-known valid ${workspace.process_known.valid}, stale ${workspace.process_known.stale}.`,
+        ...(requestedWorkspace
+          ? [`Requested workspace ${requestedWorkspace.id}: ${requestedWorkspace.classification}${requestedWorkspace.root ? ` (${requestedWorkspace.root})` : ""}.`]
+          : [])
+      ].join("\n");
+      return diagnosticTextResult(text, structured);
     }
   );
 
