@@ -25,6 +25,8 @@ import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
 import { hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactStructured, redactUnifiedDiff, sourceLanguageForPath, truncateUtf8 } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
+import { createDiagnosticContext, type CodexProDiagnosticContext } from "./diagnosticContext.js";
+export type { CodexProDiagnosticContext, DiagnosticContextOptions, DiagnosticTransportKind, HttpDiagnosticCurrentSession, HttpDiagnosticSnapshot } from "./diagnosticContext.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 const RUNTIME_STATUS_FAILURE_DETAIL_MAX_BYTES = 2_048;
@@ -2073,11 +2075,16 @@ function runtimeStatusPayload(config: CodexProConfig): Record<string, unknown> {
   };
 }
 
-export function createCodexProServer(config: CodexProConfig): McpServer {
+export interface CodexProServerOptions {
+  readonly diagnosticContext?: CodexProDiagnosticContext;
+}
+
+export function createCodexProServer(config: CodexProConfig, options: CodexProServerOptions = {}): McpServer {
   const workspaces = new WorkspaceManager(config);
   const reviewCheckpoints = new Map<string, string>();
   const guard = new PathGuard(config);
   const readAtRefSchemas = readAtRefPublicSchemas(config.maxReadBytes);
+  const diagnosticContext = options.diagnosticContext ?? createDiagnosticContext({ transportKind: "stdio" });
   const server = new McpServer({ name: "CodexPro", version: "0.30.0" }, { instructions: serverInstructions(config) });
   registeredToolNamesByServer.set(server as object, []);
   registerToolCardResource(server, config);

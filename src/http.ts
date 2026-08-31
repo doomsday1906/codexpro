@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { timingSafeEqual } from "node:crypto";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
 import { z } from "zod";
@@ -19,7 +20,13 @@ import {
   type WorkspaceProfile
 } from "./profileStore.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
+import { createDiagnosticContext, type CodexProDiagnosticContext, type HttpDiagnosticSnapshot } from "./diagnosticContext.js";
 import { createCodexProServer } from "./server.js";
+
+export interface CodexProHttpAppOptions {
+  /** Internal observer for the real server instances created by HTTP sessions. */
+  readonly onDiagnosticContext?: (context: Readonly<CodexProDiagnosticContext>) => void;
+}
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -1433,18 +1440,7 @@ function onboardingPage(config: CodexProConfig): string {
 </html>`;
 }
 
-async function main(): Promise<void> {
-  const argv = process.argv.slice(2);
-  if (argv.includes("--version") || argv.includes("-v") || argv[0] === "version") {
-    console.log(CODEXPRO_VERSION);
-    return;
-  }
-  if (argv.includes("--help") || argv[0] === "help") {
-    printHelp();
-    return;
-  }
-
-  const config = loadConfig();
+export function createCodexProHttpApp(config: CodexProConfig, options: CodexProHttpAppOptions = {}): express.Express {
   if (config.requireHttpToken && !config.authToken) {
     throw new Error(
       "CODEXPRO_HTTP_TOKEN is required for this HTTP binding. " +
@@ -1559,10 +1555,15 @@ async function main(): Promise<void> {
     transport: StreamableHTTPServerTransport;
     createdAt: number;
     lastSeenAt: number;
+    lifecycle: "active" | "closed" | "expired" | "capacity_evicted";
   };
 
   const transports = new Map<string, TransportRecord>();
   const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  let totalInitialized = 0;
+  let totalClosed = 0;
+  let totalExpired = 0;
+  let totalCapacityEvicted = 0;
 
   function requestSessionId(req: Request): string | undefined {
     const value = req.headers["mcp-session-id"];
@@ -1583,7 +1584,16 @@ async function main(): Promise<void> {
     });
   }
 
-  function closeTransport(record: TransportRecord): void {
+  function markTransportClosed(record: TransportRecord, reason: "closed" | "expired" | "capacity_evicted"): void {
+    if (record.lifecycle !== "active") return;
+    record.lifecycle = reason;
+    totalClosed += 1;
+    if (reason === "expired") totalExpired += 1;
+    if (reason === "capacity_evicted") totalCapacityEvicted += 1;
+  }
+
+  function closeTransport(record: TransportRecord, reason: "expired" | "capacity_evicted"): void {
+    markTransportClosed(record, reason);
     void record.transport.close?.();
   }
 
@@ -1592,14 +1602,38 @@ async function main(): Promise<void> {
     for (const [sessionId, record] of transports) {
       if (now - record.lastSeenAt > config.httpSessionTtlMs) {
         transports.delete(sessionId);
-        closeTransport(record);
+        closeTransport(record, "expired");
       }
     }
     while (transports.size > config.maxHttpSessions) {
       const oldest = [...transports.entries()].sort((a, b) => a[1].lastSeenAt - b[1].lastSeenAt)[0];
       if (!oldest) break;
       transports.delete(oldest[0]);
-      closeTransport(oldest[1]);
+      closeTransport(oldest[1], "capacity_evicted");
+    }
+  }
+
+  function httpDiagnosticSnapshot(currentRecord: TransportRecord | undefined): HttpDiagnosticSnapshot {
+    const currentSession = currentRecord?.lifecycle === "active"
+      ? Object.freeze({ createdAt: currentRecord.createdAt, lastSeenAt: currentRecord.lastSeenAt })
+      : null;
+    return Object.freeze({
+      active: transports.size,
+      max: config.maxHttpSessions,
+      ttlMs: config.httpSessionTtlMs,
+      totalInitialized,
+      totalClosed,
+      totalExpired,
+      totalCapacityEvicted,
+      currentSession
+    });
+  }
+
+  function removeTransportRecord(record: TransportRecord): void {
+    for (const [sessionId, candidate] of transports) {
+      if (candidate !== record) continue;
+      transports.delete(sessionId);
+      return;
     }
   }
 
@@ -1681,25 +1715,36 @@ async function main(): Promise<void> {
       if (existingTransport) {
         transport = existingTransport;
       } else if (!sessionId && isInitializeRequest(req.body)) {
+        let currentRecord: TransportRecord | undefined;
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId: string) => {
             pruneTransports();
-            transports.set(newSessionId, {
+            const now = Date.now();
+            currentRecord = {
               transport,
-              createdAt: Date.now(),
-              lastSeenAt: Date.now()
-            });
+              createdAt: now,
+              lastSeenAt: now,
+              lifecycle: "active"
+            };
+            transports.set(newSessionId, currentRecord);
+            totalInitialized += 1;
             pruneTransports();
           }
         } as any);
 
         (transport as any).onclose = () => {
-          const closedSessionId = (transport as any).sessionId;
-          if (closedSessionId) transports.delete(closedSessionId);
+          if (!currentRecord) return;
+          removeTransportRecord(currentRecord);
+          markTransportClosed(currentRecord, "closed");
         };
 
-        const server = createCodexProServer(config);
+        const diagnosticContext = createDiagnosticContext({
+          transportKind: "http",
+          getHttpSnapshot: () => httpDiagnosticSnapshot(currentRecord)
+        });
+        const server = createCodexProServer(config, { diagnosticContext });
+        options.onDiagnosticContext?.(diagnosticContext);
         await server.connect(transport);
       } else {
         sendSessionError(res, sessionId);
@@ -1766,6 +1811,22 @@ async function main(): Promise<void> {
     next(error);
   });
 
+  return app;
+}
+
+async function main(): Promise<void> {
+  const argv = process.argv.slice(2);
+  if (argv.includes("--version") || argv.includes("-v") || argv[0] === "version") {
+    console.log(CODEXPRO_VERSION);
+    return;
+  }
+  if (argv.includes("--help") || argv[0] === "help") {
+    printHelp();
+    return;
+  }
+
+  const config = loadConfig();
+  const app = createCodexProHttpApp(config);
   app.listen(config.port, config.host, () => {
     console.error(`[CodexPro] HTTP MCP listening on http://${config.host}:${config.port}/mcp`);
     console.error(`[CodexPro] defaultRoot=${config.defaultRoot}`);
@@ -1776,7 +1837,9 @@ async function main(): Promise<void> {
   });
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+    process.exit(1);
+  });
+}
