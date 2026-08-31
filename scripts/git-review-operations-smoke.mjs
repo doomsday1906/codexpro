@@ -149,6 +149,28 @@ function directLogIds(sha, maxCount) {
   return gitText(["rev-list", `--max-count=${maxCount}`, sha]).split("\n").filter(Boolean);
 }
 
+function directPathLogIds(sha, pathFilter) {
+  return gitText(["log", "--no-patch", "--format=%H", sha, "--", `:(literal)${pathFilter}`])
+    .split("\n")
+    .filter(Boolean);
+}
+
+function directPathNameStatus(baseSha, headSha, pathFilter) {
+  return mustGit([
+    "diff",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--find-renames=50%",
+    "-z",
+    "--name-status",
+    baseSha,
+    headSha,
+    "--",
+    `:(literal)${pathFilter}`
+  ]).stdout;
+}
+
 function directParents(sha) {
   const parts = gitText(["rev-list", "--parents", "-n", "1", sha]).split(" ");
   return parts.slice(1);
@@ -285,6 +307,12 @@ try {
   const privatePath = "private.txt";
   const symlinkPath = "historical-link";
   const secretTargetPath = "secret-target.txt";
+  const literalBackslashPath = "a\\b.txt";
+  const slashHierarchyPath = "a/b.txt";
+  const literalBackslashBaseline = Buffer.from("literal backslash baseline\n", "utf8");
+  const slashHierarchyBaseline = Buffer.from("slash hierarchy baseline\n", "utf8");
+  const literalBackslashChanged = Buffer.from("literal backslash changed\n", "utf8");
+  const slashHierarchyChanged = Buffer.from("slash hierarchy changed\n", "utf8");
 
   await writeFile(path.join(repoRoot, oldDeletedPath), deletedText);
   await writeFile(path.join(repoRoot, oldRenamedPath), renamedText);
@@ -297,6 +325,14 @@ try {
   await writeFile(path.join(repoRoot, "oversized.txt"), oversizedBytes);
   await mkdir(path.join(repoRoot, "directory"), { recursive: true });
   await writeFile(path.join(repoRoot, "directory", "nested.txt"), "nested historical\n", "utf8");
+  await mkdir(path.join(repoRoot, "a"), { recursive: true });
+  // POSIX Git permits a literal backslash in a tree name beside a normal
+  // slash hierarchy. This distinction is not representable on Windows,
+  // where the host filesystem treats backslash as a separator.
+  if (process.platform !== "win32") {
+    await writeFile(path.join(repoRoot, literalBackslashPath), literalBackslashBaseline);
+    await writeFile(path.join(repoRoot, slashHierarchyPath), slashHierarchyBaseline);
+  }
   await writeFile(path.join(repoRoot, ".env"), "ENV_SECRET_7X9=do-not-return\n", "utf8");
   mustGit(["add", "-A"]);
   mustGit(["update-index", "--add", "--cacheinfo", `160000,${subrepoSha},vendor/subrepo`]);
@@ -304,6 +340,15 @@ try {
   const rootSha = gitText(["rev-parse", "HEAD"]);
   mustGit(["tag", "root-lightweight", rootSha]);
   mustGit(["tag", "--annotate", "root-annotated", "--message", "annotated root", rootSha]);
+
+  let literalBackslashSha;
+  let slashHierarchySha;
+  if (process.platform !== "win32") {
+    await writeFile(path.join(repoRoot, literalBackslashPath), literalBackslashChanged);
+    literalBackslashSha = commitWorkingTree("literal backslash path change");
+    await writeFile(path.join(repoRoot, slashHierarchyPath), slashHierarchyChanged);
+    slashHierarchySha = commitWorkingTree("slash hierarchy path change");
+  }
 
   mustGit(["rm", "--quiet", "--", oldDeletedPath]);
   mustGit(["mv", "--", oldRenamedPath, currentRenamedPath]);
@@ -366,6 +411,10 @@ try {
   const binaryEntry = rootEntries.get("binary.bin");
   const oversizedEntry = rootEntries.get("oversized.txt");
   const gitlinkEntry = rootEntries.get("vendor/subrepo");
+  const literalBackslashEntry = rootEntries.get(literalBackslashPath);
+  const slashHierarchyEntry = rootEntries.get(slashHierarchyPath);
+  const literalBackslashHeadEntry = mergeEntries.get(literalBackslashPath);
+  const slashHierarchyHeadEntry = mergeEntries.get(slashHierarchyPath);
   assert.ok(deletedEntry && oldRenamedEntry && currentRenamedEntry && unicodeEntry && leadingEntry && privateEntry && symlinkEntry && binaryEntry && oversizedEntry && gitlinkEntry);
   assert.equal(deletedEntry.mode, "100644");
   assert.equal(oldRenamedEntry.mode, "100644");
@@ -401,6 +450,28 @@ try {
   assert.equal(rootCommit.body, rootBody);
   assert.equal(mergeCommit.subject, mergeSubject);
   assert.equal(mergeCommit.body, mergeBody);
+  if (process.platform !== "win32") {
+    assert.ok(literalBackslashEntry && slashHierarchyEntry && literalBackslashHeadEntry && slashHierarchyHeadEntry);
+    assert.notEqual(literalBackslashPath, slashHierarchyPath);
+    assert.notDeepEqual(literalBackslashBaseline, slashHierarchyBaseline);
+    assert.notDeepEqual(literalBackslashChanged, slashHierarchyChanged);
+    assert.deepEqual(directEntryBlob(literalBackslashEntry), literalBackslashBaseline);
+    assert.deepEqual(directEntryBlob(slashHierarchyEntry), slashHierarchyBaseline);
+    assert.deepEqual(directEntryBlob(literalBackslashHeadEntry), literalBackslashChanged);
+    assert.deepEqual(directEntryBlob(slashHierarchyHeadEntry), slashHierarchyChanged);
+    const literalBackslashLogIds = directPathLogIds(mergeSha, literalBackslashPath);
+    const slashHierarchyLogIds = directPathLogIds(mergeSha, slashHierarchyPath);
+    const literalBackslashDiffBytes = directPathNameStatus(rootSha, mergeSha, literalBackslashPath);
+    const slashHierarchyDiffBytes = directPathNameStatus(rootSha, mergeSha, slashHierarchyPath);
+    assert.deepEqual(literalBackslashLogIds, [literalBackslashSha, rootSha]);
+    assert.deepEqual(slashHierarchyLogIds, [slashHierarchySha, rootSha]);
+    assert.deepEqual([...literalBackslashDiffBytes], [...Buffer.from(`M\0${literalBackslashPath}\0`, "utf8")]);
+    assert.deepEqual([...slashHierarchyDiffBytes], [...Buffer.from(`M\0${slashHierarchyPath}\0`, "utf8")]);
+    console.log(`RAW_OBSERVATION: POSIX Git root tree contains distinct ${JSON.stringify(literalBackslashPath)} and ${JSON.stringify(slashHierarchyPath)} entries with baseline blob bytes ${JSON.stringify(literalBackslashBaseline.toString())} vs ${JSON.stringify(slashHierarchyBaseline.toString())}; head blobs are changed independently.`);
+    console.log(`RAW_OBSERVATION: direct literal-path logs = ${JSON.stringify({ [literalBackslashPath]: literalBackslashLogIds, [slashHierarchyPath]: slashHierarchyLogIds })}; direct filtered name-status bytes isolate each path independently.`);
+  } else {
+    console.log("RAW_OBSERVATION: Windows host cannot represent a POSIX literal-backslash tree name beside slash hierarchy; identity fixture is not fabricated or executed.");
+  }
   console.log("TARGET_EVIDENCE: disposable real Git repository and local object database; no production route");
   console.log(`RAW_OBSERVATION: root=${rootSha}, linear=${linearSha}, side=${sideSha}, main=${mainSha}, merge=${mergeSha}; old deleted/renamed paths are only in the root tree`);
   console.log(`RAW_OBSERVATION: root parents=${JSON.stringify(rootCommit.parents)}, merge parents=${JSON.stringify(mergeCommit.parents)}, unique bases=${JSON.stringify(directBases)}, criss-cross bases=${JSON.stringify(directCrissBases)}`);
@@ -481,8 +552,24 @@ try {
   assert.deepEqual(unicodePathLog.commits.map((commit) => commit.fullSha), [rootSha]);
   const leadingPathLog = await gitLogStructured(config, guard, workspace, { startRef: rootSha, path: leadingPath, maxCount: 20 });
   assert.deepEqual(leadingPathLog.commits.map((commit) => commit.fullSha), [rootSha]);
-  for (const result of [boundedLog, rootLog, oldPathLog, unicodePathLog, leadingPathLog]) assertJsonSafe(result, "structured log result");
+  const literalBackslashLog = process.platform === "win32"
+    ? undefined
+    : await gitLogStructured(config, guard, workspace, { startRef: mergeSha, path: literalBackslashPath, maxCount: 20 });
+  const slashHierarchyLog = process.platform === "win32"
+    ? undefined
+    : await gitLogStructured(config, guard, workspace, { startRef: mergeSha, path: slashHierarchyPath, maxCount: 20 });
+  if (process.platform !== "win32") {
+    assert.equal(literalBackslashLog.path, literalBackslashPath);
+    assert.equal(slashHierarchyLog.path, slashHierarchyPath);
+    assert.deepEqual(literalBackslashLog.commits.map((commit) => commit.fullSha), [literalBackslashSha, rootSha]);
+    assert.deepEqual(slashHierarchyLog.commits.map((commit) => commit.fullSha), [slashHierarchySha, rootSha]);
+    assert.notDeepEqual(literalBackslashLog.commits.map((commit) => commit.fullSha), slashHierarchyLog.commits.map((commit) => commit.fullSha));
+  }
+  for (const result of [boundedLog, rootLog, oldPathLog, unicodePathLog, leadingPathLog, literalBackslashLog, slashHierarchyLog]) {
+    if (result !== undefined) assertJsonSafe(result, "structured log result");
+  }
   console.log("PASS operation C NUL-structured log max_count+1/hasMore, root/merge parents, and literal Unicode/space/leading-dash/old-path filters");
+  if (process.platform !== "win32") console.log("PASS operation C POSIX literal-backslash and slash-hierarchy path filters select only their independently changed histories");
 
   const shownRoot = await gitShowCommit(config, workspace, rootSha);
   assert.equal(shownRoot.treeSha, rootCommit.treeSha);
@@ -530,6 +617,21 @@ try {
   assert.equal(unicode.text, numberLines(unicodeText));
   const leading = await readAtRef(config, guard, workspace, { ref: rootSha, path: leadingPath });
   assert.equal(leading.text, numberLines(Buffer.from("leading dash historical\n", "utf8")));
+  const literalBackslashBlob = process.platform === "win32"
+    ? undefined
+    : await readAtRef(config, guard, workspace, { ref: rootSha, path: literalBackslashPath });
+  const slashHierarchyBlob = process.platform === "win32"
+    ? undefined
+    : await readAtRef(config, guard, workspace, { ref: rootSha, path: slashHierarchyPath });
+  if (process.platform !== "win32") {
+    assert.equal(literalBackslashBlob.path, literalBackslashPath);
+    assert.equal(literalBackslashBlob.text, numberLines(literalBackslashBaseline));
+    assert.equal(literalBackslashBlob.blobSha, literalBackslashEntry.oid);
+    assert.equal(slashHierarchyBlob.path, slashHierarchyPath);
+    assert.equal(slashHierarchyBlob.text, numberLines(slashHierarchyBaseline));
+    assert.equal(slashHierarchyBlob.blobSha, slashHierarchyEntry.oid);
+    assert.notEqual(literalBackslashBlob.blobSha, slashHierarchyBlob.blobSha);
+  }
   const link = await readAtRef(config, guard, workspace, { ref: rootSha, path: symlinkPath });
   assert.equal(link.gitMode, "120000");
   assert.equal(link.entryKind, "symlink");
@@ -542,8 +644,11 @@ try {
   assert.equal(privateBody.bytes, privateRaw.byteLength);
   assert.equal(privateBody.sha256, sha256(privateRaw));
   assert.equal(privateBody.text.includes("PRIVATE_SOURCE_SECRET_7X9"), false);
-  for (const result of [deleted, renamed, unicode, leading, link, privateBody]) assertJsonSafe(result, "historical blob result");
+  for (const result of [deleted, renamed, unicode, leading, literalBackslashBlob, slashHierarchyBlob, link, privateBody]) {
+    if (result !== undefined) assertJsonSafe(result, "historical blob result");
+  }
   console.log("PASS operation E deleted/renamed/Unicode/space/leading-dash historical files, symlink raw target text, SHA/size metadata, and source redaction");
+  if (process.platform !== "win32") console.log("PASS operation E readAtRef preserves POSIX literal-backslash versus slash-hierarchy blob identity and exact bytes");
 
   // Captured full SHA downstream race proof: branch now points at merge, while
   // log/show/blob continue to read the old root object and old-tree content.

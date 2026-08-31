@@ -615,6 +615,50 @@ async function makePatchFixture() {
   };
 }
 
+async function makeLiteralPathFixture() {
+  // Windows cannot represent a POSIX literal-backslash tree entry beside a
+  // slash hierarchy, so this required identity fixture is only real on POSIX.
+  if (process.platform === "win32") return undefined;
+  const repoRoot = path.join(fixtureRoot, "literal-paths");
+  const literalBackslashPath = "a\\b.txt";
+  const slashHierarchyPath = "a/b.txt";
+  const literalBackslashBaseline = Buffer.from("literal backslash baseline\n", "utf8");
+  const slashHierarchyBaseline = Buffer.from("slash hierarchy baseline\n", "utf8");
+  const literalBackslashChanged = Buffer.from("literal backslash changed\n", "utf8");
+  const slashHierarchyChanged = Buffer.from("slash hierarchy changed\n", "utf8");
+  await initRepo(repoRoot);
+  await writeFixture(repoRoot, literalBackslashPath, literalBackslashBaseline);
+  await writeFixture(repoRoot, slashHierarchyPath, slashHierarchyBaseline);
+  const baseSha = await commitAll(repoRoot, "literal path baseline");
+  await writeFixture(repoRoot, literalBackslashPath, literalBackslashChanged);
+  const literalBackslashSha = await commitAll(repoRoot, "literal backslash path change");
+  await writeFixture(repoRoot, slashHierarchyPath, slashHierarchyChanged);
+  const slashHierarchySha = await commitAll(repoRoot, "slash hierarchy path change");
+  return {
+    repoRoot,
+    baseSha,
+    headSha: slashHierarchySha,
+    literalBackslashSha,
+    slashHierarchySha,
+    literalBackslashPath,
+    slashHierarchyPath,
+    literalBackslashBaseline,
+    slashHierarchyBaseline,
+    literalBackslashChanged,
+    slashHierarchyChanged
+  };
+}
+
+function directPathLogIds(repoRoot, headSha, pathFilter) {
+  return directTrimmed(repoRoot, ["log", "--no-patch", "--format=%H", headSha, "--", `:(literal)${pathFilter}`])
+    .split("\n")
+    .filter(Boolean);
+}
+
+function directTreePaths(repoRoot, revision) {
+  return splitNul(mustGit(repoRoot, ["ls-tree", "-r", "-z", "--name-only", revision])).map(decodePath);
+}
+
 function rawRecordKey(record) {
   return JSON.stringify(record);
 }
@@ -632,6 +676,7 @@ const blocked = await makeBlockedFixture();
 const invalidUtf8 = await makeInvalidUtf8Fixture();
 const divergent = await makeDivergentFixture();
 const patchFixture = await makePatchFixture();
+const literalPathFixture = await makeLiteralPathFixture();
 const matrixRaw = directMetadata(matrix.repoRoot, matrix.baseSha, matrix.headSha);
 const matrixRawSameSha = directMetadata(matrix.repoRoot, matrix.baseSha, matrix.baseSha);
 const matrixRawAddFilter = directMetadata(matrix.repoRoot, matrix.baseSha, matrix.headSha, "filter-add.txt");
@@ -639,6 +684,103 @@ const matrixRawDeleteFilter = directMetadata(matrix.repoRoot, matrix.baseSha, ma
 const directDivergent = directMetadata(divergent.repoRoot, divergent.leftSha, divergent.rightSha);
 const directMergeBase = directMetadata(divergent.repoRoot, divergent.mergeBase, divergent.rightSha);
 const patchRaw = directMetadata(patchFixture.repoRoot, patchFixture.baseSha, patchFixture.headSha);
+let literalPathRaw;
+if (literalPathFixture !== undefined) {
+  const baseTreePaths = directTreePaths(literalPathFixture.repoRoot, literalPathFixture.baseSha);
+  const headTreePaths = directTreePaths(literalPathFixture.repoRoot, literalPathFixture.headSha);
+  const baseBackslashBlob = directBlob(
+    literalPathFixture.repoRoot,
+    literalPathFixture.baseSha,
+    literalPathFixture.literalBackslashPath
+  );
+  const baseSlashBlob = directBlob(
+    literalPathFixture.repoRoot,
+    literalPathFixture.baseSha,
+    literalPathFixture.slashHierarchyPath
+  );
+  const headBackslashBlob = directBlob(
+    literalPathFixture.repoRoot,
+    literalPathFixture.headSha,
+    literalPathFixture.literalBackslashPath
+  );
+  const headSlashBlob = directBlob(
+    literalPathFixture.repoRoot,
+    literalPathFixture.headSha,
+    literalPathFixture.slashHierarchyPath
+  );
+  const backslashRaw = directMetadata(
+    literalPathFixture.repoRoot,
+    literalPathFixture.baseSha,
+    literalPathFixture.headSha,
+    literalPathFixture.literalBackslashPath
+  );
+  const slashRaw = directMetadata(
+    literalPathFixture.repoRoot,
+    literalPathFixture.baseSha,
+    literalPathFixture.headSha,
+    literalPathFixture.slashHierarchyPath
+  );
+  const backslashLogIds = directPathLogIds(
+    literalPathFixture.repoRoot,
+    literalPathFixture.headSha,
+    literalPathFixture.literalBackslashPath
+  );
+  const slashLogIds = directPathLogIds(
+    literalPathFixture.repoRoot,
+    literalPathFixture.headSha,
+    literalPathFixture.slashHierarchyPath
+  );
+  assert.ok(baseTreePaths.includes(literalPathFixture.literalBackslashPath));
+  assert.ok(baseTreePaths.includes(literalPathFixture.slashHierarchyPath));
+  assert.ok(headTreePaths.includes(literalPathFixture.literalBackslashPath));
+  assert.ok(headTreePaths.includes(literalPathFixture.slashHierarchyPath));
+  assert.deepEqual(baseBackslashBlob, literalPathFixture.literalBackslashBaseline);
+  assert.deepEqual(baseSlashBlob, literalPathFixture.slashHierarchyBaseline);
+  assert.deepEqual(headBackslashBlob, literalPathFixture.literalBackslashChanged);
+  assert.deepEqual(headSlashBlob, literalPathFixture.slashHierarchyChanged);
+  assert.notDeepEqual(baseBackslashBlob, baseSlashBlob);
+  assert.notDeepEqual(headBackslashBlob, headSlashBlob);
+  assert.deepEqual(backslashRaw.records.map((record) => record.newPath ?? record.oldPath), [literalPathFixture.literalBackslashPath]);
+  assert.deepEqual(slashRaw.records.map((record) => record.newPath ?? record.oldPath), [literalPathFixture.slashHierarchyPath]);
+  assert.equal(backslashRaw.records.length, 1);
+  assert.equal(slashRaw.records.length, 1);
+  assert.deepEqual(backslashLogIds, [literalPathFixture.literalBackslashSha, literalPathFixture.baseSha]);
+  assert.deepEqual(slashLogIds, [literalPathFixture.slashHierarchySha, literalPathFixture.baseSha]);
+  const backslashPatch = directPatch(
+    literalPathFixture.repoRoot,
+    literalPathFixture.baseSha,
+    literalPathFixture.headSha,
+    backslashRaw.records[0]
+  );
+  const slashPatch = directPatch(
+    literalPathFixture.repoRoot,
+    literalPathFixture.baseSha,
+    literalPathFixture.headSha,
+    slashRaw.records[0]
+  );
+  const backslashPatchText = OBSERVATION_UTF8_FATAL.decode(backslashPatch.bytes);
+  const slashPatchText = OBSERVATION_UTF8_FATAL.decode(slashPatch.bytes);
+  // Git quotes a backslash-containing diff header using C-style escaping;
+  // retain that raw producer spelling rather than treating it as hierarchy.
+  assert.ok(backslashPatchText.includes("diff --git \"a/a\\\\b.txt\" \"b/a\\\\b.txt\""));
+  assert.ok(slashPatchText.includes(`diff --git a/${literalPathFixture.slashHierarchyPath} b/${literalPathFixture.slashHierarchyPath}`));
+  assert.ok(backslashPatchText.includes(literalPathFixture.literalBackslashChanged.toString("utf8")));
+  assert.ok(slashPatchText.includes(literalPathFixture.slashHierarchyChanged.toString("utf8")));
+  literalPathRaw = {
+    baseTreePaths,
+    headTreePaths,
+    baseBackslashBlob,
+    baseSlashBlob,
+    headBackslashBlob,
+    headSlashBlob,
+    backslashRaw,
+    slashRaw,
+    backslashLogIds,
+    slashLogIds,
+    backslashPatchText,
+    slashPatchText
+  };
+}
 const rawPatchFacts = new Map();
 for (const record of patchRaw.records.filter((entry) => !entry.binary && entry.status !== "T"
   && !(entry.oldPath ?? entry.newPath ?? "").includes("\n"))) {
@@ -707,6 +849,15 @@ console.log(`RAW_OBSERVATION: direct base ${matrix.baseSha} to head ${matrix.hea
 console.log(`RAW_OBSERVATION: direct same-SHA comparison yielded ${matrixRawSameSha.records.length} records; direct divergent comparison left ${divergent.leftSha} to right ${divergent.rightSha} yielded ${directDivergent.records.length}, while merge-base ${divergent.mergeBase} to right yielded ${directMergeBase.records.length}.`);
 console.log(`RAW_OBSERVATION: direct binary records have null additions/deletions and binary=true; invalid UTF-8 fixture contains raw byte 0x80 in the name-status producer.`);
 console.log(`RAW_OBSERVATION: direct patch producer yielded ${rawPatchFacts.size} complete target fragments; raw additions/deletions/context/rename/copy fragments contain their secret-looking literals, while blocked and binary source blobs independently contain secrets.`);
+if (literalPathFixture !== undefined) {
+  console.log(`RAW_OBSERVATION: POSIX direct Git tree paths preserve distinct ${JSON.stringify(literalPathFixture.literalBackslashPath)} and ${JSON.stringify(literalPathFixture.slashHierarchyPath)}; baseline/head blob bytes and filtered logs identify separate commits.`);
+  console.log(`RAW_OBSERVATION: POSIX literal-path filtered diffs each yielded one raw record and one complete patch fragment: ${JSON.stringify({
+    [literalPathFixture.literalBackslashPath]: literalPathRaw.backslashRaw.records,
+    [literalPathFixture.slashHierarchyPath]: literalPathRaw.slashRaw.records
+  })}.`);
+} else {
+  console.log("RAW_OBSERVATION: Windows host cannot represent a POSIX literal-backslash tree name beside slash hierarchy; filtered identity fixture was not fabricated.");
+}
 console.log("SANITY_VERDICT: MATCH (direct Git facts establish the accepted metadata invariants before target diagnostics or test verdicts are consulted).");
 
 const [{ loadConfig }, { CodexProError, PathGuard, WorkspaceManager }, target, policy] = await Promise.all([
@@ -984,6 +1135,57 @@ assertStructuredContract(integratedFilter, {
   warnings: integratedFilterRaw.some((record) => !record.binary) ? ["Patch generation was disabled by request."] : []
 }, "integrated historical path-filter result");
 console.log("PASS integrated same-SHA zero result and historical old/new path-filter contract");
+
+if (literalPathFixture !== undefined) {
+  const literalPathContext = targetContext(literalPathFixture.repoRoot);
+  const literalCases = [
+    [
+      literalPathFixture.literalBackslashPath,
+      literalPathRaw.backslashRaw.records,
+      policyRedactUnifiedDiff(literalPathRaw.backslashPatchText)
+    ],
+    [
+      literalPathFixture.slashHierarchyPath,
+      literalPathRaw.slashRaw.records,
+      policyRedactUnifiedDiff(literalPathRaw.slashPatchText)
+    ]
+  ];
+  for (const [pathFilter, rawRecords, expectedPatch] of literalCases) {
+    const result = await gitDiffRange(
+      literalPathContext.config,
+      literalPathContext.guard,
+      literalPathContext.workspace,
+      {
+        baseRef: literalPathFixture.baseSha,
+        headRef: literalPathFixture.headSha,
+        path: pathFilter,
+        includePatch: true
+      }
+    );
+    assertStructuredContract(result, {
+      workspace: literalPathContext.workspace,
+      baseInput: literalPathFixture.baseSha,
+      baseSha: literalPathFixture.baseSha,
+      headInput: literalPathFixture.headSha,
+      headSha: literalPathFixture.headSha,
+      path: pathFilter,
+      rawRecords,
+      eligibleRecords: rawRecords,
+      returnedRecords: rawRecords,
+      patch: expectedPatch,
+      patchRequested: true,
+      patchTruncated: false,
+      patchLimit: 60_000,
+      patchFilesIncluded: 1,
+      omissionCounts: { blocked: 0, binary: 0, budget: 0, too_large: 0, file_limit: 0, disabled: 0 },
+      warnings: []
+    }, `integrated POSIX literal-path filter ${JSON.stringify(pathFilter)}`);
+    assert.equal(result.changed_files.length, 1);
+    assert.equal(result.changed_files[0].old_path, pathFilter);
+    assert.equal(result.changed_files[0].new_path, pathFilter);
+  }
+  console.log("PASS integrated gitDiffRange filters preserve POSIX literal-backslash versus slash-hierarchy identity, metadata, and raw patch fragments");
+}
 
 const integratedPatchContext = targetContext(patchFixture.repoRoot);
 const integratedPatchEligible = patchRaw.records.filter((record) => record.oldPath !== patchFixture.blockedPath && record.newPath !== patchFixture.blockedPath);

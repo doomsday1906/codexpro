@@ -26,14 +26,21 @@ export function validateHistoricalPath(guard: Pick<PathGuard, "isBlockedRelative
     return invalidHistoricalPath();
   }
 
-  // A leading separator is absolute on both POSIX and Windows once both
-  // separator spellings are accepted. This covers UNC, extended UNC, and
-  // device paths before any empty components are discarded.
-  if (rawPath.startsWith("/") || rawPath.startsWith("\\") || WINDOWS_DRIVE_PREFIX_PATTERN.test(rawPath)) {
+  const isWindows = process.platform === "win32";
+  // A leading forward slash is absolute on every host. Two leading
+  // backslashes are always rejected as UNC; on Windows, one leading
+  // backslash is also a root. POSIX treats a single backslash as data.
+  if (
+    rawPath.startsWith("/") ||
+    rawPath.startsWith("\\\\") ||
+    (isWindows && rawPath.startsWith("\\")) ||
+    WINDOWS_DRIVE_PREFIX_PATTERN.test(rawPath)
+  ) {
     return invalidHistoricalPath();
   }
 
-  const components = rawPath.replaceAll("\\", "/").split("/");
+  const normalized = isWindows ? rawPath.replaceAll("\\", "/") : rawPath;
+  const components = normalized.split("/");
   const canonicalComponents: string[] = [];
   for (const component of components) {
     if (component === "..") {

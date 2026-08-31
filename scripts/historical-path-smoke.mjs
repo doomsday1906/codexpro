@@ -188,42 +188,66 @@ const config = await withEnvironment({
 }, () => loadConfig([]));
 const defaultAndCustomGuard = new PathGuard(config);
 
-// Positive canonicalization and lawful names, including backslashes that are
-// separators rather than a way to bypass the blocked-path policy.
+// Positive canonicalization and lawful names. Forward-slash hierarchy is
+// canonicalized on every host; a backslash is a separator only on Windows and
+// remains literal repository data on POSIX.
 const canonicalCases = [
   ["ordinary/file.txt", "ordinary/file.txt"],
-  ["ordinary\\file.txt", "ordinary/file.txt"],
   ["ordinary//nested///file.txt", "ordinary/nested/file.txt"],
   ["./ordinary/./nested/./file.txt/", "ordinary/nested/file.txt"],
-  [".hidden\\visible.txt", ".hidden/visible.txt"],
-  ["space dir\\file name.txt", "space dir/file name.txt"],
-  ["café\\naïve.txt", "café/naïve.txt"],
-  ["-leading\\--file.txt", "-leading/--file.txt"],
   ["foo/…-lawful.txt", "foo/…-lawful.txt"]
 ];
+const backslashCases = process.platform === "win32"
+  ? [
+      ["ordinary\\file.txt", "ordinary/file.txt"],
+      [".hidden\\visible.txt", ".hidden/visible.txt"],
+      ["space dir\\file name.txt", "space dir/file name.txt"],
+      ["café\\naïve.txt", "café/naïve.txt"],
+      ["-leading\\--file.txt", "-leading/--file.txt"]
+    ]
+  : [
+      ["ordinary\\file.txt", "ordinary\\file.txt"],
+      [".hidden\\visible.txt", ".hidden\\visible.txt"],
+      ["space dir\\file name.txt", "space dir\\file name.txt"],
+      ["café\\naïve.txt", "café\\naïve.txt"],
+      ["-leading\\--file.txt", "-leading\\--file.txt"],
+      ["internal\\segment/file.txt", "internal\\segment/file.txt"],
+      ["\\leading.txt", "\\leading.txt"],
+      ["trailing\\", "trailing\\"],
+      ["multiple\\\\slashes.txt", "multiple\\\\slashes.txt"],
+      ["dot.\\adjacent.txt", "dot.\\adjacent.txt"],
+      ["ordinary/with\\literal.txt", "ordinary/with\\literal.txt"]
+    ];
+for (const [rawPath, expected] of backslashCases) canonicalCases.push([rawPath, expected]);
 for (const [rawPath, expected] of canonicalCases) {
   expectAccepted(noFilesystemGuard, rawPath, expected);
 }
-console.log(`PASS slash canonicalization, duplicate/dot/trailing segments, and lawful Unicode/space/leading-dash/hidden names (${canonicalCases.length} cases)`);
+console.log(`PASS slash-only canonicalization plus platform-conditioned backslash identity cases (${canonicalCases.length} cases)`);
 
-// Default blocked policy and custom additions must apply after slash
-// canonicalization, so a backslash spelling cannot evade either policy.
+// Default blocked policy and custom additions apply to the canonical path.
+// On Windows, backslashes canonicalize before policy matching. On POSIX, a
+// backslash is literal data, so only the slash hierarchy spelling is blocked.
 const defaultBlockedCases = [
   ".env",
-  ".env\\nested.txt",
   "config/.env",
-  ".git\\config",
   "nested/.git/objects/item",
-  "node_modules\\dependency/index.js",
-  "dist\\bundle.js",
   "keys/private.pem",
   "keys/private.key",
   "ssh/id_rsa"
 ];
+if (process.platform === "win32") {
+  defaultBlockedCases.push(
+    ".env\\nested.txt",
+    ".git\\config",
+    "node_modules\\dependency/index.js",
+    "dist\\bundle.js"
+  );
+}
 for (const rawPath of defaultBlockedCases) {
   expectBlocked(defaultAndCustomGuard, rawPath);
 }
-const customBlockedCases = ["review-blocked/file.txt", "review-blocked\\file.txt", "archive/private-note.txt", "private-root.txt"];
+const customBlockedCases = ["review-blocked/file.txt", "archive/private-note.txt", "private-root.txt"];
+if (process.platform === "win32") customBlockedCases.push("review-blocked\\file.txt");
 for (const rawPath of customBlockedCases) {
   expectBlocked(defaultAndCustomGuard, rawPath);
 }
@@ -232,13 +256,13 @@ console.log(`PASS default blocked globs and custom blocked globs reject canonica
 // Nearby negative/falsifier coverage: path normalization must never turn an
 // escape, absolute path, control payload, or option-like absolute spelling into
 // a lawful tree path. Leading-dash *relative* names above remain lawful.
-const emptyOrDotOnly = ["", ".", "./", ".\\.", "././", "\\./\\."];
+const emptyOrDotOnly = ["", ".", "./", "././"];
+if (process.platform === "win32") emptyOrDotOnly.push(".\\.", "\\./\\.");
 for (const rawPath of emptyOrDotOnly) {
   expectInvalid(noFilesystemGuard, rawPath);
 }
 const absoluteAndDevice = [
   "/etc/passwd",
-  "\\etc\\passwd",
   "C:/Windows/System32",
   "C:\\Windows\\System32",
   "C:relative.txt",
@@ -248,10 +272,12 @@ const absoluteAndDevice = [
   "\\\\.\\COM1",
   "\\\\.\\pipe\\name"
 ];
+if (process.platform === "win32") absoluteAndDevice.push("\\etc\\passwd");
 for (const rawPath of absoluteAndDevice) {
   expectInvalid(noFilesystemGuard, rawPath);
 }
-const parentEscapes = ["..", "../file.txt", "folder/../file.txt", "folder\\..\\file.txt", "./folder/../../file.txt"];
+const parentEscapes = ["..", "../file.txt", "folder/../file.txt", "./folder/../../file.txt"];
+if (process.platform === "win32") parentEscapes.push("folder\\..\\file.txt");
 for (const rawPath of parentEscapes) {
   expectInvalid(noFilesystemGuard, rawPath);
 }
@@ -271,11 +297,18 @@ const over4096Bytes = "é".repeat(2049); // 4098 UTF-8 bytes, despite 2049 code 
 expectInvalid(noFilesystemGuard, over4096Bytes, ">4096 UTF-8 bytes");
 console.log(`PASS empty/dot-only, POSIX/drive/UNC/extended/device absolute, drive-relative, parent/control, and UTF-8 byte-boundary rejection (${emptyOrDotOnly.length + absoluteAndDevice.length + parentEscapes.length + controlCases.length + 2} cases)`);
 
-// A blocked path with an attempted separator bypass and a parent escape are
-// explicit nearby falsifiers for the two common implementation mistakes.
-expectInvalid(noFilesystemGuard, "review-blocked\\..\\secret.txt", "blocked path with parent-looking segment");
-expectInvalid(noFilesystemGuard, "lawful\\..\\current.txt", "nearby parent escape falsifier");
-console.log("PASS nearby falsifiers: blocked backslash bypass remains blocked; parent escape remains rejected");
+// Slash parent segments are always rejected. A POSIX backslash sequence is a
+// literal filename and therefore must not be reinterpreted as traversal;
+// Windows retains the separator/traversal rejection.
+expectInvalid(noFilesystemGuard, "review-blocked/../secret.txt", "blocked path with slash parent-looking segment");
+if (process.platform === "win32") {
+  expectInvalid(noFilesystemGuard, "review-blocked\\..\\secret.txt", "blocked path with Windows parent-looking segment");
+  expectInvalid(noFilesystemGuard, "lawful\\..\\current.txt", "Windows parent escape falsifier");
+} else {
+  expectAccepted(noFilesystemGuard, "review-blocked\\..\\secret.txt", "review-blocked\\..\\secret.txt", "POSIX literal backslash parent-looking filename");
+  expectAccepted(noFilesystemGuard, "lawful\\..\\current.txt", "lawful\\..\\current.txt", "POSIX literal backslash parent-looking filename");
+}
+console.log("PASS nearby falsifiers: slash traversal remains rejected and POSIX backslash data is not reinterpreted");
 
 await rm(fixtureRoot, { recursive: true, force: true });
 console.log("HISTORICAL_PATH_SMOKE: PASS AP-005 focused matrix");
