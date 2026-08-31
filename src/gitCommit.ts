@@ -1173,9 +1173,11 @@ export async function withGitCommitLocks<T>(
   guard: Pick<PathGuard, "isBlockedRelativePath">,
   workspace: Workspace,
   rawInput: unknown,
-  task: (preflight: GitCommitPreflight) => Promise<T> | T
+  task: (preflight: GitCommitPreflight) => Promise<T> | T,
+  onInitialPreflight?: () => void
 ): Promise<T> {
   const first = await preflightGitCommit(config, guard, workspace, rawInput);
+  onInitialPreflight?.();
   return withGitMutationLock(workspace, async () => {
     return withFileWriteLocks(first.selected.map((entry) => entry.absPath), async () => {
       const locked = await preflightGitCommit(config, guard, workspace, rawInput);

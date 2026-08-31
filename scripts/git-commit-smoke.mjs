@@ -82,27 +82,31 @@ function waitForChild(child) {
 }
 
 async function expectReason(operation, reason) {
+  let error;
   try {
     await operation();
-    assert.fail(`expected GitCommitError(${reason})`);
-  } catch (error) {
-    assert.equal(error?.name, "GitCommitError", `expected bounded GitCommitError, got ${error?.constructor?.name ?? typeof error}`);
-    assert.equal(error.reason, reason);
-    assert.ok(!error.message.includes("HOSTILE"), "failure echoed hostile input");
-    return error;
+  } catch (caught) {
+    error = caught;
   }
+  assert.ok(error, `expected GitCommitError(${reason}); operation unexpectedly resolved`);
+  assert.equal(error.name, "GitCommitError", `expected bounded GitCommitError, got ${error?.constructor?.name ?? typeof error}`);
+  assert.equal(error.reason, reason);
+  assert.ok(!error.message.includes("HOSTILE"), "failure echoed hostile input");
+  return error;
 }
 
 async function expectReasonOneOf(operation, reasons) {
+  let error;
   try {
     await operation();
-    assert.fail(`expected GitCommitError(${reasons.join("|")})`);
-  } catch (error) {
-    assert.equal(error?.name, "GitCommitError", `expected bounded GitCommitError, got ${error?.constructor?.name ?? typeof error}`);
-    assert.ok(reasons.includes(error.reason), `unexpected GitCommitError(${error.reason})`);
-    assert.ok(!error.message.includes("HOSTILE"), "failure echoed hostile input");
-    return error;
+  } catch (caught) {
+    error = caught;
   }
+  assert.ok(error, `expected GitCommitError(${reasons.join("|")}); operation unexpectedly resolved`);
+  assert.equal(error.name, "GitCommitError", `expected bounded GitCommitError, got ${error?.constructor?.name ?? typeof error}`);
+  assert.ok(reasons.includes(error.reason), `unexpected GitCommitError(${error.reason})`);
+  assert.ok(!error.message.includes("HOSTILE"), "failure echoed hostile input");
+  return error;
 }
 
 function commitAll(root, message) {
@@ -342,11 +346,35 @@ const first = withGitCommitLocks(config, permissiveGuard, workspace, request(["t
 });
 await firstEntered;
 let secondCallbackRan = false;
+let secondInitialPreflightCount = 0;
+let secondInitialPreflightResolve;
+const serializationOrder = [];
+const secondInitialPreflight = new Promise((resolve) => {
+  secondInitialPreflightResolve = resolve;
+});
 const second = withGitCommitLocks(config, permissiveGuard, workspace, request(["tracked.txt"], mainConflictHead), async () => {
   secondCallbackRan = true;
+}, () => {
+  secondInitialPreflightCount += 1;
+  serializationOrder.push("second-initial-preflight-complete");
+  secondInitialPreflightResolve(Date.now());
 });
-await delay(100);
+const secondInitialPreflightAt = await secondInitialPreflight;
+const trackedBeforeMutation = await readFile(path.join(repoRoot, "tracked.txt"));
+const trackedBeforeStat = await lstat(path.join(repoRoot, "tracked.txt"));
+serializationOrder.push("raw-before-mutation-observed");
+const mutationAt = Date.now();
 await writeFile(path.join(repoRoot, "tracked.txt"), "changed while waiting\n");
+const trackedAfterMutation = await readFile(path.join(repoRoot, "tracked.txt"));
+const trackedAfterStat = await lstat(path.join(repoRoot, "tracked.txt"));
+serializationOrder.push("mutation-complete");
+assert.equal(secondInitialPreflightCount, 1, "initial preflight observer did not fire exactly once");
+assert.deepEqual(serializationOrder, ["second-initial-preflight-complete", "raw-before-mutation-observed", "mutation-complete"]);
+assert.equal(trackedBeforeMutation.toString("utf8"), "base\n");
+assert.equal(trackedAfterMutation.toString("utf8"), "changed while waiting\n");
+assert.equal(trackedBeforeStat.ino, trackedAfterStat.ino, "test-side mutation unexpectedly replaced the tracked pathname");
+assert.ok(secondInitialPreflightAt <= mutationAt, "tracked mutation was not ordered after the real initial preflight signal");
+console.log("RAW_ORDER: sequence=" + serializationOrder.join("->") + "; real second initial preflight completed at " + secondInitialPreflightAt + "; raw tracked.txt inode=" + trackedBeforeStat.ino + " contained " + trackedBeforeMutation.length + " bytes before test mutation at " + mutationAt + ", then " + trackedAfterMutation.length + " bytes after.");
 releaseFirst();
 await first;
 await expectReason(() => second, "preflight-changed");
