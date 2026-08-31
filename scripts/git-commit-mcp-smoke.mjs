@@ -15,6 +15,8 @@ const HOSTILE_PATH = "OPENAI_API_KEY_HOSTILE_PATH.txt";
 const HOSTILE_MESSAGE = "sk-live-git-commit-mcp-hostile-message-7x9";
 const DEFAULT_SENTINEL = "AMBIENT_DEFAULT_SENTINEL_7X9";
 const TARGET_SENTINEL = "EXPLICIT_TARGET_SENTINEL_7X9";
+const POSIX_LITERAL_PATH = "a\\b.txt";
+const POSIX_SLASH_PATH = "a/b.txt";
 
 async function freePort() {
   return new Promise((resolve, reject) => {
@@ -145,7 +147,7 @@ async function closeClient(session) {
   await session.client.close().catch(() => {});
 }
 
-async function callTool(session, name, args) {
+async function callTool(session, name, args, { captureRequest = false } = {}) {
   const start = session.captures.length;
   let result;
   let error;
@@ -164,7 +166,13 @@ async function callTool(session, name, args) {
     }
   });
   const rawEnvelope = parseEnvelopeBody(calls.at(-1));
-  return { result, error, rawEnvelope, rawBody: calls.at(-1)?.body ?? "" };
+  return {
+    result,
+    error,
+    rawEnvelope,
+    rawBody: calls.at(-1)?.body ?? "",
+    ...(captureRequest ? { requestBody: calls.at(-1)?.requestBody ?? "" } : {})
+  };
 }
 
 function resultText(output) {
@@ -267,6 +275,15 @@ function changedPaths(root, oldHead, newHead) {
   return result;
 }
 
+function treeEntry(root, commit, relativePath) {
+  const records = directGit(root, ["ls-tree", "-r", "-z", commit]).toString("utf8").split("\u0000").filter(Boolean);
+  const record = records.find((candidate) => candidate.slice(candidate.indexOf("\t") + 1) === relativePath);
+  if (record === undefined) return undefined;
+  const tab = record.indexOf("\t");
+  const [mode, type, objectId] = record.slice(0, tab).split(" ");
+  return { mode, type, objectId, path: record.slice(tab + 1) };
+}
+
 async function withHttpServer({ defaultRoot, allowedRoots, toolMode, writeMode, extraEnv = {} }, callback) {
   const port = await freePort();
   const env = {
@@ -320,6 +337,9 @@ try {
   const defaultHead = commitFixture(defaultRoot, "ambient default baseline");
   await writeFile(path.join(targetRoot, "selected.txt"), `${TARGET_SENTINEL} baseline\n`, "utf8");
   await writeFile(path.join(targetRoot, "unrelated.txt"), "unrelated baseline\n", "utf8");
+  await mkdir(path.join(targetRoot, "a"), { recursive: true });
+  await writeFile(path.join(targetRoot, POSIX_LITERAL_PATH), "literal baseline\n", "utf8");
+  await writeFile(path.join(targetRoot, POSIX_SLASH_PATH), "slash baseline\n", "utf8");
   const targetHead = commitFixture(targetRoot, "explicit target baseline");
   await mkdir(remoteRoot, { recursive: true });
   directGit(remoteRoot, ["init", "--bare", "--quiet"]);
@@ -454,6 +474,72 @@ try {
     console.log(`RAW_OBSERVATION: success envelope=${JSON.stringify(successEnvelope)}; target refs moved ${targetHead} -> ${newHead}; direct parent=${targetHead}; changed paths=${JSON.stringify(changed)}; remote-tracking origin/master remained ${remoteRefBefore}; default HEAD remained ${defaultAfter.head}.`);
     console.log("SANITY_VERDICT: MATCH — the real HTTP call advanced only the explicit target branch by one commit with one selected path; ambient default refs and bytes stayed unchanged.");
     console.log("PREDICATE: TRUE — independent pre-call ambient listing selected the default, while the supplied target ID mapped to the target root and direct post-call refs show only that root advanced.");
+    // HIGH-PATH-001 public MCP route. Establish raw target bytes/tree/status
+    // before the call, then inspect raw Git again before response assertions.
+    const publicPathHead = newHead;
+    await writeFile(path.join(targetRoot, POSIX_LITERAL_PATH), "literal public modified\n", "utf8");
+    await writeFile(path.join(targetRoot, POSIX_SLASH_PATH), "slash public modified\n", "utf8");
+    const publicPathBeforeTreeLiteral = treeEntry(targetRoot, publicPathHead, POSIX_LITERAL_PATH);
+    const publicPathBeforeTreeSlash = treeEntry(targetRoot, publicPathHead, POSIX_SLASH_PATH);
+    const publicPathBeforeStatus = directGit(targetRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
+    const publicPathBeforeSlashStatus = directGit(targetRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--", POSIX_SLASH_PATH]);
+    const publicPathBeforeLiteralBytes = await readFile(path.join(targetRoot, POSIX_LITERAL_PATH));
+    const publicPathBeforeSlashBytes = await readFile(path.join(targetRoot, POSIX_SLASH_PATH));
+    assert.equal(publicPathBeforeTreeLiteral?.path, POSIX_LITERAL_PATH);
+    assert.equal(publicPathBeforeTreeSlash?.path, POSIX_SLASH_PATH);
+    assert.equal(publicPathBeforeLiteralBytes.toString("utf8"), "literal public modified\n");
+    assert.equal(publicPathBeforeSlashBytes.toString("utf8"), "slash public modified\n");
+    assert.ok(publicPathBeforeStatus.length > 0);
+    console.log("RAW_OBSERVATION: public target HEAD=" + publicPathHead + " tree contains both exact path identities; direct worktree bytes are literal-public and slash-public modifications; raw status is non-empty.");
+
+    const publicLiteralCall = await callTool(sessionB, "git_commit", {
+     workspace_id: targetWorkspaceId,
+      paths: [POSIX_LITERAL_PATH],
+      message: "public POSIX literal backslash commit",
+      expected_head: publicPathHead
+    }, { captureRequest: true });
+    const publicLiteralAfter = await repositorySnapshot(targetRoot);
+    const publicLiteralNewHead = publicLiteralAfter.head;
+    const publicLiteralCommitRaw = directGit(targetRoot, ["cat-file", "commit", publicLiteralNewHead]).toString("utf8");
+    const publicLiteralParentLines = publicLiteralCommitRaw.split("\n").filter((line) => line.startsWith("parent "));
+    const publicLiteralChanged = changedPaths(targetRoot, publicPathHead, publicLiteralNewHead);
+    const publicLiteralTree = treeEntry(targetRoot, publicLiteralNewHead, POSIX_LITERAL_PATH);
+    const publicLiteralSlashTree = treeEntry(targetRoot, publicLiteralNewHead, POSIX_SLASH_PATH);
+    const publicLiteralLiteralBytes = await readFile(path.join(targetRoot, POSIX_LITERAL_PATH));
+    const publicLiteralSlashBytes = await readFile(path.join(targetRoot, POSIX_SLASH_PATH));
+    const publicLiteralStatus = directGit(targetRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
+    const publicLiteralSlashStatus = directGit(targetRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--", POSIX_SLASH_PATH]);
+    const publicLiteralIndex = directGit(targetRoot, ["ls-files", "--stage", "-z", "--", POSIX_LITERAL_PATH]);
+    const publicLiteralDiffNames = directGit(targetRoot, ["diff", "--name-only", "-z"]).toString("utf8").split("\u0000").filter(Boolean);
+    const publicLiteralRequest = JSON.parse(publicLiteralCall.requestBody);
+    assert.equal(publicLiteralRequest.method, "tools/call");
+    assert.equal(publicLiteralRequest.params.name, "git_commit");
+    assert.equal(publicLiteralRequest.params.arguments.workspace_id, targetWorkspaceId);
+    assert.equal(publicLiteralRequest.params.arguments.expected_head, publicPathHead);
+    assert.equal(publicLiteralRequest.params.arguments.paths[0], POSIX_LITERAL_PATH);
+    assert.equal(publicLiteralCall.requestBody.includes(JSON.stringify(POSIX_LITERAL_PATH)), true, "JSON transport did not carry escaped literal backslash path");
+    assert.notEqual(publicLiteralNewHead, publicPathHead);
+    assert.deepEqual(publicLiteralParentLines, ["parent " + publicPathHead]);
+    assert.deepEqual(publicLiteralChanged, [{ status: "M", path: POSIX_LITERAL_PATH }]);
+    assert.equal(publicLiteralTree?.path, POSIX_LITERAL_PATH);
+    assert.deepEqual(publicLiteralSlashTree, publicPathBeforeTreeSlash);
+    assert.equal(publicLiteralIndex.toString("utf8"), publicLiteralTree.mode + " " + publicLiteralTree.objectId + " 0\t" + POSIX_LITERAL_PATH + "\u0000");
+    assert.equal(publicLiteralLiteralBytes.toString("utf8"), "literal public modified\n");
+    assert.equal(publicLiteralSlashBytes.toString("utf8"), "slash public modified\n");
+    assert.deepEqual(publicLiteralSlashStatus, publicPathBeforeSlashStatus);
+    assert.equal(publicLiteralDiffNames.includes(POSIX_SLASH_PATH), true);
+    assert.equal(publicLiteralStatus.toString("utf8").includes(POSIX_SLASH_PATH), true);
+    console.log("RAW_OBSERVATION: public tools/call advanced target HEAD=" + publicLiteralNewHead + "; direct parent=" + publicLiteralParentLines.join(",") + "; raw diff-tree=" + JSON.stringify(publicLiteralChanged) + "; literal tree/worktree settled while slash lookalike tree stayed baseline and remained dirty.");
+    console.log("SANITY_VERDICT: MATCH — raw Git proves the real MCP call committed only the exact literal backslash path; decoded request and response fields are supporting transport oracles.");
+    const publicLiteralResult = expectSuccess(publicLiteralCall, "public POSIX literal backslash git_commit");
+    assert.equal(publicLiteralResult.structuredContent.workspace_id, targetWorkspaceId);
+    assert.equal(publicLiteralResult.structuredContent.root, targetCanonicalRoot);
+    assert.equal(publicLiteralResult.structuredContent.old_head, publicPathHead);
+    assert.equal(publicLiteralResult.structuredContent.new_head, publicLiteralNewHead);
+    assert.deepEqual(publicLiteralResult.structuredContent.committed_paths, [POSIX_LITERAL_PATH]);
+    assert.equal(publicLiteralResult.structuredContent.requested_path_count, 1);
+    assert.equal(publicLiteralResult.structuredContent.committed_path_count, 1);
+    console.log("PASS HIGH-PATH-001 public MCP JSON transport preserves one literal backslash and commits only that exact target identity.");
 
     const afterSelection = await callTool(sessionB, "list_workspaces", {});
     const afterSelectionResult = expectSuccess(afterSelection, "session B workspace selection after explicit commit");
@@ -464,7 +550,7 @@ try {
     const missingId = expectError(await callTool(sessionB, "git_commit", {
       paths: ["selected.txt"],
       message: "missing workspace id must not fall back",
-      expected_head: newHead
+      expected_head: publicLiteralNewHead
     }), "missing workspace_id");
     assert.match(resultText(missingId), /workspace_id/iu, "missing workspace_id error omitted the field name");
     assert.deepEqual(await repositorySnapshot(targetRoot), missingIdBefore, "missing workspace_id changed target state");
@@ -475,7 +561,7 @@ try {
       workspace_id: "ws_000000000000000000000000",
       paths: ["selected.txt"],
       message: "wrong workspace id",
-      expected_head: newHead
+      expected_head: publicLiteralNewHead
     }), "wrong workspace_id");
     assert.match(resultText(wrongId), /workspace/iu, "wrong workspace_id error omitted workspace identity wording");
     assert.deepEqual(await repositorySnapshot(targetRoot), missingIdBefore, "wrong workspace_id changed target state");
@@ -498,7 +584,7 @@ try {
       workspace_id: targetWorkspaceId,
       paths: ["selected.txt"],
       message: "hostile unknown key must be redacted",
-      expected_head: newHead,
+      expected_head: publicLiteralNewHead,
       [HOSTILE_KEY]: HOSTILE_VALUE
     }), "hostile unknown key");
     assert.match(resultText(hostile), /unknown|invalid arguments|not allowed/iu, "hostile unknown-key error was not a schema rejection");
@@ -510,11 +596,11 @@ try {
       workspace_id: targetWorkspaceId,
       paths: [HOSTILE_PATH],
       message: HOSTILE_MESSAGE,
-      expected_head: newHead
+      expected_head: publicLiteralNewHead
     }), "hostile path/message");
     assertNoRawLiterals(hostilePath, [HOSTILE_PATH, HOSTILE_MESSAGE], "hostile path/message complete envelope");
     assert.deepEqual(await repositorySnapshot(targetRoot), hostilePathBefore, "hostile path/message changed target state");
-    console.log(`RAW_OBSERVATION: complete error envelopes for missing ID, wrong ID, stale HEAD, hostile unknown key, and hostile path/message were returned; target HEAD stayed ${newHead} and selected worktree bytes stayed pending-only.`);
+    console.log(`RAW_OBSERVATION: complete error envelopes for missing ID, wrong ID, stale HEAD, hostile unknown key, and hostile path/message were returned; target HEAD stayed ${publicLiteralNewHead} and selected worktree bytes stayed pending-only.`);
     console.log("SANITY_VERDICT: MATCH — every rejected call left refs and direct repository state unchanged, and the hostile property name/value were absent from complete serialized output.");
     console.log("PREDICATE: TRUE — rejection predicates were established from request shape/independent stale refs before judging that no mutation occurred.");
     await closeClient(sessionB);

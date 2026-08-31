@@ -152,12 +152,18 @@ function canonicalInputPath(rawPath: unknown): string {
   if (typeof rawPath !== "string" || rawPath.length === 0) return fail("invalid-path");
   if (Buffer.byteLength(rawPath, "utf8") > GIT_COMMIT_MAX_PATH_BYTES) return fail("invalid-path");
   if (CONTROL_CHARACTER_PATTERN.test(rawPath)) return fail("invalid-path");
-  if (rawPath.startsWith("/") || rawPath.startsWith("\\") || WINDOWS_DRIVE_PREFIX_PATTERN.test(rawPath)) {
+  const isWindows = process.platform === "win32";
+  if (
+    rawPath.startsWith("/") ||
+    rawPath.startsWith("\\\\") ||
+    (isWindows && rawPath.startsWith("\\")) ||
+    WINDOWS_DRIVE_PREFIX_PATTERN.test(rawPath)
+  ) {
     return fail("invalid-path");
   }
-  if (rawPath.endsWith("/") || rawPath.endsWith("\\")) return fail("invalid-path");
+  if (rawPath.endsWith("/") || (isWindows && rawPath.endsWith("\\"))) return fail("invalid-path");
 
-  const normalized = rawPath.replaceAll("\\", "/");
+  const normalized = isWindows ? rawPath.replaceAll("\\", "/") : rawPath;
   if (normalized.startsWith("/") || normalized.startsWith("//")) return fail("invalid-path");
   const components = normalized.split("/");
   if (components.some((component) => component === "..")) return fail("invalid-path");

@@ -148,6 +148,46 @@ assert.equal(await exists(path.join(repoRoot, ".git", "HEAD")), true);
 console.log(`RAW_OBSERVATION: native Git reports attached branch ${rawBranch}, exact HEAD ${rawHead}, and a real disposable worktree`);
 console.log("SANITY_VERDICT: MATCH (raw repository facts satisfy the accepted AP-003/AP-004 fixture preconditions)");
 
+// HIGH-PATH-001 Pass 1: establish the exact POSIX path identities and their
+// independent raw Git/worktree state before importing or interpreting the
+// product route. Backslash is a literal POSIX filename byte, not a separator.
+const posixPathRoot = path.join(fixtureRoot, "posix-literal-paths");
+await mkdir(posixPathRoot);
+const posixPathCases = {
+  internal: "a\\b.txt",
+  leadingSingle: "\\leading.txt",
+  trailing: "trailing\\",
+  multiple: "multi\\\\backslash.txt",
+  dotAdjacent: "dot\\..txt",
+  slashLookalike: "a/b.txt"
+};
+initRepo(posixPathRoot, "POSIX Literal Path Smoke");
+for (const [caseName, relativePath] of Object.entries(posixPathCases)) {
+  const absolutePath = path.join(posixPathRoot, relativePath);
+  await mkdir(path.dirname(absolutePath), { recursive: true });
+  await writeFile(absolutePath, `${caseName} base\n`);
+}
+const posixPathBaseHead = commitAll(posixPathRoot, "POSIX literal path base");
+for (const [caseName, relativePath] of Object.entries(posixPathCases)) {
+  await writeFile(path.join(posixPathRoot, relativePath), `${caseName} modified\n`);
+}
+const posixTreeBefore = mustGit(posixPathRoot, ["ls-tree", "-r", "-z", posixPathBaseHead]);
+const posixTreeNamesBefore = posixTreeBefore.toString("utf8").split("\u0000").filter(Boolean).map((record) => record.slice(record.indexOf("\t") + 1));
+const posixDiffNamesBefore = mustGit(posixPathRoot, ["diff", "--name-only", "-z"]);
+const posixIndexBefore = mustGit(posixPathRoot, ["ls-files", "--stage", "-z"]);
+const posixStatusBefore = mustGit(posixPathRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
+assert.equal(process.platform === "win32", false, "HIGH-PATH-001 POSIX proof requires a POSIX host");
+for (const relativePath of Object.values(posixPathCases)) {
+  assert.equal(posixTreeNamesBefore.includes(relativePath), true, `raw HEAD tree omitted exact ${JSON.stringify(relativePath)}`);
+  assert.equal(posixDiffNamesBefore.toString("utf8").split("\u0000").includes(relativePath), true, `raw worktree diff omitted exact ${JSON.stringify(relativePath)}`);
+}
+assert.ok(posixIndexBefore.length > 0);
+assert.ok(posixStatusBefore.length > 0);
+const posixLiteralBeforeBytes = await readFile(path.join(posixPathRoot, posixPathCases.internal));
+const posixSlashBeforeBytes = await readFile(path.join(posixPathRoot, posixPathCases.slashLookalike));
+console.log(`RAW_OBSERVATION: POSIX HEAD=${posixPathBaseHead} tree contains exact names ${JSON.stringify(posixTreeNamesBefore)}; raw diff/status/index show all six cases modified; literal bytes=${posixLiteralBeforeBytes.toString("utf8").trim()} and slash-lookalike bytes=${posixSlashBeforeBytes.toString("utf8").trim()}.`);
+console.log("SANITY_VERDICT: MATCH — direct POSIX Git tree, diff, index, status, and worktree bytes establish distinct literal-backslash and slash identities before product execution.");
+
 const { PathGuard } = await import("../dist/guard.js");
 const {
   GitCommitError,
@@ -168,6 +208,132 @@ const request = (paths, expected = initialHead) => ({
   message: "substrate smoke commit",
   expected_head: expected
 });
+// HIGH-PATH-001 parser/preflight matrix. On POSIX these exact strings are
+// literal path identities; only the slash lookalike contains a separator.
+const posixWorkspace = { id: "ws_posix_literal_paths", root: posixPathRoot, openedAt: new Date().toISOString() };
+const posixGuard = new PathGuard({ blockedGlobs: [".git", ".git/**"] });
+const posixRequest = (paths, expected = posixPathBaseHead) => ({
+  workspace_id: posixWorkspace.id,
+  paths,
+  message: "POSIX literal path smoke commit",
+  expected_head: expected
+});
+const posixValidated = validateGitCommitRequest(posixRequest(Object.values(posixPathCases)));
+assert.deepEqual(posixValidated.paths, Object.values(posixPathCases));
+assert.equal(new Set(posixValidated.paths).size, Object.values(posixPathCases).length);
+assert.deepEqual(
+  validateGitCommitRequest(posixRequest([posixPathCases.internal, posixPathCases.slashLookalike])).paths,
+  [posixPathCases.internal, posixPathCases.slashLookalike]
+);
+for (const relativePath of Object.values(posixPathCases)) {
+  const selected = await preflightGitCommit(config, posixGuard, posixWorkspace, posixRequest([relativePath]));
+  assert.equal(selected.selected.length, 1);
+  assert.equal(selected.selected[0].path, relativePath, "preflight changed exact POSIX identity " + JSON.stringify(relativePath));
+}
+console.log("PASS HIGH-PATH-001 parser/preflight matrix preserves internal, leading-single, trailing, multiple, dot-adjacent, and slash-separated path identities: " + JSON.stringify(posixValidated.paths));
+
+const rawTreeEntry = (root, commit, relativePath) => {
+  const records = mustGit(root, ["ls-tree", "-r", "-z", commit]).toString("utf8").split("\u0000").filter(Boolean);
+  const record = records.find((candidate) => candidate.slice(candidate.indexOf("\t") + 1) === relativePath);
+  if (record === undefined) return undefined;
+  const tab = record.indexOf("\t");
+  const [mode, type, objectId] = record.slice(0, tab).split(" ");
+  return { mode, type, objectId, path: record.slice(tab + 1) };
+};
+const rawChangedPaths = (root, oldHead, newHead) => {
+  const fields = mustGit(root, ["diff-tree", "-r", "--no-commit-id", "--name-status", "-z", "--no-renames", oldHead, newHead])
+    .toString("utf8").split("\u0000").filter(Boolean);
+  assert.equal(fields.length % 2, 0);
+  const paths = [];
+  for (let index = 0; index < fields.length; index += 2) paths.push({ status: fields[index], path: fields[index + 1] });
+  return paths;
+};
+const rawNames = (buffer) => buffer.toString("utf8").split("\u0000").filter(Boolean);
+
+// HIGH-PATH-001 real internal route. Raw Git is inspected before any
+// assertion against the implementation result object.
+const posixRawBeforeCommit = {
+  head: gitTrimmed(posixPathRoot, ["rev-parse", "HEAD"]),
+  tree: mustGit(posixPathRoot, ["ls-tree", "-r", "-z", posixPathBaseHead]),
+  index: mustGit(posixPathRoot, ["ls-files", "--stage", "-z"]),
+  diff: mustGit(posixPathRoot, ["diff", "--name-status", "-z"]),
+  status: mustGit(posixPathRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]),
+  slashStatus: mustGit(posixPathRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--", posixPathCases.slashLookalike]),
+  literalBytes: await readFile(path.join(posixPathRoot, posixPathCases.internal)),
+  slashBytes: await readFile(path.join(posixPathRoot, posixPathCases.slashLookalike))
+};
+assert.equal(posixRawBeforeCommit.head, posixPathBaseHead);
+assert.ok(posixRawBeforeCommit.tree.length > 0);
+assert.ok(posixRawBeforeCommit.index.length > 0);
+assert.ok(posixRawBeforeCommit.diff.length > 0);
+assert.ok(posixRawBeforeCommit.status.length > 0);
+assert.equal(posixRawBeforeCommit.literalBytes.toString("utf8"), "internal modified\n");
+assert.equal(posixRawBeforeCommit.slashBytes.toString("utf8"), "slashLookalike modified\n");
+console.log("RAW_OBSERVATION: before internal commit HEAD=" + posixRawBeforeCommit.head + "; raw tree/index/diff/status are non-empty; literal bytes=" + posixRawBeforeCommit.literalBytes.toString("utf8").trim() + "; slash-lookalike bytes=" + posixRawBeforeCommit.slashBytes.toString("utf8").trim() + ".");
+
+const posixLiteralResult = await gitCommit(config, posixGuard, posixWorkspace, posixRequest([posixPathCases.internal]));
+const posixLiteralNewHead = gitTrimmed(posixPathRoot, ["rev-parse", "HEAD"]);
+const posixLiteralCommitRaw = mustGit(posixPathRoot, ["cat-file", "commit", posixLiteralNewHead]).toString("utf8");
+const posixLiteralParentLines = posixLiteralCommitRaw.split("\n").filter((line) => line.startsWith("parent "));
+const posixLiteralChanged = rawChangedPaths(posixPathRoot, posixPathBaseHead, posixLiteralNewHead);
+const posixLiteralTree = rawTreeEntry(posixPathRoot, posixLiteralNewHead, posixPathCases.internal);
+const posixLiteralSlashTree = rawTreeEntry(posixPathRoot, posixLiteralNewHead, posixPathCases.slashLookalike);
+const posixLiteralIndex = mustGit(posixPathRoot, ["ls-files", "--stage", "-z", "--", posixPathCases.internal]);
+const posixLiteralStatus = mustGit(posixPathRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
+const posixLiteralSlashStatus = mustGit(posixPathRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--", posixPathCases.slashLookalike]);
+const posixLiteralWorktreeBytes = await readFile(path.join(posixPathRoot, posixPathCases.internal));
+const posixLiteralSlashBytes = await readFile(path.join(posixPathRoot, posixPathCases.slashLookalike));
+const posixLiteralDiffNames = rawNames(mustGit(posixPathRoot, ["diff", "--name-only", "-z"]));
+const posixLiteralBlob = gitTrimmed(posixPathRoot, ["hash-object", "--", posixPathCases.internal]);
+const posixSlashBaseTree = rawTreeEntry(posixPathRoot, posixPathBaseHead, posixPathCases.slashLookalike);
+assert.notEqual(posixLiteralNewHead, posixPathBaseHead);
+assert.deepEqual(posixLiteralParentLines, ["parent " + posixPathBaseHead]);
+assert.deepEqual(posixLiteralChanged, [{ status: "M", path: posixPathCases.internal }]);
+assert.equal(posixLiteralTree?.path, posixPathCases.internal);
+assert.equal(posixLiteralTree?.objectId, posixLiteralBlob);
+assert.deepEqual(posixLiteralSlashTree, posixSlashBaseTree);
+assert.equal(
+  posixLiteralIndex.toString("utf8"),
+  posixLiteralTree.mode + " " + posixLiteralTree.objectId + " 0\t" + posixPathCases.internal + "\u0000"
+);
+assert.equal(posixLiteralWorktreeBytes.toString("utf8"), "internal modified\n");
+assert.equal(posixLiteralSlashBytes.toString("utf8"), "slashLookalike modified\n");
+assert.deepEqual(posixLiteralSlashStatus, posixRawBeforeCommit.slashStatus);
+assert.equal(rawNames(mustGit(posixPathRoot, ["diff", "--name-only", "-z", "--", posixPathCases.internal])).length, 0);
+assert.equal(rawNames(mustGit(posixPathRoot, ["diff", "--cached", "--name-only", "-z", "--", posixPathCases.internal])).length, 0);
+assert.equal(posixLiteralDiffNames.includes(posixPathCases.slashLookalike), true);
+assert.equal(posixLiteralStatus.toString("utf8").includes(posixPathCases.slashLookalike), true);
+console.log("RAW_OBSERVATION: internal commit HEAD=" + posixLiteralNewHead + "; direct commit parent=" + posixLiteralParentLines.join(",") + "; raw diff-tree=" + JSON.stringify(posixLiteralChanged) + "; literal tree/index/worktree settled; slash lookalike tree stayed baseline and raw status/diff still show its modified bytes.");
+assert.equal(posixLiteralResult.old_head, posixPathBaseHead);
+assert.equal(posixLiteralResult.new_head, posixLiteralNewHead);
+assert.deepEqual(posixLiteralResult.committed_paths, [posixPathCases.internal]);
+assert.equal(posixLiteralResult.requested_path_count, 1);
+assert.equal(posixLiteralResult.committed_path_count, 1);
+console.log("SANITY_VERDICT: MATCH — raw Git proves only the requested literal backslash identity committed; product response fields agree as supporting oracle.");
+
+// Select the slash-separated lookalike at the exact new HEAD. Its commit
+// must not mutate the already-settled literal backslash path.
+const posixLiteralTreeBeforeSlashCommit = rawTreeEntry(posixPathRoot, posixLiteralNewHead, posixPathCases.internal);
+const posixLiteralBytesBeforeSlashCommit = await readFile(path.join(posixPathRoot, posixPathCases.internal));
+const posixSlashResult = await gitCommit(config, posixGuard, posixWorkspace, posixRequest([posixPathCases.slashLookalike], posixLiteralNewHead));
+const posixSlashNewHead = gitTrimmed(posixPathRoot, ["rev-parse", "HEAD"]);
+const posixSlashChanged = rawChangedPaths(posixPathRoot, posixLiteralNewHead, posixSlashNewHead);
+const posixLiteralTreeAfterSlashCommit = rawTreeEntry(posixPathRoot, posixSlashNewHead, posixPathCases.internal);
+const posixLiteralBytesAfterSlashCommit = await readFile(path.join(posixPathRoot, posixPathCases.internal));
+const posixSlashTreeAfter = rawTreeEntry(posixPathRoot, posixSlashNewHead, posixPathCases.slashLookalike);
+const posixLiteralStatusAfterSlashCommit = mustGit(posixPathRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--", posixPathCases.internal]);
+assert.deepEqual(posixSlashChanged, [{ status: "M", path: posixPathCases.slashLookalike }]);
+assert.deepEqual(posixLiteralTreeAfterSlashCommit, posixLiteralTreeBeforeSlashCommit);
+assert.deepEqual(posixLiteralBytesAfterSlashCommit, posixLiteralBytesBeforeSlashCommit);
+assert.equal(posixLiteralStatusAfterSlashCommit.length, 0);
+assert.equal(rawNames(mustGit(posixPathRoot, ["diff", "--name-only", "-z", "--", posixPathCases.internal])).length, 0);
+assert.equal(rawNames(mustGit(posixPathRoot, ["diff", "--name-only", "-z", "--", posixPathCases.slashLookalike])).length, 0);
+assert.equal(posixSlashTreeAfter?.objectId, gitTrimmed(posixPathRoot, ["hash-object", "--", posixPathCases.slashLookalike]));
+assert.equal(posixSlashResult.old_head, posixLiteralNewHead);
+assert.equal(posixSlashResult.new_head, posixSlashNewHead);
+assert.deepEqual(posixSlashResult.committed_paths, [posixPathCases.slashLookalike]);
+console.log("RAW_OBSERVATION: slash lookalike commit HEAD=" + posixSlashNewHead + "; raw diff-tree=" + JSON.stringify(posixSlashChanged) + "; literal tree object and worktree bytes remained identical across the slash selection.");
+console.log("PASS HIGH-PATH-001 internal real-Git route preserves literal POSIX backslash identity and keeps slash lookalike commits separate.");
 
 assert.throws(() => validateGitCommitRequest({ paths: ["tracked.txt"], message: "x", expected_head: initialHead }), (error) => {
   assert.equal(error instanceof GitCommitError, true);
