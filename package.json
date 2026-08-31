@@ -82,6 +82,7 @@
     "diagnostic-output:smoke": "npm run build && node scripts/diagnostic-output-smoke.mjs",
     "diagnostic-context:smoke": "npm run build && node scripts/diagnostic-context-smoke.mjs",
     "session-workspace-diagnostics:smoke": "npm run build && node scripts/session-workspace-diagnostics-smoke.mjs",
+    "session-workspace-continuity:smoke": "npm run build && node scripts/session-workspace-continuity-smoke.mjs",
     "workspace-diagnostic:smoke": "npm run build && node scripts/workspace-diagnostic-smoke.mjs",
     "runtime-diagnostics:smoke": "npm run build && node scripts/runtime-diagnostics-smoke.mjs",
     "stress": "npm run build && node scripts/stress.mjs",
