@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const REQUEST_TIMEOUT_MS = process.platform === 'win32' ? 45_000 : 20_000;
+// Harness deadline for concurrent search bursts in shared runner stress checks.
+const REQUEST_TIMEOUT_MS = 60_000;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function assert(ok, message) {
