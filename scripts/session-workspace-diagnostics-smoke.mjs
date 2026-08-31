@@ -17,7 +17,12 @@ const AUTH_TOKEN = "M004_PUBLIC_DIAGNOSTIC_AUTH_4e6c9a1b";
 const HOSTILE_KEY = "OPENAI_API_KEY_UNKNOWN_PROPERTY_7X9";
 const HOSTILE_SECRET = "sk-hostile-request-secret-7X9";
 const REQUEST_SENTINEL = "REQUEST_BODY_SENTINEL_8K2";
+// Deliberately schema-sized and secret-shaped, but not a deterministic
+// workspace ID. It must be retained in the request and absent from every
+// target response layer.
+const INVALID_WORKSPACE_ID_SENTINEL = "sk-workspace-id-sentinel-8K2";
 const ENV_SENTINEL = "ENV_SENTINEL_4N8";
+const RAW_ARTIFACT_MAX_BYTES = 120_000;
 
 const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codexpro-m004-public-diagnostics-"));
 const nestedRoot = path.join(fixtureRoot, "nested-target");
@@ -153,10 +158,11 @@ function requestFor(session, method, name) {
 
 async function listHttp(session) {
   const listed = await session.client.listTools();
-  const raw = parseEnvelope(requestFor(session, "tools/list"));
+  const capture = requestFor(session, "tools/list");
+  const raw = parseEnvelope(capture);
   assert.equal(raw?.jsonrpc, "2.0", `${session.label} tools/list had no complete raw envelope`);
   assert.ok(Array.isArray(raw?.result?.tools), `${session.label} raw tools/list omitted tools`);
-  return { listed: listed.tools, raw };
+  return { listed: listed.tools, raw, capture };
 }
 
 async function callHttp(session, name, args = {}) {
@@ -185,10 +191,10 @@ function resultText(result) {
 }
 
 function assertSuccess(call, label) {
-  assert.equal(call.error, undefined, `${label} threw: ${call.error?.message ?? call.error}`);
+  assert.equal(call.error, undefined, `${label} threw outside the MCP envelope`);
   assert.equal(call.raw?.jsonrpc, "2.0", `${label} lacked a complete JSON-RPC envelope`);
   assert.ok(call.raw?.result, `${label} raw envelope omitted result`);
-  assert.notEqual(call.result?.isError, true, `${label} returned a tool error: ${resultText(call.result)}`);
+  assert.notEqual(call.result?.isError, true, `${label} returned a tool error`);
   assert.ok(call.result?.structuredContent && typeof call.result.structuredContent === "object", `${label} omitted structuredContent`);
   return call.result;
 }
@@ -200,15 +206,84 @@ function assertHostileError(call, label, literals, rawSessionIds = []) {
   assert.equal(call.result?.isError, true, `${label} unexpectedly succeeded`);
   const serialized = JSON.stringify({ raw: call.raw, result: call.result, body: call.capture?.body }) ?? "";
   assert.ok(serialized.length < 8_000, `${label} hostile response was unbounded (${serialized.length} bytes)`);
-  for (const literal of [...literals, ...rawSessionIds]) assert.equal(serialized.includes(literal), false, `${label} echoed ${literal}`);
+  assertForbiddenLiteralsAbsent(serialized, label, [...literals, ...rawSessionIds]);
   return serialized;
 }
 
 function assertNoRoutingSecrets(value, label, rawSessionIds = []) {
   const serialized = JSON.stringify(value) ?? "";
-  for (const literal of [AUTH_TOKEN, HOSTILE_SECRET, REQUEST_SENTINEL, ENV_SENTINEL, ...rawSessionIds]) {
-    assert.equal(serialized.includes(literal), false, `${label} exposed ${literal}`);
+  assertForbiddenLiteralsAbsent(serialized, label, [
+    AUTH_TOKEN,
+    HOSTILE_SECRET,
+    REQUEST_SENTINEL,
+    INVALID_WORKSPACE_ID_SENTINEL,
+    ENV_SENTINEL,
+    ...rawSessionIds
+  ]);
+}
+
+function assertForbiddenLiteralsAbsent(serialized, label, literals) {
+  for (const literal of literals.filter(Boolean)) {
+    // Do not interpolate a forbidden value into an assertion message: a
+    // failed proof must not turn the suspected secret into stderr output.
+    assert.equal(serialized.includes(literal), false, `${label} exposed forbidden response material`);
   }
+}
+
+function emitRawArtifact(prefix, label, payload) {
+  const artifact = { label, ...payload };
+  const serialized = JSON.stringify(artifact);
+  assertForbiddenLiteralsAbsent(serialized, label, [AUTH_TOKEN, ENV_SENTINEL]);
+  assert.ok(Buffer.byteLength(serialized, "utf8") <= RAW_ARTIFACT_MAX_BYTES, `${label} raw artifact exceeded bounded size`);
+  console.log(`${prefix}${serialized}`);
+  return artifact;
+}
+
+function emitRawHttpArtifact(prefix, label, call) {
+  const capture = call?.capture;
+  const response = {
+    status: capture?.status ?? null,
+    content_type: capture?.contentType ?? null,
+    body: capture?.body ?? "",
+    envelope: call?.raw ?? null,
+    result: call?.result ?? null
+  };
+  const responseSerialized = JSON.stringify(response) ?? "";
+  assertForbiddenLiteralsAbsent(responseSerialized, label, [
+    AUTH_TOKEN,
+    HOSTILE_SECRET,
+    REQUEST_SENTINEL,
+    INVALID_WORKSPACE_ID_SENTINEL,
+    ENV_SENTINEL
+  ]);
+  return emitRawArtifact(prefix, label, {
+    protocol: "http",
+    request_body: capture?.requestBody ?? "",
+    response
+  });
+}
+
+function assertInvalidWorkspaceIdError(call, label) {
+  assert.ok(INVALID_WORKSPACE_ID_SENTINEL.length <= 128, `${label} sentinel exceeded the public workspace_id bound`);
+  assert.equal(/^ws_[0-9a-f]{24}$/u.test(INVALID_WORKSPACE_ID_SENTINEL), false, `${label} sentinel unexpectedly matched the deterministic ID grammar`);
+  assert.equal(call.error, undefined, `${label} escaped its MCP envelope`);
+  assert.equal(call.raw?.jsonrpc, "2.0", `${label} lacked a complete JSON-RPC envelope`);
+  assert.ok(call.raw?.result, `${label} returned no raw result envelope`);
+  assert.equal(call.result?.isError, true, `${label} unexpectedly succeeded`);
+  const request = call.capture?.requestBody ? JSON.parse(call.capture.requestBody) : undefined;
+  assert.equal(request?.params?.arguments?.workspace_id, INVALID_WORKSPACE_ID_SENTINEL, `${label} did not send the fixed invalid-ID sentinel`);
+  const responseSerialized = JSON.stringify({ raw: call.raw, result: call.result, body: call.capture?.body }) ?? "";
+  assertForbiddenLiteralsAbsent(responseSerialized, label, [
+    AUTH_TOKEN,
+    HOSTILE_SECRET,
+    REQUEST_SENTINEL,
+    INVALID_WORKSPACE_ID_SENTINEL,
+    ENV_SENTINEL
+  ]);
+  assert.ok(Buffer.byteLength(responseSerialized, "utf8") < 8_000, `${label} sanitized error was unbounded`);
+  const text = String(resultText(call.result) ?? "");
+  assert.ok(text.length > 0, `${label} omitted sanitized error text`);
+  assert.ok(text.length < 1_000, `${label} sanitized error text was unbounded`);
 }
 
 function diagnosticTool(tools, label) {
@@ -226,8 +301,7 @@ function diagnosticTool(tools, label) {
   assert.deepEqual(Object.keys(schema.properties ?? {}), ["workspace_id"], `${label} diagnostic schema exposed extra properties`);
   assert.deepEqual(schema.required ?? [], [], `${label} diagnostic workspace_id became required`);
   assert.equal(schema.properties.workspace_id.type, "string", `${label} workspace_id was not a string`);
-  assert.equal(schema.properties.workspace_id.minLength, 1, `${label} workspace_id lower bound drifted`);
-  assert.equal(schema.properties.workspace_id.maxLength, 128, `${label} workspace_id upper bound drifted`);
+  assert.equal(schema.properties.workspace_id.pattern, "^ws_[0-9a-f]{24}$", `${label} workspace_id grammar was not deterministic`);
   assert.equal(tool._meta?.ui, undefined, `${label} diagnostic unexpectedly exposed widget metadata`);
   assert.equal(tool._meta?.["openai/outputTemplate"], undefined, `${label} diagnostic unexpectedly exposed output template`);
   return tool;
@@ -267,6 +341,7 @@ class StdioClient {
     this.buffer = "";
     this.nextId = 1;
     this.pending = new Map();
+    this.records = [];
     this.stderr = "";
     this.child = spawn(process.execPath, [
       "dist/stdio.js",
@@ -313,17 +388,22 @@ class StdioClient {
       const pending = this.pending.get(message.id);
       clearTimeout(pending.timer);
       this.pending.delete(message.id);
+      pending.record.response = message;
+      pending.record.response_line = line;
       pending.resolve(message);
     }
   }
 
   request(method, params = {}) {
     const id = this.nextId++;
-    this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    const request = { jsonrpc: "2.0", id, method, params };
+    const record = { request_body: JSON.stringify(request), response: null, response_line: "" };
+    this.records.push(record);
+    this.child.stdin.write(`${record.request_body}\n`);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`timeout waiting for ${method}; stderr=${this.stderr}`)), 15_000);
       timer.unref();
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, record });
     });
   }
 
@@ -344,6 +424,27 @@ class StdioClient {
 
 function callStdio(client, name, args = {}) {
   return client.request("tools/call", { name, arguments: args });
+}
+
+function emitRawStdioArtifact(prefix, label, client, response) {
+  const record = [...client.records].reverse().find((candidate) => candidate.response?.id === response?.id);
+  const responsePayload = {
+    response_line: record?.response_line ?? "",
+    response_envelope: response ?? null
+  };
+  const responseSerialized = JSON.stringify(responsePayload) ?? "";
+  assertForbiddenLiteralsAbsent(responseSerialized, label, [
+    AUTH_TOKEN,
+    HOSTILE_SECRET,
+    REQUEST_SENTINEL,
+    INVALID_WORKSPACE_ID_SENTINEL,
+    ENV_SENTINEL
+  ]);
+  return emitRawArtifact(prefix, label, {
+    protocol: "stdio",
+    request_body: record?.request_body ?? "",
+    response: responsePayload
+  });
 }
 
 function assertInstructions(instructions, label) {
@@ -370,11 +471,16 @@ try {
   sessionA = await connectHttp(offUrl, "http-a");
   const initializeCapture = requestFor(sessionA, "initialize");
   const initializeEnvelope = parseEnvelope(initializeCapture);
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-a-initialize", {
+    capture: initializeCapture,
+    raw: initializeEnvelope
+  });
   assert.equal(initializeEnvelope?.jsonrpc, "2.0", "HTTP initialize lacked a complete raw envelope");
   assertInstructions(String(initializeEnvelope.result?.instructions ?? ""), "HTTP initialize");
   assertNoRoutingSecrets(initializeEnvelope, "HTTP initialize raw envelope", [initializeCapture?.responseSessionId ?? ""]);
 
   const listingA = await listHttp(sessionA);
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-a-tools-list", listingA);
   const diagTool = diagnosticTool(listingA.listed, "full HTTP");
   assertNoRoutingSecrets(listingA.raw, "HTTP tools/list raw envelope", [initializeCapture?.responseSessionId ?? ""]);
   assert.equal(listingA.listed.filter((tool) => tool.name === "session_workspace_diagnostics").length, 1);
@@ -387,8 +493,10 @@ try {
   // test verdicts/implementation fields, the observable contract is one tool
   // in full mode, a compact object response, and no routing/session secrets.
   const firstCall = await callHttp(sessionA, "session_workspace_diagnostics");
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-a-diagnostic-first", firstCall);
   const first = assertSuccess(firstCall, "HTTP diagnostic A first");
   const repeatedCall = await callHttp(sessionA, "session_workspace_diagnostics");
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-a-diagnostic-repeated", repeatedCall);
   const repeated = assertSuccess(repeatedCall, "HTTP diagnostic A repeated");
   assertDiagnosticShape(first.structuredContent, "HTTP A first");
   assertDiagnosticShape(repeated.structuredContent, "HTTP A repeated");
@@ -406,9 +514,11 @@ try {
   assert.equal(resultText(first).length < 5_000, true, "diagnostic human text was not compact");
 
   const targetOpenCall = await callHttp(sessionA, "open_workspace", { root: nestedRoot, include_tree: false });
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-a-open-target", targetOpenCall);
   const targetOpen = assertSuccess(targetOpenCall, "HTTP A target open");
   assert.equal(targetOpen.structuredContent.workspace_id, targetId, "target workspace id was not deterministic");
   const selectedCall = await callHttp(sessionA, "session_workspace_diagnostics", { workspace_id: targetId });
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-a-diagnostic-selected", selectedCall);
   const selected = assertSuccess(selectedCall, "HTTP A selected diagnostic");
   assertDiagnosticShape(selected.structuredContent, "HTTP A selected", true);
   assert.equal(selected.structuredContent.requested_workspace.classification, "selected_session_workspace");
@@ -421,8 +531,10 @@ try {
   // separate HTTP MCP session and must not inherit A's selection or identity.
   sessionB = await connectHttp(offUrl, "http-b");
   const listingB = await listHttp(sessionB);
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-b-tools-list", listingB);
   assert.deepEqual(listingB.listed.map((tool) => tool.name), listingA.listed.map((tool) => tool.name), "same server config changed its actual tool set");
   const initialBCall = await callHttp(sessionB, "session_workspace_diagnostics");
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-b-diagnostic-initial", initialBCall);
   const initialB = assertSuccess(initialBCall, "HTTP B initial diagnostic");
   assertDiagnosticShape(initialB.structuredContent, "HTTP B initial");
   assert.equal(initialB.structuredContent.workspace.selected, null, "B diagnostic inherited A selection");
@@ -434,6 +546,7 @@ try {
   assertNoRoutingSecrets(initialB, "HTTP B initial", [initialBCall.capture?.responseSessionId ?? "", requestFor(sessionA, "initialize")?.responseSessionId ?? ""]);
 
   const requestedBCall = await callHttp(sessionB, "session_workspace_diagnostics", { workspace_id: targetId });
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-b-diagnostic-explicit", requestedBCall);
   const requestedB = assertSuccess(requestedBCall, "HTTP B explicit diagnostic");
   assertDiagnosticShape(requestedB.structuredContent, "HTTP B explicit", true);
   assert.equal(requestedB.structuredContent.requested_workspace.id, targetId);
@@ -444,20 +557,27 @@ try {
   assert.deepEqual(requestedB.structuredContent.workspace, initialB.structuredContent.workspace, "explicit diagnostic changed B workspace state");
   assert.equal(requestedB.structuredContent.workspace.process_known.valid >= 1, true, "explicit diagnostic omitted process-known target count");
   assertNoRoutingSecrets(requestedB, "HTTP B explicit", [requestedBCall.capture?.responseSessionId ?? "", requestFor(sessionA, "initialize")?.responseSessionId ?? ""]);
-  const listAfterProbe = assertSuccess(await callHttp(sessionB, "list_workspaces"), "HTTP B ordinary list after diagnostic");
+  const listAfterProbeCall = await callHttp(sessionB, "list_workspaces");
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-b-list-after-probe", listAfterProbeCall);
+  const listAfterProbe = assertSuccess(listAfterProbeCall, "HTTP B ordinary list after diagnostic");
   assert.equal(listAfterProbe.structuredContent.selected_workspace_id, `ws_${createHash("sha256").update(realFixtureRoot).digest("hex").slice(0, 24)}`, "diagnostic changed B ordinary selection");
-  const afterProbe = assertSuccess(await callHttp(sessionB, "session_workspace_diagnostics", { workspace_id: targetId }), "HTTP B post-list diagnostic");
+  const afterProbeCall = await callHttp(sessionB, "session_workspace_diagnostics", { workspace_id: targetId });
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-b-diagnostic-post-list", afterProbeCall);
+  const afterProbe = assertSuccess(afterProbeCall, "HTTP B post-list diagnostic");
   assert.equal(afterProbe.structuredContent.requested_workspace.classification, "process_known_reconstructible");
   assert.equal(afterProbe.structuredContent.workspace.selected.id, listAfterProbe.structuredContent.selected_workspace_id);
   assert.equal(afterProbe.structuredContent.workspace.session_opened.some((workspace) => workspace.id === targetId), false, "diagnostic/opened state unexpectedly contained target");
 
   const wrapperBaselineCall = await callHttp(sessionA, "session_workspace_diagnostics");
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-a-wrapper-baseline-diagnostic", wrapperBaselineCall);
   const wrapperBaseline = assertSuccess(wrapperBaselineCall, "HTTP wrapper baseline diagnostic");
   assertDiagnosticShape(wrapperBaseline.structuredContent, "HTTP wrapper baseline");
   const actionsCall = await callHttp(sessionA, "codexpro", { action: "list_actions" });
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-a-wrapper-list-actions", actionsCall);
   const actionsA = assertSuccess(actionsCall, "full HTTP wrapper list_actions");
   assert.equal(actionsA.structuredContent.actions.filter((action) => action === "session_workspace_diagnostics").length, 1, "full wrapper omitted or duplicated diagnostic action");
   const wrappedCall = await callHttp(sessionA, "codexpro", { action: "session_workspace_diagnostics", args: {} });
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-a-wrapper-diagnostic", wrappedCall);
   const wrapped = assertSuccess(wrappedCall, "full HTTP wrapper diagnostic");
   assert.equal(wrapped.structuredContent.codexpro_super_action, "session_workspace_diagnostics");
   assert.equal(wrapped.structuredContent.schema_version, 1, "wrapper diagnostic omitted diagnostic schema");
@@ -479,16 +599,38 @@ try {
   assertHostileError(oversized, "oversized-id diagnostic", [REQUEST_SENTINEL], knownHttpSessionIds);
   const whitespace = await callHttp(sessionA, "session_workspace_diagnostics", { workspace_id: ` ${targetId} ` });
   assertHostileError(whitespace, "whitespace-id diagnostic", [targetId], knownHttpSessionIds);
+  // Regression for an arbitrary secret-shaped value that is within the
+  // public argument size bound but outside the deterministic workspace-ID
+  // grammar. The request is intentionally retained without auth headers;
+  // only the response must be secret-safe.
+  const invalidWorkspaceIdCall = await callHttp(sessionA, "session_workspace_diagnostics", {
+    workspace_id: INVALID_WORKSPACE_ID_SENTINEL
+  });
+  emitRawHttpArtifact("RAW_HTTP_INVALID_ID_ARTIFACT:", "http-invalid-workspace-id", invalidWorkspaceIdCall);
+  assertInvalidWorkspaceIdError(invalidWorkspaceIdCall, "HTTP invalid workspace_id");
+  const unknownWorkspaceCall = await callHttp(sessionA, "session_workspace_diagnostics", {
+    workspace_id: "ws_000000000000000000000000"
+  });
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-unknown-valid-format-workspace-id", unknownWorkspaceCall);
+  const unknownWorkspace = assertSuccess(unknownWorkspaceCall, "HTTP unknown valid-format workspace_id");
+  assertDiagnosticShape(unknownWorkspace.structuredContent, "HTTP unknown valid-format workspace_id", true);
+  assert.equal(unknownWorkspace.structuredContent.requested_workspace.id, "ws_000000000000000000000000");
+  assert.equal(unknownWorkspace.structuredContent.requested_workspace.classification, "unknown_or_invalid");
+  assert.equal(unknownWorkspace.structuredContent.requested_workspace.root, null);
+  assertNoRoutingSecrets(unknownWorkspace, "HTTP unknown valid-format workspace_id");
+  assertNoRoutingSecrets(unknownWorkspaceCall.raw, "HTTP unknown valid-format workspace_id raw envelope", knownHttpSessionIds);
 
   const safeApp = createCodexProHttpApp(configFor("safe"));
   ({ listener: safeListener, url: safeUrl } = await listen(safeApp));
   safeSession = await connectHttp(safeUrl, "http-safe");
   const safeListing = await listHttp(safeSession);
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-safe-tools-list", safeListing);
   const safeNames = new Set(safeListing.listed.map((tool) => tool.name));
   const offNames = new Set(listingA.listed.map((tool) => tool.name));
   const actualCatalogDifference = [...new Set([...safeNames, ...offNames])].filter((name) => safeNames.has(name) !== offNames.has(name));
   assert.deepEqual(actualCatalogDifference, ["bash"], "bash mode did not produce an independently observed registered-tool-set difference");
   const safeDiagnosticCall = await callHttp(safeSession, "session_workspace_diagnostics");
+  emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-safe-diagnostic", safeDiagnosticCall);
   const safeDiagnostic = assertSuccess(safeDiagnosticCall, "safe-mode diagnostic");
   assert.notEqual(safeDiagnostic.structuredContent.server.catalog_fingerprint, first.structuredContent.server.catalog_fingerprint, "catalog fingerprint ignored actual registered surface change");
   assert.equal(safeDiagnostic.structuredContent.server.registered_tool_count, safeListing.listed.length, "safe catalog count disagreed with actual tools/list");
@@ -506,18 +648,34 @@ try {
       clientInfo: { name: "m004-public-diagnostic-stdio", version: "1.0.0" }
     });
     stdioFull.notify("notifications/initialized");
+    emitRawStdioArtifact("RAW_STDIO_ARTIFACT:", "stdio-full-initialize", stdioFull, init);
     assert.equal(init.jsonrpc, "2.0", "stdio initialize lacked a complete envelope");
     assertInstructions(String(init.result?.instructions ?? ""), "stdio initialize");
     const tools = await stdioFull.request("tools/list", {});
+    emitRawStdioArtifact("RAW_STDIO_ARTIFACT:", "stdio-full-tools-list", stdioFull, tools);
     assert.equal(tools.jsonrpc, "2.0", "stdio tools/list lacked a complete envelope");
     diagnosticTool(tools.result?.tools ?? [], "full stdio");
     const stdioDiagnostic = await callStdio(stdioFull, "session_workspace_diagnostics");
+    emitRawStdioArtifact("RAW_STDIO_ARTIFACT:", "stdio-full-diagnostic", stdioFull, stdioDiagnostic);
     assert.equal(stdioDiagnostic.jsonrpc, "2.0", "stdio diagnostic lacked a complete envelope");
-    assert.notEqual(stdioDiagnostic.result?.isError, true, `stdio diagnostic failed: ${resultText(stdioDiagnostic.result)}`);
+    assert.notEqual(stdioDiagnostic.result?.isError, true, "stdio diagnostic returned a tool error");
     assertDiagnosticShape(stdioDiagnostic.result.structuredContent, "stdio diagnostic");
     assert.equal(stdioDiagnostic.result.structuredContent.session.transport, "stdio", "stdio diagnostic reported the wrong transport");
     assert.equal(stdioDiagnostic.result.structuredContent.http_sessions, null, "stdio diagnostic fabricated HTTP lifecycle data");
     assertNoRoutingSecrets(stdioDiagnostic.result, "stdio diagnostic");
+    const stdioInvalidWorkspaceId = await callStdio(stdioFull, "session_workspace_diagnostics", {
+      workspace_id: INVALID_WORKSPACE_ID_SENTINEL
+    });
+    emitRawStdioArtifact("RAW_STDIO_INVALID_ID_ARTIFACT:", "stdio-invalid-workspace-id", stdioFull, stdioInvalidWorkspaceId);
+    assertInvalidWorkspaceIdError({
+      error: undefined,
+      raw: stdioInvalidWorkspaceId,
+      result: stdioInvalidWorkspaceId.result,
+      capture: {
+        requestBody: [...stdioFull.records].findLast((record) => record.response?.id === stdioInvalidWorkspaceId.id)?.request_body,
+        body: JSON.stringify(stdioInvalidWorkspaceId)
+      }
+    }, "stdio invalid workspace_id");
   } finally {
     await stdioFull.close();
   }
@@ -525,19 +683,23 @@ try {
   for (const mode of ["standard", "minimal"]) {
     const stdio = new StdioClient(mode);
     try {
-      await stdio.request("initialize", {
+      const init = await stdio.request("initialize", {
         protocolVersion: "2024-11-05",
         capabilities: {},
         clientInfo: { name: `m004-public-diagnostic-${mode}`, version: "1.0.0" }
       });
       stdio.notify("notifications/initialized");
+      emitRawStdioArtifact("RAW_STDIO_ARTIFACT:", `stdio-${mode}-initialize`, stdio, init);
       const tools = await stdio.request("tools/list", {});
+      emitRawStdioArtifact("RAW_STDIO_ARTIFACT:", `stdio-${mode}-tools-list`, stdio, tools);
       const names = (tools.result?.tools ?? []).map((tool) => tool.name);
       assert.equal(names.includes("session_workspace_diagnostics"), false, `${mode} tools/list exposed full-only diagnostic`);
       const actions = await callStdio(stdio, "codexpro", { action: "list_actions" });
+      emitRawStdioArtifact("RAW_STDIO_ARTIFACT:", `stdio-${mode}-wrapper-list-actions`, stdio, actions);
       assert.notEqual(actions.result?.isError, true, `${mode} wrapper list_actions failed`);
       assert.equal(actions.result.structuredContent.actions.includes("session_workspace_diagnostics"), false, `${mode} wrapper listed full-only diagnostic`);
       const denied = await callStdio(stdio, "codexpro", { action: "session_workspace_diagnostics" });
+      emitRawStdioArtifact("RAW_STDIO_ARTIFACT:", `stdio-${mode}-wrapper-denial`, stdio, denied);
       assert.equal(denied.jsonrpc, "2.0", `${mode} wrapper denial lacked a complete envelope`);
       assert.equal(denied.result?.isError, true, `${mode} wrapper invoked unavailable diagnostic action`);
       assert.equal(denied.result?.structuredContent?.schema_version, undefined, `${mode} wrapper denial returned diagnostic semantics`);
@@ -550,7 +712,7 @@ try {
   // technical assertions only explain/record those direct facts afterward.
   console.log("AUTHORITY: MISSION_PLAN.md TASK-004/AP-007/AP-008; MISSION_ANCHOR.md A001 LAW-003/005/006/007/008/009/010/012/013/014.");
   console.log("TARGET_PRODUCER: actual createCodexProHttpApp -> StreamableHTTPServerTransport and dist/stdio.js -> StdioServerTransport MCP registrations/handlers.");
-  console.log(`RAW_OBSERVATION: full HTTP tools/list exposed exactly one session_workspace_diagnostics with only workspace_id; repeated A diagnostics kept fingerprint/generation/creation identity; B had a distinct identity and no inherited selection; raw JSON-RPC envelopes contained no MCP session IDs/auth/request/env sentinels.`);
+  console.log(`RAW_OBSERVATION: full HTTP tools/list exposed exactly one session_workspace_diagnostics with only workspace_id; repeated A diagnostics kept fingerprint/generation/creation identity; B had a distinct identity and no inherited selection; response JSON-RPC/SSE envelopes contained no MCP session IDs/auth/request/env sentinels.`);
   console.log(`RAW_OBSERVATION: explicit B workspace probe classified ${targetId} as process_known_reconstructible without selecting/opening it; ordinary list_workspaces subsequently selected only the configured default; bash-off vs bash-safe actual catalogs differed by [bash] before catalog hashes were compared.`);
   console.log("RAW_OBSERVATION: full stdio diagnostic reported transport=stdio and http_sessions=null; standard/minimal tools/list and wrapper actions omitted the diagnostic and denied wrapper invocation.");
   console.log("SANITY_VERDICT: MATCH — direct MCP catalogs, response envelopes, continuity identities, state classifications, and transport facts match the accepted TASK-004 public outcome.");

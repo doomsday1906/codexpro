@@ -18,7 +18,9 @@ const AUTH_TOKEN = "M004_PUBLIC_DIAGNOSTIC_AUTH_4e6c9a1b";
 const HOSTILE_KEY = "OPENAI_API_KEY_UNKNOWN_PROPERTY_7X9";
 const HOSTILE_SECRET = "sk-hostile-request-secret-7X9";
 const REQUEST_SENTINEL = "REQUEST_BODY_SENTINEL_8K2";
+const INVALID_WORKSPACE_ID_SENTINEL = "sk-workspace-id-sentinel-8K2";
 const ENV_SENTINEL = "ENV_SENTINEL_4N8";
+const RAW_ARTIFACT_MAX_BYTES = 120_000;
 
 const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codexpro-m004-continuity-"));
 const nestedRoot = path.join(fixtureRoot, "nested-target");
@@ -211,6 +213,7 @@ function captureFetch(captures) {
       requestBody: typeof init?.body === "string" ? init.body : "",
       responseSessionId: response.headers.get("mcp-session-id") ?? "",
       status: response.status,
+      contentType: response.headers.get("content-type") ?? "",
       body
     });
     return response;
@@ -253,7 +256,8 @@ function requestFor(session, method, name) {
 
 async function listTools(session) {
   const listed = await session.client.listTools();
-  return { listed: listed.tools, raw: parseEnvelope(requestFor(session, "tools/list")) };
+  const capture = requestFor(session, "tools/list");
+  return { listed: listed.tools, raw: parseEnvelope(capture), capture };
 }
 
 async function callTool(session, name, args = {}) {
@@ -282,7 +286,7 @@ function structured(call) {
 }
 
 function success(call, label) {
-  assert.equal(call.error, undefined, `${label} threw outside MCP: ${call.error?.message ?? call.error}`);
+  assert.equal(call.error, undefined, `${label} threw outside MCP`);
   assert.equal(call.raw?.jsonrpc, "2.0", `${label} lacked raw JSON-RPC envelope`);
   assert.ok(call.raw?.result, `${label} lacked raw result`);
   assert.notEqual(call.result?.isError, true, `${label} returned an MCP error`);
@@ -297,6 +301,7 @@ function noRoutingSecrets(value, label, rawSessionIds = []) {
     ["hostile-key", HOSTILE_KEY],
     ["hostile-value", HOSTILE_SECRET],
     ["request-sentinel", REQUEST_SENTINEL],
+    ["invalid-workspace-id-sentinel", INVALID_WORKSPACE_ID_SENTINEL],
     ["environment-sentinel", ENV_SENTINEL],
     ...rawSessionIds.filter(Boolean).map((literal, index) => [`routing-session-${index + 1}`, literal])
   ];
@@ -313,6 +318,76 @@ function hostileError(call, label, rawSessionIds = []) {
   assert.equal(call.result?.isError, true, `${label} unexpectedly succeeded`);
   const serialized = noRoutingSecrets({ raw: call.raw, result: call.result, body: call.capture?.body }, label, rawSessionIds);
   assert.ok(serialized.length < 8_000, `${label} response was unbounded`);
+}
+
+function assertForbiddenLiteralsAbsent(serialized, label, literals) {
+  for (const literal of literals.filter(Boolean)) {
+    // Keep suspected secret material out of assertion messages and stderr.
+    assert.equal(serialized.includes(literal), false, `${label} exposed forbidden response material`);
+  }
+}
+
+function emitContinuityArtifact(label, payload) {
+  const artifact = { label, ...payload };
+  const serialized = JSON.stringify(artifact);
+  assertForbiddenLiteralsAbsent(serialized, label, [AUTH_TOKEN, ENV_SENTINEL]);
+  assert.ok(Buffer.byteLength(serialized, "utf8") <= RAW_ARTIFACT_MAX_BYTES, `${label} raw artifact exceeded bounded size`);
+  console.log(`RAW_CONTINUITY_ARTIFACT:${serialized}`);
+  return artifact;
+}
+
+function emitContinuityHttpArtifact(label, call) {
+  const capture = call?.capture;
+  const response = {
+    status: capture?.status ?? null,
+    content_type: capture?.contentType ?? null,
+    body: capture?.body ?? "",
+    envelope: call?.raw ?? null,
+    result: call?.result ?? null
+  };
+  const responseSerialized = JSON.stringify(response) ?? "";
+  assertForbiddenLiteralsAbsent(responseSerialized, label, [
+    AUTH_TOKEN,
+    HOSTILE_SECRET,
+    REQUEST_SENTINEL,
+    INVALID_WORKSPACE_ID_SENTINEL,
+    ENV_SENTINEL
+  ]);
+  return emitContinuityArtifact(label, {
+    protocol: "http",
+    request_body: capture?.requestBody ?? "",
+    response
+  });
+}
+
+function emitContinuityCensus(label, snapshot) {
+  return emitContinuityArtifact(label, {
+    kind: "filesystem_census",
+    snapshot
+  });
+}
+
+function assertInvalidWorkspaceIdError(call, label) {
+  assert.ok(INVALID_WORKSPACE_ID_SENTINEL.length <= 128, `${label} sentinel exceeded the public workspace_id bound`);
+  assert.equal(/^ws_[0-9a-f]{24}$/u.test(INVALID_WORKSPACE_ID_SENTINEL), false, `${label} sentinel unexpectedly matched the deterministic ID grammar`);
+  assert.equal(call.error, undefined, `${label} escaped its MCP envelope`);
+  assert.equal(call.raw?.jsonrpc, "2.0", `${label} lacked a complete JSON-RPC envelope`);
+  assert.ok(call.raw?.result, `${label} returned no raw result envelope`);
+  assert.equal(call.result?.isError, true, `${label} unexpectedly succeeded`);
+  const request = call.capture?.requestBody ? JSON.parse(call.capture.requestBody) : undefined;
+  assert.equal(request?.params?.arguments?.workspace_id, INVALID_WORKSPACE_ID_SENTINEL, `${label} did not send the fixed invalid-ID sentinel`);
+  const responseSerialized = JSON.stringify({ raw: call.raw, result: call.result, body: call.capture?.body }) ?? "";
+  assertForbiddenLiteralsAbsent(responseSerialized, label, [
+    AUTH_TOKEN,
+    HOSTILE_SECRET,
+    REQUEST_SENTINEL,
+    INVALID_WORKSPACE_ID_SENTINEL,
+    ENV_SENTINEL
+  ]);
+  assert.ok(Buffer.byteLength(responseSerialized, "utf8") < 8_000, `${label} sanitized error was unbounded`);
+  const text = call.result?.content?.find?.((part) => part.type === "text")?.text ?? "";
+  assert.ok(text.length > 0, `${label} omitted sanitized error text`);
+  assert.ok(text.length < 1_000, `${label} sanitized error text was unbounded`);
 }
 
 async function census(root) {
@@ -374,6 +449,8 @@ const homeBefore = await census(isolatedHome);
 const configBefore = await census(isolatedConfigRoot);
 
 try {
+  emitContinuityCensus("isolated-home-before", homeBefore);
+  emitContinuityCensus("isolated-config-before", configBefore);
   assertNoDiskBindingRegistry(homeBefore, "isolated CODEXPRO_HOME before run");
   assertNoDiskBindingRegistry(configBefore, "isolated config root before run");
 
@@ -382,31 +459,51 @@ try {
   sessionA = await connectHttp(processA.url, "A");
   rememberRoutingSessionId(sessionA);
   const initializeA = parseEnvelope(requestFor(sessionA, "initialize"));
+  emitContinuityHttpArtifact("A-initialize", {
+    capture: requestFor(sessionA, "initialize"),
+    raw: initializeA
+  });
   const toolsA = await listTools(sessionA);
+  emitContinuityHttpArtifact("A-tools-list", toolsA);
   const diagA0Call = await diagnosticCall(sessionA);
+  emitContinuityHttpArtifact("A-diagnostic-before-open", diagA0Call);
   const diagA0 = structured(diagA0Call);
   const openTargetCall = await callTool(sessionA, "open_workspace", { root: realNestedRoot, include_tree: false });
+  emitContinuityHttpArtifact("A-open-target", openTargetCall);
   const openTarget = structured(openTargetCall);
   const diagA1Call = await diagnosticCall(sessionA, { workspace_id: targetId });
+  emitContinuityHttpArtifact("A-diagnostic-selected", diagA1Call);
   const diagA1 = structured(diagA1Call);
 
   sessionB = await connectHttp(processA.url, "B");
   rememberRoutingSessionId(sessionB);
   const initializeB = parseEnvelope(requestFor(sessionB, "initialize"));
-  await listTools(sessionB);
+  emitContinuityHttpArtifact("B-initialize", {
+    capture: requestFor(sessionB, "initialize"),
+    raw: initializeB
+  });
+  const toolsB = await listTools(sessionB);
+  emitContinuityHttpArtifact("B-tools-list", toolsB);
   const diagB0Call = await diagnosticCall(sessionB);
+  emitContinuityHttpArtifact("B-diagnostic-pre", diagB0Call);
   const diagB0 = structured(diagB0Call);
   const diagBProbeCall = await diagnosticCall(sessionB, { workspace_id: targetId });
+  emitContinuityHttpArtifact("B-diagnostic-probe", diagBProbeCall);
   const diagBProbe = structured(diagBProbeCall);
   const listBCall = await callTool(sessionB, "list_workspaces");
+  emitContinuityHttpArtifact("B-list-workspaces", listBCall);
   const listB = structured(listBCall);
   const openDefaultBCall = await callTool(sessionB, "open_current_workspace", { include_tree: false });
+  emitContinuityHttpArtifact("B-open-configured-default", openDefaultBCall);
   const openDefaultB = structured(openDefaultBCall);
   const diagBBeforeReadCall = await diagnosticCall(sessionB);
+  emitContinuityHttpArtifact("B-diagnostic-before-explicit-read", diagBBeforeReadCall);
   const diagBBeforeRead = structured(diagBBeforeReadCall);
   const explicitReadBCall = await callTool(sessionB, "workspace_snapshot", { workspace_id: targetId, max_depth: 1, max_files: 20 });
+  emitContinuityHttpArtifact("B-explicit-read", explicitReadBCall);
   const explicitReadB = structured(explicitReadBCall);
   const diagBAfterReadCall = await diagnosticCall(sessionB, { workspace_id: targetId });
+  emitContinuityHttpArtifact("B-diagnostic-post-explicit-read", diagBAfterReadCall);
   const diagBAfterRead = structured(diagBAfterReadCall);
 
   const hostileCalls = [
@@ -415,21 +512,34 @@ try {
     await diagnosticCall(sessionA, { workspace_id: `${"x".repeat(10_000)}${REQUEST_SENTINEL}` }),
     await diagnosticCall(sessionA, { workspace_id: ` ${targetId} ` })
   ];
+  const invalidWorkspaceIdCall = await diagnosticCall(sessionA, { workspace_id: INVALID_WORKSPACE_ID_SENTINEL });
+  emitContinuityHttpArtifact("A-invalid-workspace-id", invalidWorkspaceIdCall);
+  assertInvalidWorkspaceIdError(invalidWorkspaceIdCall, "continuity HTTP invalid workspace_id");
+  hostileCalls.push(invalidWorkspaceIdCall);
   const unknownWorkspaceCall = await diagnosticCall(sessionA, { workspace_id: "ws_000000000000000000000000" });
+  emitContinuityHttpArtifact("A-unknown-valid-format-workspace-id", unknownWorkspaceCall);
   const unknownWorkspace = structured(unknownWorkspaceCall);
 
   // Capture a direct same-process close observation before killing process A.
   await closeClient(sessionB);
   const diagAAfterBCloseCall = await diagnosticCall(sessionA);
+  emitContinuityHttpArtifact("A-diagnostic-after-B-close", diagAAfterBCloseCall);
   const diagAAfterBClose = structured(diagAAfterBCloseCall);
   await closeClient(sessionA);
   sessionA = undefined;
   sessionB = undefined;
   processAExit = await stopHttpProcess(processA);
+  emitContinuityArtifact("process-A-exit", {
+    kind: "child_process_exit",
+    pid: processAPid,
+    exit: processAExit
+  });
   processA = undefined;
 
   const homeAfterA = await census(isolatedHome);
   const configAfterA = await census(isolatedConfigRoot);
+  emitContinuityCensus("isolated-home-after-process-A", homeAfterA);
+  emitContinuityCensus("isolated-config-after-process-A", configAfterA);
 
   // Fresh OS process C: same default/allowed configuration, no nested target
   // in args or environment, and no inherited module-level process registry.
@@ -438,19 +548,30 @@ try {
   sessionC = await connectHttp(processC.url, "C");
   rememberRoutingSessionId(sessionC);
   const toolsC = await listTools(sessionC);
+  emitContinuityHttpArtifact("C-tools-list", toolsC);
   const diagC0Call = await diagnosticCall(sessionC);
+  emitContinuityHttpArtifact("C-diagnostic-fresh-process", diagC0Call);
   const diagC0 = structured(diagC0Call);
   const diagCTargetCall = await diagnosticCall(sessionC, { workspace_id: targetId });
+  emitContinuityHttpArtifact("C-diagnostic-unknown-prior-target", diagCTargetCall);
   const diagCTarget = structured(diagCTargetCall);
   const diagCConfiguredCall = await diagnosticCall(sessionC, { workspace_id: configuredId });
+  emitContinuityHttpArtifact("C-diagnostic-configured-root", diagCConfiguredCall);
   const diagCConfigured = structured(diagCConfiguredCall);
   const explicitReadC = await callTool(sessionC, "workspace_snapshot", { workspace_id: configuredId, max_depth: 1, max_files: 20 });
+  emitContinuityHttpArtifact("C-explicit-configured-root-read", explicitReadC);
   const explicitReadCResult = structured(explicitReadC);
   const diagCAfterReadCall = await diagnosticCall(sessionC);
+  emitContinuityHttpArtifact("C-diagnostic-post-configured-read", diagCAfterReadCall);
   const diagCAfterRead = structured(diagCAfterReadCall);
   await closeClient(sessionC);
   sessionC = undefined;
   processCExit = await stopHttpProcess(processC);
+  emitContinuityArtifact("process-C-exit", {
+    kind: "child_process_exit",
+    pid: processCPid,
+    exit: processCExit
+  });
   processC = undefined;
 
   // A deliberate registered-surface change is proved by actual tools/list in
@@ -459,11 +580,18 @@ try {
   sessionD = await connectHttp(processD.url, "D");
   rememberRoutingSessionId(sessionD);
   const toolsD = await listTools(sessionD);
+  emitContinuityHttpArtifact("D-tools-list", toolsD);
   const diagDCall = await diagnosticCall(sessionD);
+  emitContinuityHttpArtifact("D-diagnostic-catalog-change", diagDCall);
   const diagD = structured(diagDCall);
   await closeClient(sessionD);
   sessionD = undefined;
   processDExit = await stopHttpProcess(processD);
+  emitContinuityArtifact("process-D-exit", {
+    kind: "child_process_exit",
+    pid: processD.pid,
+    exit: processDExit
+  });
   processD = undefined;
 
   // Real HTTP lifecycle proof uses low-limit disposable app listeners. The
@@ -473,20 +601,33 @@ try {
   rememberRoutingSessionId(lifecycleCloseA);
   lifecycleSessions.push(lifecycleCloseA);
   const lifecycleInitialCall = await diagnosticCall(lifecycleCloseA);
+  emitContinuityHttpArtifact("lifecycle-close-before", lifecycleInitialCall);
   const lifecycleInitial = structured(lifecycleInitialCall);
   await closeClient(lifecycleCloseA);
+  const lifecycleCloseARequest = [...lifecycleCloseA.captures].reverse().find((capture) => capture.method === "DELETE");
+  emitContinuityHttpArtifact("lifecycle-close-delete", {
+    capture: lifecycleCloseARequest,
+    raw: parseEnvelope(lifecycleCloseARequest)
+  });
   lifecycleSessions = lifecycleSessions.filter((item) => item !== lifecycleCloseA);
   const lifecycleCloseB = await connectHttp(lifecycleServer.url, "life-close-b");
   rememberRoutingSessionId(lifecycleCloseB);
   lifecycleSessions.push(lifecycleCloseB);
   const lifecycleAfterCloseCall = await diagnosticCall(lifecycleCloseB);
+  emitContinuityHttpArtifact("lifecycle-close-after", lifecycleAfterCloseCall);
   const lifecycleAfterClose = structured(lifecycleAfterCloseCall);
   await closeClient(lifecycleCloseB);
+  const lifecycleCloseBRequest = [...lifecycleCloseB.captures].reverse().find((capture) => capture.method === "DELETE");
+  emitContinuityHttpArtifact("lifecycle-close-replacement-delete", {
+    capture: lifecycleCloseBRequest,
+    raw: parseEnvelope(lifecycleCloseBRequest)
+  });
   lifecycleSessions = lifecycleSessions.filter((item) => item !== lifecycleCloseB);
   const lifecycleTtlA = await connectHttp(lifecycleServer.url, "life-ttl-a");
   rememberRoutingSessionId(lifecycleTtlA);
   lifecycleSessions.push(lifecycleTtlA);
   const lifecycleTtlInitialCall = await diagnosticCall(lifecycleTtlA);
+  emitContinuityHttpArtifact("lifecycle-ttl-before", lifecycleTtlInitialCall);
   const lifecycleTtlInitial = structured(lifecycleTtlInitialCall);
   const ttlLastSeenAt = Date.parse(lifecycleTtlInitial?.http_sessions?.current_session?.last_seen_at ?? "");
   await delay(250);
@@ -494,6 +635,7 @@ try {
   rememberRoutingSessionId(lifecycleTtlB);
   lifecycleSessions.push(lifecycleTtlB);
   const lifecycleAfterTtlCall = await diagnosticCall(lifecycleTtlB);
+  emitContinuityHttpArtifact("lifecycle-ttl-after", lifecycleAfterTtlCall);
   const lifecycleAfterTtl = structured(lifecycleAfterTtlCall);
   await closeInProcessHttp(lifecycleServer);
   lifecycleServer = undefined;
@@ -503,12 +645,18 @@ try {
   rememberRoutingSessionId(capacityOld);
   capacitySessions.push(capacityOld);
   const capacityOldDiagCall = await diagnosticCall(capacityOld);
+  emitContinuityHttpArtifact("lifecycle-capacity-before", capacityOldDiagCall);
   const capacityOldDiag = structured(capacityOldDiagCall);
   const capacityNew = await connectHttp(capacityServer.url, "capacity-new");
   rememberRoutingSessionId(capacityNew);
   capacitySessions.push(capacityNew);
   const capacityNewDiagCall = await diagnosticCall(capacityNew);
+  emitContinuityHttpArtifact("lifecycle-capacity-after", capacityNewDiagCall);
   const capacityNewDiag = structured(capacityNewDiagCall);
+  const finalHome = await census(isolatedHome);
+  const finalConfig = await census(isolatedConfigRoot);
+  emitContinuityCensus("isolated-home-final", finalHome);
+  emitContinuityCensus("isolated-config-final", finalConfig);
 
   // PASS 1: direct observations only, before interpreting implementation
   // labels or technical test verdicts.
@@ -520,7 +668,7 @@ try {
   console.log(`RAW_OBSERVATION: A exited with ${processAExit?.signal ?? processAExit?.code ?? "unknown"}; C was a new OS child with pid=${processCPid ?? "unknown"} after A termination and exited with ${processCExit?.signal ?? processCExit?.code ?? "unknown"}; C's target probe returned root=${diagCTarget?.requested_workspace?.root ?? "null"}; C's configured-root probe returned root=${diagCConfigured?.requested_workspace?.root ?? "null"}; C's explicit configured-root snapshot returned ${explicitReadCResult?.root ?? "no root"} with selected=${diagCAfterRead?.workspace?.selected?.id ?? "null"}.`);
   console.log(`RAW_OBSERVATION: A/B/C session fingerprints were ${diagA0?.session?.fingerprint ? "present" : "absent"}/${diagB0?.session?.fingerprint ? "present" : "absent"}/${diagC0?.session?.fingerprint ? "present" : "absent"}; runtime process pids were ${diagA0?.runtime?.process?.pid ?? "unknown"} and ${diagC0?.runtime?.process?.pid ?? "unknown"}; A/C tools/list sets were ${toolsA.listed.length}/${toolsC.listed.length}, while D's actual tools/list differed from A by ${JSON.stringify([...new Set([...toolsA.listed.map((tool) => tool.name), ...toolsD.listed.map((tool) => tool.name)])].filter((name) => toolsA.listed.some((tool) => tool.name === name) !== toolsD.listed.some((tool) => tool.name === name)))}.`);
   console.log(`RAW_OBSERVATION: close replacement showed active=${lifecycleAfterClose?.http_sessions?.active ?? "unknown"}, closed=${lifecycleAfterClose?.http_sessions?.total_closed ?? "unknown"}; after idle wall time ${Number.isFinite(ttlLastSeenAt) ? Date.now() - ttlLastSeenAt : "unknown"}ms (>100ms target), replacement showed expired=${lifecycleAfterTtl?.http_sessions?.total_expired ?? "unknown"}; capacity max=1 after two initialized sessions showed active=${capacityNewDiag?.http_sessions?.active ?? "unknown"}, evicted=${capacityNewDiag?.http_sessions?.total_capacity_evicted ?? "unknown"}.`);
-  console.log(`RAW_OBSERVATION: isolated CODEXPRO_HOME/config census entries before=${homeBefore.entries.length}/${configBefore.entries.length}, after A=${homeAfterA.entries.length}/${configAfterA.entries.length}, final=${(await census(isolatedHome)).entries.length}/${(await census(isolatedConfigRoot)).entries.length}; no target identity or session/workspace binding registry was observed; hostile diagnostic responses were captured as bounded JSON-RPC/SSE envelopes internally.`);
+  console.log(`RAW_OBSERVATION: isolated CODEXPRO_HOME/config census entries before=${homeBefore.entries.length}/${configBefore.entries.length}, after A=${homeAfterA.entries.length}/${configAfterA.entries.length}, final=${finalHome.entries.length}/${finalConfig.entries.length}; no target identity or session/workspace binding registry was observed; bounded JSON-RPC/SSE envelopes and before/after census artifacts were retained above.`);
   console.log(`RAW_OBSERVATION: hostile diagnostic outcome flags=${JSON.stringify([...hostileCalls, unknownWorkspaceCall].map((call) => ({ threw: Boolean(call.error), is_error: call.result?.isError ?? null, raw_error: Boolean(call.raw?.error), raw_result: Boolean(call.raw?.result) })))}; valid-format unknown probe classification=${unknownWorkspace?.requested_workspace?.classification ?? "unobserved"}.`);
   console.log("RAW_OBSERVATION: new process/session identity and actual tools/list differences establish only a bounded server-side negative claim; no client catalog refresh or transport reuse was simulated or claimed.");
   console.log("SANITY_VERDICT: MATCH — direct HTTP responses, OS process replacement, filesystem census, lifecycle elapsed time, and actual tool catalogs match the load-bearing TASK-005 outcome.");
@@ -602,8 +750,6 @@ try {
   assert.ok(capacityNewDiag?.http_sessions?.total_capacity_evicted >= 1, "real capacity eviction was not counted");
   assert.equal(capacityNewDiag?.http_sessions?.active, 1, "capacity fixture retained more than max active sessions");
 
-  const finalHome = await census(isolatedHome);
-  const finalConfig = await census(isolatedConfigRoot);
   assert.deepEqual(homeAfterA, homeBefore, "A process changed CODEXPRO_HOME");
   assert.deepEqual(configAfterA, configBefore, "A process changed isolated config root");
   assert.deepEqual(finalHome, homeBefore, "CODEXPRO_HOME changed during session/workspace proof");
@@ -622,7 +768,12 @@ try {
   }
   console.log(`ACCEPTANCE_MATRIX: ${JSON.stringify(acceptance)}; EVIDENCE_CONFLICT: ${rawPrinted ? "TECHNICAL_ASSERTION_CONFLICT" : "TARGET_INPUT_MISSING_OR_ROUTE_FAILURE"}.`);
   const message = error instanceof Error ? error.message : String(error);
-  const safeMessage = message.replaceAll(AUTH_TOKEN, "<auth>").replaceAll(HOSTILE_SECRET, "<hostile>").replaceAll(REQUEST_SENTINEL, "<request>").replaceAll(ENV_SENTINEL, "<env>");
+  const safeMessage = message
+    .replaceAll(AUTH_TOKEN, "<auth>")
+    .replaceAll(HOSTILE_SECRET, "<hostile>")
+    .replaceAll(REQUEST_SENTINEL, "<request>")
+    .replaceAll(INVALID_WORKSPACE_ID_SENTINEL, "<invalid-id>")
+    .replaceAll(ENV_SENTINEL, "<env>");
   console.error(`FAILURE_ID: ${error?.name ?? "Error"}: ${safeMessage.slice(0, 500)}`);
   throw error;
 } finally {

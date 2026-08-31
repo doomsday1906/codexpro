@@ -60,6 +60,10 @@ const REVIEW_WORKSPACE_ID_SCHEMA = z.string()
   .refine((value) => value.trim() === value, "workspace_id must not have surrounding whitespace.")
   .describe("Explicit workspace id from open_current_workspace or open_workspace.");
 
+const SESSION_WORKSPACE_DIAGNOSTICS_WORKSPACE_ID_SCHEMA = z.string()
+  .regex(/^ws_[0-9a-f]{24}$/u, "workspace_id must match the deterministic workspace ID grammar.")
+  .describe("Explicit deterministic workspace id from open_current_workspace or open_workspace.");
+
 const SESSION_WORKSPACE_DIAGNOSTICS_FIELD_NAMES = new Set(["workspace_id"]);
 
 function boundedSessionWorkspaceDiagnosticsValidationError(issues: readonly z.ZodIssue[]): z.ZodError {
@@ -95,7 +99,7 @@ function boundedSessionWorkspaceDiagnosticsValidationError(issues: readonly z.Zo
 // envelope permissive. The strict runtime parser below owns rejection and
 // emits only bounded, caller-key-safe errors for hostile unknown properties.
 const SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA = z.object({
-  workspace_id: REVIEW_WORKSPACE_ID_SCHEMA.optional()
+  workspace_id: SESSION_WORKSPACE_DIAGNOSTICS_WORKSPACE_ID_SCHEMA.optional()
 }).strict();
 const rawSessionWorkspaceDiagnosticsSafeParse = SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA.safeParse.bind(SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA);
 SESSION_WORKSPACE_DIAGNOSTICS_ARGUMENTS_SCHEMA.safeParse = ((args: unknown) => {
