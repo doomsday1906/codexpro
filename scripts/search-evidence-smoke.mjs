@@ -32,6 +32,7 @@ const INELIGIBLE_OVERSIZED_BYTES = 16_001;
 const HOSTILE_VISIBLE_BINARY_COUNT = 10_000;
 const SHIM_MAX_OUTPUT_BYTES = 4000;
 const UNTERMINATED_RECORD_BYTES = 96_000;
+const REQUEST_TIMEOUT_MS = 60_000;
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const serverEntry = path.join(projectRoot, 'dist', 'stdio.js');
 const importBuilt = (relativePath) => import(pathToFileURL(path.join(projectRoot, 'dist', relativePath)).href);
@@ -109,7 +110,11 @@ class McpStdioClient {
     const id = this.nextId++;
     this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${method}: ${this.stderr}`)), 20_000);
+      const toolName = method === 'tools/call' && typeof params?.name === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(params.name)
+        ? params.name
+        : undefined;
+      const requestLabel = toolName ? `${method} ${toolName}` : method;
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${requestLabel}`)), REQUEST_TIMEOUT_MS);
       timer.unref();
       this.pending.set(id, { resolve, reject, timer });
     });
