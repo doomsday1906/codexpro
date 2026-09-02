@@ -93,6 +93,7 @@
     "git-push-policy:smoke": "npm run build && node scripts/git-push-policy-smoke.mjs",
     "git-push-preflight:smoke": "npm run build && node scripts/git-push-preflight-smoke.mjs",
     "git-push-mcp:smoke": "npm run build && node scripts/git-push-mcp-smoke.mjs",
+    "git-push-task003:tester": "npm run build && node scripts/git-push-task003-tester-smoke.mjs",
     "git-commit:smoke": "npm run build && node scripts/git-commit-smoke.mjs && node scripts/git-commit-task004-smoke.mjs && node scripts/git-commit-mcp-smoke.mjs && node scripts/git-commit-task006-smoke.mjs",
     "git-commit-task006:smoke": "npm run build && node scripts/git-commit-task006-smoke.mjs",
     "git-commit-mcp:smoke": "npm run build && node scripts/git-commit-mcp-smoke.mjs",
