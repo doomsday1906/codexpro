@@ -165,8 +165,6 @@ const MAX_CONFIG_INCLUDE_QUERY_BYTES = 32 * 1024;
 const MAX_CONFIG_INCLUDE_DEPTH = 64;
 const INTERNAL_CONFIG_ORIGIN = "command line:";
 const INTERNAL_CONFIG_KEYS = new Set(["color.ui"]);
-const GIT_VAR_SYSTEM_PREFIX = "GIT_CONFIG_SYSTEM=";
-const GIT_VAR_GLOBAL_PREFIX = "GIT_CONFIG_GLOBAL=";
 const UTF8_FATAL = new TextDecoder("utf-8", { fatal: true });
 const GIT_HISTORY_MARKERS = [
   "MERGE_HEAD",
@@ -382,15 +380,14 @@ function trustedGlobalConfigTargets(): readonly string[] {
   ]);
 }
 
-function parseGitVarConfigTargets(bytes: Buffer, workspaceRoot: string): readonly string[] {
+type GitConfigPathVariable = "GIT_CONFIG_SYSTEM" | "GIT_CONFIG_GLOBAL";
+
+function parseGitConfigPathVariable(bytes: Buffer, workspaceRoot: string): readonly string[] {
   if (bytes.length === 0 || bytes.length > MAX_CONFIG_SOURCE_BYTES || bytes.at(-1) !== 0x0a) {
     return fail("config-source-discovery");
   }
-  const systemPrefix = Buffer.from(GIT_VAR_SYSTEM_PREFIX, "utf8");
-  const globalPrefix = Buffer.from(GIT_VAR_GLOBAL_PREFIX, "utf8");
   const targets = new Map<string, string>();
-  let systemCount = 0;
-  let globalCount = 0;
+  let lineCount = 0;
   const addTarget = (rawPath: string): void => {
     if (!path.isAbsolute(rawPath)) return fail("config-source-discovery");
     const normalized = normalizeConfigTargetPath(rawPath, workspaceRoot);
@@ -404,29 +401,36 @@ function parseGitVarConfigTargets(bytes: Buffer, workspaceRoot: string): readonl
     const newline = bytes.indexOf(0x0a, offset);
     if (newline < 0) return fail("config-source-discovery");
     const line = bytes.subarray(offset, newline);
-    const isSystem = line.subarray(0, systemPrefix.length).equals(systemPrefix);
-    const isGlobal = line.subarray(0, globalPrefix.length).equals(globalPrefix);
-    if (isSystem || isGlobal) {
-      const prefixLength = isSystem ? systemPrefix.length : globalPrefix.length;
-      let rawPath: string;
-      try {
-        rawPath = UTF8_FATAL.decode(line.subarray(prefixLength));
-      } catch {
-        return fail("config-source-discovery");
-      }
-      addTarget(rawPath);
-      if (isSystem) systemCount += 1;
-      else globalCount += 1;
-    } else if (line.subarray(0, Buffer.byteLength("GIT_CONFIG_", "utf8")).equals(Buffer.from("GIT_CONFIG_", "utf8"))) {
-      // The sealed query has a fixed output contract. An unexpected config
-      // variable-shaped line must not be silently treated as harmless text.
-      return fail("dynamic-config-source");
+    if (line.length === 0) return fail("config-source-discovery");
+    lineCount += 1;
+    if (lineCount > MAX_CONFIG_SOURCE_COUNT) return fail("config-source-discovery");
+    let rawPath: string;
+    try {
+      rawPath = UTF8_FATAL.decode(line);
+    } catch {
+      return fail("config-source-discovery");
     }
+    addTarget(rawPath);
     offset = newline + 1;
   }
 
-  if (targets.size === 0 || systemCount === 0 || globalCount === 0) return fail("config-source-discovery");
+  if (lineCount === 0 || targets.size === 0) return fail("config-source-discovery");
   return Object.freeze([...targets.values()]);
+}
+
+async function discoverGitConfigPathVariable(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  variable: GitConfigPathVariable
+): Promise<readonly string[]> {
+  // Git exposes these two sealed variables as path-only, newline-delimited
+  // output. Keep the queries separate so no broad variable/config listing can
+  // capture unrelated effective values such as credentials or remote URLs.
+  const result = await runGitExitAware(config, workspace, ["var", variable]);
+  if (result.exitCode !== 0 || result.signal !== null || result.timedOut || result.stdoutOverflow || result.stderrOverflow || result.copyStderrBytes().length > 0) {
+    return fail("config-source-discovery");
+  }
+  return parseGitConfigPathVariable(result.copyStdoutBytes(), workspace.root);
 }
 
 function parseIncludeQueryRecords(bytes: Buffer, sourcePath: string, workspaceRoot: string): readonly string[] {
@@ -566,11 +570,10 @@ async function discoverGitPushConfigSources(
     }
   }
 
-  const varResult = await runGitExitAware(config, workspace, ["var", "-l"]);
-  if (varResult.exitCode !== 0 || varResult.signal !== null || varResult.timedOut || varResult.stdoutOverflow || varResult.stderrOverflow || varResult.copyStderrBytes().length > 0) {
-    return fail("config-source-discovery");
-  }
-  for (const target of parseGitVarConfigTargets(varResult.copyStdoutBytes(), workspace.root)) addPath(target);
+  const systemConfigTargets = await discoverGitConfigPathVariable(config, workspace, "GIT_CONFIG_SYSTEM");
+  const globalConfigTargets = await discoverGitConfigPathVariable(config, workspace, "GIT_CONFIG_GLOBAL");
+  for (const target of systemConfigTargets) addPath(target);
+  for (const target of globalConfigTargets) addPath(target);
   addPath(repositoryConfigPath);
   addPath(worktreeConfigPath);
   for (const target of trustedGlobalConfigTargets()) addPath(target);

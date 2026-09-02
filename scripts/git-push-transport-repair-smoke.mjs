@@ -45,6 +45,19 @@ function gitResult(cwd, args, options = {}) {
   });
 }
 
+function exactGitPathVariableResult(cwd, variable, envOverrides = {}) {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (/^GIT_/u.test(key)) delete env[key];
+  }
+  return spawnSync("git", ["--no-pager", "var", variable], {
+    cwd,
+    encoding: "buffer",
+    env: { ...env, ...envOverrides },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+}
+
 function git(cwd, args, options = {}) {
   const result = gitResult(cwd, args, options);
   if (result.error || result.status !== 0) {
@@ -278,6 +291,9 @@ const targetRoot = path.join(fixture, "target");
 const receivePackPath = path.join(fixture, "sentinel-receive-pack");
 const receivePackFired = path.join(fixture, "receive-pack-fired");
 const configRaceFired = path.join(fixture, "config-race-result");
+
+const preflightSource = await readFile(path.join(REPO_ROOT, "src", "gitPushPreflight.ts"), "utf8");
+assert.equal(/\bvar\s+-l\b/u.test(preflightSource), false, "preflight source must not use broad Git variable listing");
 let daemon;
 let session;
 
@@ -419,6 +435,23 @@ try {
   git(raceTargetRoot, ["config", "user.name", "Config Source Race Target"]);
   git(raceTargetRoot, ["config", "user.email", "config-source-race@example.test"]);
   git(raceTargetRoot, ["config", "--local", "include.path", raceInclude]);
+  for (const variable of ["GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL"]) {
+    const pathQuery = exactGitPathVariableResult(raceTargetRoot, variable, {
+      HOME: raceHome,
+      XDG_CONFIG_HOME: path.join(fixture, "race-xdg")
+    });
+    const capturedStdout = Buffer.from(pathQuery.stdout ?? "");
+    const capturedStderr = Buffer.from(pathQuery.stderr ?? "");
+    assert.equal(pathQuery.error, undefined, `${variable} path query could not be launched`);
+    assert.equal(pathQuery.status, 0, `${variable} path query failed`);
+    assert.ok(capturedStdout.length > 0, `${variable} path query returned no source path`);
+    assert.equal(capturedStderr.length, 0, `${variable} path query emitted diagnostics`);
+    for (const sentinel of [SECRET, CONFIG_VALUE_SENTINEL, CONFIG_CREDENTIAL_SENTINEL]) {
+      assert.equal(capturedStdout.includes(sentinel), false, `${variable} path query stdout exposed a config sentinel`);
+      assert.equal(capturedStderr.includes(sentinel), false, `${variable} path query stderr exposed a config sentinel`);
+    }
+  }
+  console.log("CONFIG_PATH_QUERY_PRIVACY: PASS — exact system/global path queries captured only bounded paths; synthetic config values and credentials were absent from query output and server diagnostics.");
   await writeFile(path.join(raceTargetRoot, "notes.txt"), "R0\nL1\n", "utf8");
   const raceLocalHead = commit(raceTargetRoot, "L1");
   const raceWorkspaceId = workspaceId(raceTargetRoot);

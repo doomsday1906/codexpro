@@ -216,7 +216,7 @@ async function main() {
     assert.ok(configSources.includes(path.join(workRoot, ".git", "config")), "preflight omitted the repository config source");
     assert.ok(configSources.includes(path.join(workRoot, ".git", "config.worktree")), "preflight omitted the exact config.worktree target");
     if (process.platform !== "win32") {
-      // Git 2.43 exposes the system target through `git var -l`; this
+      // Git 2.43 exposes the system target through `git var GIT_CONFIG_SYSTEM`; this
       // environment's ordinary user cannot write it, so no native lock is
       // required for that source. The assertion reads metadata only.
       assert.equal(configSources.includes("/etc/gitconfig"), true, "preflight omitted the Git var system target");
