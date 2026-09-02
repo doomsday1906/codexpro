@@ -7,7 +7,7 @@ import { redactSearchQuery, redactSensitiveTextPreservingLines, sourceLanguageFo
 import { detectProjectTypes } from "./classify.js";
 import { getCachedWorkspaceAnalysis, invalidateWorkspaceAnalysis, setCachedWorkspaceAnalysis } from "./cache.js";
 import { extractWorkspaceFiles } from "./extract.js";
-import { buildRelationshipsWithCoverage } from "./graph.js";
+import { buildRelationshipsWithCoverage, traverseImpactGraph } from "./graph.js";
 import { inventoryWorkspace } from "./inventory.js";
 import { classifyDefinitionMatch, classifySearchIntent, emptySearchGroups, groupForFile, sortStructuredMatches } from "./rank.js";
 import type { AnalysisSearchIntent, StructuredSearchMatch, StructuredSearchResult, WorkspaceAnalysis } from "./types.js";
@@ -104,6 +104,10 @@ class StructuredEvidenceAccumulator {
     const existing = this.byIdentity.get(key);
     this.byIdentity.set(key, existing ? mergeEvidenceMatches(existing, match) : { ...match, reasons: [...match.reasons] });
     return true;
+  }
+
+  has(path: string, group: string): boolean {
+    return this.logicalKeys.has(`${path}\u0000${group}`);
   }
 
   finalize(): StructuredSearchMatch[] {
@@ -387,7 +391,62 @@ export async function searchWorkspaceStructured(
   if (searchBudgetReached) warnings.push("Grouped search reached its configured file or byte limit.");
   if (skippedFiles) warnings.push(`Grouped search skipped ${skippedFiles} file${skippedFiles === 1 ? "" : "s"} that changed or became unreadable during analysis.`);
 
-  if (intent === "references" || intent === "impact") {
+  if (intent === "impact") {
+    const definitionPaths = new Set(
+      analysis.symbols
+        .filter((symbol) => includePath(symbol.path) && classifyDefinitionMatch(symbol, query) !== null)
+        .map((symbol) => symbol.path)
+    );
+    const impactResults = traverseImpactGraph(definitionPaths, analysis.relationships, {
+      maxDepth: 3,
+      maxCandidates: candidateLimit,
+      includeTests: Boolean(options.includeTests),
+      includePath
+    });
+    for (const res of impactResults) {
+      const group = res.kind === "tests" ? "tests" : "references";
+      const score = res.kind === "tests"
+        ? (res.depth === 1 ? 166 : 158)
+        : (res.depth === 1 ? 170 : 162);
+      const admitted = accumulator.add({
+        path: res.path,
+        line: 1,
+        text: `${res.kind} ${res.via ?? [...definitionPaths][0] ?? query}`,
+        group,
+        score,
+        reasons: res.reasons,
+        confidence: "strong",
+        source: "built-in import extraction"
+      }, candidateLimit, testCandidateLimit);
+      if (!admitted) {
+        if (group === "tests") testCandidateLimitReached = true;
+        else sourceCandidateLimitReached = true;
+        candidateLimitReached = true;
+      }
+    }
+    if (options.includeTests) {
+      const defBasenames = [...definitionPaths].map((p) => p.split("/").pop()?.replace(/\.[^.]+$/, "").toLowerCase()).filter(Boolean) as string[];
+      const queryStem = query.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+      for (const file of analysis.files) {
+        if (!includePath(file.path) || file.role !== "test" || file.generated) continue;
+        const fileLower = (file.path.split("/").pop() ?? "").toLowerCase();
+        const matchesDef = defBasenames.some((stem) => stem.length > 3 && fileLower.includes(stem));
+        const matchesQuery = queryStem.length > 3 && fileLower.replace(/[^a-z0-9]/g, "").includes(queryStem);
+        if (matchesDef || matchesQuery) {
+          accumulator.add({
+            path: file.path,
+            line: 1,
+            text: `related test for ${query}`,
+            group: "tests",
+            score: 150,
+            reasons: ["dependent test", "related test", "test filename matches definition"],
+            confidence: "inferred",
+            source: "built-in analysis"
+          }, candidateLimit, testCandidateLimit);
+        }
+      }
+    }
+  } else if (intent === "references") {
     const definitionPaths = new Set(
       analysis.symbols
         .filter((symbol) => includePath(symbol.path) && classifyDefinitionMatch(symbol, query) !== null)

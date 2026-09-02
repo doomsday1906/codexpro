@@ -75,10 +75,47 @@ function importSpecifiers(language: AnalysisLanguage, line: string): string[] {
     const match = line.match(/^\s*#include\s*["<]([^">]+)[">]/);
     return match ? [match[1]] : [];
   }
+  if (language === "python") {
+    const fromMatch = line.match(/^\s*from\s+([.\w]+)\s+import/);
+    if (fromMatch?.[1]) return [fromMatch[1]];
+    const importMatch = line.match(/^\s*import\s+([.\w]+)/);
+    if (importMatch?.[1]) return [importMatch[1]];
+  }
   return [];
 }
 
-function resolveInternalImport(fromPath: string, specifier: string, files: Set<string>): string | undefined {
+function resolveInternalImport(fromPath: string, specifier: string, files: Set<string>, language?: AnalysisLanguage): string | undefined {
+  if (language === "python") {
+    const dotMatch = specifier.match(/^(\.+)(.*)$/);
+    if (dotMatch) {
+      const dotCount = dotMatch[1].length;
+      const rest = dotMatch[2];
+      let baseDir = path.posix.dirname(fromPath);
+      for (let i = 1; i < dotCount; i++) baseDir = path.posix.dirname(baseDir);
+      const subPath = rest ? rest.split(".").join("/") : "";
+      const targetBase = subPath ? path.posix.normalize(path.posix.join(baseDir, subPath)) : baseDir;
+      const candidates = [`${targetBase}.py`, `${targetBase}/__init__.py`];
+      return candidates.find((c) => files.has(c));
+    }
+    const asPath = specifier.split(".").join("/");
+    const candidates = [
+      `${asPath}.py`,
+      `${asPath}/__init__.py`,
+      `src/${asPath}.py`,
+      `src/${asPath}/__init__.py`
+    ];
+    const found = candidates.find((c) => files.has(c));
+    if (found) return found;
+    const parts = fromPath.split("/");
+    if (parts.length > 1) {
+      const topDir = parts[0];
+      const topCandidates = [`${topDir}/${asPath}.py`, `${topDir}/${asPath}/__init__.py`];
+      const topFound = topCandidates.find((c) => files.has(c));
+      if (topFound) return topFound;
+    }
+    return undefined;
+  }
+
   if (!specifier.startsWith(".")) return undefined;
   const raw = path.posix.normalize(path.posix.join(path.posix.dirname(fromPath), specifier));
   const withoutRuntimeExtension = raw.replace(/\.(js|mjs|cjs)$/, "");
@@ -136,8 +173,8 @@ export async function extractWorkspaceFiles(
         symbolCount += 1;
       }
       for (const specifier of importSpecifiers(file.language, line)) {
-        const target = resolveInternalImport(file.path, specifier, fileSet);
-        if (target && !imports.includes(target)) imports.push(target);
+        const target = resolveInternalImport(file.path, specifier, fileSet, file.language);
+        if (target && target !== file.path && !imports.includes(target)) imports.push(target);
       }
     }
     extracted.push({ path: file.path, text, symbols, imports });

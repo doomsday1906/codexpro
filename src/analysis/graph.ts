@@ -53,3 +53,91 @@ export function buildRelationships(extractedFiles: ExtractedFile[], inventoryFil
 export function reverseDependencies(relationships: AnalysisRelationship[], targetPath: string): AnalysisRelationship[] {
   return relationships.filter((relationship) => relationship.to === targetPath);
 }
+
+export interface ImpactTraversalResult {
+  path: string;
+  depth: number;
+  kind: "imports" | "tests";
+  reasons: string[];
+  via?: string;
+}
+
+export function traverseImpactGraph(
+  definitionPaths: Set<string>,
+  relationships: AnalysisRelationship[],
+  options: {
+    maxDepth?: number;
+    maxCandidates?: number;
+    includeTests?: boolean;
+    includePath?: (filePath: string) => boolean;
+  } = {}
+): ImpactTraversalResult[] {
+  const maxDepth = options.maxDepth ?? 3;
+  const maxCandidates = options.maxCandidates ?? 200;
+  const includePath = options.includePath ?? (() => true);
+
+  const incomingByTarget = new Map<string, AnalysisRelationship[]>();
+  for (const rel of relationships) {
+    if (!includePath(rel.from) || !includePath(rel.to)) continue;
+    const list = incomingByTarget.get(rel.to) ?? [];
+    list.push(rel);
+    incomingByTarget.set(rel.to, list);
+  }
+
+  const results: ImpactTraversalResult[] = [];
+  const visited = new Set<string>(definitionPaths);
+
+  type QueueItem = { path: string; depth: number; rootDef: string; via?: string };
+  const queue: QueueItem[] = [];
+  for (const defPath of definitionPaths) {
+    queue.push({ path: defPath, depth: 0, rootDef: defPath });
+  }
+
+  while (queue.length > 0 && results.length < maxCandidates) {
+    const current = queue.shift()!;
+    if (current.depth >= maxDepth) continue;
+
+    const incoming = incomingByTarget.get(current.path) ?? [];
+    for (const rel of incoming) {
+      if (rel.kind === "tests" && !options.includeTests) continue;
+      if (visited.has(rel.from)) continue;
+      visited.add(rel.from);
+
+      const nextDepth = current.depth + 1;
+      const isDirect = nextDepth === 1;
+      const isTest = rel.kind === "tests";
+
+      const reasons: string[] = [];
+      if (isTest) {
+        reasons.push(isDirect ? "dependent test" : "transitive test dependent");
+        reasons.push(`${rel.kind} relationship`);
+        if (isDirect) reasons.push(`tests ${current.rootDef}`);
+        else if (current.via) reasons.push(`tests via ${current.via}`);
+      } else {
+        reasons.push(isDirect ? "dependent module" : "transitive dependent module");
+        reasons.push(`${rel.kind} relationship`);
+        if (isDirect) reasons.push(`imports ${current.rootDef}`);
+        else if (current.via) reasons.push(`transitive dependent via ${current.via}`);
+      }
+
+      results.push({
+        path: rel.from,
+        depth: nextDepth,
+        kind: rel.kind === "tests" ? "tests" : "imports",
+        reasons,
+        via: isDirect ? rel.from : current.via
+      });
+
+      if (results.length >= maxCandidates) break;
+
+      queue.push({
+        path: rel.from,
+        depth: nextDepth,
+        rootDef: current.rootDef,
+        via: isDirect ? rel.from : current.via
+      });
+    }
+  }
+
+  return results;
+}

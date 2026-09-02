@@ -1,0 +1,150 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const importBuilt = (relativePath) => import(pathToFileURL(path.join(projectRoot, 'dist', relativePath)).href);
+const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-search-quality-task004-'));
+
+async function write(relativePath, content) {
+  const target = path.join(fixtureRoot, relativePath);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.writeFile(target, content, 'utf8');
+}
+
+function analysisOf(result) {
+  assert(result.analysis, 'structured search omitted analysis');
+  return result.analysis;
+}
+
+try {
+  await write('package.json', JSON.stringify({ name: 'task004-fixture' }, null, 2));
+
+  // Python module chain:
+  // pkg/base.py defines BaseService
+  // pkg/direct.py imports from pkg.base import BaseService
+  // pkg/transitive.py imports from pkg.direct import DirectService
+  // tests/test_base.py imports from pkg.base import BaseService
+  // tests/test_unlinked_base.py (fallback test with matching filename)
+  await write('pkg/__init__.py', '');
+  await write('pkg/base.py', [
+    'class BaseService:',
+    '    def execute(self): pass'
+  ].join('\n') + '\n');
+
+  await write('pkg/direct.py', [
+    'from pkg.base import BaseService',
+    'class DirectService(BaseService):',
+    '    pass'
+  ].join('\n') + '\n');
+
+  await write('pkg/transitive.py', [
+    'from pkg.direct import DirectService',
+    'class TransitiveConsumer:',
+    '    service = DirectService()'
+  ].join('\n') + '\n');
+
+  // Cycle test: cycle_a imports cycle_b, cycle_b imports cycle_a, cycle_a imports base
+  await write('pkg/cycle_a.py', [
+    'from pkg.base import BaseService',
+    'from pkg.cycle_b import CycleB'
+  ].join('\n') + '\n');
+
+  await write('pkg/cycle_b.py', [
+    'from pkg.cycle_a import BaseService'
+  ].join('\n') + '\n');
+
+  await write('tests/test_base.py', [
+    'from pkg.base import BaseService',
+    'def test_base(): pass'
+  ].join('\n') + '\n');
+
+  await write('tests/test_base_service_fallback.py', [
+    '# Test file for BaseService without explicit import',
+    'def test_unlinked(): pass'
+  ].join('\n') + '\n');
+
+  const [
+    { loadConfig },
+    { PathGuard, WorkspaceManager },
+    { searchWorkspace },
+    { inspectWorkspace },
+    { traverseImpactGraph }
+  ] = await Promise.all([
+    importBuilt('config.js'),
+    importBuilt('guard.js'),
+    importBuilt('searchOps.js'),
+    importBuilt('analysis/index.js'),
+    importBuilt('analysis/graph.js')
+  ]);
+
+  const config = loadConfig(['--root', fixtureRoot, '--allow-root', fixtureRoot, '--bash', 'off', '--write', 'off']);
+  const guard = new PathGuard(config);
+  const workspace = new WorkspaceManager(config).defaultWorkspace();
+
+  // Test 1: AP-007: Python relationship extraction produces bounded internal graph edges
+  const analysis = await inspectWorkspace(config, guard, workspace);
+  const pythonRels = analysis.relationships;
+  assert(pythonRels.length > 0, 'No Python relationships extracted');
+  assert(pythonRels.some((r) => r.from === 'pkg/direct.py' && r.to === 'pkg/base.py' && r.kind === 'imports'), 'direct import relationship missing');
+  assert(pythonRels.some((r) => r.from === 'pkg/transitive.py' && r.to === 'pkg/direct.py' && r.kind === 'imports'), 'transitive import relationship missing');
+  assert(pythonRels.some((r) => r.from === 'tests/test_base.py' && r.to === 'pkg/base.py' && r.kind === 'tests'), 'test relationship missing');
+  console.log('PASS: AP-007: Python relationship extraction cleanly produces internal graph edges.');
+
+  // Test 2: Graph traversal with cycle avoidance and depth tracking
+  const baseDefPaths = new Set(['pkg/base.py']);
+  const impactTraversed = traverseImpactGraph(baseDefPaths, analysis.relationships, {
+    maxDepth: 3,
+    includeTests: true
+  });
+  assert(impactTraversed.some((t) => t.path === 'pkg/direct.py' && t.depth === 1), 'direct dependent missing at depth 1');
+  assert(impactTraversed.some((t) => t.path === 'pkg/transitive.py' && t.depth === 2), 'transitive dependent missing at depth 2');
+  assert(impactTraversed.some((t) => t.path === 'tests/test_base.py' && t.depth === 1 && t.kind === 'tests'), 'test dependent missing at depth 1');
+  // Cycle safety: cycle_a and cycle_b are visited at most once
+  const cycleACount = impactTraversed.filter((t) => t.path === 'pkg/cycle_a.py').length;
+  const cycleBCount = impactTraversed.filter((t) => t.path === 'pkg/cycle_b.py').length;
+  assert.equal(cycleACount, 1, 'cycle_a was visited more than once');
+  assert.equal(cycleBCount, 1, 'cycle_b was visited more than once');
+  console.log('PASS: Reverse dependency traversal handles depth, transitive dependencies, and cycles.');
+
+  // Test 3: AP-008: End-to-end impact search returns direct/transitive modules and tests
+  const impactResult = await searchWorkspace(config, guard, workspace, {
+    query: 'BaseService',
+    intent: 'impact',
+    includeTests: true,
+    maxResults: 20
+  });
+  const impactAnalysis = analysisOf(impactResult);
+  assert.equal(impactAnalysis.intent, 'impact', 'intent was not impact');
+  assert.equal(impactAnalysis.groups.definitions.length, 1, 'BaseService definition missing');
+  assert.equal(impactAnalysis.groups.definitions[0].path, 'pkg/base.py');
+
+  // Verify direct dependent module
+  const directMatch = impactAnalysis.matches.find((m) => m.path === 'pkg/direct.py');
+  assert(directMatch, 'direct dependent module missing from matches');
+  assert(directMatch.reasons.includes('dependent module'));
+  assert(directMatch.reasons.some((r) => r.includes('imports pkg/base.py')));
+
+  // Verify transitive dependent module
+  const transitiveMatch = impactAnalysis.matches.find((m) => m.path === 'pkg/transitive.py');
+  assert(transitiveMatch, 'transitive dependent module missing from matches');
+  assert(transitiveMatch.reasons.includes('transitive dependent module'));
+  assert(transitiveMatch.reasons.some((r) => r.includes('transitive dependent via')));
+
+  // Verify test dependent
+  const testMatch = impactAnalysis.groups.tests.find((m) => m.path === 'tests/test_base.py');
+  assert(testMatch, 'direct test dependent missing from groups.tests');
+  assert(testMatch.reasons.includes('dependent test'));
+
+  // Verify fallback test
+  const fallbackTest = impactAnalysis.groups.tests.find((m) => m.path === 'tests/test_base_service_fallback.py');
+  assert(fallbackTest, 'fallback test missing from groups.tests');
+  assert(fallbackTest.reasons.includes('test filename matches definition'));
+
+  console.log('PASS: AP-008: impact returns direct/transitive affected modules and relevant tests with reasons.');
+  console.log('ALL TASK-004 SMOKE CHECKS PASSED.');
+} finally {
+  await fs.rm(fixtureRoot, { recursive: true, force: true });
+}
