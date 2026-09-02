@@ -26,9 +26,11 @@ function withoutCache(result) {
 
 try {
   await write('package.json', JSON.stringify({ name: 'task002-fixture' }, null, 2));
+  await write('src/aaa.ts', "const first = 'StableNeedle';\n");
   await write('src/repeated.ts', Array.from({ length: 20 }, (_, index) => `const marker${index} = 'StableNeedle';`).join('\n') + '\n');
   await write('src/target.ts', 'export class StableTarget {}\n');
   await write('src/consumer.ts', "import { StableTarget } from './target.js';\nconst current = StableTarget;\n");
+  await write('src/zzz.ts', "const last = 'StableNeedle';\n");
   await write('src/definitions.ts', "export function PreserveDefinition() {}\nconst note = PreserveDefinition;\nexport function PreserveDefinition() {}\n");
 
   const [{ loadConfig }, { PathGuard, WorkspaceManager }, { searchWorkspace }] = await Promise.all([
@@ -48,7 +50,13 @@ try {
   });
   const repeated = analysisOf(repeatedResult);
   const repeatedMatches = repeated.matches.filter((match) => match.path === 'src/repeated.ts');
+  const lexicalKeys = repeatedResult.matches.map((match) => `${match.path}:${match.line}`);
+  const sortedLexicalKeys = [...repeatedResult.matches]
+    .sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line)
+    .map((match) => `${match.path}:${match.line}`);
   assert.equal(repeated.schemaVersion, 2, 'structured accumulator did not expose schema v2');
+  assert.deepEqual(lexicalKeys, sortedLexicalKeys, 'structured lexical evidence was not deterministically ordered');
+  assert(repeated.matches.some((match) => match.path === 'src/zzz.ts'), 'later logical evidence was starved by repeated lines');
   assert.equal(repeatedMatches.length, 1, `same-file occurrences were not compressed: ${JSON.stringify(repeatedMatches)}`);
   assert.equal(repeatedMatches[0].line, 1);
   assert.equal(repeatedMatches[0].occurrenceCount, 20);

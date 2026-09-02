@@ -20,6 +20,7 @@ export interface SearchOptions {
   intent?: AnalysisSearchIntent;
   symbol?: string;
   includeTests?: boolean;
+  deterministicOrder?: boolean;
 }
 
 export interface SearchResult {
@@ -139,6 +140,7 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
   if (options.includeHidden) args.push("--hidden");
   for (const glob of config.blockedGlobs) args.push("-g", `!${glob}`);
   if (options.glob) args.push("-g", options.glob);
+  if (options.deterministicOrder) args.push("--sort", "path");
   // Pass the query via -e so patterns beginning with "-" (e.g. "->", "--flag")
   // are treated as the search term instead of ripgrep options.
   args.push("-e", options.query, "--", target.absPath);
@@ -384,6 +386,7 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
 export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, workspace: Workspace, rawOptions: Partial<SearchOptions>): Promise<SearchResult> {
   const query = rawOptions.symbol?.toString() || rawOptions.query?.toString() || "";
   if (!query) throw new CodexProError("query is required.");
+  const structuredRequested = rawOptions.intent !== undefined || rawOptions.symbol !== undefined || rawOptions.includeTests !== undefined;
   const options: SearchOptions = {
     query,
     regex: Boolean(rawOptions.regex),
@@ -393,7 +396,8 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
     maxResults: Math.max(1, Math.min(rawOptions.maxResults ?? config.maxSearchResults, config.maxSearchResults)),
     intent: rawOptions.intent,
     symbol: rawOptions.symbol,
-    includeTests: rawOptions.includeTests
+    includeTests: rawOptions.includeTests,
+    deterministicOrder: structuredRequested
   };
   let lexical: SearchResult;
   if (await commandExists("rg")) {
@@ -403,7 +407,6 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
   } else {
     lexical = await runNodeSearch(config, guard, workspace, options);
   }
-  const structuredRequested = rawOptions.intent !== undefined || rawOptions.symbol !== undefined || rawOptions.includeTests !== undefined;
   if (!structuredRequested) return lexical;
   if (!config.analysisEnabled) {
     lexical.analysis = {

@@ -169,11 +169,11 @@ try {
     maxResults: 2
   });
   assert.equal(candidateLimited.matches.length, 1);
-  assert.equal(candidateLimited.matches[0].occurrenceCount, 8);
-  assert.deepEqual(candidateLimited.matches[0].additionalLines, [2, 3, 4, 5, 6, 7, 8]);
-  assert.equal(candidateLimited.matches[0].additionalLinesTruncated, false);
-  assert.equal(candidateLimited.coverage.truncated, true);
-  assert(candidateLimited.warnings.some((warning) => warning.includes('retained the first 8 candidates')));
+  assert.equal(candidateLimited.matches[0].occurrenceCount, 20);
+  assert.deepEqual(candidateLimited.matches[0].additionalLines, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+  assert.equal(candidateLimited.matches[0].additionalLinesTruncated, true);
+  assert.equal(candidateLimited.coverage.truncated, false);
+  assert(!candidateLimited.warnings.some((warning) => warning.includes('retained the first 8 candidates')));
 
   console.log('✓ analysis smoke test passed');
 } finally {
