@@ -3,6 +3,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { CodexProConfig } from "./config.js";
+import { sanitizeGitPushPolicy, summarizeGitPushPolicy, type GitPushPolicy } from "./gitPushPolicy.js";
 import { isSubpath, type Workspace } from "./guard.js";
 
 export interface SkillInventoryItem {
@@ -452,12 +453,15 @@ export async function codexproInventory(
   text: string;
   skills: SkillInventoryItem[];
   mcpServers: McpServerInventoryItem[];
+  gitPushPolicy: GitPushPolicy;
 }> {
   const skills = await discoverSkillInventory(workspace, {
     includeGlobal: options.includeGlobalSkills !== false,
     maxSkills: options.maxSkills
   });
   const mcpServers = options.includeMcpServers === false ? [] : await discoverMcpServers(workspace);
+  const gitPushPolicy = sanitizeGitPushPolicy(config.gitPushPolicy);
+  const gitPushPolicySummary = summarizeGitPushPolicy(gitPushPolicy);
 
   const bySource = skills.reduce<Record<string, number>>((acc, skill) => {
     acc[skill.source] = (acc[skill.source] ?? 0) + 1;
@@ -477,6 +481,7 @@ Workspace: ${workspace.root}
 Bash mode: ${config.bashMode}
 Write mode: ${config.writeMode}
 Tool mode: ${config.toolMode}
+Git push policy: ${gitPushPolicySummary.enabled ? "enabled" : "disabled"} (${gitPushPolicySummary.rule_count} exact rule${gitPushPolicySummary.rule_count === 1 ? "" : "s"})
 
 ## Skill summary
 
@@ -493,5 +498,5 @@ ${skillLines}
 ${mcpLines}
 `;
 
-  return { text, skills, mcpServers };
+  return { text, skills, mcpServers, gitPushPolicy };
 }

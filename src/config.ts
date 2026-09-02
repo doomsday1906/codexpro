@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULT_ANALYSIS_LIMITS, type AnalysisLimits } from "./analysis/types.js";
+import { parseGitPushPolicy, type GitPushPolicy } from "./gitPushPolicy.js";
 
 export type BashMode = "off" | "safe" | "full";
 export type BashTranscriptMode = "compact" | "full";
@@ -39,6 +40,7 @@ export interface CodexProConfig {
   blockedGlobs: string[];
   contextDir: string;
   toolCards: boolean;
+  gitPushPolicy: GitPushPolicy;
   connectionTest: boolean;
   analysisEnabled: boolean;
   analysisLimits: AnalysisLimits;
@@ -285,6 +287,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
       : typeof args["tool-cards"] === "string"
         ? args["tool-cards"]
         : undefined;
+  const gitPushPolicyArg = typeof args["git-push-policy"] === "string" ? args["git-push-policy"] : undefined;
   const extraBlockedGlobs = splitList(process.env.CODEXPRO_BLOCKED_GLOBS, ",");
   const host = hostArg ?? process.env.CODEXPRO_HOST ?? process.env.HOST ?? "127.0.0.1";
   const authToken = process.env.CODEXPRO_HTTP_TOKEN ?? process.env.CODEBASE_BRIDGE_HTTP_TOKEN;
@@ -337,6 +340,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     blockedGlobs: [...DEFAULT_BLOCKED_GLOBS, ...extraBlockedGlobs],
     contextDir: contextDirFrom(process.env.CODEXPRO_CONTEXT_DIR),
     toolCards: boolFrom(toolCardsArg ?? process.env.CODEXPRO_TOOL_CARDS, false),
+    gitPushPolicy: parseGitPushPolicy(gitPushPolicyArg ?? process.env.CODEXPRO_GIT_PUSH_POLICY),
     connectionTest: boolFrom(process.env.CODEXPRO_CONNECTION_TEST, false),
     analysisEnabled: boolFrom(process.env.CODEXPRO_ANALYSIS, true),
     analysisLimits: {

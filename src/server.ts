@@ -32,6 +32,7 @@ import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidg
 import { hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactStructured, redactUnifiedDiff, sourceLanguageForPath, truncateUtf8 } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { createDiagnosticContext, type CodexProDiagnosticContext } from "./diagnosticContext.js";
+import { sanitizeGitPushPolicy } from "./gitPushPolicy.js";
 export type { CodexProDiagnosticContext, DiagnosticContextOptions, DiagnosticTransportKind, HttpDiagnosticCurrentSession, HttpDiagnosticSnapshot } from "./diagnosticContext.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
@@ -2342,6 +2343,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         writeMode: config.writeMode,
         toolMode: config.toolMode,
         toolCards: config.toolCards,
+        gitPushPolicy: sanitizeGitPushPolicy(config.gitPushPolicy),
         connectionTest: config.connectionTest,
         analysisEnabled: config.analysisEnabled,
         analysisLimits: config.analysisLimits,
@@ -2762,6 +2764,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         bash_mode: config.bashMode,
         write_mode: config.writeMode,
         tool_mode: config.toolMode,
+        git_push_policy: sanitizeGitPushPolicy(config.gitPushPolicy),
         skills: inventory.skills,
         skill_count: inventory.skills.length,
         mcp_servers: inventory.mcpServers,

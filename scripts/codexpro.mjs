@@ -21,6 +21,11 @@ import {
   redactDiagnosticText,
   truncateUtf8
 } from './redaction-policy.mjs';
+import {
+  parseGitPushPolicy,
+  sanitizeGitPushPolicy,
+  serializeGitPushPolicy
+} from './git-push-policy.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const UNTRACKED_FILE_HASH_BYTES = 64 * 1024;
@@ -101,6 +106,7 @@ Options:
   --widget-domain <origin>   Dedicated HTTPS origin for ChatGPT widget iframes.
                              Required for app submission. Default: https://rebel0789.github.io.
   --tool-cards <on|off>      Opt in to ChatGPT widget metadata on tool descriptors. Default: off.
+  --git-push-policy <json>   Optional exact remote/endpoint/branch policy. Disabled when absent.
   --tunnel <none|cloudflare|cloudflare-named|ngrok|tailscale>
                              Expose local MCP. Default: cloudflare.
                              cloudflare = quick tunnel with a new URL each restart.
@@ -193,6 +199,7 @@ Workspace settings:
   codexpro settings show
   codexpro settings list
   codexpro settings set --tunnel ngrok --hostname your-domain.ngrok-free.dev
+  codexpro settings set --git-push-policy '{"enabled":true,"rules":[{"remote":"origin","endpoint":"https://host/repo.git","branches":["main"]}]}'
   codexpro settings set --project /path/to/another/repo
   codexpro settings set --clear-projects
   codexpro settings use
@@ -708,12 +715,15 @@ function deleteWorkspaceProfile(root) {
 function saveWorkspaceProfile(root, profile) {
   const dir = profileDir();
   const filePath = profilePathForRoot(root);
+  const { gitPushPolicy, ...rest } = profile || {};
+  const normalizedGitPushPolicy = gitPushPolicy === undefined ? undefined : parseGitPushPolicy(gitPushPolicy);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const payload = {
     version: 1,
     root,
     updatedAt: new Date().toISOString(),
-    ...profile
+    ...rest,
+    ...(normalizedGitPushPolicy !== undefined ? { gitPushPolicy: normalizedGitPushPolicy } : {})
   };
   fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
   try {
@@ -808,12 +818,34 @@ function clearRuntimeConnection(root) {
 
 function sanitizedProfile(profile) {
   if (!profile || !Object.keys(profile).length) return {};
-  const { token, cloudflareToken, ...rest } = profile;
+  const { token, cloudflareToken, gitPushPolicy, ...rest } = profile;
   return {
     ...rest,
+    ...(gitPushPolicy !== undefined ? { gitPushPolicy: sanitizeGitPushPolicy(gitPushPolicy) } : {}),
     ...(token ? { token: '<saved>' } : {}),
     ...(cloudflareToken ? { cloudflareToken: '<saved>' } : {})
   };
+}
+
+function hasGitPushPolicyInput(args = {}, profile = {}) {
+  return args.gitPushPolicy !== undefined ||
+    (process.env.CODEXPRO_GIT_PUSH_POLICY !== undefined && process.env.CODEXPRO_GIT_PUSH_POLICY !== '') ||
+    profile.gitPushPolicy !== undefined;
+}
+
+function configuredGitPushPolicy(args = {}, profile = {}) {
+  const value = args.gitPushPolicy !== undefined
+    ? args.gitPushPolicy
+    : process.env.CODEXPRO_GIT_PUSH_POLICY !== undefined && process.env.CODEXPRO_GIT_PUSH_POLICY !== ''
+      ? process.env.CODEXPRO_GIT_PUSH_POLICY
+      : profile.gitPushPolicy;
+  return parseGitPushPolicy(value);
+}
+
+function gitPushPolicyProfileEntry(args = {}, profile = {}) {
+  return hasGitPushPolicyInput(args, profile)
+    ? { gitPushPolicy: configuredGitPushPolicy(args, profile) }
+    : {};
 }
 
 function reusableProfilePayload(profile, overrides = {}) {
@@ -825,8 +857,13 @@ function reusableProfilePayload(profile, overrides = {}) {
     allowedRoots,
     ...rest
   } = profile || {};
+  const policyEntry = rest.gitPushPolicy === undefined
+    ? {}
+    : { gitPushPolicy: parseGitPushPolicy(rest.gitPushPolicy) };
+  delete rest.gitPushPolicy;
   return {
     ...rest,
+    ...policyEntry,
     ...overrides
   };
 }
@@ -3322,6 +3359,7 @@ function profileFromPreference(root, args, profile, preference) {
     ...(toolMode ? { toolMode } : {}),
     ...(widgetDomain ? { widgetDomain } : {}),
     ...toolCardsProfileEntry(args, profile),
+    ...gitPushPolicyProfileEntry(args, profile),
     ...(allowedRoots.length ? { allowedRoots } : {}),
     ...(args.noInstallCloudflared ? { noInstallCloudflared: true } : {}),
     root
@@ -3550,6 +3588,7 @@ async function runSetupWizard(argv) {
         ...(toolMode ? { toolMode } : {}),
         ...(widgetDomain ? { widgetDomain } : {}),
         ...toolCardsEntry,
+        ...gitPushPolicyProfileEntry(defaults, profile),
         ...(allowedRoots.length ? { allowedRoots } : {}),
         ...(defaults.noInstallCloudflared ? { noInstallCloudflared: true } : {})
       });
@@ -3597,6 +3636,9 @@ function printProfile(root, profile) {
     ...(safe.write ? [labelValue('Write', safe.write)] : []),
     ...(safe.toolMode ? [labelValue('Tool mode', safe.toolMode)] : []),
     ...(safe.toolCards !== undefined ? [labelValue('Tool cards', safe.toolCards ? 'on' : 'off')] : []),
+    ...(safe.gitPushPolicy
+      ? [labelValue('Git push policy', safe.gitPushPolicy.enabled ? `enabled (${safe.gitPushPolicy.rules.length} rule${safe.gitPushPolicy.rules.length === 1 ? '' : 's'})` : 'disabled')]
+      : []),
     labelValue('Bash transcript', safe.bashTranscript ?? 'compact'),
     labelValue('Codex sessions', safe.codexSessions ?? 'off'),
     ...(safe.codexDir ? [labelValue('Codex dir', safe.codexDir)] : []),
@@ -3683,6 +3725,7 @@ function saveSettingsFromArgs(root, args, profile) {
     ...(toolMode ? { toolMode } : {}),
     ...(widgetDomain ? { widgetDomain } : {}),
     ...toolCardsProfileEntry(args, profile),
+    ...gitPushPolicyProfileEntry(args, profile),
     ...(allowedRoots.length ? { allowedRoots } : {}),
     ...(args.noInstallCloudflared ?? profile.noInstallCloudflared ? { noInstallCloudflared: true } : {})
   });
@@ -4168,6 +4211,7 @@ async function main() {
   const toolMode = optionValue(args, profile, 'toolMode', ['CODEXPRO_TOOL_MODE'], 'standard');
   const widgetDomain = optionValue(args, profile, 'widgetDomain', ['CODEXPRO_WIDGET_DOMAIN'], 'https://rebel0789.github.io');
   const toolCards = optionBool(args, profile, 'toolCards', ['CODEXPRO_TOOL_CARDS'], false);
+  const gitPushPolicy = configuredGitPushPolicy(args, profile);
   validateChoice('bash', bash, ['off', 'safe', 'full']);
   validateChoice('write', write, ['off', 'handoff', 'workspace']);
   validateChoice('tool-mode', toolMode, ['minimal', 'standard', 'full']);
@@ -4195,6 +4239,7 @@ async function main() {
     CODEXPRO_TOOL_MODE: toolMode,
     CODEXPRO_WIDGET_DOMAIN: widgetDomain,
     CODEXPRO_TOOL_CARDS: toolCards ? '1' : '0',
+    CODEXPRO_GIT_PUSH_POLICY: serializeGitPushPolicy(gitPushPolicy),
     CODEXPRO_CONNECTION_TEST: connectionTest ? '1' : '0',
     CODEXPRO_MODE: mode,
     CODEXPRO_RUNTIME_KIND: 'http',

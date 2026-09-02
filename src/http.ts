@@ -23,6 +23,7 @@ import { redactSensitiveText, redactStructured } from "./redact.js";
 import { createDiagnosticContext, type CodexProDiagnosticContext, type HttpDiagnosticSnapshot } from "./diagnosticContext.js";
 import type { WorkspaceDiagnosticReader } from "./guard.js";
 import { createCodexProServer } from "./server.js";
+import { defaultGitPushPolicy, normalizeGitPushPolicy, sanitizeGitPushPolicy, summarizeGitPushPolicy, type GitPushPolicy } from "./gitPushPolicy.js";
 
 export interface CodexProHttpAppOptions {
   /** Internal observer for the real server instances created by HTTP sessions. */
@@ -85,6 +86,7 @@ const AdminProfilePatch = z.object({
   write: z.enum(WRITE_MODES).optional(),
   toolMode: z.enum(TOOL_MODES).optional(),
   toolCards: z.boolean().optional(),
+  gitPushPolicy: z.unknown().optional(),
   widgetDomain: textField(2048),
   tunnelName: textField(128),
   ngrokConfig: textField(4096),
@@ -113,6 +115,7 @@ interface ProfileFormValues {
   write: "off" | "handoff" | "workspace";
   toolMode: "minimal" | "standard" | "full";
   toolCards: boolean;
+  gitPushPolicy: GitPushPolicy;
   widgetDomain: string;
   noInstallCloudflared: boolean;
 }
@@ -172,6 +175,14 @@ function profileValues(config: CodexProConfig, profile = readWorkspaceProfile(co
     "";
   const mode = oneOf(profile.mode ?? process.env.CODEXPRO_MODE, MODES, "agent");
   const write = effectiveWriteMode(mode, oneOf(profile.write ?? config.writeMode, WRITE_MODES, config.writeMode));
+  let gitPushPolicy = config.gitPushPolicy;
+  if (profile.gitPushPolicy !== undefined) {
+    try {
+      gitPushPolicy = normalizeGitPushPolicy(profile.gitPushPolicy);
+    } catch {
+      gitPushPolicy = defaultGitPushPolicy();
+    }
+  }
   return {
     port: String(profile.port ?? config.port),
     mode,
@@ -190,6 +201,7 @@ function profileValues(config: CodexProConfig, profile = readWorkspaceProfile(co
     write,
     toolMode: oneOf(profile.toolMode ?? config.toolMode, TOOL_MODES, config.toolMode),
     toolCards: Boolean(profile.toolCards ?? config.toolCards),
+    gitPushPolicy,
     widgetDomain: String(profile.widgetDomain ?? config.widgetDomain),
     noInstallCloudflared: Boolean(profile.noInstallCloudflared)
   };
@@ -264,6 +276,7 @@ function profileForm(config: CodexProConfig): string {
     process.env.CODEXPRO_PUBLIC_HOSTNAME ??
     process.env.CODEXPRO_HOSTNAME ??
     (values.tunnel === "cloudflare-named" ? values.hostname : "");
+  const gitPushPolicySummary = summarizeGitPushPolicy(values.gitPushPolicy);
   const currentUrlBlock = runtimeUrl
     ? `<div class="current-url">
         <div>
@@ -326,6 +339,7 @@ function profileForm(config: CodexProConfig): string {
           <div class="readonly-grid">
             <div><span>Bash transcript</span><code>${escapeHtml(values.bashTranscript)}</code></div>
             <div><span>Widget origin</span><code>${escapeHtml(values.widgetDomain)}</code></div>
+            <div><span>Git push policy</span><code>${escapeHtml(gitPushPolicySummary.enabled ? `enabled (${gitPushPolicySummary.rule_count} exact rule${gitPushPolicySummary.rule_count === 1 ? "" : "s"})` : "disabled")}</code></div>
           </div>
         </fieldset>
         <div class="actions">
@@ -339,9 +353,10 @@ function profileForm(config: CodexProConfig): string {
 
 function buildProfilePayload(config: CodexProConfig, existing: WorkspaceProfile, input: AdminProfilePatch): WorkspaceProfile {
   const current = profileValues(config, existing);
+  const { gitPushPolicy: requestedGitPushPolicy, ...profileInput } = input;
   const next: ProfileFormValues = {
     ...current,
-    ...input,
+    ...profileInput,
     port: input.port ? String(input.port) : current.port,
     requireBashSession: input.requireBashSession ?? current.requireBashSession,
     noInstallCloudflared: input.noInstallCloudflared ?? current.noInstallCloudflared
@@ -363,6 +378,10 @@ function buildProfilePayload(config: CodexProConfig, existing: WorkspaceProfile,
   const ngrokConfig = next.tunnel === "ngrok" ? normalizeProfilePath(config.defaultRoot, next.ngrokConfig) : "";
   const cloudflareConfig = next.tunnel === "cloudflare-named" ? normalizeProfilePath(config.defaultRoot, next.cloudflareConfig) : "";
   const cloudflareTokenFile = next.tunnel === "cloudflare-named" ? normalizeProfilePath(config.defaultRoot, next.cloudflareTokenFile) : "";
+  const gitPushPolicy = requestedGitPushPolicy === undefined
+    ? current.gitPushPolicy
+    : normalizeGitPushPolicy(requestedGitPushPolicy);
+  const shouldSaveGitPushPolicy = requestedGitPushPolicy !== undefined || existing.gitPushPolicy !== undefined;
   return {
     port: next.port,
     mode: next.mode,
@@ -383,6 +402,7 @@ function buildProfilePayload(config: CodexProConfig, existing: WorkspaceProfile,
     write,
     toolMode: next.toolMode,
     toolCards: next.toolCards,
+    ...(shouldSaveGitPushPolicy ? { gitPushPolicy } : {}),
     ...(next.widgetDomain ? { widgetDomain: next.widgetDomain } : {}),
     ...(existing.allowedRoots?.length ? { allowedRoots: existing.allowedRoots } : {}),
     ...(next.noInstallCloudflared ? { noInstallCloudflared: true } : {})
@@ -392,12 +412,16 @@ function buildProfilePayload(config: CodexProConfig, existing: WorkspaceProfile,
 function profileResponse(config: CodexProConfig): Record<string, unknown> {
   const profile = readWorkspaceProfile(config.defaultRoot);
   const runtime = readRuntimeConnection(config.defaultRoot);
+  const gitPushPolicy = profile.gitPushPolicy !== undefined
+    ? sanitizeGitPushPolicy(profile.gitPushPolicy)
+    : sanitizeGitPushPolicy(config.gitPushPolicy);
   return redactStructured({
     ok: true,
     profile_path: profile.profilePath ?? profilePathForRoot(config.defaultRoot),
     exists: Boolean(profile.profilePath),
     profile: sanitizeWorkspaceProfile(profile),
     effective: profileValues(config, profile),
+    git_push_policy: gitPushPolicy,
     runtime_connection: runtime,
     runtime: {
       defaultRoot: config.defaultRoot,
@@ -408,6 +432,7 @@ function profileResponse(config: CodexProConfig): Record<string, unknown> {
       writeMode: config.writeMode,
       toolMode: config.toolMode,
       toolCards: config.toolCards,
+      gitPushPolicy: sanitizeGitPushPolicy(config.gitPushPolicy),
       widgetDomain: config.widgetDomain,
       authEnabled: Boolean(config.authToken)
     }

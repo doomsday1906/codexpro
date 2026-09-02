@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { BashMode, BashTranscriptMode, CodexSessionsMode, ToolMode, WriteMode } from "./config.js";
 import { expandHome } from "./config.js";
+import { normalizeGitPushPolicy, sanitizeGitPushPolicy, type GitPushPolicy } from "./gitPushPolicy.js";
 
 export type TunnelMode = "none" | "cloudflare" | "cloudflare-named" | "ngrok" | "tailscale";
 export type ConnectorMode = "agent" | "handoff" | "pro";
@@ -32,6 +33,7 @@ export interface WorkspaceProfile {
   write?: WriteMode | string;
   toolMode?: ToolMode | string;
   toolCards?: boolean;
+  gitPushPolicy?: GitPushPolicy;
   widgetDomain?: string;
   noInstallCloudflared?: boolean;
   allowedRoots?: string[];
@@ -145,12 +147,14 @@ export function saveWorkspaceProfile(root: string, profile: WorkspaceProfile): s
   const canonicalRoot = canonicalRootForIdentity(root);
   const dir = profileDir();
   const filePath = profilePathForRoot(canonicalRoot);
-  const { profilePath: _profilePath, ...rest } = profile;
+  const { profilePath: _profilePath, gitPushPolicy, ...rest } = profile;
+  const normalizedGitPushPolicy = gitPushPolicy === undefined ? undefined : normalizeGitPushPolicy(gitPushPolicy);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const payload: WorkspaceProfile = {
     version: 1,
     updatedAt: new Date().toISOString(),
     ...rest,
+    ...(normalizedGitPushPolicy !== undefined ? { gitPushPolicy: normalizedGitPushPolicy } : {}),
     root: canonicalRoot
   };
   fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
@@ -164,9 +168,10 @@ export function saveWorkspaceProfile(root: string, profile: WorkspaceProfile): s
 
 export function sanitizeWorkspaceProfile(profile: WorkspaceProfile): WorkspaceProfile {
   if (!profile || !Object.keys(profile).length) return {};
-  const { token, cloudflareToken, ...rest } = profile;
+  const { token, cloudflareToken, gitPushPolicy, ...rest } = profile;
   return {
     ...rest,
+    ...(gitPushPolicy !== undefined ? { gitPushPolicy: sanitizeGitPushPolicy(gitPushPolicy) } : {}),
     ...(token ? { token: "<saved>" } : {}),
     ...(cloudflareToken ? { cloudflareToken: "<saved>" } : {})
   };
