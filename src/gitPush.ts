@@ -9,11 +9,12 @@ import {
   type GitPushRemoteObservation
 } from "./gitPushPreflight.js";
 
-export type GitPushFailureReason = "cas-stale" | "mutation-failed" | "postcondition";
+export type GitPushFailureReason = "cas-stale" | "mutation-failed" | "mutation-uncertain" | "postcondition";
 
 const FAILURE_MESSAGES: Record<GitPushFailureReason, string> = {
   "cas-stale": "Git push compare-and-swap was stale; the remote branch changed before mutation.",
   "mutation-failed": "Git push mutation failed; the remote branch was not confirmed as updated.",
+  "mutation-uncertain": "Git push mutation outcome could not be confirmed.",
   postcondition: "Git push completed without a matching remote branch postcondition."
 };
 
@@ -173,10 +174,19 @@ export async function gitPush(
   const observed = await observeAfterPush(config, workspace, preflight, endpoint);
 
   if (execution.failed || execution.result?.exitCode !== 0 || execution.result?.signal !== null || execution.result?.timedOut || execution.result?.stdoutOverflow || execution.result?.stderrOverflow) {
-    if (observed.status === "absent" || (observed.status === "head" && observed.head !== preflight.expected_remote_head)) {
-      return failPush(preflight, "cas-stale", observed.status === "head" ? observed.head : undefined);
+    if (observed.status === "head") {
+      if (observed.head === preflight.expected_remote_head) {
+        return failPush(preflight, "mutation-failed", observed.head);
+      }
+      if (observed.head === preflight.expected_local_head) {
+        return failPush(preflight, "mutation-uncertain", observed.head);
+      }
+      return failPush(preflight, "cas-stale", observed.head);
     }
-    return failPush(preflight, "mutation-failed", observed.status === "head" ? observed.head : undefined);
+    if (observed.status === "absent") {
+      return failPush(preflight, "cas-stale");
+    }
+    return failPush(preflight, "mutation-failed");
   }
 
   if (observed.status !== "head" || observed.head !== preflight.expected_local_head) {
