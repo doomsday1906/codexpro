@@ -280,6 +280,8 @@ const evilSeedRoot = path.join(fixture, "evil-seed");
 const raceTargetRoot = path.join(fixture, "race-target");
 const raceHome = path.join(fixture, CONFIG_PATH_SENTINEL);
 const raceInclude = path.join(raceHome, "include-" + CONFIG_PATH_SENTINEL + ".conf");
+const raceNestedInclude = path.join(raceHome, "nested-include.conf");
+const raceNestedIncludeIf = path.join(raceHome, "nested-include-if.conf");
 const raceWriterFired = path.join(fixture, "config-source-race-result");
 const emptyIncludeTargetRoot = path.join(fixture, "empty-include-target");
 const worktreeTargetRoot = path.join(fixture, "worktree-target");
@@ -294,6 +296,7 @@ const configRaceFired = path.join(fixture, "config-race-result");
 
 const preflightSource = await readFile(path.join(REPO_ROOT, "src", "gitPushPreflight.ts"), "utf8");
 assert.equal(/\bvar\s+-l\b/u.test(preflightSource), false, "preflight source must not use broad Git variable listing");
+assert.equal(preflightSource.includes("^include.*"), false, "preflight source must not query broad include-prefixed keys");
 let daemon;
 let session;
 
@@ -427,7 +430,20 @@ try {
   // an active included file are both locked while the named-remote hook tries
   // to redirect GOOD to a distinct EVIL endpoint through ordinary git config.
   await mkdir(raceHome, { recursive: true });
-  await writeFile(raceInclude, `[codexpro.synthetic]\n\tvalue = ${CONFIG_VALUE_SENTINEL}\n\tcredential = ${CONFIG_CREDENTIAL_SENTINEL}\n`, "utf8");
+  await writeFile(raceNestedInclude, "", "utf8");
+  await writeFile(raceNestedIncludeIf, "", "utf8");
+  await writeFile(raceInclude, [
+    "[codexpro.synthetic]",
+    `\tvalue = ${CONFIG_VALUE_SENTINEL}`,
+    `\tcredential = ${CONFIG_CREDENTIAL_SENTINEL}`,
+    "[includesecret]",
+    `\tpath = ${CONFIG_CREDENTIAL_SENTINEL}`,
+    "[include]",
+    `\tpath = ${path.basename(raceNestedInclude)}`,
+    `[includeIf "gitdir:${raceTargetRoot}/"]`,
+    `\tpath = ${path.basename(raceNestedIncludeIf)}`,
+    ""
+  ].join("\n"), "utf8");
   const raceGlobal = path.join(raceHome, ".gitconfig");
   const raceGoodEndpoint = `git://127.0.0.1:${port}/race-good.git`;
   const raceEvilEndpoint = `git://127.0.0.1:${port}/race-evil.git`;
@@ -435,6 +451,34 @@ try {
   git(raceTargetRoot, ["config", "user.name", "Config Source Race Target"]);
   git(raceTargetRoot, ["config", "user.email", "config-source-race@example.test"]);
   git(raceTargetRoot, ["config", "--local", "include.path", raceInclude]);
+  for (const [queryPattern, expectedPath] of [
+    ["^include\\.path$", path.basename(raceNestedInclude)],
+    ["^includeif\\..*\\.path$", path.basename(raceNestedIncludeIf)]
+  ]) {
+    const includeQuery = gitResult(raceTargetRoot, [
+      "config",
+      "--file",
+      raceInclude,
+      "--no-includes",
+      "--show-origin",
+      "--null",
+      "--type",
+      "path",
+      "--get-regexp",
+      queryPattern
+    ]);
+    const capturedStdout = Buffer.from(includeQuery.stdout ?? "");
+    const capturedStderr = Buffer.from(includeQuery.stderr ?? "");
+    assert.equal(includeQuery.error, undefined, `${queryPattern} include query could not be launched`);
+    assert.equal(includeQuery.status, 0, `${queryPattern} include query failed`);
+    assert.ok(capturedStdout.includes(expectedPath), `${queryPattern} include query omitted the legitimate target`);
+    assert.equal(capturedStderr.length, 0, `${queryPattern} include query emitted diagnostics`);
+    for (const sentinel of [SECRET, CONFIG_VALUE_SENTINEL, CONFIG_CREDENTIAL_SENTINEL]) {
+      assert.equal(capturedStdout.includes(sentinel), false, `${queryPattern} include query stdout exposed an unrelated config sentinel`);
+      assert.equal(capturedStderr.includes(sentinel), false, `${queryPattern} include query stderr exposed an unrelated config sentinel`);
+    }
+  }
+  console.log("INCLUDE_QUERY_PRIVACY: PASS — exact include/includeIf queries returned legitimate paths while excluding the unrelated includesecret value and synthetic config sentinels.");
   for (const variable of ["GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL"]) {
     const pathQuery = exactGitPathVariableResult(raceTargetRoot, variable, {
       HOME: raceHome,
@@ -466,6 +510,8 @@ try {
   const raceLocalConfig = path.join(raceTargetRoot, ".git", "config");
   const raceLocalConfigBefore = await readFile(raceLocalConfig);
   const raceIncludeBefore = await readFile(raceInclude);
+  const raceNestedIncludeBefore = await readFile(raceNestedInclude);
+  const raceNestedIncludeIfBefore = await readFile(raceNestedIncludeIf);
   const raceHookPath = path.join(raceTargetRoot, ".git", "hooks", "pre-push");
   const raceHook = [
     "#!/bin/sh",
@@ -507,12 +553,16 @@ try {
   assert.equal(await readFile(raceGlobal).catch(() => null), null, "global config writer created the protected absent target");
   assert.equal((await readFile(raceLocalConfig)).equals(raceLocalConfigBefore), true, "source-set race changed the repository config");
   assert.equal((await readFile(raceInclude)).equals(raceIncludeBefore), true, "active include writer changed the protected source");
+  assert.equal((await readFile(raceNestedInclude)).equals(raceNestedIncludeBefore), true, "legitimate include target changed during push");
+  assert.equal((await readFile(raceNestedIncludeIf)).equals(raceNestedIncludeIfBefore), true, "legitimate includeIf target changed during push");
   assert.equal(refs(raceGoodRoot), `refs/heads/${BRANCH}=${raceLocalHead}`, "GOOD acquired an unrelated ref in source-set race");
   assert.equal(refs(raceEvilRoot), `refs/heads/${BRANCH}=${r0}`, "EVIL acquired an unrelated ref in source-set race");
   for (const lockPath of [
     path.join(raceTargetRoot, ".git", "config.lock"),
     `${raceGlobal}.lock`,
-    `${raceInclude}.lock`
+    `${raceInclude}.lock`,
+    `${raceNestedInclude}.lock`,
+    `${raceNestedIncludeIf}.lock`
   ]) {
     assert.equal(await readFile(lockPath).catch(() => null), null, "config-source lock residue remained after push");
   }

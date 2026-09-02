@@ -165,6 +165,7 @@ const MAX_CONFIG_INCLUDE_QUERY_BYTES = 32 * 1024;
 const MAX_CONFIG_INCLUDE_DEPTH = 64;
 const INTERNAL_CONFIG_ORIGIN = "command line:";
 const INTERNAL_CONFIG_KEYS = new Set(["color.ui"]);
+const INCLUDE_PATH_QUERY_PATTERNS = Object.freeze(["^include\\.path$", "^includeif\\..*\\.path$"] as const);
 const UTF8_FATAL = new TextDecoder("utf-8", { fatal: true });
 const GIT_HISTORY_MARKERS = [
   "MERGE_HEAD",
@@ -460,7 +461,7 @@ function parseIncludeQueryRecords(bytes: Buffer, sourcePath: string, workspaceRo
     const originPath = normalizeConfigSourcePath(origin, workspaceRoot);
     if (configSourcePathKey(originPath) !== sourceKey) return fail("config-source-discovery");
     const loweredKey = key.toLowerCase();
-    if (loweredKey !== "include.path" && !(loweredKey.startsWith("includeif.") && loweredKey.endsWith(".path"))) {
+    if (loweredKey !== "include.path" && !/^includeif\..*\.path$/u.test(loweredKey)) {
       return fail("dynamic-config-source");
     }
     targets.push(normalizeConfigTargetPath(rawPath, path.dirname(sourcePath)));
@@ -483,34 +484,41 @@ async function discoverIncludeTargets(
   }
   if (!stat.isFile()) return Object.freeze([]);
 
-  const result = await runGitExitAware(config, workspace, [
-    "config",
-    "--file",
-    sourcePath,
-    "--no-includes",
-    "--show-origin",
-    "--null",
-    "--type",
-    "path",
-    "--get-regexp",
-    "^include.*\\.path$"
-  ]);
-  const output = result.copyStdoutBytes();
-  const diagnostics = result.copyStderrBytes();
-  if (result.exitCode === 1 && result.signal === null && !result.timedOut && !result.stdoutOverflow && !result.stderrOverflow && output.length === 0 && diagnostics.length === 0) {
-    return Object.freeze([]);
+  const targets: string[] = [];
+  for (const queryPattern of INCLUDE_PATH_QUERY_PATTERNS) {
+    const result = await runGitExitAware(config, workspace, [
+      "config",
+      "--file",
+      sourcePath,
+      "--no-includes",
+      "--show-origin",
+      "--null",
+      "--type",
+      "path",
+      "--get-regexp",
+      queryPattern
+    ]);
+    const output = result.copyStdoutBytes();
+    const diagnostics = result.copyStderrBytes();
+    if (result.exitCode === 1 && result.signal === null && !result.timedOut && !result.stdoutOverflow && !result.stderrOverflow && output.length === 0 && diagnostics.length === 0) {
+      continue;
+    }
+    if (result.exitCode !== 0 || result.signal !== null || result.timedOut || result.stdoutOverflow || result.stderrOverflow || diagnostics.length > 0) {
+      return fail("config-source-discovery");
+    }
+    const queryTargets = parseIncludeQueryRecords(output, sourcePath, workspace.root);
+    if (targets.length + queryTargets.length > MAX_CONFIG_SOURCE_COUNT) return fail("config-source-discovery");
+    targets.push(...queryTargets);
   }
-  if (result.exitCode !== 0 || result.signal !== null || result.timedOut || result.stdoutOverflow || result.stderrOverflow || diagnostics.length > 0) {
-    return fail("config-source-discovery");
-  }
-  return parseIncludeQueryRecords(output, sourcePath, workspace.root);
+  return Object.freeze(targets);
 }
 
 /**
  * Enumerate the ordinary active config origins and key names. `--name-only`
  * is intentional: values (including URLs and credentials) never enter this
  * inventory or any public result. Include path values are collected by the
- * separate bounded path-only query above so empty targets can be covered.
+ * separate bounded exact-key path-only queries above so empty targets can be
+ * covered without reading values from unrelated `include*` sections.
  * Git emits origin/key pairs as NUL-delimited fields; recursive active
  * includes are enabled explicitly.
  */
