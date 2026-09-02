@@ -24,6 +24,7 @@ import { gitDiffRange } from "./gitDiffRange.js";
 import { gitLogStructured, gitMergeBase, gitResolveRef, gitShowCommit } from "./gitHistoryOps.js";
 import { readAtRef } from "./gitHistoricalBlob.js";
 import { GIT_COMMIT_MAX_MESSAGE_BYTES, GIT_COMMIT_MAX_PATH_BYTES, GIT_COMMIT_MAX_PATHS, gitCommit } from "./gitCommit.js";
+import { preflightGitPush } from "./gitPushPreflight.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
@@ -32,7 +33,7 @@ import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidg
 import { hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactStructured, redactUnifiedDiff, sourceLanguageForPath, truncateUtf8 } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { createDiagnosticContext, type CodexProDiagnosticContext } from "./diagnosticContext.js";
-import { sanitizeGitPushPolicy } from "./gitPushPolicy.js";
+import { normalizeGitPushPolicy, sanitizeGitPushPolicy } from "./gitPushPolicy.js";
 export type { CodexProDiagnosticContext, DiagnosticContextOptions, DiagnosticTransportKind, HttpDiagnosticCurrentSession, HttpDiagnosticSnapshot } from "./diagnosticContext.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
@@ -394,6 +395,96 @@ GIT_COMMIT_ARGUMENTS_SCHEMA.safeParseAsync = (async (args: unknown) => {
 }) as typeof GIT_COMMIT_ARGUMENTS_SCHEMA.safeParseAsync;
 GIT_COMMIT_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_COMMIT_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_COMMIT_PUBLIC_SCHEMA.safeParse;
 GIT_COMMIT_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_COMMIT_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_COMMIT_PUBLIC_SCHEMA.safeParseAsync;
+
+const GIT_PUSH_ARGUMENTS_SCHEMA = z.object({
+  workspace_id: REVIEW_WORKSPACE_ID_SCHEMA,
+  remote: z.string()
+    .min(1)
+    .max(256)
+    .describe("Exact configured Git remote name; endpoint and credentials are policy-owned."),
+  branch: z.string()
+    .min(1)
+    .max(256)
+    .describe("Exact existing branch name to update."),
+  expected_local_head: z.string()
+    .max(64)
+    .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu, "expected_local_head must be a full commit SHA.")
+    .describe("Exact full current local commit SHA."),
+  expected_remote_head: z.string()
+    .max(64)
+    .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu, "expected_remote_head must be a full commit SHA.")
+    .describe("Exact full remote branch commit SHA used for the mutation precondition.")
+}).strict();
+
+const GIT_PUSH_FIELD_NAMES = new Set([
+  "workspace_id",
+  "remote",
+  "branch",
+  "expected_local_head",
+  "expected_remote_head"
+]);
+
+function boundedGitPushValidationError(issues: readonly z.ZodIssue[]): z.ZodError {
+  const safeIssues: z.ZodIssue[] = [];
+  const seenMessages = new Set<string>();
+  for (const issue of issues) {
+    if (issue.code === "unrecognized_keys") {
+      if (!seenMessages.has("Unknown keys are not allowed.")) {
+        safeIssues.push({ code: "custom", path: [], message: "Unknown keys are not allowed." });
+        seenMessages.add("Unknown keys are not allowed.");
+      }
+      continue;
+    }
+
+    const field = issue.path.length === 1 && typeof issue.path[0] === "string" && GIT_PUSH_FIELD_NAMES.has(issue.path[0])
+      ? issue.path[0]
+      : undefined;
+    const message = field === "workspace_id" && issue.code === "invalid_type" && issue.received === "undefined"
+      ? "Workspace id is required."
+      : field
+        ? "Invalid value."
+        : "Schema constraints were not satisfied.";
+    const path = field ? [field] : [];
+    const key = `${path.join(".")}:${message}`;
+    if (seenMessages.has(key)) continue;
+    seenMessages.add(key);
+    safeIssues.push({ code: "custom", path, message });
+  }
+
+  if (safeIssues.length === 0) {
+    safeIssues.push({ code: "custom", path: [], message: "Schema constraints were not satisfied." });
+  }
+  return new z.ZodError(safeIssues);
+}
+
+// The SDK uses the published Zod object for tools/list and transport-level
+// tools/call validation. Keep the transport envelope permissive so hostile
+// unknown property names/values cannot be copied into SDK-generated errors;
+// the strict runtime schema remains the source of truth in validateToolArgs.
+const GIT_PUSH_TRANSPORT_SCHEMA = z.object({
+  workspace_id: z.unknown().optional(),
+  remote: z.unknown().optional(),
+  branch: z.unknown().optional(),
+  expected_local_head: z.unknown().optional(),
+  expected_remote_head: z.unknown().optional()
+}).passthrough();
+const rawGitPushSafeParse = GIT_PUSH_ARGUMENTS_SCHEMA.safeParse.bind(GIT_PUSH_ARGUMENTS_SCHEMA);
+GIT_PUSH_ARGUMENTS_SCHEMA.safeParse = ((args: unknown) => {
+  const parsed = rawGitPushSafeParse(args);
+  return parsed.success
+    ? parsed
+    : { success: false, error: boundedGitPushValidationError(parsed.error.issues) };
+}) as typeof GIT_PUSH_ARGUMENTS_SCHEMA.safeParse;
+const rawGitPushSafeParseAsync = GIT_PUSH_ARGUMENTS_SCHEMA.safeParseAsync.bind(GIT_PUSH_ARGUMENTS_SCHEMA);
+GIT_PUSH_ARGUMENTS_SCHEMA.safeParseAsync = (async (args: unknown) => {
+  const parsed = await rawGitPushSafeParseAsync(args);
+  return parsed.success
+    ? parsed
+    : { success: false, error: boundedGitPushValidationError(parsed.error.issues) };
+}) as typeof GIT_PUSH_ARGUMENTS_SCHEMA.safeParseAsync;
+const GIT_PUSH_PUBLIC_SCHEMA = z.object(GIT_PUSH_ARGUMENTS_SCHEMA.shape).strict();
+GIT_PUSH_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_PUSH_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_PUSH_PUBLIC_SCHEMA.safeParse;
+GIT_PUSH_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_PUSH_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_PUSH_PUBLIC_SCHEMA.safeParseAsync;
 
 const READ_AT_REF_TRANSPORT_SCHEMA = z.object({
   workspace_id: z.unknown().optional(),
@@ -980,7 +1071,7 @@ const SUPERTOOL_NAME = "codexpro";
 // through the loose, general-purpose supertool wrapper. Keep the explicit
 // registration visible to mode/configuration reporting while excluding it
 // from wrapper actions and the wrapper handler map.
-const SUPERTOOL_EXCLUDED_ACTIONS = new Set<string>(["git_commit"]);
+const SUPERTOOL_EXCLUDED_ACTIONS = new Set<string>(["git_commit", "git_push"]);
 const SUPERTOOL_ACTION_ALIASES: Record<string, string> = {
   actions: "list_actions",
   config: "server_config",
@@ -994,6 +1085,16 @@ const SUPERTOOL_ACTION_ALIASES: Record<string, string> = {
   agent_handoff: "handoff_to_agent",
   codex_handoff: "handoff_to_codex"
 };
+
+function hasEnabledGitPushPolicy(config: CodexProConfig): boolean {
+  if (config.toolMode !== "full" || config.writeMode !== "workspace") return false;
+  try {
+    const policy = normalizeGitPushPolicy(config.gitPushPolicy);
+    return policy.enabled === true && policy.rules.length > 0;
+  } catch {
+    return false;
+  }
+}
 
 const registeredToolHandlersByServer = new WeakMap<object, Map<string, CodexToolHandler>>();
 
@@ -1141,6 +1242,7 @@ const FULL_TOOL_NAMES = [
   "read_at_ref",
   "git_diff_range",
   "git_commit",
+  "git_push",
   "git_status",
   "git_diff",
   "show_changes",
@@ -1160,6 +1262,7 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "apply_patch",
   "import_file",
   "git_commit",
+  "git_push",
   "bash",
   "export_pro_context",
   "handoff_to_agent",
@@ -1185,10 +1288,14 @@ function toolNamesForMode(config: CodexProConfig): string[] {
     if (bashIndex !== -1) names.splice(bashIndex, 1);
   }
   if (config.writeMode !== "workspace") {
-    for (const writeTool of ["write", "edit", "apply_patch", "import_file", "git_commit"]) {
+    for (const writeTool of ["write", "edit", "apply_patch", "import_file", "git_commit", "git_push"]) {
       const toolIndex = names.indexOf(writeTool);
       if (toolIndex !== -1) names.splice(toolIndex, 1);
     }
+  }
+  if (!hasEnabledGitPushPolicy(config)) {
+    const gitPushIndex = names.indexOf("git_push");
+    if (gitPushIndex !== -1) names.splice(gitPushIndex, 1);
   }
   if (config.writeMode === "handoff" && !names.includes("handoff_to_agent")) names.push("handoff_to_agent");
   if (!config.analysisEnabled) {
@@ -1227,6 +1334,7 @@ function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
   if (name === "bash" && config.bashMode === "off") return false;
   if ((name === "write" || name === "edit" || name === "apply_patch" || name === "import_file") && config.writeMode !== "workspace") return false;
   if (name === "git_commit" && (config.toolMode !== "full" || config.writeMode !== "workspace")) return false;
+  if (name === "git_push" && !hasEnabledGitPushPolicy(config)) return false;
   if (name === "codex_sessions") return config.codexSessions !== "off";
   if (name === "read_codex_session") return config.codexSessions === "read";
   if (name === "inspect_workspace" && !config.analysisEnabled) return false;
@@ -1270,7 +1378,7 @@ function serverInstructions(config: CodexProConfig): string {
     "Preferred workflow:",
     "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects. A transport or MCP session change can lose the prior session selection; ChatGPT is not required to preserve one connection, and diagnostics cannot force client transport reuse or refresh a stale direct tool catalog.",
     "2. list_workspaces is session-local, not a process-global workspace directory. When continuity is unclear, call session_workspace_diagnostics; it reports runtime/session/catalog truth and can classify an explicit workspace_id without selecting or opening it. A valid explicit-ID recovery targets that workspace without changing ambient or global selection.",
-    "3. For correctness-sensitive Git tools (git_commit, git_resolve_ref, git_merge_base, git_log, git_show_commit, read_at_ref, git_diff_range), always pass the explicit workspace_id returned by open_current_workspace/open_workspace. Harmless reads may omit it when ambient selection is clear.",
+    "3. For correctness-sensitive Git tools (git_commit, git_push, git_resolve_ref, git_merge_base, git_log, git_show_commit, read_at_ref, git_diff_range), always pass the explicit workspace_id returned by open_current_workspace/open_workspace. Harmless reads may omit it when ambient selection is clear.",
     "4. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
     "5. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
     editInstruction.replace(/^5\./u, "6."),
@@ -2046,6 +2154,8 @@ const READ_ONLY_ANNOTATIONS = { readOnlyHint: true, openWorldHint: false, destru
 const SESSION_READ_ANNOTATIONS = { readOnlyHint: true, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 const LOCAL_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false };
 const GIT_COMMIT_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false };
+const GIT_PUSH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
+const GIT_PUSH_MUTATION_UNAVAILABLE_MESSAGE = "Git push mutation is not yet available.";
 const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
 const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 
@@ -3606,6 +3716,28 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         `Paths committed: ${result.committed_path_count}/${result.requested_path_count}`
       ].join("\n");
       return textResult(text, { ...result });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "git_push",
+    {
+      title: "Git Push",
+      description: "Validate one explicit workspace, exact local and remote heads, configured remote endpoint, branch policy, and fast-forward ancestry before a bounded remote push. Available only in full tool mode with CODEXPRO_WRITE_MODE=workspace and an enabled exact Git push policy. The TASK-003 public checkpoint performs preflight only; remote mutation is not yet available.",
+      inputSchema: GIT_PUSH_PUBLIC_SCHEMA,
+      runtimeInputSchema: GIT_PUSH_ARGUMENTS_SCHEMA,
+      annotations: GIT_PUSH_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Validating Git push preconditions...",
+        "openai/toolInvocation/invoked": "Git push preconditions checked"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      await preflightGitPush(config, workspace, args);
+      throw new CodexProError(GIT_PUSH_MUTATION_UNAVAILABLE_MESSAGE);
     }
   );
 
