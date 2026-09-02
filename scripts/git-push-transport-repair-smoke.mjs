@@ -296,7 +296,8 @@ const configRaceFired = path.join(fixture, "config-race-result");
 
 const preflightSource = await readFile(path.join(REPO_ROOT, "src", "gitPushPreflight.ts"), "utf8");
 assert.equal(/\bvar\s+-l\b/u.test(preflightSource), false, "preflight source must not use broad Git variable listing");
-assert.equal(preflightSource.includes("^include.*"), false, "preflight source must not query broad include-prefixed keys");
+const broadIncludeQueryPattern = ["^include", ".*"].join("");
+assert.equal(preflightSource.includes(broadIncludeQueryPattern), false, "preflight source must not query broad include-prefixed keys");
 let daemon;
 let session;
 
