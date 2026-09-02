@@ -848,6 +848,19 @@ function gitPushPolicyProfileEntry(args = {}, profile = {}) {
     : {};
 }
 
+function targetGitPushPolicyProfileEntry(args = {}, profile = {}) {
+  // Reuse is a cross-workspace settings copy. Only a dedicated target flag or
+  // the target's own saved policy may cross that boundary; source policy and
+  // ambient policy environment variables must never be copied implicitly.
+  if (args.gitPushPolicy !== undefined) {
+    return { gitPushPolicy: parseGitPushPolicy(args.gitPushPolicy) };
+  }
+  if (profile.gitPushPolicy !== undefined) {
+    return { gitPushPolicy: parseGitPushPolicy(profile.gitPushPolicy) };
+  }
+  return {};
+}
+
 function reusableProfilePayload(profile, overrides = {}) {
   const {
     version,
@@ -855,15 +868,11 @@ function reusableProfilePayload(profile, overrides = {}) {
     updatedAt,
     profilePath,
     allowedRoots,
+    gitPushPolicy,
     ...rest
   } = profile || {};
-  const policyEntry = rest.gitPushPolicy === undefined
-    ? {}
-    : { gitPushPolicy: parseGitPushPolicy(rest.gitPushPolicy) };
-  delete rest.gitPushPolicy;
   return {
     ...rest,
-    ...policyEntry,
     ...overrides
   };
 }
@@ -3388,7 +3397,8 @@ async function maybeConfigureFirstRun(root, args, profile) {
         const selected = shown[selectedIndex - 1];
         const payload = reusableProfilePayload(selected, {
           port: String(optionValue(args, selected, 'port', ['CODEXPRO_PORT'], selected.port ?? '8787')),
-          mode: optionValue(args, selected, 'mode', ['CODEXPRO_MODE'], selected.mode ?? 'agent')
+          mode: optionValue(args, selected, 'mode', ['CODEXPRO_MODE'], selected.mode ?? 'agent'),
+          ...targetGitPushPolicyProfileEntry(args, profile)
         });
         const savedPath = saveWorkspaceProfile(root, payload);
         statusLine('ok', `Saved workspace settings from ${selected.root}: ${savedPath}`);
@@ -3813,7 +3823,10 @@ async function runSettings(argv) {
       statusLine('warn', 'No reusable saved settings found.');
       return;
     }
-    const savedPath = saveWorkspaceProfile(root, reusableProfilePayload(source));
+    const savedPath = saveWorkspaceProfile(root, reusableProfilePayload(
+      source,
+      targetGitPushPolicyProfileEntry(args, profile)
+    ));
     statusLine('ok', `Saved workspace settings from ${source.root}: ${savedPath}`);
     printProfile(root, loadWorkspaceProfile(root));
     return;
@@ -3848,7 +3861,10 @@ async function runSettings(argv) {
         statusLine('warn', 'No reusable saved settings found.');
         return;
       }
-      const savedPath = saveWorkspaceProfile(root, reusableProfilePayload(source));
+      const savedPath = saveWorkspaceProfile(root, reusableProfilePayload(
+        source,
+        targetGitPushPolicyProfileEntry(args, profile)
+      ));
       statusLine('ok', `Saved workspace settings from ${source.root}: ${savedPath}`);
       printProfile(root, loadWorkspaceProfile(root));
       return;

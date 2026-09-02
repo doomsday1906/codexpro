@@ -91,6 +91,7 @@
     "analysis:cli-smoke": "npm run build && node scripts/analysis-cli-smoke.mjs",
     "git-review-runner:smoke": "node scripts/git-review-runner-smoke.mjs",
     "git-push-policy:smoke": "npm run build && node scripts/git-push-policy-smoke.mjs",
+    "git-push-policy:reuse-smoke": "npm run build && node scripts/git-push-policy-reuse-smoke.mjs",
     "git-push-preflight:smoke": "npm run build && node scripts/git-push-preflight-smoke.mjs",
     "git-push-mcp:smoke": "npm run build && node scripts/git-push-mcp-smoke.mjs",
     "git-push-task003:tester": "npm run build && node scripts/git-push-task003-tester-smoke.mjs",
