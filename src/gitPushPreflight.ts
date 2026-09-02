@@ -1,0 +1,496 @@
+import fsp from "node:fs/promises";
+import path from "node:path";
+import { TextDecoder } from "node:util";
+import type { CodexProConfig } from "./config.js";
+import { GitExecutionError, runGitMutation, type GitExecutionResult } from "./gitOps.js";
+import { CodexProError, type Workspace } from "./guard.js";
+import { evaluateGitPushPolicy, inspectGitPushEndpoint } from "./gitPushPolicy.js";
+
+/** The exact internal input carried from the later public wrapper. */
+export interface GitPushRequest {
+  readonly workspace_id: string;
+  readonly remote: string;
+  readonly branch: string;
+  readonly expected_local_head: string;
+  readonly expected_remote_head: string;
+}
+
+/** Configuration needed by the preflight; no public tool registration is implied. */
+export type GitPushPreflightConfig = Pick<
+  CodexProConfig,
+  "maxGitTimeoutMs" | "maxOutputBytes" | "toolMode" | "writeMode" | "gitPushPolicy"
+>;
+
+export type GitPushPreflightFailureReason =
+  | "invalid-input"
+  | "mode"
+  | "write-mode"
+  | "workspace"
+  | "repository"
+  | "detached"
+  | "branch-mismatch"
+  | "unborn"
+  | "in-progress"
+  | "invalid-head"
+  | "head-mismatch"
+  | "missing-remote-object"
+  | "remote-object-not-commit"
+  | "non-fast-forward"
+  | "policy-disabled"
+  | "invalid-policy"
+  | "invalid-remote-or-branch"
+  | "remote-or-branch-not-allowlisted"
+  | "ambiguous-policy-rule"
+  | "effective-endpoint-not-allowlisted"
+  | "effective-endpoint-unavailable"
+  | "zero-effective-push-endpoints"
+  | "ambiguous-multiple-effective-push-endpoints"
+  | "credential-bearing-endpoint"
+  | "disallowed-remote-helper"
+  | "disallowed-file-endpoint"
+  | "disallowed-endpoint-scheme"
+  | "invalid-endpoint"
+  | "disallowed-local-or-helper-endpoint"
+  | "disallowed-local-endpoint"
+  | "remote-absent"
+  | "remote-ambiguous"
+  | "remote-head-mismatch"
+  | "remote-malformed"
+  | "malformed-output"
+  | "execution";
+
+const FAILURE_MESSAGES: Record<GitPushPreflightFailureReason, string> = {
+  "invalid-input": "Git push preflight input is invalid.",
+  mode: "Git push requires full tool mode.",
+  "write-mode": "Git push requires workspace write mode.",
+  workspace: "Git push workspace identity is invalid.",
+  repository: "Git push requires the exact root of a non-bare Git worktree.",
+  detached: "Git push requires an attached local branch.",
+  "branch-mismatch": "Git push requested branch does not match the attached local branch.",
+  unborn: "Git push requires an existing local HEAD commit.",
+  "in-progress": "Git push is unavailable during an in-progress history operation.",
+  "invalid-head": "Git push expected heads are not full object-format SHAs.",
+  "head-mismatch": "Git push expected_local_head does not match the current HEAD.",
+  "missing-remote-object": "Git push expected_remote_head is not available as a local object.",
+  "remote-object-not-commit": "Git push expected_remote_head is not a local commit object.",
+  "non-fast-forward": "Git push local history is not a descendant of expected_remote_head.",
+  "policy-disabled": "Git push policy is disabled.",
+  "invalid-policy": "Git push policy is invalid.",
+  "invalid-remote-or-branch": "Git push remote or branch is invalid.",
+  "remote-or-branch-not-allowlisted": "Git push remote and branch are not allowlisted.",
+  "ambiguous-policy-rule": "Git push policy has an ambiguous remote and branch rule.",
+  "effective-endpoint-not-allowlisted": "Git push effective endpoint is not allowlisted.",
+  "effective-endpoint-unavailable": "Git push effective endpoint could not be observed.",
+  "zero-effective-push-endpoints": "Git push remote has no effective push endpoint.",
+  "ambiguous-multiple-effective-push-endpoints": "Git push remote has ambiguous effective push endpoints.",
+  "credential-bearing-endpoint": "Git push remote endpoint is not credential-safe.",
+  "disallowed-remote-helper": "Git push remote helper is not allowed.",
+  "disallowed-file-endpoint": "Git push file endpoint is not allowed.",
+  "disallowed-endpoint-scheme": "Git push endpoint scheme is not allowed.",
+  "invalid-endpoint": "Git push endpoint is invalid.",
+  "disallowed-local-or-helper-endpoint": "Git push local or helper endpoint is not allowed.",
+  "disallowed-local-endpoint": "Git push local endpoint is not allowed.",
+  "remote-absent": "Git push remote branch does not exist.",
+  "remote-ambiguous": "Git push remote branch observation was ambiguous.",
+  "remote-head-mismatch": "Git push remote branch does not match expected_remote_head.",
+  "remote-malformed": "Git push remote branch observation was malformed.",
+  "malformed-output": "Git push returned malformed preflight output.",
+  execution: "Git push preflight failed during local Git execution."
+};
+
+/** Constant-message, JSON-safe internal failure. Git/auth output is never returned. */
+export class GitPushPreflightError extends CodexProError {
+  constructor(
+    readonly reason: GitPushPreflightFailureReason,
+    readonly policyReason?: string
+  ) {
+    super(FAILURE_MESSAGES[reason]);
+    this.name = "GitPushPreflightError";
+  }
+
+  toJSON(): object {
+    return {
+      name: this.name,
+      message: this.message,
+      reason: this.reason,
+      ...(this.policyReason === undefined ? {} : { policy_reason: this.policyReason })
+    };
+  }
+}
+
+/** Exact internal source/destination facts consumed by the mutation leaf. */
+export interface GitPushPreflight {
+  readonly schema_version: 1;
+  readonly workspace_id: string;
+  readonly root: string;
+  readonly git_dir: string;
+  readonly object_format: "sha1" | "sha256";
+  readonly remote: string;
+  readonly endpoint: string;
+  readonly branch: string;
+  readonly source_ref: string;
+  readonly destination_ref: string;
+  readonly expected_local_head: string;
+  readonly expected_remote_head: string;
+}
+
+const CONTROL_OR_WHITESPACE = /[\u0000-\u001f\u007f\s]/u;
+const GLOB_TOKEN = /[*?\[\]]/u;
+const WORKSPACE_ID_PATTERN = /^ws_[0-9a-f]{24}$/u;
+const FULL_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
+const MAX_WORKSPACE_ID_BYTES = 128;
+const MAX_REMOTE_BYTES = 256;
+const MAX_BRANCH_BYTES = 256;
+const MAX_HEAD_BYTES = 64;
+const MAX_REMOTE_OBSERVATION_BYTES = 16 * 1024;
+const UTF8_FATAL = new TextDecoder("utf-8", { fatal: true });
+const GIT_HISTORY_MARKERS = [
+  "MERGE_HEAD",
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+  "BISECT_HEAD",
+  "BISECT_LOG",
+  "rebase-merge",
+  "rebase-apply",
+  "sequencer"
+] as const;
+
+function fail(reason: GitPushPreflightFailureReason, policyReason?: string): never {
+  throw new GitPushPreflightError(reason, policyReason);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validBoundedString(value: unknown, maxBytes: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.trim() === value && Buffer.byteLength(value, "utf8") <= maxBytes && !CONTROL_OR_WHITESPACE.test(value);
+}
+
+function validateRemote(value: unknown): string {
+  if (!validBoundedString(value, MAX_REMOTE_BYTES) || value.startsWith("-") || GLOB_TOKEN.test(value) || value.includes("::")) {
+    return fail("invalid-remote-or-branch");
+  }
+  return value;
+}
+
+function validateBranch(value: unknown): string {
+  if (!validBoundedString(value, MAX_BRANCH_BYTES)) return fail("invalid-remote-or-branch");
+  const branch = value;
+  const components = branch.split("/");
+  if (
+    branch.startsWith("-") ||
+    branch.startsWith("/") ||
+    branch.endsWith("/") ||
+    branch.endsWith(".") ||
+    branch.endsWith(".lock") ||
+    branch.includes("..") ||
+    branch.includes("//") ||
+    branch.includes("@{") ||
+    branch.includes("~") ||
+    branch.includes("^") ||
+    branch.includes(":") ||
+    branch.includes("\\") ||
+    branch === "@" ||
+    branch === "." ||
+    branch === ".." ||
+    GLOB_TOKEN.test(branch) ||
+    components.some((component) => component.startsWith(".") || component.endsWith(".") || component.endsWith(".lock"))
+  ) {
+    return fail("invalid-remote-or-branch");
+  }
+  return branch;
+}
+
+function validateHead(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0 || value.trim() !== value || Buffer.byteLength(value, "utf8") > MAX_HEAD_BYTES || !FULL_OBJECT_ID_PATTERN.test(value)) {
+    return fail("invalid-head");
+  }
+  return value.toLowerCase();
+}
+
+/** Strict internal request validator; the public wrapper owns its own schema surface. */
+export function validateGitPushRequest(raw: unknown): GitPushRequest {
+  if (!isRecord(raw)) return fail("invalid-input");
+  const keys = Object.keys(raw);
+  const allowed = new Set(["workspace_id", "remote", "branch", "expected_local_head", "expected_remote_head"]);
+  if (keys.length !== allowed.size || keys.some((key) => !allowed.has(key))) return fail("invalid-input");
+
+  const workspaceId = raw.workspace_id;
+  if (
+    typeof workspaceId !== "string" ||
+    workspaceId.length === 0 ||
+    Buffer.byteLength(workspaceId, "utf8") > MAX_WORKSPACE_ID_BYTES ||
+    workspaceId.trim() !== workspaceId ||
+    !WORKSPACE_ID_PATTERN.test(workspaceId)
+  ) {
+    return fail("invalid-input");
+  }
+
+  return {
+    workspace_id: workspaceId,
+    remote: validateRemote(raw.remote),
+    branch: validateBranch(raw.branch),
+    expected_local_head: validateHead(raw.expected_local_head),
+    expected_remote_head: validateHead(raw.expected_remote_head)
+  };
+}
+
+function decodeUtf8(result: GitExecutionResult): string {
+  try {
+    return UTF8_FATAL.decode(result.copyStdoutBytes());
+  } catch {
+    return fail("malformed-output");
+  }
+}
+
+function oneLine(result: GitExecutionResult): string {
+  const text = decodeUtf8(result);
+  if (!text.endsWith("\n")) return fail("malformed-output");
+  const line = text.slice(0, -1);
+  if (!line || line.includes("\n") || line.includes("\r")) return fail("malformed-output");
+  return line;
+}
+
+async function runGitExitAware(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  args: readonly string[]
+): Promise<GitExecutionResult> {
+  try {
+    return await runGitMutation(config, workspace, args);
+  } catch (error) {
+    if (error instanceof GitExecutionError) return error.result;
+    return fail("execution");
+  }
+}
+
+async function runGitChecked(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  args: readonly string[]
+): Promise<GitExecutionResult> {
+  const result = await runGitExitAware(config, workspace, args);
+  if (result.exitCode !== 0 || result.signal !== null || result.timedOut || result.stdoutOverflow || result.stderrOverflow) {
+    return fail("execution");
+  }
+  return result;
+}
+
+function objectFormatFromResult(result: GitExecutionResult): "sha1" | "sha256" {
+  const value = oneLine(result);
+  if (value === "sha1" || value === "sha256") return value;
+  return fail("malformed-output");
+}
+
+function objectIdPattern(objectFormat: "sha1" | "sha256"): RegExp {
+  return objectFormat === "sha1" ? /^[0-9a-f]{40}$/iu : /^[0-9a-f]{64}$/iu;
+}
+
+function parseObjectId(value: string, objectFormat: "sha1" | "sha256"): string {
+  const normalized = value.toLowerCase();
+  if (!objectIdPattern(objectFormat).test(normalized)) return fail("malformed-output");
+  return normalized;
+}
+
+async function repositoryRoot(
+  config: GitPushPreflightConfig,
+  workspace: Workspace
+): Promise<{ readonly root: string; readonly gitDir: string; readonly objectFormat: "sha1" | "sha256" }> {
+  if (!path.isAbsolute(workspace.root)) return fail("workspace");
+  let root: string;
+  try {
+    root = await fsp.realpath(workspace.root);
+  } catch {
+    return fail("workspace");
+  }
+  if (root !== workspace.root) return fail("workspace");
+
+  const inside = oneLine(await runGitChecked(config, workspace, ["rev-parse", "--is-inside-work-tree"]));
+  const bare = oneLine(await runGitChecked(config, workspace, ["rev-parse", "--is-bare-repository"]));
+  if (inside !== "true" || bare !== "false") return fail("repository");
+
+  const topText = oneLine(await runGitChecked(config, workspace, ["rev-parse", "--show-toplevel"]));
+  let top: string;
+  try {
+    top = await fsp.realpath(path.isAbsolute(topText) ? topText : path.resolve(root, topText));
+  } catch {
+    return fail("repository");
+  }
+  if (top !== root) return fail("repository");
+
+  const gitDirText = oneLine(await runGitChecked(config, workspace, ["rev-parse", "--git-dir"]));
+  let gitDir: string;
+  try {
+    gitDir = await fsp.realpath(path.isAbsolute(gitDirText) ? gitDirText : path.resolve(root, gitDirText));
+  } catch {
+    return fail("repository");
+  }
+  const objectFormat = objectFormatFromResult(
+    await runGitChecked(config, workspace, ["rev-parse", "--show-object-format=storage"])
+  );
+  return { root, gitDir, objectFormat };
+}
+
+async function assertNoHistoryOperation(
+  config: GitPushPreflightConfig,
+  workspace: Workspace
+): Promise<void> {
+  for (const marker of GIT_HISTORY_MARKERS) {
+    const markerText = oneLine(await runGitChecked(config, workspace, ["rev-parse", "--git-path", marker]));
+    if (CONTROL_OR_WHITESPACE.test(markerText)) return fail("malformed-output");
+    const markerPath = path.isAbsolute(markerText) ? path.resolve(markerText) : path.resolve(workspace.root, markerText);
+    try {
+      await fsp.lstat(markerPath);
+      return fail("in-progress");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return fail("in-progress");
+    }
+  }
+}
+
+function policyFailureReason(reason: string | undefined): GitPushPreflightFailureReason {
+  const known = new Set<GitPushPreflightFailureReason>([
+    "policy-disabled",
+    "invalid-policy",
+    "invalid-remote-or-branch",
+    "remote-or-branch-not-allowlisted",
+    "ambiguous-policy-rule",
+    "effective-endpoint-not-allowlisted",
+    "effective-endpoint-unavailable",
+    "zero-effective-push-endpoints",
+    "ambiguous-multiple-effective-push-endpoints",
+    "credential-bearing-endpoint",
+    "disallowed-remote-helper",
+    "disallowed-file-endpoint",
+    "disallowed-endpoint-scheme",
+    "invalid-endpoint",
+    "disallowed-local-or-helper-endpoint",
+    "disallowed-local-endpoint"
+  ]);
+  return reason !== undefined && known.has(reason as GitPushPreflightFailureReason)
+    ? reason as GitPushPreflightFailureReason
+    : "invalid-policy";
+}
+
+async function assertRemoteObject(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  expectedRemoteHead: string
+): Promise<void> {
+  const result = await runGitExitAware(config, workspace, ["cat-file", "-t", expectedRemoteHead]);
+  if (result.exitCode !== 0 || result.signal !== null || result.timedOut || result.stdoutOverflow || result.stderrOverflow) {
+    return fail("missing-remote-object");
+  }
+  if (oneLine(result) !== "commit") return fail("remote-object-not-commit");
+}
+
+async function assertRemoteHead(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  endpoint: string,
+  destinationRef: string,
+  objectFormat: "sha1" | "sha256",
+  expectedRemoteHead: string
+): Promise<void> {
+  const result = await runGitChecked(config, workspace, ["ls-remote", "--refs", "--heads", "--", endpoint, destinationRef]);
+  const bytes = result.copyStdoutBytes();
+  if (bytes.length > MAX_REMOTE_OBSERVATION_BYTES) return fail("remote-ambiguous");
+  const text = decodeUtf8(result);
+  if (text.length === 0) return fail("remote-absent");
+  if (!text.endsWith("\n")) return fail("remote-malformed");
+  const body = text.slice(0, -1);
+  if (!body) return fail("remote-absent");
+  const lines = body.split("\n");
+  if (lines.length !== 1) return fail("remote-ambiguous");
+  const separator = lines[0].indexOf("\t");
+  if (separator <= 0 || lines[0].indexOf("\t", separator + 1) >= 0) return fail("remote-malformed");
+  const head = parseObjectId(lines[0].slice(0, separator), objectFormat);
+  if (lines[0].slice(separator + 1) !== destinationRef) return fail("remote-malformed");
+  if (head !== expectedRemoteHead) return fail("remote-head-mismatch");
+}
+
+async function effectivePushEndpoint(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  remote: string,
+  expectedIdentity: string
+): Promise<string> {
+  const result = await runGitChecked(config, workspace, ["remote", "get-url", "--push", "--all", remote]);
+  const bytes = result.copyStdoutBytes();
+  if (bytes.length > MAX_REMOTE_OBSERVATION_BYTES) return fail("ambiguous-multiple-effective-push-endpoints");
+  const text = decodeUtf8(result);
+  if (!text.endsWith("\n")) return fail("effective-endpoint-unavailable");
+  const body = text.slice(0, -1);
+  if (!body) return fail("zero-effective-push-endpoints");
+  const lines = body.split("\n");
+  if (lines.length !== 1) return fail("ambiguous-multiple-effective-push-endpoints");
+  const rawEndpoint = lines[0];
+  const parsed = inspectGitPushEndpoint(rawEndpoint);
+  if (!parsed.ok) return fail(policyFailureReason(parsed.reason), parsed.reason);
+  if (parsed.identity !== expectedIdentity) return fail("effective-endpoint-not-allowlisted");
+  return rawEndpoint;
+}
+
+/**
+ * Validate one explicit workspace and exact local/remote/policy push precondition.
+ * Every Git invocation uses the sealed trusted-config runner and only fixed
+ * direct argv. This function never invokes push or any local/remote mutation.
+ */
+export async function preflightGitPush(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  rawInput: unknown
+): Promise<GitPushPreflight> {
+  const request = validateGitPushRequest(rawInput);
+  if (config.toolMode !== "full") return fail("mode");
+  if (config.writeMode !== "workspace") return fail("write-mode");
+  if (typeof workspace.id !== "string" || workspace.id !== request.workspace_id || !WORKSPACE_ID_PATTERN.test(workspace.id)) {
+    return fail("workspace");
+  }
+
+  const repository = await repositoryRoot(config, workspace);
+  if (request.expected_local_head.length !== (repository.objectFormat === "sha1" ? 40 : 64) || request.expected_remote_head.length !== (repository.objectFormat === "sha1" ? 40 : 64)) {
+    return fail("invalid-head");
+  }
+
+  const branchRef = `refs/heads/${request.branch}`;
+  const symbolicResult = await runGitExitAware(config, workspace, ["symbolic-ref", "--quiet", "HEAD"]);
+  if (symbolicResult.exitCode !== 0 || symbolicResult.signal !== null || symbolicResult.timedOut) return fail("detached");
+  const attachedRef = oneLine(symbolicResult);
+  if (attachedRef !== branchRef) return fail("branch-mismatch");
+
+  const headResult = await runGitExitAware(config, workspace, ["rev-parse", "--verify", "HEAD^{commit}"]);
+  if (headResult.exitCode !== 0 || headResult.signal !== null || headResult.timedOut) return fail("unborn");
+  const currentHead = parseObjectId(oneLine(headResult), repository.objectFormat);
+  if (currentHead !== request.expected_local_head) return fail("head-mismatch");
+
+  await assertNoHistoryOperation(config, workspace);
+
+  const policy = evaluateGitPushPolicy(repository.root, config.gitPushPolicy, request.remote, request.branch);
+  if (!policy.allowed) return fail(policyFailureReason(policy.reason), policy.reason);
+  if (!policy.endpoint) return fail("invalid-policy", "missing-effective-endpoint");
+  const endpoint = await effectivePushEndpoint(config, workspace, request.remote, policy.endpoint);
+
+  await assertRemoteObject(config, workspace, request.expected_remote_head);
+  const ancestry = await runGitExitAware(config, workspace, ["merge-base", "--is-ancestor", request.expected_remote_head, request.expected_local_head]);
+  if (ancestry.exitCode === 1 && ancestry.signal === null && !ancestry.timedOut) return fail("non-fast-forward");
+  if (ancestry.exitCode !== 0 || ancestry.signal !== null || ancestry.timedOut) return fail("execution");
+
+  await assertRemoteHead(config, workspace, endpoint, branchRef, repository.objectFormat, request.expected_remote_head);
+
+  return Object.freeze({
+    schema_version: 1 as const,
+    workspace_id: request.workspace_id,
+    root: repository.root,
+    git_dir: repository.gitDir,
+    object_format: repository.objectFormat,
+    remote: request.remote,
+    endpoint: policy.endpoint,
+    branch: request.branch,
+    source_ref: branchRef,
+    destination_ref: branchRef,
+    expected_local_head: request.expected_local_head,
+    expected_remote_head: request.expected_remote_head
+  });
+}
