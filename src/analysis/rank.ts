@@ -1,4 +1,5 @@
-import type { AnalysisFileRole, AnalysisSearchIntent, AnalysisSymbolKind, StructuredSearchMatch, WorkspaceAnalysis } from "./types.js";
+import { isHiddenRelativePath } from "../fsOps.js";
+import type { AnalysisFileRole, AnalysisResultGroup, AnalysisSearchIntent, AnalysisSymbolKind, StructuredSearchMatch, WorkspaceAnalysis } from "./types.js";
 
 const GROUPS = ["definitions", "references", "tests", "configuration", "documentation", "other"] as const;
 
@@ -119,4 +120,103 @@ export function groupForFile(
   if (role === "config") return "configuration";
   if (role === "docs") return "documentation";
   return "references";
+}
+
+export function scheduleStructuredMatches(
+  matches: StructuredSearchMatch[],
+  options: {
+    intent: Exclude<AnalysisSearchIntent, "auto">;
+    resultLimit: number;
+    includeHidden?: boolean;
+    includeTests?: boolean;
+  }
+): StructuredSearchMatch[] {
+  if (matches.length <= options.resultLimit) {
+    return sortStructuredMatches([...matches]);
+  }
+
+  const sorted = sortStructuredMatches([...matches]);
+  const selected: StructuredSearchMatch[] = [];
+  const selectedKeys = new Set<string>();
+
+  const matchKey = (m: StructuredSearchMatch) => `${m.path}\u0000${m.line}\u0000${m.group}`;
+  const select = (m: StructuredSearchMatch): boolean => {
+    const key = matchKey(m);
+    if (selectedKeys.has(key)) return false;
+    selectedKeys.add(key);
+    selected.push(m);
+    return true;
+  };
+
+  // Visibility fairness reservation:
+  // With include_hidden=true and capacity >= 2, reserve at least one result for each
+  // visibility class if both classes have relevant candidates available.
+  if (options.includeHidden === true && options.resultLimit >= 2) {
+    const bestVisible = sorted.find((m) => !isHiddenRelativePath(m.path));
+    const bestHidden = sorted.find((m) => isHiddenRelativePath(m.path));
+    if (bestVisible) select(bestVisible);
+    if (bestHidden) select(bestHidden);
+  }
+
+  // Bounded class reservation based on intent:
+  // Definitions for orientation, primary category for intent, tests when requested, config/docs supplements.
+  const classQuotas: Record<AnalysisResultGroup, number> = {
+    definitions: 0,
+    references: 0,
+    tests: 0,
+    configuration: 0,
+    documentation: 0,
+    other: 0
+  };
+
+  if (options.intent === "references") {
+    classQuotas.definitions = 2;
+    classQuotas.references = 8;
+    classQuotas.tests = options.includeTests ? 3 : 0;
+    classQuotas.configuration = 1;
+    classQuotas.documentation = 1;
+    classQuotas.other = 1;
+  } else if (options.intent === "impact") {
+    classQuotas.definitions = 2;
+    classQuotas.references = 8;
+    classQuotas.tests = options.includeTests ? 4 : 0;
+    classQuotas.configuration = 1;
+    classQuotas.documentation = 1;
+    classQuotas.other = 1;
+  } else if (options.intent === "symbol") {
+    classQuotas.definitions = 6;
+    classQuotas.references = 6;
+    classQuotas.tests = options.includeTests ? 3 : 0;
+    classQuotas.configuration = 1;
+    classQuotas.documentation = 1;
+    classQuotas.other = 1;
+  } else {
+    classQuotas.definitions = 2;
+    classQuotas.references = 6;
+    classQuotas.tests = options.includeTests ? 3 : 0;
+    classQuotas.configuration = 2;
+    classQuotas.documentation = 2;
+    classQuotas.other = 1;
+  }
+
+  // Reserve bounded representation for each available class
+  for (const group of GROUPS) {
+    const quota = classQuotas[group];
+    if (quota <= 0) continue;
+    let count = selected.filter((m) => m.group === group).length;
+    for (const m of sorted) {
+      if (count >= quota || selected.length >= options.resultLimit) break;
+      if (m.group === group && select(m)) {
+        count += 1;
+      }
+    }
+  }
+
+  // Fill remaining capacity by global score
+  for (const m of sorted) {
+    if (selected.length >= options.resultLimit) break;
+    select(m);
+  }
+
+  return sortStructuredMatches(selected);
 }

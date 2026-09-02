@@ -9,7 +9,7 @@ import { getCachedWorkspaceAnalysis, invalidateWorkspaceAnalysis, setCachedWorks
 import { extractWorkspaceFiles } from "./extract.js";
 import { buildRelationshipsWithCoverage, traverseImpactGraph } from "./graph.js";
 import { inventoryWorkspace } from "./inventory.js";
-import { classifyDefinitionMatch, classifySearchIntent, emptySearchGroups, groupForFile, sortStructuredMatches } from "./rank.js";
+import { classifyDefinitionMatch, classifySearchIntent, emptySearchGroups, groupForFile, scheduleStructuredMatches, sortStructuredMatches } from "./rank.js";
 import type { AnalysisSearchIntent, StructuredSearchMatch, StructuredSearchResult, WorkspaceAnalysis } from "./types.js";
 
 const REDACTED_SEARCH_CONTEXT = "[REDACTED_SECRET]";
@@ -477,12 +477,24 @@ export async function searchWorkspaceStructured(
     }
   }
 
-  if (candidateLimitReached || sourceCandidateLimitReached || testCandidateLimitReached) {
+  if (sourceCandidateLimitReached) {
+    warnings.push(`Grouped search retained the first ${candidateLimit} source/non-test candidates before ranking.`);
+  }
+  if (testCandidateLimitReached) {
+    warnings.push(`Grouped search retained the first ${testCandidateLimit} test candidates before ranking.`);
+  }
+  if (candidateLimitReached && !sourceCandidateLimitReached && !testCandidateLimitReached) {
     warnings.push(`Grouped search retained the first ${candidateLimit} candidates (after logical deduplication) before ranking.`);
   }
 
   const matches = accumulator.finalize();
-  for (const match of sortStructuredMatches(matches).slice(0, resultLimit)) groups[match.group].push(match);
+  const scheduled = scheduleStructuredMatches(matches, {
+    intent,
+    resultLimit,
+    includeHidden: Boolean(options.includeHidden),
+    includeTests: Boolean(options.includeTests)
+  });
+  for (const match of scheduled) groups[match.group].push(match);
   const orderedMatches = Object.values(groups).flat();
   return {
     schemaVersion: 2,

@@ -90,6 +90,7 @@
     "search-quality:task002": "npm run build && node scripts/search-quality-task002-smoke.mjs",
     "search-quality:task003": "npm run build && node scripts/search-quality-task003-smoke.mjs",
     "search-quality:task004": "npm run build && node scripts/search-quality-task004-smoke.mjs",
+    "search-quality:task005": "npm run build && node scripts/search-quality-task005-smoke.mjs",
     "search-evidence:smoke": "npm run build && node scripts/search-evidence-smoke.mjs",
     "analysis:cli-smoke": "npm run build && node scripts/analysis-cli-smoke.mjs",
     "git-review-runner:smoke": "node scripts/git-review-runner-smoke.mjs",
