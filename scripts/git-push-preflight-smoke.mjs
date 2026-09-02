@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import net from "node:net";
@@ -126,6 +127,7 @@ async function main() {
   const priorXdgConfigHome = process.env.XDG_CONFIG_HOME;
   const remoteRoot = path.join(fixture, "remote.git");
   const workRoot = path.join(fixture, "work");
+  const missingIncludePath = path.join(fixture, "missing-include-target.conf");
   let daemon;
   try {
     await fs.mkdir(isolatedHome);
@@ -210,7 +212,28 @@ async function main() {
       expected_remote_head: initialHead
     }, "successful preflight returned unexpected source/destination facts");
     assert.ok(configSources.includes(path.join(isolatedHome, ".gitconfig")), "preflight omitted the writable global target");
+    assert.ok(configSources.includes(path.join(isolatedHome, ".config", "git", "config")), "preflight omitted the XDG global target");
     assert.ok(configSources.includes(path.join(workRoot, ".git", "config")), "preflight omitted the repository config source");
+    assert.ok(configSources.includes(path.join(workRoot, ".git", "config.worktree")), "preflight omitted the exact config.worktree target");
+    if (process.platform !== "win32") {
+      // Git 2.43 exposes the system target through `git var -l`; this
+      // environment's ordinary user cannot write it, so no native lock is
+      // required for that source. The assertion reads metadata only.
+      assert.equal(configSources.includes("/etc/gitconfig"), true, "preflight omitted the Git var system target");
+      let systemWritable = false;
+      try {
+        await fs.access("/etc/gitconfig", fsConstants.W_OK);
+        systemWritable = true;
+      } catch {
+        // Missing or read-only system config is both non-writable for this
+        // invocation and safe to leave outside the cooperative lock set.
+      }
+      assert.equal(systemWritable, false, "test environment unexpectedly made the system config writable");
+    }
+    runGit(workRoot, ["config", "--local", "include.path", missingIncludePath]);
+    const missingIncludePreflight = await preflightGitPush(config, workspace, request);
+    assert.equal(missingIncludePreflight.config_sources.includes(missingIncludePath), true, "preflight omitted the configured missing include target");
+    runGit(workRoot, ["config", "--local", "--unset-all", "include.path"]);
     console.log("PASS success preflight: exact local head, local remote commit, ancestry, policy, and loopback ls-remote matched");
 
     await expectFailure("wrong expected local head", { ...request, expected_local_head: initialHead }, "head-mismatch");

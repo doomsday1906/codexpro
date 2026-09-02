@@ -132,7 +132,7 @@ export interface GitPushPreflight {
   readonly root: string;
   readonly git_dir: string;
   readonly config_path: string;
-  /** Every active file origin plus trusted top-level global targets. */
+  /** Every active file origin plus all bounded config/include targets. */
   readonly config_sources: readonly string[];
   readonly object_format: "sha1" | "sha256";
   readonly remote: string;
@@ -161,8 +161,12 @@ const MAX_REMOTE_OBSERVATION_BYTES = 16 * 1024;
 const MAX_CONFIG_SOURCE_BYTES = 128 * 1024;
 const MAX_CONFIG_SOURCE_COUNT = 512;
 const MAX_CONFIG_SOURCE_PATH_BYTES = 8 * 1024;
+const MAX_CONFIG_INCLUDE_QUERY_BYTES = 32 * 1024;
+const MAX_CONFIG_INCLUDE_DEPTH = 64;
 const INTERNAL_CONFIG_ORIGIN = "command line:";
 const INTERNAL_CONFIG_KEYS = new Set(["color.ui"]);
+const GIT_VAR_SYSTEM_PREFIX = "GIT_CONFIG_SYSTEM=";
+const GIT_VAR_GLOBAL_PREFIX = "GIT_CONFIG_GLOBAL=";
 const UTF8_FATAL = new TextDecoder("utf-8", { fatal: true });
 const GIT_HISTORY_MARKERS = [
   "MERGE_HEAD",
@@ -328,13 +332,40 @@ function normalizeConfigSourcePath(origin: string, workspaceRoot: string): strin
   const rawPath = origin.slice("file:".length);
   if (!rawPath || Buffer.byteLength(rawPath, "utf8") > MAX_CONFIG_SOURCE_PATH_BYTES || CONTROL_CHARACTERS.test(rawPath)) return fail("config-source-discovery");
   const resolved = path.isAbsolute(rawPath) ? path.normalize(rawPath) : path.resolve(workspaceRoot, rawPath);
-  if (!path.isAbsolute(resolved) || CONTROL_CHARACTERS.test(resolved)) return fail("config-source-discovery");
+  if (!path.isAbsolute(resolved) || Buffer.byteLength(resolved, "utf8") > MAX_CONFIG_SOURCE_PATH_BYTES || CONTROL_CHARACTERS.test(resolved)) return fail("config-source-discovery");
+  return resolved;
+}
+
+function trustedHomeDirectory(): string {
+  const home = process.env.HOME ?? os.homedir();
+  if (!home || CONTROL_CHARACTERS.test(home) || !path.isAbsolute(home)) return fail("config-source-discovery");
+  return path.normalize(home);
+}
+
+function normalizeConfigTargetPath(rawPath: string, baseDirectory: string): string {
+  if (!rawPath || Buffer.byteLength(rawPath, "utf8") > MAX_CONFIG_SOURCE_PATH_BYTES || CONTROL_CHARACTERS.test(rawPath)) {
+    return fail("config-source-discovery");
+  }
+  let expanded = rawPath;
+  if (expanded === "~" || expanded.startsWith("~/")) {
+    const home = trustedHomeDirectory();
+    expanded = expanded === "~" ? home : path.join(home, expanded.slice(2));
+  } else if (expanded.startsWith("~")) {
+    // `~user` expansion is not tied to the trusted process HOME and is not
+    // needed by the accepted Git configuration route.
+    return fail("config-source-discovery");
+  }
+  // Git include globs and other prefix substitutions do not identify one
+  // exact native lock target. Refuse them instead of guessing or expanding a
+  // potentially unbounded set of files.
+  if (GLOB_TOKEN.test(expanded) || expanded.includes("%")) return fail("config-source-discovery");
+  const resolved = path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(baseDirectory, expanded);
+  if (!path.isAbsolute(resolved) || Buffer.byteLength(resolved, "utf8") > MAX_CONFIG_SOURCE_PATH_BYTES || CONTROL_CHARACTERS.test(resolved)) return fail("config-source-discovery");
   return resolved;
 }
 
 function trustedGlobalConfigTargets(): readonly string[] {
-  const home = process.env.HOME ?? os.homedir();
-  if (!home || CONTROL_CHARACTERS.test(home) || !path.isAbsolute(home)) return fail("config-source-discovery");
+  const home = trustedHomeDirectory();
 
   const xdgConfigHome = process.env.XDG_CONFIG_HOME;
   const xdgRoot = xdgConfigHome === undefined || xdgConfigHome === ""
@@ -351,18 +382,141 @@ function trustedGlobalConfigTargets(): readonly string[] {
   ]);
 }
 
+function parseGitVarConfigTargets(bytes: Buffer, workspaceRoot: string): readonly string[] {
+  if (bytes.length === 0 || bytes.length > MAX_CONFIG_SOURCE_BYTES || bytes.at(-1) !== 0x0a) {
+    return fail("config-source-discovery");
+  }
+  const systemPrefix = Buffer.from(GIT_VAR_SYSTEM_PREFIX, "utf8");
+  const globalPrefix = Buffer.from(GIT_VAR_GLOBAL_PREFIX, "utf8");
+  const targets = new Map<string, string>();
+  let systemCount = 0;
+  let globalCount = 0;
+  const addTarget = (rawPath: string): void => {
+    if (!path.isAbsolute(rawPath)) return fail("config-source-discovery");
+    const normalized = normalizeConfigTargetPath(rawPath, workspaceRoot);
+    const key = configSourcePathKey(normalized);
+    if (!targets.has(key)) targets.set(key, normalized);
+    if (targets.size > MAX_CONFIG_SOURCE_COUNT) return fail("config-source-discovery");
+  };
+
+  let offset = 0;
+  while (offset < bytes.length) {
+    const newline = bytes.indexOf(0x0a, offset);
+    if (newline < 0) return fail("config-source-discovery");
+    const line = bytes.subarray(offset, newline);
+    const isSystem = line.subarray(0, systemPrefix.length).equals(systemPrefix);
+    const isGlobal = line.subarray(0, globalPrefix.length).equals(globalPrefix);
+    if (isSystem || isGlobal) {
+      const prefixLength = isSystem ? systemPrefix.length : globalPrefix.length;
+      let rawPath: string;
+      try {
+        rawPath = UTF8_FATAL.decode(line.subarray(prefixLength));
+      } catch {
+        return fail("config-source-discovery");
+      }
+      addTarget(rawPath);
+      if (isSystem) systemCount += 1;
+      else globalCount += 1;
+    } else if (line.subarray(0, Buffer.byteLength("GIT_CONFIG_", "utf8")).equals(Buffer.from("GIT_CONFIG_", "utf8"))) {
+      // The sealed query has a fixed output contract. An unexpected config
+      // variable-shaped line must not be silently treated as harmless text.
+      return fail("dynamic-config-source");
+    }
+    offset = newline + 1;
+  }
+
+  if (targets.size === 0 || systemCount === 0 || globalCount === 0) return fail("config-source-discovery");
+  return Object.freeze([...targets.values()]);
+}
+
+function parseIncludeQueryRecords(bytes: Buffer, sourcePath: string, workspaceRoot: string): readonly string[] {
+  if (bytes.length > MAX_CONFIG_INCLUDE_QUERY_BYTES) return fail("config-source-discovery");
+  if (bytes.length === 0) return Object.freeze([]);
+  if (bytes.at(-1) !== 0) return fail("config-source-discovery");
+  let text: string;
+  try {
+    text = UTF8_FATAL.decode(bytes);
+  } catch {
+    return fail("config-source-discovery");
+  }
+  const fields = text.split("\u0000");
+  if (fields.at(-1) === "") fields.pop();
+  if (fields.length % 2 !== 0) return fail("config-source-discovery");
+  const sourceKey = configSourcePathKey(path.normalize(sourcePath));
+  const targets: string[] = [];
+  for (let index = 0; index < fields.length; index += 2) {
+    const origin = fields[index];
+    const record = fields[index + 1];
+    if (!origin || !record || CONTROL_CHARACTERS.test(origin)) return fail("config-source-discovery");
+    const separator = record.indexOf("\n");
+    if (separator <= 0 || record.indexOf("\n", separator + 1) >= 0) return fail("config-source-discovery");
+    const key = record.slice(0, separator);
+    const rawPath = record.slice(separator + 1);
+    if (!key || !rawPath || CONTROL_CHARACTERS.test(key) || CONTROL_CHARACTERS.test(rawPath)) return fail("config-source-discovery");
+    const originPath = normalizeConfigSourcePath(origin, workspaceRoot);
+    if (configSourcePathKey(originPath) !== sourceKey) return fail("config-source-discovery");
+    const loweredKey = key.toLowerCase();
+    if (loweredKey !== "include.path" && !(loweredKey.startsWith("includeif.") && loweredKey.endsWith(".path"))) {
+      return fail("dynamic-config-source");
+    }
+    targets.push(normalizeConfigTargetPath(rawPath, path.dirname(sourcePath)));
+    if (targets.length > MAX_CONFIG_SOURCE_COUNT) return fail("config-source-discovery");
+  }
+  return Object.freeze(targets);
+}
+
+async function discoverIncludeTargets(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  sourcePath: string
+): Promise<readonly string[]> {
+  let stat;
+  try {
+    stat = await fsp.stat(sourcePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return Object.freeze([]);
+    return fail("config-source-discovery");
+  }
+  if (!stat.isFile()) return Object.freeze([]);
+
+  const result = await runGitExitAware(config, workspace, [
+    "config",
+    "--file",
+    sourcePath,
+    "--no-includes",
+    "--show-origin",
+    "--null",
+    "--type",
+    "path",
+    "--get-regexp",
+    "^include.*\\.path$"
+  ]);
+  const output = result.copyStdoutBytes();
+  const diagnostics = result.copyStderrBytes();
+  if (result.exitCode === 1 && result.signal === null && !result.timedOut && !result.stdoutOverflow && !result.stderrOverflow && output.length === 0 && diagnostics.length === 0) {
+    return Object.freeze([]);
+  }
+  if (result.exitCode !== 0 || result.signal !== null || result.timedOut || result.stdoutOverflow || result.stderrOverflow || diagnostics.length > 0) {
+    return fail("config-source-discovery");
+  }
+  return parseIncludeQueryRecords(output, sourcePath, workspace.root);
+}
+
 /**
- * Enumerate only config source origins and key names. `--name-only` is
- * intentional: values (including URLs, credentials, and include paths) never
- * enter this inventory or any public result. Git emits origin/key pairs as
- * NUL-delimited fields; recursive active includes are enabled explicitly.
+ * Enumerate the ordinary active config origins and key names. `--name-only`
+ * is intentional: values (including URLs and credentials) never enter this
+ * inventory or any public result. Include path values are collected by the
+ * separate bounded path-only query above so empty targets can be covered.
+ * Git emits origin/key pairs as NUL-delimited fields; recursive active
+ * includes are enabled explicitly.
  */
 async function discoverGitPushConfigSources(
   config: GitPushPreflightConfig,
   workspace: Workspace,
-  repositoryConfigPath: string
+  repositoryConfigPath: string,
+  worktreeConfigPath: string
 ): Promise<readonly string[]> {
-  const result = await runGitExitAware(config, workspace, [
+  const sourceResult = await runGitExitAware(config, workspace, [
     "config",
     "--show-origin",
     "--name-only",
@@ -370,10 +524,10 @@ async function discoverGitPushConfigSources(
     "--list",
     "--includes"
   ]);
-  if (result.exitCode !== 0 || result.signal !== null || result.timedOut || result.stdoutOverflow || result.stderrOverflow) {
+  if (sourceResult.exitCode !== 0 || sourceResult.signal !== null || sourceResult.timedOut || sourceResult.stdoutOverflow || sourceResult.stderrOverflow) {
     return fail("config-source-discovery");
   }
-  const bytes = result.copyStdoutBytes();
+  const bytes = sourceResult.copyStdoutBytes();
   if (bytes.length > MAX_CONFIG_SOURCE_BYTES) return fail("config-source-discovery");
   let text: string;
   try {
@@ -389,6 +543,9 @@ async function discoverGitPushConfigSources(
   const paths = new Map<string, string>();
   const addPath = (sourcePath: string): void => {
     const normalized = path.normalize(sourcePath);
+    if (!path.isAbsolute(normalized) || Buffer.byteLength(normalized, "utf8") > MAX_CONFIG_SOURCE_PATH_BYTES || CONTROL_CHARACTERS.test(normalized)) {
+      return fail("config-source-discovery");
+    }
     const key = configSourcePathKey(normalized);
     if (!paths.has(key)) paths.set(key, normalized);
     if (paths.size > MAX_CONFIG_SOURCE_COUNT) fail("config-source-discovery");
@@ -409,15 +566,49 @@ async function discoverGitPushConfigSources(
     }
   }
 
+  const varResult = await runGitExitAware(config, workspace, ["var", "-l"]);
+  if (varResult.exitCode !== 0 || varResult.signal !== null || varResult.timedOut || varResult.stdoutOverflow || varResult.stderrOverflow || varResult.copyStderrBytes().length > 0) {
+    return fail("config-source-discovery");
+  }
+  for (const target of parseGitVarConfigTargets(varResult.copyStdoutBytes(), workspace.root)) addPath(target);
   addPath(repositoryConfigPath);
+  addPath(worktreeConfigPath);
   for (const target of trustedGlobalConfigTargets()) addPath(target);
+
+  // `--list --includes --name-only` cannot report an empty or missing include
+  // file. Query each known file directly for include path metadata only, then
+  // recurse over every exactly resolved target. Conditional include targets
+  // are intentionally over-locked; their path is still exact even when the
+  // condition is inactive, while unsupported path forms fail closed above.
+  const queued = [...paths.values()];
+  const depths = new Map<string, number>(queued.map((sourcePath) => [configSourcePathKey(sourcePath), 0]));
+  for (let index = 0; index < queued.length; index += 1) {
+    const sourcePath = queued[index];
+    const depth = depths.get(configSourcePathKey(sourcePath)) ?? 0;
+    if (depth >= MAX_CONFIG_INCLUDE_DEPTH) return fail("config-source-discovery");
+    for (const target of await discoverIncludeTargets(config, workspace, sourcePath)) {
+      addPath(target);
+      const targetKey = configSourcePathKey(target);
+      if (!depths.has(targetKey)) {
+        depths.set(targetKey, depth + 1);
+        queued.push(target);
+      }
+    }
+  }
+
   return Object.freeze([...paths.values()].sort(compareConfigSourcePaths));
 }
 
 async function repositoryRoot(
   config: GitPushPreflightConfig,
   workspace: Workspace
-): Promise<{ readonly root: string; readonly gitDir: string; readonly configPath: string; readonly objectFormat: "sha1" | "sha256" }> {
+): Promise<{
+  readonly root: string;
+  readonly gitDir: string;
+  readonly configPath: string;
+  readonly worktreeConfigPath: string;
+  readonly objectFormat: "sha1" | "sha256";
+}> {
   if (!path.isAbsolute(workspace.root)) return fail("workspace");
   let root: string;
   try {
@@ -448,7 +639,7 @@ async function repositoryRoot(
     return fail("repository");
   }
   const configPathText = oneLine(await runGitChecked(config, workspace, ["rev-parse", "--path-format=absolute", "--git-path", "config"]));
-  if (!path.isAbsolute(configPathText) || CONTROL_CHARACTERS.test(configPathText) || path.basename(configPathText) !== "config") {
+  if (!path.isAbsolute(configPathText) || Buffer.byteLength(configPathText, "utf8") > MAX_CONFIG_SOURCE_PATH_BYTES || CONTROL_CHARACTERS.test(configPathText) || path.basename(configPathText) !== "config") {
     return fail("repository");
   }
   const configPath = path.normalize(configPathText);
@@ -458,10 +649,15 @@ async function repositoryRoot(
   } catch {
     return fail("repository");
   }
+  const worktreeConfigPathText = oneLine(await runGitChecked(config, workspace, ["rev-parse", "--path-format=absolute", "--git-path", "config.worktree"]));
+  if (!path.isAbsolute(worktreeConfigPathText) || Buffer.byteLength(worktreeConfigPathText, "utf8") > MAX_CONFIG_SOURCE_PATH_BYTES || CONTROL_CHARACTERS.test(worktreeConfigPathText) || path.basename(worktreeConfigPathText) !== "config.worktree") {
+    return fail("repository");
+  }
+  const worktreeConfigPath = path.normalize(worktreeConfigPathText);
   const objectFormat = objectFormatFromResult(
     await runGitChecked(config, workspace, ["rev-parse", "--show-object-format=storage"])
   );
-  return { root, gitDir, configPath, objectFormat };
+  return { root, gitDir, configPath, worktreeConfigPath, objectFormat };
 }
 
 async function assertNoHistoryOperation(
@@ -660,7 +856,12 @@ export async function preflightGitPush(
   }
 
   const repository = await repositoryRoot(config, workspace);
-  const configSources = await discoverGitPushConfigSources(config, workspace, repository.configPath);
+  const configSources = await discoverGitPushConfigSources(
+    config,
+    workspace,
+    repository.configPath,
+    repository.worktreeConfigPath
+  );
   if (request.expected_local_head.length !== (repository.objectFormat === "sha1" ? 40 : 64) || request.expected_remote_head.length !== (repository.objectFormat === "sha1" ? 40 : 64)) {
     return fail("invalid-head");
   }

@@ -268,6 +268,12 @@ const raceTargetRoot = path.join(fixture, "race-target");
 const raceHome = path.join(fixture, CONFIG_PATH_SENTINEL);
 const raceInclude = path.join(raceHome, "include-" + CONFIG_PATH_SENTINEL + ".conf");
 const raceWriterFired = path.join(fixture, "config-source-race-result");
+const emptyIncludeTargetRoot = path.join(fixture, "empty-include-target");
+const worktreeTargetRoot = path.join(fixture, "worktree-target");
+const zeroEntryHome = path.join(fixture, "zero-entry-" + CONFIG_PATH_SENTINEL);
+const emptyIncludePath = path.join(zeroEntryHome, "empty-include-" + CONFIG_PATH_SENTINEL + ".conf");
+const emptyIncludeWriterFired = path.join(fixture, "empty-include-writer-result");
+const worktreeWriterFired = path.join(fixture, "worktree-writer-result");
 const targetRoot = path.join(fixture, "target");
 const receivePackPath = path.join(fixture, "sentinel-receive-pack");
 const receivePackFired = path.join(fixture, "receive-pack-fired");
@@ -480,6 +486,162 @@ try {
   console.log("RAW_OBSERVATION: with GOOD and EVIL both physically at R0, synchronized ordinary git config --global (absent target) and --file(active-include) writers recorded nonzero status; GOOD alone advanced to L1, EVIL remained R0, tracking remained L1, repository/include config stayed byte-identical, the global target stayed absent, and all three lock paths were absent.");
   console.log("SANITY_VERDICT: MATCH — direct loopback refs, source bytes, writer statuses, tracking ref, and lock census establish the complete cooperative source-set boundary.");
   console.log("CONFIG_SOURCE_RACE: PASS — repository, global, and active-include native config locks covered final validation, named-remote push, hook, route recheck, and post-observation; raw same-UID pathname replacement remains outside the cooperative boundary.");
+
+  // Empty include targets do not appear in `--list --includes --name-only`.
+  // The parent directive is relative to the including repository config, so
+  // this case also proves exact relative-path resolution before locking.
+  git(raceGoodRoot, ["update-ref", REF, r0]);
+  git(raceEvilRoot, ["update-ref", REF, r0]);
+  await mkdir(zeroEntryHome, { recursive: true });
+  await writeFile(emptyIncludePath, "", "utf8");
+  git(REPO_ROOT, ["clone", "--quiet", raceGoodEndpoint, emptyIncludeTargetRoot]);
+  git(emptyIncludeTargetRoot, ["config", "user.name", "Empty Include Target"]);
+  git(emptyIncludeTargetRoot, ["config", "user.email", "empty-include@example.test"]);
+  const emptyIncludeRelativePath = path.relative(path.join(emptyIncludeTargetRoot, ".git"), emptyIncludePath);
+  git(emptyIncludeTargetRoot, ["config", "--local", "include.path", emptyIncludeRelativePath]);
+  await writeFile(path.join(emptyIncludeTargetRoot, "notes.txt"), "R0\nL1-empty-include\n", "utf8");
+  const emptyIncludeLocalHead = commit(emptyIncludeTargetRoot, "L1 empty include");
+  const emptyIncludeWorkspaceId = workspaceId(emptyIncludeTargetRoot);
+  const emptyIncludeRequest = {
+    workspace_id: emptyIncludeWorkspaceId,
+    remote: "origin",
+    branch: BRANCH,
+    expected_local_head: emptyIncludeLocalHead,
+    expected_remote_head: r0
+  };
+  const emptyIncludePolicy = { enabled: true, rules: [{ remote: "origin", endpoint: raceGoodEndpoint, branches: [BRANCH] }] };
+  const emptyIncludeBefore = await readFile(emptyIncludePath);
+  const emptyIncludeLocalConfig = path.join(emptyIncludeTargetRoot, ".git", "config");
+  const emptyIncludeLocalConfigBefore = await readFile(emptyIncludeLocalConfig);
+  const emptyIncludeHookPath = path.join(emptyIncludeTargetRoot, ".git", "hooks", "pre-push");
+  await writeFile(emptyIncludeHookPath, [
+    "#!/bin/sh",
+    "set +e",
+    `git config --file '${emptyIncludePath}' url.${raceEvilEndpoint}.insteadOf ${raceGoodEndpoint}`,
+    "empty_status=$?",
+    `printf 'empty=%s %s\\n' \"$empty_status\" '${CONFIG_RACE_SENTINEL}' > '${emptyIncludeWriterFired}'`,
+    "exit 0",
+    ""
+  ].join("\n"), "utf8");
+  await chmod(emptyIncludeHookPath, 0o755);
+  assert.equal(head(raceGoodRoot), r0, "empty-include GOOD did not begin at R0");
+  assert.equal(head(raceEvilRoot), r0, "empty-include EVIL did not begin at R0");
+
+  await withHttpServer({
+    defaultRoot: emptyIncludeTargetRoot,
+    allowedRoots: [path.dirname(emptyIncludeTargetRoot)],
+    policy: emptyIncludePolicy,
+    environment: {
+      HOME: zeroEntryHome,
+      XDG_CONFIG_HOME: path.join(fixture, "zero-entry-xdg")
+    },
+    forbiddenOutput: [CONFIG_PATH_SENTINEL, CONFIG_VALUE_SENTINEL, CONFIG_CREDENTIAL_SENTINEL]
+  }, async (url) => {
+    session = await connect(url);
+    expectSuccess(await call(session, "open_current_workspace", {}), "open empty-include workspace");
+    const success = expectSuccess(await call(session, "git_push", emptyIncludeRequest), "empty-include target push");
+    assertSafe(success, "empty-include result", [raceGoodEndpoint, raceEvilEndpoint, emptyIncludePath, zeroEntryHome, CONFIG_PATH_SENTINEL, CONFIG_VALUE_SENTINEL, CONFIG_CREDENTIAL_SENTINEL]);
+    await close(session);
+    session = undefined;
+  });
+
+  assert.match((await readFile(emptyIncludeWriterFired, "utf8")).trim(), new RegExp(`^empty=[1-9][0-9]* ${CONFIG_RACE_SENTINEL}$`), "empty-include writer did not fail under its native lock");
+  assert.equal(head(raceGoodRoot), emptyIncludeLocalHead, "empty-include push did not update GOOD");
+  assert.equal(head(raceEvilRoot), r0, "empty-include push redirected to EVIL");
+  assert.equal(remoteHead(emptyIncludeTargetRoot, "origin"), emptyIncludeLocalHead, "empty-include post-observation did not remain on GOOD");
+  assert.equal(gitText(emptyIncludeTargetRoot, ["rev-parse", `refs/remotes/origin/${BRANCH}`]), emptyIncludeLocalHead, "empty-include tracking ref was not preserved");
+  assert.equal((await readFile(emptyIncludePath)).equals(emptyIncludeBefore), true, "empty include target was changed");
+  assert.equal((await readFile(emptyIncludeLocalConfig)).equals(emptyIncludeLocalConfigBefore), true, "empty-include repository config changed");
+  assert.equal(refs(raceGoodRoot), `refs/heads/${BRANCH}=${emptyIncludeLocalHead}`, "empty-include GOOD acquired an unrelated ref");
+  assert.equal(refs(raceEvilRoot), `refs/heads/${BRANCH}=${r0}`, "empty-include EVIL acquired an unrelated ref");
+  for (const lockPath of [
+    path.join(emptyIncludeTargetRoot, ".git", "config.lock"),
+    `${emptyIncludePath}.lock`,
+    `${path.join(zeroEntryHome, ".gitconfig")}.lock`,
+    `${path.join(emptyIncludeTargetRoot, ".git", "config.worktree")}.lock`
+  ]) {
+    assert.equal(await readFile(lockPath).catch(() => null), null, "empty-include lock residue remained after push");
+  }
+  console.log("RAW_OBSERVATION: GOOD and EVIL both began at R0; an empty relative include target writer returned nonzero, GOOD alone advanced to L1, EVIL remained R0, tracking/config stayed exact, and native source/worktree/global locks were absent afterward.");
+  console.log("SANITY_VERDICT: MATCH — direct loopback refs, empty-target bytes, writer status, tracking ref, and lock census establish zero-entry include protection.");
+  console.log("ZERO_ENTRY_INCLUDE: PASS — parent include metadata resolved the empty target exactly; no path/value/credential sentinel surfaced publicly.");
+
+  // An absent config.worktree is likewise invisible to config-name output.
+  // Enable the ordinary worktree config route, then prove its native writer
+  // cannot create the target while the one-shot push is in flight.
+  git(raceGoodRoot, ["update-ref", REF, r0]);
+  git(raceEvilRoot, ["update-ref", REF, r0]);
+  git(REPO_ROOT, ["clone", "--quiet", raceGoodEndpoint, worktreeTargetRoot]);
+  git(worktreeTargetRoot, ["config", "user.name", "Worktree Target"]);
+  git(worktreeTargetRoot, ["config", "user.email", "worktree@example.test"]);
+  git(worktreeTargetRoot, ["config", "--local", "extensions.worktreeConfig", "true"]);
+  const worktreeConfigPath = gitText(worktreeTargetRoot, ["rev-parse", "--path-format=absolute", "--git-path", "config.worktree"]);
+  assert.equal(path.basename(worktreeConfigPath), "config.worktree", "worktree config path was not exact");
+  assert.equal(await readFile(worktreeConfigPath).catch(() => null), null, "worktree config target was not absent before the falsifier");
+  await writeFile(path.join(worktreeTargetRoot, "notes.txt"), "R0\nL1-worktree\n", "utf8");
+  const worktreeLocalHead = commit(worktreeTargetRoot, "L1 worktree");
+  const worktreeWorkspaceId = workspaceId(worktreeTargetRoot);
+  const worktreeRequest = {
+    workspace_id: worktreeWorkspaceId,
+    remote: "origin",
+    branch: BRANCH,
+    expected_local_head: worktreeLocalHead,
+    expected_remote_head: r0
+  };
+  const worktreePolicy = { enabled: true, rules: [{ remote: "origin", endpoint: raceGoodEndpoint, branches: [BRANCH] }] };
+  const worktreeLocalConfig = path.join(worktreeTargetRoot, ".git", "config");
+  const worktreeLocalConfigBefore = await readFile(worktreeLocalConfig);
+  const worktreeHookPath = path.join(worktreeTargetRoot, ".git", "hooks", "pre-push");
+  await writeFile(worktreeHookPath, [
+    "#!/bin/sh",
+    "set +e",
+    `git config --worktree url.${raceEvilEndpoint}.insteadOf ${raceGoodEndpoint}`,
+    "worktree_status=$?",
+    `printf 'worktree=%s %s\\n' \"$worktree_status\" '${CONFIG_RACE_SENTINEL}' > '${worktreeWriterFired}'`,
+    "exit 0",
+    ""
+  ].join("\n"), "utf8");
+  await chmod(worktreeHookPath, 0o755);
+  assert.equal(head(raceGoodRoot), r0, "worktree GOOD did not begin at R0");
+  assert.equal(head(raceEvilRoot), r0, "worktree EVIL did not begin at R0");
+
+  await withHttpServer({
+    defaultRoot: worktreeTargetRoot,
+    allowedRoots: [path.dirname(worktreeTargetRoot)],
+    policy: worktreePolicy,
+    environment: {
+      HOME: zeroEntryHome,
+      XDG_CONFIG_HOME: path.join(fixture, "zero-entry-xdg")
+    },
+    forbiddenOutput: [CONFIG_PATH_SENTINEL, CONFIG_VALUE_SENTINEL, CONFIG_CREDENTIAL_SENTINEL]
+  }, async (url) => {
+    session = await connect(url);
+    expectSuccess(await call(session, "open_current_workspace", {}), "open worktree-config workspace");
+    const success = expectSuccess(await call(session, "git_push", worktreeRequest), "worktree-config target push");
+    assertSafe(success, "worktree-config result", [raceGoodEndpoint, raceEvilEndpoint, worktreeConfigPath, zeroEntryHome, CONFIG_PATH_SENTINEL, CONFIG_VALUE_SENTINEL, CONFIG_CREDENTIAL_SENTINEL]);
+    await close(session);
+    session = undefined;
+  });
+
+  assert.match((await readFile(worktreeWriterFired, "utf8")).trim(), new RegExp(`^worktree=[1-9][0-9]* ${CONFIG_RACE_SENTINEL}$`), "worktree writer did not fail under its native lock");
+  assert.equal(head(raceGoodRoot), worktreeLocalHead, "worktree-config push did not update GOOD");
+  assert.equal(head(raceEvilRoot), r0, "worktree-config push redirected to EVIL");
+  assert.equal(remoteHead(worktreeTargetRoot, "origin"), worktreeLocalHead, "worktree-config post-observation did not remain on GOOD");
+  assert.equal(gitText(worktreeTargetRoot, ["rev-parse", `refs/remotes/origin/${BRANCH}`]), worktreeLocalHead, "worktree-config tracking ref was not preserved");
+  assert.equal(await readFile(worktreeConfigPath).catch(() => null), null, "worktree writer created config.worktree despite the lock");
+  assert.equal((await readFile(worktreeLocalConfig)).equals(worktreeLocalConfigBefore), true, "worktree-config repository config changed");
+  assert.equal(refs(raceGoodRoot), `refs/heads/${BRANCH}=${worktreeLocalHead}`, "worktree GOOD acquired an unrelated ref");
+  assert.equal(refs(raceEvilRoot), `refs/heads/${BRANCH}=${r0}`, "worktree EVIL acquired an unrelated ref");
+  for (const lockPath of [
+    path.join(worktreeTargetRoot, ".git", "config.lock"),
+    `${worktreeConfigPath}.lock`,
+    `${path.join(zeroEntryHome, ".gitconfig")}.lock`
+  ]) {
+    assert.equal(await readFile(lockPath).catch(() => null), null, "worktree-config lock residue remained after push");
+  }
+  console.log("RAW_OBSERVATION: GOOD and EVIL both began at R0; an absent enabled config.worktree writer returned nonzero, GOOD alone advanced to L1, EVIL remained R0, tracking/config stayed exact, and the worktree/global locks were absent afterward.");
+  console.log("SANITY_VERDICT: MATCH — direct loopback refs, absent worktree target, writer status, tracking ref, and lock census establish config.worktree protection.");
+  console.log("WORKTREE_CONFIG: PASS — exact config.worktree target was locked before mutation; no path/value/credential sentinel surfaced publicly.");
   console.log("GIT_PUSH_TRANSPORT_REPAIR_SMOKE: PASS");
 } finally {
   await close(session);
