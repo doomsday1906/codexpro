@@ -1,4 +1,6 @@
+import { constants as fsConstants, type Stats } from "node:fs";
 import fsp from "node:fs/promises";
+import path from "node:path";
 import type { CodexProConfig } from "./config.js";
 import { GitExecutionError, runGitMutation, type GitExecutionResult } from "./gitOps.js";
 import { CodexProError, type Workspace } from "./guard.js";
@@ -125,6 +127,7 @@ function failPush(preflight: GitPushPreflight, reason: GitPushFailureReason, rem
 }
 
 interface GitPushConfigLock {
+  readonly source_path: string;
   readonly path: string;
   readonly handle: Awaited<ReturnType<typeof fsp.open>>;
   readonly device: number;
@@ -132,7 +135,7 @@ interface GitPushConfigLock {
   readonly mode: number;
 }
 
-function lockIdentity(stat: import("node:fs").Stats): Pick<GitPushConfigLock, "device" | "inode" | "mode"> {
+function lockIdentity(stat: Stats): Pick<GitPushConfigLock, "device" | "inode" | "mode"> {
   return {
     device: stat.dev,
     inode: stat.ino,
@@ -148,19 +151,65 @@ function sameLockIdentity(
 }
 
 /**
- * Hold Git's native config lock across final validation, named-remote push,
- * and post-observation. Cooperative `git config` writers then fail at their
- * normal config.lock boundary instead of redirecting one step of the route.
+ * Determine whether a config source can be changed by an ordinary writer.
+ * The containing directory matters: Git replaces a read-only file by
+ * renaming its lock when the directory is writable. Missing top-level global
+ * files are therefore covered whenever their parent already exists and is
+ * writable. A missing parent cannot be reached by an ordinary `git config`
+ * writer and is left out of the lock set; a later appearance is caught by the
+ * under-lock coverage check.
  */
-async function acquireGitPushConfigLock(configPath: string): Promise<GitPushConfigLock> {
-  const lockPath = `${configPath}.lock`;
+async function writableConfigDirectory(directory: string): Promise<boolean> {
+  try {
+    const stat = await fsp.stat(directory);
+    if (!stat.isDirectory()) return false;
+    await fsp.access(directory, fsConstants.W_OK | fsConstants.X_OK);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "EACCES" || code === "EPERM") return false;
+    throw new CodexProError("Git push configuration sources could not be safely enumerated.");
+  }
+}
+
+async function configSourceNeedsLock(sourcePath: string): Promise<boolean> {
+  let sourceStat: Stats;
+  try {
+    sourceStat = await fsp.stat(sourcePath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") throw new CodexProError("Git push configuration sources could not be safely enumerated.");
+    return writableConfigDirectory(path.dirname(sourcePath));
+  }
+
+  const parentWritable = await writableConfigDirectory(path.dirname(sourcePath));
+  if (!sourceStat.isFile()) {
+    if (parentWritable) throw new CodexProError("Git push configuration source is not a regular file.");
+    return false;
+  }
+  let sourceWritable = false;
+  try {
+    await fsp.access(sourcePath, fsConstants.W_OK);
+    sourceWritable = true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EACCES" && code !== "EPERM") {
+      throw new CodexProError("Git push configuration sources could not be safely enumerated.");
+    }
+  }
+  return sourceWritable || parentWritable;
+}
+
+/** Acquire one exact native `<config-file>.lock` identity. */
+async function acquireGitPushConfigLock(sourcePath: string): Promise<GitPushConfigLock> {
+  const lockPath = `${sourcePath}.lock`;
   let handle: Awaited<ReturnType<typeof fsp.open>> | undefined;
   try {
     handle = await fsp.open(lockPath, "wx", 0o600);
     const identity = lockIdentity(await handle.stat());
     const onDisk = await fsp.lstat(lockPath);
     if (!onDisk.isFile() || !sameLockIdentity(identity, lockIdentity(onDisk))) throw new Error("lock identity changed");
-    return { path: lockPath, handle, ...identity };
+    return { source_path: sourcePath, path: lockPath, handle, ...identity };
   } catch {
     try {
       await handle?.close();
@@ -192,10 +241,65 @@ async function releaseGitPushConfigLock(lock: GitPushConfigLock): Promise<void> 
   }
 }
 
-async function withGitPushConfigLock<T>(preflight: GitPushPreflight, action: () => Promise<T>): Promise<T> {
-  let lock: GitPushConfigLock;
+async function acquireGitPushConfigLocks(preflight: GitPushPreflight): Promise<readonly GitPushConfigLock[]> {
+  const locks: GitPushConfigLock[] = [];
   try {
-    lock = await acquireGitPushConfigLock(preflight.config_path);
+    const sourcePaths = [...preflight.config_sources].sort((left, right) => {
+      const leftKey = process.platform === "win32" ? left.toLowerCase() : left;
+      const rightKey = process.platform === "win32" ? right.toLowerCase() : right;
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+    const seen = new Set<string>();
+    for (const sourcePath of sourcePaths) {
+      const sourceKey = process.platform === "win32" ? sourcePath.toLowerCase() : sourcePath;
+      if (seen.has(sourceKey)) continue;
+      seen.add(sourceKey);
+      if (await configSourceNeedsLock(sourcePath)) locks.push(await acquireGitPushConfigLock(sourcePath));
+    }
+    return Object.freeze(locks);
+  } catch {
+    await releaseGitPushConfigLocks(locks).catch(() => {});
+    throw new CodexProError("Git push configuration sources could not be locked.");
+  }
+}
+
+async function releaseGitPushConfigLocks(locks: readonly GitPushConfigLock[]): Promise<void> {
+  let releaseFailed = false;
+  for (let index = locks.length - 1; index >= 0; index -= 1) {
+    try {
+      await releaseGitPushConfigLock(locks[index]);
+    } catch {
+      releaseFailed = true;
+    }
+  }
+  if (releaseFailed) throw new CodexProError("Git push configuration locks could not be released.");
+}
+
+function sameConfigSourceSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const normalize = (sourcePath: string): string => process.platform === "win32" ? sourcePath.toLowerCase() : sourcePath;
+  const expected = new Set(left.map(normalize));
+  return right.every((sourcePath) => expected.has(normalize(sourcePath)));
+}
+
+async function configSourcesCovered(
+  preflight: GitPushPreflight,
+  locks: readonly GitPushConfigLock[]
+): Promise<boolean> {
+  const locked = new Set(locks.map((lock) => process.platform === "win32" ? lock.source_path.toLowerCase() : lock.source_path));
+  for (const sourcePath of preflight.config_sources) {
+    if (await configSourceNeedsLock(sourcePath)) {
+      const key = process.platform === "win32" ? sourcePath.toLowerCase() : sourcePath;
+      if (!locked.has(key)) return false;
+    }
+  }
+  return true;
+}
+
+async function withGitPushConfigLock<T>(preflight: GitPushPreflight, action: (locks: readonly GitPushConfigLock[]) => Promise<T>): Promise<T> {
+  let locks: readonly GitPushConfigLock[];
+  try {
+    locks = await acquireGitPushConfigLocks(preflight);
   } catch {
     return failPush(preflight, "mutation-failed");
   }
@@ -203,14 +307,14 @@ async function withGitPushConfigLock<T>(preflight: GitPushPreflight, action: () 
   let value: T | undefined;
   let actionError: unknown;
   try {
-    value = await action();
+    value = await action(locks);
   } catch (error) {
     actionError = error;
   }
 
   let releaseError: unknown;
   try {
-    await releaseGitPushConfigLock(lock);
+    await releaseGitPushConfigLocks(locks);
   } catch (error) {
     releaseError = error;
   }
@@ -277,8 +381,16 @@ export async function gitPush(
   rawInput: unknown
 ): Promise<GitPushResult> {
   const initial = await preflightGitPush(config, workspace, rawInput);
-  return withGitPushConfigLock(initial, async () => {
+  return withGitPushConfigLock(initial, async (locks) => {
     const { preflight } = await revalidateGitPushPreflight(config, workspace, initial);
+    // The first inventory was collected before the native locks existed. The
+    // complete inventory must be identical under those locks, and every
+    // source that is currently writable must be represented by one held lock.
+    // A changed or newly writable source fails closed before any network
+    // mutation rather than allowing observation and mutation to diverge.
+    if (!sameConfigSourceSet(initial.config_sources, preflight.config_sources) || !(await configSourcesCovered(preflight, locks))) {
+      return failPush(initial, "mutation-failed");
+    }
     const args = buildGitPushArgs(preflight);
     const execution = await executePush(config, workspace, args);
     const postRouteValid = await postRouteMatchesPolicy(config, workspace, preflight);

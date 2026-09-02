@@ -121,10 +121,16 @@ async function withEnvironment(values, callback) {
 
 async function main() {
   const fixture = await fs.mkdtemp(path.join(os.tmpdir(), "codexpro-git-push-preflight-"));
+  const isolatedHome = path.join(fixture, "home");
+  const priorHome = process.env.HOME;
+  const priorXdgConfigHome = process.env.XDG_CONFIG_HOME;
   const remoteRoot = path.join(fixture, "remote.git");
   const workRoot = path.join(fixture, "work");
   let daemon;
   try {
+    await fs.mkdir(isolatedHome);
+    process.env.HOME = isolatedHome;
+    delete process.env.XDG_CONFIG_HOME;
     await fs.mkdir(workRoot);
     runGit(fixture, ["init", "--bare", remoteRoot]);
     runGit(workRoot, ["init", "--initial-branch=main"]);
@@ -187,7 +193,8 @@ async function main() {
     const success = await preflightGitPush(config, workspace, request);
     const afterSuccess = await snapshot(workRoot, remoteRoot);
     assert.deepEqual(afterSuccess, beforeSuccess, "successful preflight mutated repository state");
-    assert.deepEqual(success, {
+    const { config_sources: configSources, ...successFacts } = success;
+    assert.deepEqual(successFacts, {
       schema_version: 1,
       workspace_id: workspace.id,
       root: workRoot,
@@ -202,6 +209,8 @@ async function main() {
       expected_local_head: localHead,
       expected_remote_head: initialHead
     }, "successful preflight returned unexpected source/destination facts");
+    assert.ok(configSources.includes(path.join(isolatedHome, ".gitconfig")), "preflight omitted the writable global target");
+    assert.ok(configSources.includes(path.join(workRoot, ".git", "config")), "preflight omitted the repository config source");
     console.log("PASS success preflight: exact local head, local remote commit, ancestry, policy, and loopback ls-remote matched");
 
     await expectFailure("wrong expected local head", { ...request, expected_local_head: initialHead }, "head-mismatch");
@@ -308,6 +317,10 @@ async function main() {
       daemon.kill("SIGTERM");
       await new Promise((resolve) => daemon.once("close", resolve));
     }
+    if (priorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = priorHome;
+    if (priorXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = priorXdgConfigHome;
     await fs.rm(fixture, { recursive: true, force: true });
   }
 }

@@ -1,4 +1,5 @@
 import fsp from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { TextDecoder } from "node:util";
 import type { CodexProConfig } from "./config.js";
@@ -53,6 +54,8 @@ export type GitPushPreflightFailureReason =
   | "disallowed-local-or-helper-endpoint"
   | "disallowed-local-endpoint"
   | "non-default-receive-pack"
+  | "config-source-discovery"
+  | "dynamic-config-source"
   | "remote-absent"
   | "remote-ambiguous"
   | "remote-head-mismatch"
@@ -92,6 +95,8 @@ const FAILURE_MESSAGES: Record<GitPushPreflightFailureReason, string> = {
   "disallowed-local-or-helper-endpoint": "Git push local or helper endpoint is not allowed.",
   "disallowed-local-endpoint": "Git push local endpoint is not allowed.",
   "non-default-receive-pack": "Git push configured receive-pack is not the default.",
+  "config-source-discovery": "Git push configuration sources could not be safely enumerated.",
+  "dynamic-config-source": "Git push configuration includes an unsupported dynamic source.",
   "remote-absent": "Git push remote branch does not exist.",
   "remote-ambiguous": "Git push remote branch observation was ambiguous.",
   "remote-head-mismatch": "Git push remote branch does not match expected_remote_head.",
@@ -127,6 +132,8 @@ export interface GitPushPreflight {
   readonly root: string;
   readonly git_dir: string;
   readonly config_path: string;
+  /** Every active file origin plus trusted top-level global targets. */
+  readonly config_sources: readonly string[];
   readonly object_format: "sha1" | "sha256";
   readonly remote: string;
   readonly endpoint: string;
@@ -151,6 +158,11 @@ const MAX_REMOTE_BYTES = 256;
 const MAX_BRANCH_BYTES = 256;
 const MAX_HEAD_BYTES = 64;
 const MAX_REMOTE_OBSERVATION_BYTES = 16 * 1024;
+const MAX_CONFIG_SOURCE_BYTES = 128 * 1024;
+const MAX_CONFIG_SOURCE_COUNT = 512;
+const MAX_CONFIG_SOURCE_PATH_BYTES = 8 * 1024;
+const INTERNAL_CONFIG_ORIGIN = "command line:";
+const INTERNAL_CONFIG_KEYS = new Set(["color.ui"]);
 const UTF8_FATAL = new TextDecoder("utf-8", { fatal: true });
 const GIT_HISTORY_MARKERS = [
   "MERGE_HEAD",
@@ -299,6 +311,107 @@ function parseObjectId(value: string, objectFormat: "sha1" | "sha256"): string {
   const normalized = value.toLowerCase();
   if (!objectIdPattern(objectFormat).test(normalized)) return fail("malformed-output");
   return normalized;
+}
+
+function compareConfigSourcePaths(left: string, right: string): number {
+  const leftKey = process.platform === "win32" ? left.toLowerCase() : left;
+  const rightKey = process.platform === "win32" ? right.toLowerCase() : right;
+  return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+}
+
+function configSourcePathKey(sourcePath: string): string {
+  return process.platform === "win32" ? sourcePath.toLowerCase() : sourcePath;
+}
+
+function normalizeConfigSourcePath(origin: string, workspaceRoot: string): string {
+  if (!origin.startsWith("file:")) return fail("dynamic-config-source");
+  const rawPath = origin.slice("file:".length);
+  if (!rawPath || Buffer.byteLength(rawPath, "utf8") > MAX_CONFIG_SOURCE_PATH_BYTES || CONTROL_CHARACTERS.test(rawPath)) return fail("config-source-discovery");
+  const resolved = path.isAbsolute(rawPath) ? path.normalize(rawPath) : path.resolve(workspaceRoot, rawPath);
+  if (!path.isAbsolute(resolved) || CONTROL_CHARACTERS.test(resolved)) return fail("config-source-discovery");
+  return resolved;
+}
+
+function trustedGlobalConfigTargets(): readonly string[] {
+  const home = process.env.HOME ?? os.homedir();
+  if (!home || CONTROL_CHARACTERS.test(home) || !path.isAbsolute(home)) return fail("config-source-discovery");
+
+  const xdgConfigHome = process.env.XDG_CONFIG_HOME;
+  const xdgRoot = xdgConfigHome === undefined || xdgConfigHome === ""
+    ? path.join(home, ".config")
+    : xdgConfigHome;
+  if (CONTROL_CHARACTERS.test(xdgRoot) || !path.isAbsolute(xdgRoot)) return fail("config-source-discovery");
+
+  // Git 2.43 writes `git config --global` to $HOME/.gitconfig on this
+  // platform. The XDG target is also included because it is a valid global
+  // source when present and can be the active file for included config.
+  return Object.freeze([
+    path.normalize(path.join(home, ".gitconfig")),
+    path.normalize(path.join(xdgRoot, "git", "config"))
+  ]);
+}
+
+/**
+ * Enumerate only config source origins and key names. `--name-only` is
+ * intentional: values (including URLs, credentials, and include paths) never
+ * enter this inventory or any public result. Git emits origin/key pairs as
+ * NUL-delimited fields; recursive active includes are enabled explicitly.
+ */
+async function discoverGitPushConfigSources(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  repositoryConfigPath: string
+): Promise<readonly string[]> {
+  const result = await runGitExitAware(config, workspace, [
+    "config",
+    "--show-origin",
+    "--name-only",
+    "--null",
+    "--list",
+    "--includes"
+  ]);
+  if (result.exitCode !== 0 || result.signal !== null || result.timedOut || result.stdoutOverflow || result.stderrOverflow) {
+    return fail("config-source-discovery");
+  }
+  const bytes = result.copyStdoutBytes();
+  if (bytes.length > MAX_CONFIG_SOURCE_BYTES) return fail("config-source-discovery");
+  let text: string;
+  try {
+    text = UTF8_FATAL.decode(bytes);
+  } catch {
+    return fail("config-source-discovery");
+  }
+
+  if (text.length > 0 && !text.endsWith("\u0000")) return fail("config-source-discovery");
+  const fields = text.length === 0 ? [] : text.split("\u0000");
+  if (fields.length > 0 && fields.at(-1) === "") fields.pop();
+  if (fields.length % 2 !== 0) return fail("config-source-discovery");
+  const paths = new Map<string, string>();
+  const addPath = (sourcePath: string): void => {
+    const normalized = path.normalize(sourcePath);
+    const key = configSourcePathKey(normalized);
+    if (!paths.has(key)) paths.set(key, normalized);
+    if (paths.size > MAX_CONFIG_SOURCE_COUNT) fail("config-source-discovery");
+  };
+
+  for (let index = 0; index < fields.length; index += 2) {
+    const origin = fields[index];
+    const key = fields[index + 1];
+    if (!origin || !key || CONTROL_CHARACTERS.test(key)) return fail("config-source-discovery");
+    if (origin.startsWith("file:")) {
+      addPath(normalizeConfigSourcePath(origin, workspace.root));
+      continue;
+    }
+    // runGitMutation supplies only this fixed command-line setting. Any other
+    // dynamic origin could redirect the named remote outside the lock set.
+    if (origin !== INTERNAL_CONFIG_ORIGIN || !INTERNAL_CONFIG_KEYS.has(key)) {
+      return fail("dynamic-config-source");
+    }
+  }
+
+  addPath(repositoryConfigPath);
+  for (const target of trustedGlobalConfigTargets()) addPath(target);
+  return Object.freeze([...paths.values()].sort(compareConfigSourcePaths));
 }
 
 async function repositoryRoot(
@@ -547,6 +660,7 @@ export async function preflightGitPush(
   }
 
   const repository = await repositoryRoot(config, workspace);
+  const configSources = await discoverGitPushConfigSources(config, workspace, repository.configPath);
   if (request.expected_local_head.length !== (repository.objectFormat === "sha1" ? 40 : 64) || request.expected_remote_head.length !== (repository.objectFormat === "sha1" ? 40 : 64)) {
     return fail("invalid-head");
   }
@@ -583,6 +697,7 @@ export async function preflightGitPush(
     root: repository.root,
     git_dir: repository.gitDir,
     config_path: repository.configPath,
+    config_sources: configSources,
     object_format: repository.objectFormat,
     remote: request.remote,
     endpoint: policy.endpoint,

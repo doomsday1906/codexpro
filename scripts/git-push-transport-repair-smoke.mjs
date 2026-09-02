@@ -15,6 +15,9 @@ const REF = `refs/heads/${BRANCH}`;
 const SECRET = "TASK004_TRANSPORT_SECRET_7X9";
 const RECEIVEPACK_SENTINEL = "TASK004_RECEIVEPACK_SENTINEL_7X9";
 const CONFIG_RACE_SENTINEL = "TASK004_CONFIG_RACE_SENTINEL_7X9";
+const CONFIG_PATH_SENTINEL = "TASK004_CONFIG_PATH_SENTINEL_7X9";
+const CONFIG_VALUE_SENTINEL = "TASK004_CONFIG_VALUE_SENTINEL_7X9";
+const CONFIG_CREDENTIAL_SENTINEL = "TASK004_CONFIG_CREDENTIAL_SENTINEL_7X9";
 
 function cleanGitEnvironment(overrides = {}) {
   const env = { ...process.env };
@@ -196,7 +199,7 @@ function assertSafe(value, label, disallowedValues) {
   }
 }
 
-async function withHttpServer({ defaultRoot, allowedRoots, policy }, callback) {
+async function withHttpServer({ defaultRoot, allowedRoots, policy, environment = {}, forbiddenOutput = [] }, callback) {
   const port = await freePort();
   const env = {
     ...process.env,
@@ -211,7 +214,8 @@ async function withHttpServer({ defaultRoot, allowedRoots, policy }, callback) {
     CODEXPRO_TOOL_CARDS: "0",
     CODEXPRO_CODEX_SESSIONS: "off",
     CODEXPRO_CONNECTION_TEST: "0",
-    CODEXPRO_GIT_PUSH_POLICY: JSON.stringify(policy)
+    CODEXPRO_GIT_PUSH_POLICY: JSON.stringify(policy),
+    ...environment
   };
   delete env.CODEXPRO_HTTP_TOKEN;
   delete env.CODEBASE_BRIDGE_HTTP_TOKEN;
@@ -247,14 +251,23 @@ async function withHttpServer({ defaultRoot, allowedRoots, policy }, callback) {
         resolve();
       }, 5_000).unref();
     });
+    for (const forbidden of forbiddenOutput) {
+      assert.equal(stderr.includes(forbidden), false, "server diagnostics exposed a synthetic config sentinel");
+    }
   }
 }
 
 const fixture = await mkdtemp(path.join(os.tmpdir(), "codexpro-git-push-transport-"));
 const goodRoot = path.join(fixture, "good.git");
 const evilRoot = path.join(fixture, "evil.git");
+const raceGoodRoot = path.join(fixture, "race-good.git");
+const raceEvilRoot = path.join(fixture, "race-evil.git");
 const seedRoot = path.join(fixture, "seed");
 const evilSeedRoot = path.join(fixture, "evil-seed");
+const raceTargetRoot = path.join(fixture, "race-target");
+const raceHome = path.join(fixture, CONFIG_PATH_SENTINEL);
+const raceInclude = path.join(raceHome, "include-" + CONFIG_PATH_SENTINEL + ".conf");
+const raceWriterFired = path.join(fixture, "config-source-race-result");
 const targetRoot = path.join(fixture, "target");
 const receivePackPath = path.join(fixture, "sentinel-receive-pack");
 const receivePackFired = path.join(fixture, "receive-pack-fired");
@@ -267,6 +280,8 @@ try {
   await chmod(receivePackPath, 0o755);
   await mkdir(goodRoot, { recursive: true });
   await mkdir(evilRoot, { recursive: true });
+  await mkdir(raceGoodRoot, { recursive: true });
+  await mkdir(raceEvilRoot, { recursive: true });
   await mkdir(seedRoot, { recursive: true });
   await mkdir(evilSeedRoot, { recursive: true });
   initRepo(seedRoot, "Good Seed");
@@ -278,10 +293,16 @@ try {
 
   git(goodRoot, ["init", "--bare", "--quiet"]);
   git(evilRoot, ["init", "--bare", "--quiet"]);
+  git(raceGoodRoot, ["init", "--bare", "--quiet"]);
+  git(raceEvilRoot, ["init", "--bare", "--quiet"]);
   git(seedRoot, ["push", "--quiet", goodRoot, `${r0}:${REF}`]);
   git(evilSeedRoot, ["push", "--quiet", evilRoot, `${e0}:${REF}`]);
+  git(seedRoot, ["push", "--quiet", raceGoodRoot, `${r0}:${REF}`]);
+  git(seedRoot, ["push", "--quiet", raceEvilRoot, `${r0}:${REF}`]);
   git(goodRoot, ["symbolic-ref", "HEAD", REF]);
   git(evilRoot, ["symbolic-ref", "HEAD", REF]);
+  git(raceGoodRoot, ["symbolic-ref", "HEAD", REF]);
+  git(raceEvilRoot, ["symbolic-ref", "HEAD", REF]);
 
   const port = await freePort();
   const goodEndpoint = `git://127.0.0.1:${port}/good.git`;
@@ -379,6 +400,86 @@ try {
   console.log("SANITY_VERDICT: MATCH — physical GOOD/EVIL refs, tracking ref, config, and hook sentinel establish one route across preflight, push, and post-observation.");
   console.log("CONFIG_RACE: PASS — native config.lock protected final validation, named-remote mutation, and post-observation; raw same-UID pathname replacement remains outside this cooperative boundary.");
   console.log("RECEIVEPACK: PASS — configured non-default receive-pack was rejected; fixed git-receive-pack preserved ordinary loopback push behavior.");
+
+  // Exercise the complete cooperative source set: a writable global file and
+  // an active included file are both locked while the named-remote hook tries
+  // to redirect GOOD to a distinct EVIL endpoint through ordinary git config.
+  await mkdir(raceHome, { recursive: true });
+  await writeFile(raceInclude, `[codexpro.synthetic]\n\tvalue = ${CONFIG_VALUE_SENTINEL}\n\tcredential = ${CONFIG_CREDENTIAL_SENTINEL}\n`, "utf8");
+  const raceGlobal = path.join(raceHome, ".gitconfig");
+  const raceGoodEndpoint = `git://127.0.0.1:${port}/race-good.git`;
+  const raceEvilEndpoint = `git://127.0.0.1:${port}/race-evil.git`;
+  git(REPO_ROOT, ["clone", "--quiet", raceGoodEndpoint, raceTargetRoot]);
+  git(raceTargetRoot, ["config", "user.name", "Config Source Race Target"]);
+  git(raceTargetRoot, ["config", "user.email", "config-source-race@example.test"]);
+  git(raceTargetRoot, ["config", "--local", "include.path", raceInclude]);
+  await writeFile(path.join(raceTargetRoot, "notes.txt"), "R0\nL1\n", "utf8");
+  const raceLocalHead = commit(raceTargetRoot, "L1");
+  const raceWorkspaceId = workspaceId(raceTargetRoot);
+  const racePolicy = { enabled: true, rules: [{ remote: "origin", endpoint: raceGoodEndpoint, branches: [BRANCH] }] };
+  const raceRequest = {
+    workspace_id: raceWorkspaceId,
+    remote: "origin",
+    branch: BRANCH,
+    expected_local_head: raceLocalHead,
+    expected_remote_head: r0
+  };
+  const raceLocalConfig = path.join(raceTargetRoot, ".git", "config");
+  const raceLocalConfigBefore = await readFile(raceLocalConfig);
+  const raceIncludeBefore = await readFile(raceInclude);
+  const raceHookPath = path.join(raceTargetRoot, ".git", "hooks", "pre-push");
+  const raceHook = [
+    "#!/bin/sh",
+    "set +e",
+    `git config --global url.${raceEvilEndpoint}.insteadOf ${raceGoodEndpoint}`,
+    "global_status=$?",
+    `git config --file '${raceInclude}' url.${raceEvilEndpoint}.insteadOf ${raceGoodEndpoint}`,
+    "include_status=$?",
+    `printf 'global=%s include=%s %s\\n' \"$global_status\" \"$include_status\" '${CONFIG_RACE_SENTINEL}' > '${raceWriterFired}'`,
+    "exit 0",
+    ""
+  ].join("\n");
+  await writeFile(raceHookPath, raceHook, "utf8");
+  await chmod(raceHookPath, 0o755);
+
+  await withHttpServer({
+    defaultRoot: raceTargetRoot,
+    allowedRoots: [path.dirname(raceTargetRoot)],
+    policy: racePolicy,
+    environment: {
+      HOME: raceHome,
+      XDG_CONFIG_HOME: path.join(fixture, "race-xdg")
+    },
+    forbiddenOutput: [CONFIG_PATH_SENTINEL, CONFIG_VALUE_SENTINEL, CONFIG_CREDENTIAL_SENTINEL]
+  }, async (url) => {
+    session = await connect(url);
+    expectSuccess(await call(session, "open_current_workspace", {}), "open config-source race workspace");
+    const success = expectSuccess(await call(session, "git_push", raceRequest), "global-and-include config-source race push");
+    assertSafe(success, "config-source race result", [raceGoodEndpoint, raceEvilEndpoint, raceHome, raceInclude, CONFIG_PATH_SENTINEL, CONFIG_VALUE_SENTINEL, CONFIG_CREDENTIAL_SENTINEL]);
+    await close(session);
+    session = undefined;
+  });
+
+  assert.match((await readFile(raceWriterFired, "utf8")).trim(), new RegExp(`^global=[1-9][0-9]* include=[1-9][0-9]* ${CONFIG_RACE_SENTINEL}$`), "ordinary global/include writers did not fail under their native locks");
+  assert.equal(head(raceGoodRoot), raceLocalHead, "global/include race changed GOOD unexpectedly");
+  assert.equal(head(raceEvilRoot), r0, "global/include race redirected the push to EVIL");
+  assert.equal(remoteHead(raceTargetRoot, "origin"), raceLocalHead, "post-observation route did not remain on GOOD");
+  assert.equal(gitText(raceTargetRoot, ["rev-parse", `refs/remotes/origin/${BRANCH}`]), raceLocalHead, "native named-remote tracking ref was not preserved in source-set race");
+  assert.equal(await readFile(raceGlobal).catch(() => null), null, "global config writer created the protected absent target");
+  assert.equal((await readFile(raceLocalConfig)).equals(raceLocalConfigBefore), true, "source-set race changed the repository config");
+  assert.equal((await readFile(raceInclude)).equals(raceIncludeBefore), true, "active include writer changed the protected source");
+  assert.equal(refs(raceGoodRoot), `refs/heads/${BRANCH}=${raceLocalHead}`, "GOOD acquired an unrelated ref in source-set race");
+  assert.equal(refs(raceEvilRoot), `refs/heads/${BRANCH}=${r0}`, "EVIL acquired an unrelated ref in source-set race");
+  for (const lockPath of [
+    path.join(raceTargetRoot, ".git", "config.lock"),
+    `${raceGlobal}.lock`,
+    `${raceInclude}.lock`
+  ]) {
+    assert.equal(await readFile(lockPath).catch(() => null), null, "config-source lock residue remained after push");
+  }
+  console.log("RAW_OBSERVATION: with GOOD and EVIL both physically at R0, synchronized ordinary git config --global (absent target) and --file(active-include) writers recorded nonzero status; GOOD alone advanced to L1, EVIL remained R0, tracking remained L1, repository/include config stayed byte-identical, the global target stayed absent, and all three lock paths were absent.");
+  console.log("SANITY_VERDICT: MATCH — direct loopback refs, source bytes, writer statuses, tracking ref, and lock census establish the complete cooperative source-set boundary.");
+  console.log("CONFIG_SOURCE_RACE: PASS — repository, global, and active-include native config locks covered final validation, named-remote push, hook, route recheck, and post-observation; raw same-UID pathname replacement remains outside the cooperative boundary.");
   console.log("GIT_PUSH_TRANSPORT_REPAIR_SMOKE: PASS");
 } finally {
   await close(session);
