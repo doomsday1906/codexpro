@@ -52,6 +52,7 @@ export type GitPushPreflightFailureReason =
   | "invalid-endpoint"
   | "disallowed-local-or-helper-endpoint"
   | "disallowed-local-endpoint"
+  | "non-default-receive-pack"
   | "remote-absent"
   | "remote-ambiguous"
   | "remote-head-mismatch"
@@ -90,6 +91,7 @@ const FAILURE_MESSAGES: Record<GitPushPreflightFailureReason, string> = {
   "invalid-endpoint": "Git push endpoint is invalid.",
   "disallowed-local-or-helper-endpoint": "Git push local or helper endpoint is not allowed.",
   "disallowed-local-endpoint": "Git push local endpoint is not allowed.",
+  "non-default-receive-pack": "Git push configured receive-pack is not the default.",
   "remote-absent": "Git push remote branch does not exist.",
   "remote-ambiguous": "Git push remote branch observation was ambiguous.",
   "remote-head-mismatch": "Git push remote branch does not match expected_remote_head.",
@@ -124,6 +126,7 @@ export interface GitPushPreflight {
   readonly workspace_id: string;
   readonly root: string;
   readonly git_dir: string;
+  readonly config_path: string;
   readonly object_format: "sha1" | "sha256";
   readonly remote: string;
   readonly endpoint: string;
@@ -139,6 +142,7 @@ export type GitPushRemoteObservation =
   | { readonly status: "absent" | "ambiguous" | "malformed" | "execution" };
 
 const CONTROL_OR_WHITESPACE = /[\u0000-\u001f\u007f\s]/u;
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/u;
 const GLOB_TOKEN = /[*?\[\]]/u;
 const WORKSPACE_ID_PATTERN = /^ws_[0-9a-f]{24}$/u;
 const FULL_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
@@ -300,7 +304,7 @@ function parseObjectId(value: string, objectFormat: "sha1" | "sha256"): string {
 async function repositoryRoot(
   config: GitPushPreflightConfig,
   workspace: Workspace
-): Promise<{ readonly root: string; readonly gitDir: string; readonly objectFormat: "sha1" | "sha256" }> {
+): Promise<{ readonly root: string; readonly gitDir: string; readonly configPath: string; readonly objectFormat: "sha1" | "sha256" }> {
   if (!path.isAbsolute(workspace.root)) return fail("workspace");
   let root: string;
   try {
@@ -330,10 +334,21 @@ async function repositoryRoot(
   } catch {
     return fail("repository");
   }
+  const configPathText = oneLine(await runGitChecked(config, workspace, ["rev-parse", "--path-format=absolute", "--git-path", "config"]));
+  if (!path.isAbsolute(configPathText) || CONTROL_CHARACTERS.test(configPathText) || path.basename(configPathText) !== "config") {
+    return fail("repository");
+  }
+  const configPath = path.normalize(configPathText);
+  try {
+    const configStat = await fsp.stat(configPath);
+    if (!configStat.isFile()) return fail("repository");
+  } catch {
+    return fail("repository");
+  }
   const objectFormat = objectFormatFromResult(
     await runGitChecked(config, workspace, ["rev-parse", "--show-object-format=storage"])
   );
-  return { root, gitDir, objectFormat };
+  return { root, gitDir, configPath, objectFormat };
 }
 
 async function assertNoHistoryOperation(
@@ -389,16 +404,46 @@ async function assertRemoteObject(
   if (oneLine(result) !== "commit") return fail("remote-object-not-commit");
 }
 
+const DEFAULT_RECEIVE_PACK = "git-receive-pack";
+
+async function assertDefaultReceivePack(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  remote: string
+): Promise<void> {
+  const result = await runGitExitAware(config, workspace, ["config", "--null", "--get-all", `remote.${remote}.receivepack`]);
+  const output = result.copyStdoutBytes();
+  const diagnostics = result.copyStderrBytes();
+  if (result.exitCode === 1 && result.signal === null && !result.timedOut && !result.stdoutOverflow && !result.stderrOverflow && output.length === 0 && diagnostics.length === 0) {
+    return;
+  }
+  if (result.exitCode !== 0 || result.signal !== null || result.timedOut || result.stdoutOverflow || result.stderrOverflow) {
+    return fail("execution");
+  }
+  const bytes = output;
+  if (bytes.length > MAX_REMOTE_OBSERVATION_BYTES) return fail("malformed-output");
+  let text: string;
+  try {
+    text = UTF8_FATAL.decode(bytes);
+  } catch {
+    return fail("malformed-output");
+  }
+  if (!text) return fail("malformed-output");
+  if (!text.endsWith("\u0000")) return fail("malformed-output");
+  const values = text.slice(0, -1).split("\u0000");
+  if (values.length !== 1 || values[0] !== DEFAULT_RECEIVE_PACK) return fail("non-default-receive-pack");
+}
+
 export async function observeGitPushRemoteHead(
   config: GitPushPreflightConfig,
   workspace: Workspace,
-  endpoint: string,
+  remote: string,
   destinationRef: string,
   objectFormat: "sha1" | "sha256"
 ): Promise<GitPushRemoteObservation> {
   let result: GitExecutionResult;
   try {
-    result = await runGitExitAware(config, workspace, ["ls-remote", "--refs", "--heads", "--", endpoint, destinationRef]);
+    result = await runGitExitAware(config, workspace, ["ls-remote", "--refs", "--heads", "--", remote, destinationRef]);
   } catch {
     return { status: "execution" };
   }
@@ -434,12 +479,12 @@ export async function observeGitPushRemoteHead(
 async function assertRemoteHead(
   config: GitPushPreflightConfig,
   workspace: Workspace,
-  endpoint: string,
+  remote: string,
   destinationRef: string,
   objectFormat: "sha1" | "sha256",
   expectedRemoteHead: string
 ): Promise<void> {
-  const observed = await observeGitPushRemoteHead(config, workspace, endpoint, destinationRef, objectFormat);
+  const observed = await observeGitPushRemoteHead(config, workspace, remote, destinationRef, objectFormat);
   if (observed.status === "absent") return fail("remote-absent");
   if (observed.status === "ambiguous") return fail("remote-ambiguous");
   if (observed.status === "malformed") return fail("remote-malformed");
@@ -467,13 +512,13 @@ async function effectivePushEndpoint(
   const parsed = inspectGitPushEndpoint(rawEndpoint);
   if (!parsed.ok) return fail(policyFailureReason(parsed.reason), parsed.reason);
   if (parsed.identity !== expectedIdentity) return fail("effective-endpoint-not-allowlisted");
-  return rawEndpoint;
+  return parsed.identity;
 }
 
 /**
  * Re-resolve one credential-free effective push endpoint through the trusted
- * named-remote configuration. The raw endpoint is private to the mutation
- * runner; callers only use it for Git's own remote observation.
+ * named-remote configuration. Callers receive only its policy identity; the
+ * raw endpoint is never reused as a Git repository argument.
  */
 export async function resolveGitPushMutationEndpoint(
   config: GitPushPreflightConfig,
@@ -522,20 +567,22 @@ export async function preflightGitPush(
   const policy = evaluateGitPushPolicy(repository.root, config.gitPushPolicy, request.remote, request.branch);
   if (!policy.allowed) return fail(policyFailureReason(policy.reason), policy.reason);
   if (!policy.endpoint) return fail("invalid-policy", "missing-effective-endpoint");
-  const endpoint = await effectivePushEndpoint(config, workspace, request.remote, policy.endpoint);
+  await effectivePushEndpoint(config, workspace, request.remote, policy.endpoint);
 
   await assertRemoteObject(config, workspace, request.expected_remote_head);
   const ancestry = await runGitExitAware(config, workspace, ["merge-base", "--is-ancestor", request.expected_remote_head, request.expected_local_head]);
   if (ancestry.exitCode === 1 && ancestry.signal === null && !ancestry.timedOut) return fail("non-fast-forward");
   if (ancestry.exitCode !== 0 || ancestry.signal !== null || ancestry.timedOut) return fail("execution");
 
-  await assertRemoteHead(config, workspace, endpoint, branchRef, repository.objectFormat, request.expected_remote_head);
+  await assertDefaultReceivePack(config, workspace, request.remote);
+  await assertRemoteHead(config, workspace, request.remote, branchRef, repository.objectFormat, request.expected_remote_head);
 
   return Object.freeze({
     schema_version: 1 as const,
     workspace_id: request.workspace_id,
     root: repository.root,
     git_dir: repository.gitDir,
+    config_path: repository.configPath,
     object_format: repository.objectFormat,
     remote: request.remote,
     endpoint: policy.endpoint,
@@ -550,15 +597,15 @@ export async function preflightGitPush(
 /**
  * Re-run the complete immutable preflight immediately before mutation. This
  * closes the mutable local/policy/remote observation window without changing
- * the accepted one-shot CAS contract. A final endpoint resolution follows so
- * the push uses the exact authorized named-remote identity observed at the
- * mutation boundary.
+ * the accepted one-shot CAS contract. A final endpoint identity resolution
+ * binds the named-remote push route to the authorized policy identity; the
+ * caller never receives or reuses the raw endpoint string.
  */
 export async function revalidateGitPushPreflight(
   config: GitPushPreflightConfig,
   workspace: Workspace,
   initial: GitPushPreflight
-): Promise<{ readonly preflight: GitPushPreflight; readonly endpoint: string }> {
+): Promise<{ readonly preflight: GitPushPreflight }> {
   const refreshed = await preflightGitPush(config, workspace, {
     workspace_id: initial.workspace_id,
     remote: initial.remote,
@@ -567,6 +614,7 @@ export async function revalidateGitPushPreflight(
     expected_remote_head: initial.expected_remote_head
   });
   if (refreshed.endpoint !== initial.endpoint) return fail("effective-endpoint-not-allowlisted");
-  const endpoint = await resolveGitPushMutationEndpoint(config, workspace, refreshed.remote, refreshed.endpoint);
-  return Object.freeze({ preflight: refreshed, endpoint });
+  const endpointIdentity = await resolveGitPushMutationEndpoint(config, workspace, refreshed.remote, refreshed.endpoint);
+  if (endpointIdentity !== refreshed.endpoint || endpointIdentity !== initial.endpoint) return fail("effective-endpoint-not-allowlisted");
+  return Object.freeze({ preflight: refreshed });
 }

@@ -97,6 +97,7 @@
     "git-push-task004:smoke": "npm run build && node scripts/git-push-task004-smoke.mjs",
     "git-push-task005:smoke": "npm run build && node scripts/git-push-task005-smoke.mjs",
     "git-push-task004:failure-probe": "npm run build && node scripts/git-push-task004-failure-probe.mjs",
+    "git-push-transport-repair:smoke": "npm run build && node scripts/git-push-transport-repair-smoke.mjs",
     "git-commit:smoke": "npm run build && node scripts/git-commit-smoke.mjs && node scripts/git-commit-task004-smoke.mjs && node scripts/git-commit-mcp-smoke.mjs && node scripts/git-commit-task006-smoke.mjs",
     "git-commit-task006:smoke": "npm run build && node scripts/git-commit-task006-smoke.mjs",
     "git-commit-mcp:smoke": "npm run build && node scripts/git-commit-mcp-smoke.mjs",

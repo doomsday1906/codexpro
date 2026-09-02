@@ -192,6 +192,7 @@ async function main() {
       workspace_id: workspace.id,
       root: workRoot,
       git_dir: path.join(workRoot, ".git"),
+      config_path: path.join(workRoot, ".git", "config"),
       object_format: "sha1",
       remote: "origin",
       endpoint,
