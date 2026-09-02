@@ -249,6 +249,7 @@ try {
   const ambientFailures = [];
   for (const [label, poison] of poisonCases) {
     const resolved = await withEnvironment(poison, () => resolveEffectivePushEndpoint(fixture, "origin"));
+    console.log(`PLAIN_POLICY_FACT: repaired resolver returned ${resolved.ok ? resolved.identity : resolved.reason ?? "<no endpoint>"}`);
     if (!resolved.ok || resolved.identity !== safeIdentity) {
       ambientFailures.push({ label, resolved });
       continue;
