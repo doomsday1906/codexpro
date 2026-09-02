@@ -9,7 +9,7 @@ import { getCachedWorkspaceAnalysis, invalidateWorkspaceAnalysis, setCachedWorks
 import { extractWorkspaceFiles } from "./extract.js";
 import { buildRelationshipsWithCoverage } from "./graph.js";
 import { inventoryWorkspace } from "./inventory.js";
-import { classifySearchIntent, emptySearchGroups, groupForFile, sortStructuredMatches } from "./rank.js";
+import { classifyDefinitionMatch, classifySearchIntent, emptySearchGroups, groupForFile, sortStructuredMatches } from "./rank.js";
 import type { AnalysisSearchIntent, StructuredSearchMatch, StructuredSearchResult, WorkspaceAnalysis } from "./types.js";
 
 const REDACTED_SEARCH_CONTEXT = "[REDACTED_SECRET]";
@@ -73,19 +73,31 @@ function mergeEvidenceMatches(a: StructuredSearchMatch, b: StructuredSearchMatch
 class StructuredEvidenceAccumulator {
   private readonly byIdentity = new Map<string, StructuredSearchMatch>();
   private readonly logicalKeys = new Set<string>();
+  private readonly testLogicalKeys = new Set<string>();
+  private readonly sourceLogicalKeys = new Set<string>();
 
   /**
    * Admit one producer record while counting only the logical identity that
    * survives finalization. Repeated non-definition lines in one file/group
    * therefore do not exhaust the candidate window before later evidence can
    * be considered; distinct definitions remain line-addressable.
+   * Tests are tracked independently from source candidates so include_tests=true
+   * cannot starve source references.
    */
-  add(match: StructuredSearchMatch, candidateLimit?: number): boolean {
+  add(match: StructuredSearchMatch, candidateLimit?: number, testCandidateLimit?: number): boolean {
+    const isTest = match.group === "tests";
     const logicalKey = match.group === "definitions"
       ? structuredEvidenceKey(match)
       : occurrenceGroupKey(match);
     if (!this.logicalKeys.has(logicalKey)) {
-      if (candidateLimit !== undefined && this.logicalKeys.size >= candidateLimit) return false;
+      if (isTest) {
+        const limit = testCandidateLimit ?? candidateLimit;
+        if (limit !== undefined && this.testLogicalKeys.size >= limit) return false;
+        this.testLogicalKeys.add(logicalKey);
+      } else {
+        if (candidateLimit !== undefined && this.sourceLogicalKeys.size >= candidateLimit) return false;
+        this.sourceLogicalKeys.add(logicalKey);
+      }
       this.logicalKeys.add(logicalKey);
     }
     const key = structuredEvidenceKey(match);
@@ -213,16 +225,22 @@ export async function searchWorkspaceStructured(
   const query = options.query.trim();
   if (!query) throw new Error("query is required.");
   const analysis = await inspectWorkspace(config, guard, workspace);
-  const intent = classifySearchIntent(query, options.intent ?? "auto", options.regex);
-  const groups = emptySearchGroups();
   const lowered = query.toLowerCase();
+  const includePath = (filePath: string) => options.includeHidden === true || !isHiddenRelativePath(filePath);
+  const hasSymbolEvidence = analysis.symbols.some((symbol) => {
+    if (!includePath(symbol.path)) return false;
+    const nameLower = symbol.name.toLowerCase();
+    return symbol.name === query || nameLower === lowered || symbol.name.startsWith(query) || nameLower.startsWith(lowered);
+  });
+  const intent = classifySearchIntent(query, options.intent ?? "auto", options.regex, hasSymbolEvidence);
+  const groups = emptySearchGroups();
   const accumulator = new StructuredEvidenceAccumulator();
   const warnings = [...analysis.warnings];
   const resultLimit = Math.max(1, Math.min(options.maxResults ?? config.maxSearchResults, config.maxSearchResults));
   const candidateLimit = Math.max(resultLimit, Math.min(resultLimit * 4, 20_000));
+  const testCandidateLimit = candidateLimit;
   const resolvedRoot = options.root?.trim() ? guard.resolve(workspace, options.root).relPath.replace(/^\.\/?$/, "") : "";
   const inScope = (filePath: string) => !resolvedRoot || filePath === resolvedRoot || filePath.startsWith(`${resolvedRoot}/`);
-  const includePath = (filePath: string) => options.includeHidden === true || !isHiddenRelativePath(filePath);
   if (resolvedRoot && options.includeHidden !== true && isHiddenRelativePath(resolvedRoot)) {
     return {
       schemaVersion: 2,
@@ -235,11 +253,13 @@ export async function searchWorkspaceStructured(
       cache: analysis.cache
     };
   }
-  const definitionsByPath = new Map<string, Map<number, WorkspaceAnalysis["symbols"][number]>>();
+  const definitionsByPath = new Map<string, Map<number, WorkspaceAnalysis["symbols"][number][]>>();
   for (const symbol of analysis.symbols) {
     if (!includePath(symbol.path)) continue;
-    const byLine = definitionsByPath.get(symbol.path) ?? new Map<number, WorkspaceAnalysis["symbols"][number]>();
-    byLine.set(symbol.line, symbol);
+    const byLine = definitionsByPath.get(symbol.path) ?? new Map<number, WorkspaceAnalysis["symbols"][number][]>();
+    const list = byLine.get(symbol.line) ?? [];
+    list.push(symbol);
+    byLine.set(symbol.line, list);
     definitionsByPath.set(symbol.path, byLine);
   }
   if (options.regex) {
@@ -259,12 +279,20 @@ export async function searchWorkspaceStructured(
   let scannedBytes = 0;
   let searchBudgetReached = false;
   let candidateLimitReached = false;
+  let sourceCandidateLimitReached = false;
+  let testCandidateLimitReached = false;
   let skippedFiles = 0;
 
   scan:
   for (const file of analysis.files) {
-    if (!includePath(file.path) || file.generated || (!options.includeTests && file.role === "test")) continue;
+    if (!includePath(file.path) || file.generated) continue;
+    if (!options.includeTests && file.role === "test") continue;
     if (!inScope(file.path) && !(options.includeTests && file.role === "test")) continue;
+    if (file.role === "test" && testCandidateLimitReached) continue;
+    if (file.role !== "test" && sourceCandidateLimitReached) {
+      if (!options.includeTests || testCandidateLimitReached) break scan;
+      continue;
+    }
     if (scannedFiles >= config.analysisLimits.maxAnalyzedFiles || scannedBytes + file.bytes > config.analysisLimits.maxScannedBytes) {
       searchBudgetReached = true;
       break;
@@ -302,23 +330,56 @@ export async function searchWorkspaceStructured(
           language: sourceLanguageForPath(file.path)
         }).split(/\r?\n/);
       }
-      const symbol = definitions.get(index + 1);
-      const isDefinition = Boolean(symbol && symbol.name.toLowerCase() === lowered);
-      const group = groupForFile(analysis, file.path, isDefinition);
-      const reasons = isDefinition ? ["exact text match", "symbol definition"] : file.role === "test" ? ["exact text match", "related test"] : ["exact text match"];
+      const lineSymbols = definitions.get(index + 1);
+      let bestDefTier: ReturnType<typeof classifyDefinitionMatch> = null;
+      if (lineSymbols) {
+        for (const sym of lineSymbols) {
+          const tier = classifyDefinitionMatch(sym, query);
+          if (tier && (!bestDefTier || tier.score > bestDefTier.score)) {
+            bestDefTier = tier;
+          }
+        }
+      }
+      const isDefinition = bestDefTier !== null;
+      const group = groupForFile(analysis, file.path, isDefinition, file.role);
+      const reasons = bestDefTier
+        ? bestDefTier.nameTier === 0
+          ? ["exact text match", "symbol definition", "exact symbol match"]
+          : ["exact text match", "symbol definition"]
+        : file.role === "test"
+          ? ["exact text match", "related test"]
+          : ["exact text match"];
+      const score = bestDefTier
+        ? bestDefTier.score
+        : file.role === "source"
+          ? 150
+          : file.role === "test"
+            ? 130
+            : file.role === "config"
+              ? 110
+              : file.role === "docs"
+                ? 100
+                : 90;
       const admitted = accumulator.add({
         path: file.path,
         line: index + 1,
         text: (redactedLines?.[index] ?? REDACTED_SEARCH_CONTEXT).trim().slice(0, 400),
         group,
-        score: isDefinition ? 190 : file.role === "test" ? 160 : 100,
+        score,
         reasons,
         confidence: isDefinition ? "strong" : "exact",
         source: "built-in analysis"
-      }, candidateLimit);
+      }, candidateLimit, testCandidateLimit);
       if (!admitted) {
-        candidateLimitReached = true;
-        break scan;
+        if (group === "tests") {
+          testCandidateLimitReached = true;
+        } else {
+          sourceCandidateLimitReached = true;
+        }
+        if (sourceCandidateLimitReached && (!options.includeTests || testCandidateLimitReached)) {
+          candidateLimitReached = true;
+          break scan;
+        }
       }
     }
   }
@@ -329,7 +390,7 @@ export async function searchWorkspaceStructured(
   if (intent === "references" || intent === "impact") {
     const definitionPaths = new Set(
       analysis.symbols
-        .filter((symbol) => includePath(symbol.path) && symbol.name.toLowerCase() === lowered)
+        .filter((symbol) => includePath(symbol.path) && classifyDefinitionMatch(symbol, query) !== null)
         .map((symbol) => symbol.path)
     );
     for (const relationship of analysis.relationships) {
@@ -338,21 +399,28 @@ export async function searchWorkspaceStructured(
       const group = relationship.kind === "tests" ? "tests" : "references";
       if (group === "tests" && !options.includeTests) continue;
       const reason = relationship.kind === "tests" ? "dependent test" : "dependent module";
+      const score = relationship.kind === "tests" ? 140 : 165;
       const admitted = accumulator.add({
         path: relationship.from,
         line: 1,
         text: `${relationship.kind} ${relationship.to}`,
         group,
-        score: relationship.kind === "tests" ? 170 : 165,
+        score,
         reasons: [reason, `${relationship.kind} relationship`],
         confidence: "strong",
         source: relationship.source
-      }, candidateLimit);
-      if (!admitted) candidateLimitReached = true;
+      }, candidateLimit, testCandidateLimit);
+      if (!admitted) {
+        if (group === "tests") testCandidateLimitReached = true;
+        else sourceCandidateLimitReached = true;
+        candidateLimitReached = true;
+      }
     }
   }
 
-  if (candidateLimitReached) warnings.push(`Grouped search retained the first ${candidateLimit} candidates (after logical deduplication) before ranking.`);
+  if (candidateLimitReached || sourceCandidateLimitReached || testCandidateLimitReached) {
+    warnings.push(`Grouped search retained the first ${candidateLimit} candidates (after logical deduplication) before ranking.`);
+  }
 
   const matches = accumulator.finalize();
   for (const match of sortStructuredMatches(matches).slice(0, resultLimit)) groups[match.group].push(match);
