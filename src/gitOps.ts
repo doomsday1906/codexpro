@@ -125,6 +125,8 @@ interface GitMutationOptions {
    * transaction. This is deliberately not a general environment override.
    */
   readonly indexFile?: string;
+  /** Clear repository push.pushOption values for the fixed push mutation. */
+  readonly clearPushOptions?: boolean;
 }
 
 function gitReviewerEnvironment(overrides?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -318,9 +320,10 @@ export async function runGitReadOnly(
  * Execute one bounded local Git operation for the mutation substrate.
  *
  * Unlike the reviewer runner above, this deliberately leaves Git's normal
- * system/global/local configuration hierarchy enabled. The caller cannot
- * supply environment or global-option overrides; every inherited GIT_* value
- * is removed before the fixed direct-argv invocation starts.
+ * system/global/local configuration hierarchy enabled. Trusted internal
+ * callers may select the fixed mutation controls below; user data never
+ * reaches those options. Every inherited GIT_* value is removed before the
+ * direct-argv invocation starts.
  */
 export async function runGitMutation(
   config: Pick<CodexProConfig, "maxGitTimeoutMs" | "maxOutputBytes">,
@@ -366,7 +369,8 @@ export async function runGitMutation(
     "--no-pager",
     ...(options?.literalPathspecs === false ? [] : ["--literal-pathspecs"]),
     "-c",
-    "color.ui=false"
+    "color.ui=false",
+    ...(options?.clearPushOptions ? ["-c", "push.pushOption="] : [])
   ] as const;
   return new Promise((resolve, reject) => {
     const child = spawn("git", [...globalArgs, ...args], {

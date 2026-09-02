@@ -366,7 +366,7 @@ try {
   const directHead = gitText(targetRoot, ["rev-parse", "--verify", "HEAD^{commit}"]);
   const ancestry = spawnSync("git", ["merge-base", "--is-ancestor", initialHead, localHead], { cwd: targetRoot, env: cleanGitEnvironment() });
   console.log(`AUTHORITY: MISSION_PLAN.md TASK-003/AP-005/AP-006 and MISSION_ANCHOR.md A002 sections 1-16.`);
-  console.log(`TARGET_PRODUCER_ROUTE: real MCP HTTP server -> explicit workspace_id -> preflightGitPush -> ordinary Git ls-remote -> loopback git daemon; target=${targetCanonical}.`);
+  console.log(`TARGET_PRODUCER_ROUTE: real MCP HTTP server -> explicit workspace_id -> gitPush -> bounded named-remote mutation attempt -> ordinary Git ls-remote -> read-only loopback git daemon; target=${targetCanonical}.`);
   console.log(`TARGET_EVIDENCE: tools/list/tools/call envelopes plus direct target/ambient refs, branch/tracking config, worktree/index bytes, and bare-remote refs/config.`);
   console.log(`RAW_OBSERVATION: target path contains spaces; attached branch=${directBranch}; local HEAD=${directHead}; ordinary ls-remote=${directRemote}; merge-base ancestor exit=${ancestry.status}; ambient HEAD=${ambientHead}.`);
   assert.equal(directBranch, `refs/heads/${BRANCH}`);
@@ -473,14 +473,14 @@ try {
 
     const uppercaseValid = { ...request, expected_local_head: localHead.toUpperCase(), expected_remote_head: initialHead.toUpperCase() };
     const validBefore = await snapshot(targetRoot, remoteRoot, hookFired, knownFiles);
-    const valid = expectError(await call(sessionB, "git_push", uppercaseValid), "fully valid uppercase full-SHA preflight");
-    assert.match(text(valid), /^CodexProError: Git push mutation is not yet available\.$/u);
-    assertSafe(valid, "valid preflight");
+    const valid = expectError(await call(sessionB, "git_push", uppercaseValid), "fully valid uppercase full-SHA mutation attempt");
+    assert.match(text(valid), /Git push mutation failed|remote branch was not confirmed|pre-push/iu);
+    assertSafe(valid, "valid mutation attempt");
     assert.deepEqual(await snapshot(targetRoot, remoteRoot, hookFired, knownFiles), validBefore);
-    assert.equal(await readFile(hookFired).catch(() => null), null, "pre-push hook ran before TASK-004");
-    const validAgain = expectError(await call(sessionB, "git_push", uppercaseValid), "repeated fully valid preflight");
-    assert.equal(text(validAgain), text(valid), "valid preflight error was not constant");
-    assertSafe(validAgain, "repeated valid preflight");
+    assert.equal(await readFile(hookFired).catch(() => null), null, "read-only loopback transport reached the pre-push hook unexpectedly");
+    const validAgain = expectError(await call(sessionB, "git_push", uppercaseValid), "repeated fully valid mutation attempt");
+    assert.match(text(validAgain), /Git push mutation failed|remote branch was not confirmed|pre-push/iu);
+    assertSafe(validAgain, "repeated mutation attempt");
     assert.deepEqual(await snapshot(targetRoot, remoteRoot, hookFired, knownFiles), validBefore);
 
     const blob = gitText(targetRoot, ["hash-object", "-w", "--stdin"], { input: "not a commit\n" });
@@ -529,10 +529,10 @@ try {
 
     const finalTarget = await snapshot(targetRoot, remoteRoot, hookFired, knownFiles);
     const finalAmbient = await snapshot(defaultRoot, remoteRoot, hookFired, ["ambient.txt"]);
-    assert.deepEqual(finalTarget, before, "integrated preflight calls changed target state");
-    assert.deepEqual(finalAmbient, ambientBefore, "integrated preflight calls changed ambient selected repository");
-    console.log("RAW_OBSERVATION: fresh explicit-ID session calls, wrapper/missing/unknown/hostile/stale inputs, uppercase full-SHA valid preflight, object/ancestry failures, endpoint substitutions/forms, and absent remote branch left target, ambient, index, tracking/config, hook, and remote refs byte-identical.");
-    console.log("SANITY_VERDICT: MATCH — direct before/after physical evidence agrees with the accepted nonmutation and bounded-preflight outcome.");
+    assert.deepEqual(finalTarget, before, "integrated preflight and mutation-failure calls changed target state");
+    assert.deepEqual(finalAmbient, ambientBefore, "integrated preflight and mutation-failure calls changed ambient selected repository");
+    console.log("RAW_OBSERVATION: fresh explicit-ID session calls, wrapper/missing/unknown/hostile/stale inputs, uppercase full-SHA mutation attempts, object/ancestry failures, endpoint substitutions/forms, and absent remote branch left target, ambient, index, tracking/config, worktree, hook, and remote refs byte-identical.");
+    console.log("SANITY_VERDICT: MATCH — direct before/after physical evidence agrees with the accepted preflight boundaries and bounded mutation-failure outcome.");
     console.log("PREDICATE: TRUE — independent branch/head/object/ancestry/policy/ordinary ls-remote facts preceded every effect judgment; poisoned GIT_* did not redirect the target.");
     await close(sessionB);
     sessionB = undefined;

@@ -336,7 +336,7 @@ try {
   assert.equal(initialHead.length, 40);
   assert.equal(localHead.length, 40);
   console.log("AUTHORITY: MISSION_PLAN.md TASK-003/AP-005/AP-006, MISSION_ANCHOR.md A002, and launcher public contract sections 13-15.");
-  console.log(`TARGET_PRODUCER_ROUTE: real MCP HTTP server -> WorkspaceManager explicit workspace_id -> preflightGitPush -> loopback git daemon; target=${targetCanonical}; ambient=${defaultCanonical}.`);
+  console.log(`TARGET_PRODUCER_ROUTE: real MCP HTTP server -> WorkspaceManager explicit workspace_id -> gitPush -> bounded named-remote mutation attempt -> read-only loopback git daemon; target=${targetCanonical}; ambient=${defaultCanonical}.`);
   console.log("TARGET_EVIDENCE: complete tools/list/tools/call envelopes plus direct local/remote refs, config, index, worktree, and hook sentinel snapshots.");
   console.log(`RAW_OBSERVATION: target local HEAD=${localHead} descends from remote main=${initialHead}; target has staged and untracked bytes; ambient HEAD=${defaultHead}.`);
   console.log("SANITY_VERDICT: MATCH — direct fixture refs and bytes establish the requested target and untouched ambient repository before public calls.");
@@ -409,16 +409,16 @@ try {
     assert.match(text(ambientAttempt), /workspace_id/iu, "ambient fallback did not fail at explicit identity boundary");
     assertNoSecrets(ambientAttempt, "ambient fallback");
 
-    const valid = expectError(await call(sessionB, "git_push", request), "fully valid preflight stub");
-    assert.match(text(valid), /Git push mutation is not yet available\./u, "valid preflight did not reach the constant mutation-unavailable error");
-    assertNoSecrets(valid, "valid preflight stub");
+    const valid = expectError(await call(sessionB, "git_push", request), "fully valid hook rejection");
+    assert.match(text(valid), /Git push mutation failed|remote branch was not confirmed|pre-push/iu, "valid push did not report the bounded hook/mutation failure");
+    assertNoSecrets(valid, "fully valid hook rejection");
     const targetAfter = await snapshot(targetRoot, remoteRoot, path.join(fixture, "hook-fired"));
     const defaultAfter = await snapshot(defaultRoot, remoteRoot, path.join(fixture, "hook-fired"));
-    assert.deepEqual(targetAfter, targetBefore, "fully valid TASK-003 checkpoint mutated target local or remote state");
-    assert.deepEqual(defaultAfter, defaultBefore, "fully valid TASK-003 checkpoint mutated ambient default state");
-    assert.equal(await readFile(path.join(fixture, "hook-fired")).catch(() => null), null, "pre-push hook ran before TASK-004");
-    console.log("RAW_OBSERVATION: direct target/ambient snapshots remained byte-identical after wrapper, missing/unknown/ambient, hostile, stale, and fully valid calls; hook sentinel is absent and remote main remains at the expected SHA.");
-    console.log("SANITY_VERDICT: MATCH — valid preflight reaches only the bounded mutation-unavailable error and performs no push or hook invocation.");
+    assert.deepEqual(targetAfter, targetBefore, "fully valid mutation failure changed target local or remote state");
+    assert.deepEqual(defaultAfter, defaultBefore, "fully valid mutation failure changed ambient default state");
+    assert.equal(await readFile(path.join(fixture, "hook-fired")).catch(() => null), null, "read-only loopback transport reached the pre-push hook unexpectedly");
+    console.log("RAW_OBSERVATION: direct target/ambient snapshots remained byte-identical after wrapper, missing/unknown/ambient, hostile, stale, and fully valid mutation attempts; the read-only loopback daemon left remote main and the hook sentinel absent.");
+    console.log("SANITY_VERDICT: MATCH — valid preflight reaches the bounded mutation failure with no local/remote mutation in this TASK-003 read-only transport fixture.");
     console.log("PREDICATE: TRUE — direct before/after refs/config/index/worktree/remote snapshots establish nonmutation independently of the error classification.");
     await close(sessionB);
     sessionB = undefined;
@@ -453,7 +453,7 @@ try {
   }
 
   console.log("PASS AP-005: exact five-field direct git_push is exposed once only in full+workspace-write+enabled-policy, with strict schema, truthful remote-write annotations, and wrapper exclusion.");
-  console.log("PASS AP-006: explicit workspace identity, preflight rejection boundaries, fully valid mutation-unavailable stub, loopback remote observation, and local/remote nonmutation are proven.");
+  console.log("PASS AP-006: explicit workspace identity, preflight rejection boundaries, fully valid bounded mutation failure, loopback remote observation, and local/remote nonmutation are proven.");
   console.log("GIT_PUSH_MCP_SMOKE: PASS (TASK-003 AP-005/AP-006 focused public-surface proof).");
 } finally {
   await close(sessionA);

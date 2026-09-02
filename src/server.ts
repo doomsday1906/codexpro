@@ -24,7 +24,7 @@ import { gitDiffRange } from "./gitDiffRange.js";
 import { gitLogStructured, gitMergeBase, gitResolveRef, gitShowCommit } from "./gitHistoryOps.js";
 import { readAtRef } from "./gitHistoricalBlob.js";
 import { GIT_COMMIT_MAX_MESSAGE_BYTES, GIT_COMMIT_MAX_PATH_BYTES, GIT_COMMIT_MAX_PATHS, gitCommit } from "./gitCommit.js";
-import { preflightGitPush } from "./gitPushPreflight.js";
+import { gitPush } from "./gitPush.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
@@ -2155,7 +2155,6 @@ const SESSION_READ_ANNOTATIONS = { readOnlyHint: true, openWorldHint: false, des
 const LOCAL_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false };
 const GIT_COMMIT_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false };
 const GIT_PUSH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
-const GIT_PUSH_MUTATION_UNAVAILABLE_MESSAGE = "Git push mutation is not yet available.";
 const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
 const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 
@@ -3725,19 +3724,32 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     "git_push",
     {
       title: "Git Push",
-      description: "Validate one explicit workspace, exact local and remote heads, configured remote endpoint, branch policy, and fast-forward ancestry before a bounded remote push. Available only in full tool mode with CODEXPRO_WRITE_MODE=workspace and an enabled exact Git push policy. The TASK-003 public checkpoint performs preflight only; remote mutation is not yet available.",
+      description: "Perform one bounded fast-forward remote push for an existing allowlisted branch after exact local/remote preflight and mutation-time compare-and-swap validation. Available only in full tool mode with CODEXPRO_WRITE_MODE=workspace and an enabled exact Git push policy. The endpoint, lease, refspec, and push options are internally controlled; Git authentication and synchronous pre-push hooks remain Git-owned.",
       inputSchema: GIT_PUSH_PUBLIC_SCHEMA,
       runtimeInputSchema: GIT_PUSH_ARGUMENTS_SCHEMA,
       annotations: GIT_PUSH_ANNOTATIONS,
       _meta: {
-        "openai/toolInvocation/invoking": "Validating Git push preconditions...",
-        "openai/toolInvocation/invoked": "Git push preconditions checked"
+        "openai/toolInvocation/invoking": "Preparing one bounded Git push...",
+        "openai/toolInvocation/invoked": "Git push completed"
       }
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
-      await preflightGitPush(config, workspace, args);
-      throw new CodexProError(GIT_PUSH_MUTATION_UNAVAILABLE_MESSAGE);
+      const result = await gitPush(config, workspace, args);
+      const text = [
+        "# Git Push",
+        "",
+        `Workspace: ${result.root}`,
+        `Remote: ${result.remote}`,
+        `Branch: ${result.branch}`,
+        `Destination: ${result.destination_ref}`,
+        `Source HEAD: ${result.source_head}`,
+        `Expected remote HEAD: ${result.expected_remote_head}`,
+        `Remote HEAD: ${result.remote_head}`,
+        `Push attempts: ${result.push_attempts}`,
+        "Status: pushed"
+      ].join("\n");
+      return textResult(text, { ...result });
     }
   );
 

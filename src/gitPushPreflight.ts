@@ -134,6 +134,10 @@ export interface GitPushPreflight {
   readonly expected_remote_head: string;
 }
 
+export type GitPushRemoteObservation =
+  | { readonly status: "head"; readonly head: string }
+  | { readonly status: "absent" | "ambiguous" | "malformed" | "execution" };
+
 const CONTROL_OR_WHITESPACE = /[\u0000-\u001f\u007f\s]/u;
 const GLOB_TOKEN = /[*?\[\]]/u;
 const WORKSPACE_ID_PATTERN = /^ws_[0-9a-f]{24}$/u;
@@ -385,6 +389,48 @@ async function assertRemoteObject(
   if (oneLine(result) !== "commit") return fail("remote-object-not-commit");
 }
 
+export async function observeGitPushRemoteHead(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  endpoint: string,
+  destinationRef: string,
+  objectFormat: "sha1" | "sha256"
+): Promise<GitPushRemoteObservation> {
+  let result: GitExecutionResult;
+  try {
+    result = await runGitExitAware(config, workspace, ["ls-remote", "--refs", "--heads", "--", endpoint, destinationRef]);
+  } catch {
+    return { status: "execution" };
+  }
+  if (result.exitCode !== 0 || result.signal !== null || result.timedOut || result.stdoutOverflow || result.stderrOverflow) {
+    return { status: "execution" };
+  }
+  const bytes = result.copyStdoutBytes();
+  if (bytes.length > MAX_REMOTE_OBSERVATION_BYTES) return { status: "ambiguous" };
+  let text: string;
+  try {
+    text = decodeUtf8(result);
+  } catch {
+    return { status: "malformed" };
+  }
+  if (text.length === 0) return { status: "absent" };
+  if (!text.endsWith("\n")) return { status: "malformed" };
+  const body = text.slice(0, -1);
+  if (!body) return { status: "absent" };
+  const lines = body.split("\n");
+  if (lines.length !== 1) return { status: "ambiguous" };
+  const separator = lines[0].indexOf("\t");
+  if (separator <= 0 || lines[0].indexOf("\t", separator + 1) >= 0) return { status: "malformed" };
+  let head: string;
+  try {
+    head = parseObjectId(lines[0].slice(0, separator), objectFormat);
+  } catch {
+    return { status: "malformed" };
+  }
+  if (lines[0].slice(separator + 1) !== destinationRef) return { status: "malformed" };
+  return { status: "head", head };
+}
+
 async function assertRemoteHead(
   config: GitPushPreflightConfig,
   workspace: Workspace,
@@ -393,21 +439,13 @@ async function assertRemoteHead(
   objectFormat: "sha1" | "sha256",
   expectedRemoteHead: string
 ): Promise<void> {
-  const result = await runGitChecked(config, workspace, ["ls-remote", "--refs", "--heads", "--", endpoint, destinationRef]);
-  const bytes = result.copyStdoutBytes();
-  if (bytes.length > MAX_REMOTE_OBSERVATION_BYTES) return fail("remote-ambiguous");
-  const text = decodeUtf8(result);
-  if (text.length === 0) return fail("remote-absent");
-  if (!text.endsWith("\n")) return fail("remote-malformed");
-  const body = text.slice(0, -1);
-  if (!body) return fail("remote-absent");
-  const lines = body.split("\n");
-  if (lines.length !== 1) return fail("remote-ambiguous");
-  const separator = lines[0].indexOf("\t");
-  if (separator <= 0 || lines[0].indexOf("\t", separator + 1) >= 0) return fail("remote-malformed");
-  const head = parseObjectId(lines[0].slice(0, separator), objectFormat);
-  if (lines[0].slice(separator + 1) !== destinationRef) return fail("remote-malformed");
-  if (head !== expectedRemoteHead) return fail("remote-head-mismatch");
+  const observed = await observeGitPushRemoteHead(config, workspace, endpoint, destinationRef, objectFormat);
+  if (observed.status === "absent") return fail("remote-absent");
+  if (observed.status === "ambiguous") return fail("remote-ambiguous");
+  if (observed.status === "malformed") return fail("remote-malformed");
+  if (observed.status === "execution") return fail("execution");
+  if (observed.status !== "head") return fail("execution");
+  if (observed.head !== expectedRemoteHead) return fail("remote-head-mismatch");
 }
 
 async function effectivePushEndpoint(
@@ -430,6 +468,20 @@ async function effectivePushEndpoint(
   if (!parsed.ok) return fail(policyFailureReason(parsed.reason), parsed.reason);
   if (parsed.identity !== expectedIdentity) return fail("effective-endpoint-not-allowlisted");
   return rawEndpoint;
+}
+
+/**
+ * Re-resolve one credential-free effective push endpoint through the trusted
+ * named-remote configuration. The raw endpoint is private to the mutation
+ * runner; callers only use it for Git's own remote observation.
+ */
+export async function resolveGitPushMutationEndpoint(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  remote: string,
+  authorizedIdentity: string
+): Promise<string> {
+  return effectivePushEndpoint(config, workspace, remote, authorizedIdentity);
 }
 
 /**
@@ -493,4 +545,28 @@ export async function preflightGitPush(
     expected_local_head: request.expected_local_head,
     expected_remote_head: request.expected_remote_head
   });
+}
+
+/**
+ * Re-run the complete immutable preflight immediately before mutation. This
+ * closes the mutable local/policy/remote observation window without changing
+ * the accepted one-shot CAS contract. A final endpoint resolution follows so
+ * the push uses the exact authorized named-remote identity observed at the
+ * mutation boundary.
+ */
+export async function revalidateGitPushPreflight(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  initial: GitPushPreflight
+): Promise<{ readonly preflight: GitPushPreflight; readonly endpoint: string }> {
+  const refreshed = await preflightGitPush(config, workspace, {
+    workspace_id: initial.workspace_id,
+    remote: initial.remote,
+    branch: initial.branch,
+    expected_local_head: initial.expected_local_head,
+    expected_remote_head: initial.expected_remote_head
+  });
+  if (refreshed.endpoint !== initial.endpoint) return fail("effective-endpoint-not-allowlisted");
+  const endpoint = await resolveGitPushMutationEndpoint(config, workspace, refreshed.remote, refreshed.endpoint);
+  return Object.freeze({ preflight: refreshed, endpoint });
 }
