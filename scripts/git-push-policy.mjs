@@ -260,6 +260,31 @@ function safeRemoteForGit(value) {
   }
 }
 
+function sealedGitEnvironment() {
+  // Match the existing Git mutation runner's trust boundary: preserve the
+  // ordinary process environment (including auth sockets), but never inherit
+  // Git's caller-controlled routing/config/object/ref/replacement/prompt or
+  // trace variables. Leaving the config-path variables unset preserves the
+  // trusted system/global/local Git config hierarchy and its url rewrite
+  // rules. Fixed values prevent this read-only query from prompting, paging,
+  // lazily fetching, replacing objects, or taking incidental locks.
+  const environment = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!/^GIT_/iu.test(key) && value !== undefined) environment[key] = value;
+  }
+  Object.assign(environment, {
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_NO_LAZY_FETCH: "1",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_PAGER: "cat",
+    NO_COLOR: "1",
+    LC_ALL: "C",
+    LANG: "C"
+  });
+  return environment;
+}
+
 export function resolveEffectivePushEndpoint(repoRoot, remote, options = {}) {
   const safeRemote = safeRemoteForGit(remote);
   if (!safeRemote || typeof repoRoot !== "string" || !repoRoot) {
@@ -269,8 +294,21 @@ export function resolveEffectivePushEndpoint(repoRoot, remote, options = {}) {
   const timeout = Number.isInteger(options.timeoutMs) ? Math.max(1_000, Math.min(options.timeoutMs, 300_000)) : 60_000;
   let result;
   try {
-    result = spawnSync(gitBin, ["-C", repoRoot, "remote", "get-url", "--push", "--all", safeRemote], {
+    result = spawnSync(gitBin, [
+      "--no-replace-objects",
+      "--no-pager",
+      "-c",
+      "color.ui=false",
+      "-C",
+      repoRoot,
+      "remote",
+      "get-url",
+      "--push",
+      "--all",
+      safeRemote
+    ], {
       encoding: "utf8",
+      env: sealedGitEnvironment(),
       timeout,
       maxBuffer: 64 * 1024,
       windowsHide: true,
