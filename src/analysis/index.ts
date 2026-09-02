@@ -14,6 +14,106 @@ import type { AnalysisSearchIntent, StructuredSearchMatch, StructuredSearchResul
 
 const REDACTED_SEARCH_CONTEXT = "[REDACTED_SECRET]";
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+const MAX_ADDITIONAL_OCCURRENCE_LINES = 16;
+const CONFIDENCE_RANK: Record<StructuredSearchMatch["confidence"], number> = { exact: 0, inferred: 1, strong: 2 };
+
+function structuredEvidenceKey(match: Pick<StructuredSearchMatch, "path" | "line" | "group">): string {
+  return `${match.path}\u0000${match.line}\u0000${match.group}`;
+}
+
+function occurrenceGroupKey(match: Pick<StructuredSearchMatch, "path" | "group">): string {
+  return `${match.path}\u0000${match.group}`;
+}
+
+function orderedUnique(values: Iterable<string>): string[] {
+  return [...new Set(values)].sort((a, b) => a.localeCompare(b));
+}
+
+function evidenceQualityCompare(a: StructuredSearchMatch, b: StructuredSearchMatch): number {
+  return b.score - a.score
+    || CONFIDENCE_RANK[b.confidence] - CONFIDENCE_RANK[a.confidence]
+    || a.line - b.line
+    || a.text.localeCompare(b.text)
+    || a.source.localeCompare(b.source);
+}
+
+function mergeEvidenceMatches(a: StructuredSearchMatch, b: StructuredSearchMatch): StructuredSearchMatch {
+  const winner = evidenceQualityCompare(a, b) <= 0 ? a : b;
+  const sources = orderedUnique([
+    ...(a.provenance ?? [a.source]),
+    ...(b.provenance ?? [b.source])
+  ]);
+  const merged: StructuredSearchMatch = {
+    ...winner,
+    score: Math.max(a.score, b.score),
+    confidence: CONFIDENCE_RANK[a.confidence] >= CONFIDENCE_RANK[b.confidence] ? a.confidence : b.confidence,
+    reasons: orderedUnique([...a.reasons, ...b.reasons])
+  };
+  if (sources.length > 1) merged.provenance = sources;
+  else if (winner.provenance?.length) merged.provenance = sources;
+  else delete merged.provenance;
+  // A source-line producer is the safest text for an exact path/line merge;
+  // relationship-only records retain their derived text when no source line
+  // exists. The score/confidence above still preserve the strongest semantics.
+  const sourceLine = a.line === b.line && a.path === b.path && a.group === b.group
+    ? [a, b].find((match) => match.source === "built-in analysis")
+    : undefined;
+  if (sourceLine) {
+    merged.text = sourceLine.text;
+    merged.source = "built-in analysis";
+  }
+  return merged;
+}
+
+/**
+ * Internal structured evidence owner. Raw producer candidates enter once,
+ * exact path/line/group identities merge, and non-definition same-file/group
+ * lines compress at finalization so candidate limits remain truthful.
+ */
+class StructuredEvidenceAccumulator {
+  private readonly byIdentity = new Map<string, StructuredSearchMatch>();
+
+  add(match: StructuredSearchMatch): void {
+    const key = structuredEvidenceKey(match);
+    const existing = this.byIdentity.get(key);
+    this.byIdentity.set(key, existing ? mergeEvidenceMatches(existing, match) : { ...match, reasons: [...match.reasons] });
+  }
+
+  finalize(): StructuredSearchMatch[] {
+    const definitions: StructuredSearchMatch[] = [];
+    const nonDefinitions = new Map<string, StructuredSearchMatch[]>();
+    for (const match of this.byIdentity.values()) {
+      if (match.group === "definitions") {
+        definitions.push(match);
+        continue;
+      }
+      const key = occurrenceGroupKey(match);
+      const entries = nonDefinitions.get(key) ?? [];
+      entries.push(match);
+      nonDefinitions.set(key, entries);
+    }
+
+    const compressed: StructuredSearchMatch[] = [...definitions];
+    for (const entries of nonDefinitions.values()) {
+      const representative = [...entries].sort(evidenceQualityCompare)[0];
+      const lines = [...new Set(entries.map((entry) => entry.line))].sort((a, b) => a - b);
+      const extraLines = lines.filter((line) => line !== representative.line);
+      let merged = entries.filter((entry) => entry !== representative).reduce(mergeEvidenceMatches, representative);
+      // The representative may have been replaced by reduce's quality merge;
+      // line provenance is physical and therefore derived from every entry.
+      merged = { ...merged, reasons: orderedUnique(entries.flatMap((entry) => entry.reasons)) };
+      const sources = orderedUnique(entries.flatMap((entry) => entry.provenance ?? [entry.source]));
+      if (sources.length > 1) merged.provenance = sources;
+      if (lines.length > 1) {
+        merged.occurrenceCount = lines.length;
+        merged.additionalLines = extraLines.slice(0, MAX_ADDITIONAL_OCCURRENCE_LINES);
+        merged.additionalLinesTruncated = extraLines.length > MAX_ADDITIONAL_OCCURRENCE_LINES;
+      }
+      compressed.push(merged);
+    }
+    return compressed;
+  }
+}
 
 function decodeSearchBuffer(buffer: Buffer): { text: string; contextAvailable: boolean } {
   if (buffer.includes(0)) return { text: buffer.toString("utf8"), contextAvailable: false };
@@ -101,7 +201,7 @@ export async function searchWorkspaceStructured(
   const intent = classifySearchIntent(query, options.intent ?? "auto", options.regex);
   const groups = emptySearchGroups();
   const lowered = query.toLowerCase();
-  const matches: StructuredSearchMatch[] = [];
+  const accumulator = new StructuredEvidenceAccumulator();
   const warnings = [...analysis.warnings];
   const resultLimit = Math.max(1, Math.min(options.maxResults ?? config.maxSearchResults, config.maxSearchResults));
   const candidateLimit = Math.max(resultLimit, Math.min(resultLimit * 4, 20_000));
@@ -110,7 +210,7 @@ export async function searchWorkspaceStructured(
   const includePath = (filePath: string) => options.includeHidden === true || !isHiddenRelativePath(filePath);
   if (resolvedRoot && options.includeHidden !== true && isHiddenRelativePath(resolvedRoot)) {
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       query: redactSearchQuery(query),
       intent,
       groups,
@@ -130,7 +230,7 @@ export async function searchWorkspaceStructured(
   if (options.regex) {
     warnings.push("Grouped results are unavailable for regular expression searches. Lexical regex matching remains delegated to ripgrep.");
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       query: redactSearchQuery(query),
       intent,
       groups,
@@ -145,6 +245,7 @@ export async function searchWorkspaceStructured(
   let searchBudgetReached = false;
   let candidateLimitReached = false;
   let skippedFiles = 0;
+  let candidateCount = 0;
 
   scan:
   for (const file of analysis.files) {
@@ -191,11 +292,12 @@ export async function searchWorkspaceStructured(
       const isDefinition = Boolean(symbol && symbol.name.toLowerCase() === lowered);
       const group = groupForFile(analysis, file.path, isDefinition);
       const reasons = isDefinition ? ["exact text match", "symbol definition"] : file.role === "test" ? ["exact text match", "related test"] : ["exact text match"];
-      if (matches.length >= candidateLimit) {
+      if (candidateCount >= candidateLimit) {
         candidateLimitReached = true;
         break scan;
       }
-      matches.push({
+      candidateCount += 1;
+      accumulator.add({
         path: file.path,
         line: index + 1,
         text: (redactedLines?.[index] ?? REDACTED_SEARCH_CONTEXT).trim().slice(0, 400),
@@ -223,18 +325,12 @@ export async function searchWorkspaceStructured(
       const group = relationship.kind === "tests" ? "tests" : "references";
       if (group === "tests" && !options.includeTests) continue;
       const reason = relationship.kind === "tests" ? "dependent test" : "dependent module";
-      const existing = matches.find((match) => match.path === relationship.from && match.group === group);
-      if (existing) {
-        if (!existing.reasons.includes(reason)) existing.reasons.push(reason);
-        existing.score = Math.max(existing.score, relationship.kind === "tests" ? 170 : 165);
-        existing.confidence = "strong";
-        continue;
-      }
-      if (matches.length >= candidateLimit) {
+      if (candidateCount >= candidateLimit) {
         candidateLimitReached = true;
         continue;
       }
-      matches.push({
+      candidateCount += 1;
+      accumulator.add({
         path: relationship.from,
         line: 1,
         text: `${relationship.kind} ${relationship.to}`,
@@ -249,10 +345,11 @@ export async function searchWorkspaceStructured(
 
   if (candidateLimitReached) warnings.push(`Grouped search retained the first ${candidateLimit} candidates before ranking.`);
 
+  const matches = accumulator.finalize();
   for (const match of sortStructuredMatches(matches).slice(0, resultLimit)) groups[match.group].push(match);
   const orderedMatches = Object.values(groups).flat();
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     query: redactSearchQuery(query, orderedMatches.map((match) => match.text)),
     intent,
     groups,

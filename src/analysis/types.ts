@@ -115,12 +115,20 @@ export interface StructuredSearchMatch {
   reasons: string[];
   confidence: AnalysisConfidence;
   source: string;
+  /** Additional producer/reason provenance for merged logical evidence. */
+  provenance?: string[];
+  /** Number of distinct physical matching lines represented by this record. */
+  occurrenceCount?: number;
+  /** Bounded, sorted line numbers represented beyond the representative line. */
+  additionalLines?: number[];
+  /** True when additionalLines is bounded and more lines are represented. */
+  additionalLinesTruncated?: boolean;
 }
 
 export type StructuredSearchGroups = Record<AnalysisResultGroup, StructuredSearchMatch[]>;
 
 export interface StructuredSearchResult {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   query: string;
   intent: Exclude<AnalysisSearchIntent, "auto">;
   groups: StructuredSearchGroups;

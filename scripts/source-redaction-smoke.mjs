@@ -2819,8 +2819,11 @@ try {
           );
         }
         if (lawful && variantName === 'structured' && Array.isArray(analysis.matches)) {
+          const representedLines = analysis.matches
+            .flatMap((match) => [match.line, ...(match.additionalLines ?? [])])
+            .sort((a, b) => a - b);
           assert.deepEqual(
-            analysis.matches.map((match) => match.line),
+            representedLines,
             expectedLines,
             `Python continuation provenance ${variantName} search ${query} changed analysis.matches lines`
           );
@@ -3537,14 +3540,16 @@ try {
     arguments: { workspace_id: workspaceId, query: 'policyHasSecretValue', path: 'source.ts', intent: 'text', max_results: 10 }
   }), 'structured source search policyHasSecretValue');
   const structuredMatches = structuredSearch.structuredContent.analysis?.matches ?? [];
+  assert.equal(structuredMatches.length, 1, 'structured source search did not compress same-file evidence');
   assert.deepEqual(
     structuredMatches.map((match) => ({ path: match.path, line: match.line, text: match.text })),
     [
-      { path: 'source.ts', line: 2, text: sourceTs.split('\n')[1].trim() },
-      { path: 'source.ts', line: 15, text: sourceTs.split('\n')[14].trim() }
+      { path: 'source.ts', line: 2, text: sourceTs.split('\n')[1].trim() }
     ],
     'structured source search changed lawful source text or ordering'
   );
+  assert.equal(structuredMatches[0].occurrenceCount, 2, 'structured source search lost repeated-line count');
+  assert.deepEqual(structuredMatches[0].additionalLines, [15], 'structured source search lost repeated-line provenance');
   assert.equal(resultText(structuredSearch).includes('[REDACTED_SECRET]'), false, 'structured source search content envelope redacted lawful source');
   assert.equal(structuredSearch.structuredContent.analysis?.query, 'policyHasSecretValue', 'structured source search changed a lawful query');
 
@@ -3605,17 +3610,17 @@ try {
     name: 'search',
     arguments: { workspace_id: workspaceId, query: 'duplicate = true', path: 'private-duplicate.txt', intent: 'text', max_results: 10 }
   }), 'duplicate-line structured private-key search');
+  const duplicatePrivateAnalysisMatches = duplicatePrivateStructured.structuredContent.analysis?.matches ?? [];
+  assert.equal(duplicatePrivateAnalysisMatches.length, 1, 'duplicate-line structured private-key search did not compress same-file evidence');
   assert.deepEqual(
-    duplicatePrivateStructured.structuredContent.analysis?.matches?.map((match) => ({ line: match.line, text: match.text })),
+    duplicatePrivateAnalysisMatches.map((match) => ({ line: match.line, text: match.text })),
     [
-      { line: 1, text: 'const duplicate = true;' },
-      { line: 2, text: 'const duplicate = true;' },
-      { line: 4, text: '[REDACTED_PRIVATE_KEY]' },
-      { line: 6, text: 'const duplicate = true;' },
-      { line: 7, text: 'const duplicate = true;' }
+      { line: 1, text: 'const duplicate = true;' }
     ],
     'duplicate-line structured private-key search changed lawful line mapping or source text'
   );
+  assert.equal(duplicatePrivateAnalysisMatches[0].occurrenceCount, 5, 'duplicate-line structured private-key search lost occurrence count');
+  assert.deepEqual(duplicatePrivateAnalysisMatches[0].additionalLines, [2, 4, 6, 7], 'duplicate-line structured private-key search lost occurrence provenance');
 
   const binaryPrivateSearch = assertToolSuccess(await client.request('tools/call', {
     name: 'search',

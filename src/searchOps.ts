@@ -8,7 +8,7 @@ import type { Workspace } from "./guard.js";
 import { CodexProError, PathGuard } from "./guard.js";
 import { isHiddenRelativePath, listFiles, textScanByteLimit } from "./fsOps.js";
 import { redactDiagnosticText, redactSearchQuery, redactSensitiveTextPreservingLines, sourceLanguageForPath, truncateUtf8 } from "./redact.js";
-import { searchWorkspaceStructured, type AnalysisSearchIntent, type StructuredSearchResult } from "./analysis/index.js";
+import { searchWorkspaceStructured, type AnalysisSearchIntent, type StructuredSearchMatch, type StructuredSearchResult } from "./analysis/index.js";
 
 export interface SearchOptions {
   query: string;
@@ -110,6 +110,23 @@ function selectRedactedSearchLine(lines: RedactedSearchLines, lineNumber: number
   return contextualLine === undefined
     ? REDACTED_SEARCH_CONTEXT
     : truncateLine(contextualLine);
+}
+
+function mergeLexicalProvenance(structured: StructuredSearchResult, lexical: SearchResult): void {
+  const byPathLine = new Map<string, StructuredSearchMatch>();
+  for (const match of structured.matches) {
+    byPathLine.set(`${match.path}\u0000${match.line}`, match);
+    for (const line of match.additionalLines ?? []) {
+      byPathLine.set(`${match.path}\u0000${line}`, match);
+    }
+  }
+  for (const lexicalMatch of lexical.matches) {
+    const structuredMatch = byPathLine.get(`${lexicalMatch.path}\u0000${lexicalMatch.line}`);
+    if (!structuredMatch) continue;
+    structuredMatch.reasons = [...new Set([...structuredMatch.reasons, "lexical exact match"])].sort((a, b) => a.localeCompare(b));
+    const provenance = [...new Set([...(structuredMatch.provenance ?? [structuredMatch.source]), "lexical"])].sort((a, b) => a.localeCompare(b));
+    structuredMatch.provenance = provenance;
+  }
 }
 
 async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: Workspace, options: SearchOptions): Promise<SearchResult> {
@@ -411,6 +428,7 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
       root: options.root,
       maxResults: options.maxResults
     });
+    mergeLexicalProvenance(structured, lexical);
     // Binary/NUL files may be found by lexical ripgrep while analysis has no
     // decodable inventory or structured matches. Use both redacted producers
     // before echoing the query, including the regex structured route.

@@ -87,6 +87,7 @@
     "runtime-diagnostics:smoke": "npm run build && node scripts/runtime-diagnostics-smoke.mjs",
     "stress": "npm run build && node scripts/stress.mjs",
     "analysis:smoke": "npm run build && node scripts/analysis-smoke.mjs",
+    "search-quality:task002": "npm run build && node scripts/search-quality-task002-smoke.mjs",
     "search-evidence:smoke": "npm run build && node scripts/search-evidence-smoke.mjs",
     "analysis:cli-smoke": "npm run build && node scripts/analysis-cli-smoke.mjs",
     "git-review-runner:smoke": "node scripts/git-review-runner-smoke.mjs",

@@ -168,7 +168,10 @@ try {
     intent: 'text',
     maxResults: 2
   });
-  assert.equal(candidateLimited.matches.length, 2);
+  assert.equal(candidateLimited.matches.length, 1);
+  assert.equal(candidateLimited.matches[0].occurrenceCount, 8);
+  assert.deepEqual(candidateLimited.matches[0].additionalLines, [2, 3, 4, 5, 6, 7, 8]);
+  assert.equal(candidateLimited.matches[0].additionalLinesTruncated, false);
   assert.equal(candidateLimited.coverage.truncated, true);
   assert(candidateLimited.warnings.some((warning) => warning.includes('retained the first 8 candidates')));
 
