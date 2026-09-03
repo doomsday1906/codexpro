@@ -549,14 +549,99 @@ try {
     // Supplemental candidates were properly underfilled (mandatory envelope exceeded budget)
     assert(!heavyPaths.some((p) => p.includes('extra_ref_')), 'Supplemental references were unexpectedly added to overflowing budget');
 
-    // Budget truncation condition is truthfully exposed
-    assert.equal(heavyAnalysis.coverage.truncated, true, 'Coverage should be marked truncated when mandatory envelope exceeds budget');
+    // Budget truncation and overflow conditions are truthfully exposed
+    assert.equal(heavyAnalysis.coverage.truncated, true, 'Coverage should be marked truncated when supplemental candidates are omitted');
     assert(heavyAnalysis.warnings.some((w) => w.includes('Structured search results were truncated to fit the structured payload budget.')), 'Budget truncation warning was missing');
+    assert(heavyAnalysis.warnings.some((w) => w.includes('Mandatory structured evidence exceeds the structured payload budget; required evidence was preserved.')), 'Mandatory budget overflow warning was missing');
     assert(heavyBytes > 9400, `Expected heavy mandatory envelope to exceed 9400 bytes, got ${heavyBytes}`);
 
     console.log('PASS: HIGH-MANDATORY-001: Required impact modules are not discarded to meet the byte budget; budget conflict is truthfully exposed.');
   } finally {
     await fs.rm(mandatoryFixtureRoot, { recursive: true, force: true });
+  }
+
+  // --- Test 7c: HIGH-BUDGET-TRUTH-001 falsifier ---
+  // Mandatory-only envelope that exceeds payload budget with ZERO supplemental candidates.
+  // Physically establishes selected.length === sorted.length and serialized mandatory evidence > maxPayloadBytes.
+  const mandatoryOnlyFixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-task006-mandatory-only-'));
+  try {
+    const pkgDir = path.join(mandatoryOnlyFixtureRoot, 'packages/domain_infrastructure_lifecycle_orchestration_services/components');
+    await fs.mkdir(pkgDir, { recursive: true });
+    await fs.mkdir(path.join(mandatoryOnlyFixtureRoot, 'tests'), { recursive: true });
+
+    const sym = 'CoreTargetProcessorEnterpriseOrchestrationLifecycle';
+    const linePad = (size) => ' # ' + 'Y'.repeat(size);
+
+    // EXACTLY 1 definition match in the entire workspace
+    await fs.writeFile(path.join(pkgDir, 'core_target_definition_provider.py'), [
+      `class ${sym}:${linePad(350)}`,
+      `    pass`
+    ].join('\n') + '\n');
+
+    // EXACTLY 4 affected source modules (1 match each, total 4 matches)
+    for (let i = 0; i < 4; i++) {
+      await fs.writeFile(path.join(pkgDir, `core_dependent_module_service_consumer_${i}.py`), [
+        `from packages.domain_infrastructure_lifecycle_orchestration_services.components.core_target_definition_provider import ${sym}${linePad(350)}`,
+        `class Dep${i}:`,
+        `    pass`
+      ].join('\n') + '\n');
+    }
+
+    // EXACTLY 1 test match in the entire workspace
+    await fs.writeFile(path.join(mandatoryOnlyFixtureRoot, 'tests/test_core_target_definition_provider.py'), [
+      `from packages.domain_infrastructure_lifecycle_orchestration_services.components.core_target_definition_provider import ${sym}${linePad(350)}`,
+      `def test_provider():`,
+      `    pass`
+    ].join('\n') + '\n');
+
+    // ZERO supplemental candidates exist in the fixture.
+    const onlyConfig = loadConfig(['--root', mandatoryOnlyFixtureRoot, '--allow-root', mandatoryOnlyFixtureRoot, '--bash', 'off', '--write', 'off']);
+    const onlyGuard = new PathGuard(onlyConfig);
+    const onlyWorkspace = new WorkspaceManager(onlyConfig).defaultWorkspace();
+
+    const onlyResult = await searchWorkspace(onlyConfig, onlyGuard, onlyWorkspace, {
+      query: sym,
+      intent: 'impact',
+      includeTests: true,
+      maxResults: 20
+    });
+    const onlyAnalysis = analysisOf(onlyResult, 'mandatory only envelope');
+    const onlyPaths = onlyAnalysis.matches.map((m) => m.path);
+    const onlySC = supportingStructuredContent(onlyWorkspace, onlyResult);
+    const onlyBytes = Buffer.byteLength(JSON.stringify(onlySC), 'utf8');
+    console.log(`RAW_OBSERVATION: mandatoryOnlyBytes=${onlyBytes}, matches=${onlyAnalysis.matches.length}`);
+
+    // Physically establish that all available candidates were selected (nothing was omitted: selected.length === sorted.length)
+    // and serialized mandatory evidence exceeds 9,400 bytes.
+    assert.equal(onlyAnalysis.matches.length, 6, 'Expected exactly 6 matches selected (all available in fixture)');
+    assert(onlyBytes > 9400, `Expected mandatory only envelope to exceed 9400 bytes, got ${onlyBytes}`);
+    assert(onlyAnalysis.matches.length <= 20, 'Hard max_results was violated');
+
+    // Prove every mandatory record survives
+    assert(onlyPaths.some((p) => p.includes('core_target_definition_provider.py')), 'Core definition was dropped');
+    for (let i = 0; i < 4; i++) {
+      assert(onlyPaths.some((p) => p.includes(`core_dependent_module_service_consumer_${i}.py`)), `Core affected module ${i} was dropped`);
+    }
+    assert(onlyPaths.some((p) => p.includes('test_core_target_definition_provider.py')), 'Core test was dropped');
+
+    // Prove explicit mandatory budget conflict warning is present
+    assert(
+      onlyAnalysis.warnings.some((w) => w.includes('Mandatory structured evidence exceeds the structured payload budget; required evidence was preserved.')),
+      'Mandatory budget overflow warning was missing when mandatory envelope exceeded budget'
+    );
+
+    // Prove supplemental underfill warning is NOT falsely emitted when nothing was omitted
+    assert(
+      !onlyAnalysis.warnings.some((w) => w.includes('Structured search results were truncated to fit the structured payload budget.')),
+      'Supplemental underfill warning was falsely emitted when no results were omitted'
+    );
+
+    // Prove coverage.truncated reflects real coverage/truncation truth (false because nothing was omitted)
+    assert.equal(onlyAnalysis.coverage.truncated, false, 'coverage.truncated should be false when all available candidates were selected');
+
+    console.log('PASS: HIGH-BUDGET-TRUTH-001: Mandatory budget conflict truthfully reported without falsely claiming results were truncated to fit; coverage.truncated reflects actual omission truth.');
+  } finally {
+    await fs.rm(mandatoryOnlyFixtureRoot, { recursive: true, force: true });
   }
 
   console.log('PASS: SUPPORTING_ONLY public/structured payload remains bounded with required definitions, affected source modules, tests, reasons, provenance, and warnings.');

@@ -9,7 +9,7 @@ import { getCachedWorkspaceAnalysis, invalidateWorkspaceAnalysis, setCachedWorks
 import { extractWorkspaceFiles } from "./extract.js";
 import { buildRelationshipsWithCoverage, IMPACT_TRAVERSAL_TRUNCATION_WARNING, traverseImpactGraph } from "./graph.js";
 import { inventoryWorkspace } from "./inventory.js";
-import { BUDGET_TRUNCATION_WARNING, classifyDefinitionMatch, classifySearchIntent, emptySearchGroups, groupForFile, scheduleStructuredMatches, sortStructuredMatches } from "./rank.js";
+import { BUDGET_TRUNCATION_WARNING, classifyDefinitionMatch, classifySearchIntent, emptySearchGroups, groupForFile, MANDATORY_BUDGET_OVERFLOW_WARNING, scheduleStructuredMatches, sortStructuredMatches } from "./rank.js";
 import { resolveSearchScope, searchScopeCacheKey } from "./scope.js";
 import type { AnalysisSearchIntent, StructuredSearchMatch, StructuredSearchResult, WorkspaceAnalysis } from "./types.js";
 
@@ -558,6 +558,9 @@ export async function searchWorkspaceStructured(
     if (!trialWarnings.includes(BUDGET_TRUNCATION_WARNING)) {
       trialWarnings.push(BUDGET_TRUNCATION_WARNING);
     }
+    if (!trialWarnings.includes(MANDATORY_BUDGET_OVERFLOW_WARNING)) {
+      trialWarnings.push(MANDATORY_BUDGET_OVERFLOW_WARNING);
+    }
     const trialEnvelope: Record<string, unknown> = {
       codexpro_tool: "search",
       codexpro_title: "Search Workspace",
@@ -584,7 +587,7 @@ export async function searchWorkspaceStructured(
     return Buffer.byteLength(JSON.stringify(trialEnvelope), "utf8") + 128;
   };
 
-  const { matches: scheduled, budgetTruncated } = scheduleStructuredMatches(eligibleMatches, {
+  const { matches: scheduled, budgetTruncated, budgetOverflow } = scheduleStructuredMatches(eligibleMatches, {
     intent,
     resultLimit,
     includeHidden: Boolean(options.includeHidden),
@@ -592,6 +595,9 @@ export async function searchWorkspaceStructured(
     calculatePayloadBytes: measureStructuredPayloadBytes
   });
   for (const match of scheduled) groups[match.group].push(match);
+  if (budgetOverflow) {
+    warnings.push(MANDATORY_BUDGET_OVERFLOW_WARNING);
+  }
   if (budgetTruncated) {
     warnings.push(BUDGET_TRUNCATION_WARNING);
   }

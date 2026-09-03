@@ -125,6 +125,7 @@ export function groupForFile(
 export const DEFAULT_STRUCTURED_PAYLOAD_BUDGET_IMPACT = 9_400;
 export const DEFAULT_STRUCTURED_PAYLOAD_BUDGET_STANDARD = 14_500;
 export const BUDGET_TRUNCATION_WARNING = "Structured search results were truncated to fit the structured payload budget.";
+export const MANDATORY_BUDGET_OVERFLOW_WARNING = "Mandatory structured evidence exceeds the structured payload budget; required evidence was preserved.";
 
 export function defaultStructuredPayloadBudget(
   intent: Exclude<AnalysisSearchIntent, "auto">,
@@ -199,6 +200,7 @@ export interface ScheduleStructuredMatchesOptions {
 export interface ScheduleStructuredMatchesResult {
   matches: StructuredSearchMatch[];
   budgetTruncated: boolean;
+  budgetOverflow: boolean;
 }
 
 export function scheduleStructuredMatches(
@@ -206,7 +208,7 @@ export function scheduleStructuredMatches(
   options: ScheduleStructuredMatchesOptions
 ): ScheduleStructuredMatchesResult {
   if (matches.length === 0 || options.resultLimit <= 0) {
-    return { matches: [], budgetTruncated: false };
+    return { matches: [], budgetTruncated: false, budgetOverflow: false };
   }
 
   const sorted = sortStructuredMatches([...matches]);
@@ -323,7 +325,7 @@ export function scheduleStructuredMatches(
   }
 
   // 2. Supplemental evidence fill, bounded by deterministic payload byte budget
-  let budgetTruncated = measure(selected) > maxPayloadBytes;
+  let supplementalOmittedDueToBudget = false;
   for (const m of sorted) {
     if (selected.length >= options.resultLimit) break;
     const key = matchKey(m);
@@ -331,12 +333,18 @@ export function scheduleStructuredMatches(
 
     const trialBytes = measure([...selected, m]);
     if (trialBytes > maxPayloadBytes) {
-      budgetTruncated = true;
+      supplementalOmittedDueToBudget = true;
       break;
     }
     select(m);
   }
 
-  const finalBudgetTruncated = budgetTruncated && (selected.length < options.resultLimit || measure(selected) > maxPayloadBytes) && selected.length < sorted.length;
-  return { matches: sortStructuredMatches(selected), budgetTruncated: finalBudgetTruncated };
+  const finalSelectedBytes = measure(selected);
+  const budgetOverflow = finalSelectedBytes > maxPayloadBytes;
+  const budgetTruncated = supplementalOmittedDueToBudget && selected.length < options.resultLimit && selected.length < sorted.length;
+  return {
+    matches: sortStructuredMatches(selected),
+    budgetTruncated,
+    budgetOverflow
+  };
 }
