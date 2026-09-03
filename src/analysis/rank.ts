@@ -122,17 +122,91 @@ export function groupForFile(
   return "references";
 }
 
+export const DEFAULT_STRUCTURED_PAYLOAD_BUDGET_IMPACT = 9_400;
+export const DEFAULT_STRUCTURED_PAYLOAD_BUDGET_STANDARD = 14_500;
+export const BUDGET_TRUNCATION_WARNING = "Structured search results were truncated to fit the structured payload budget.";
+
+export function defaultStructuredPayloadBudget(
+  intent: Exclude<AnalysisSearchIntent, "auto">,
+  resultLimit: number,
+  maxOutputBytes = 120_000
+): number {
+  const envBudget = Number(process.env.CODEXPRO_SEARCH_PAYLOAD_BUDGET);
+  if (Number.isFinite(envBudget) && envBudget > 0) {
+    return Math.min(maxOutputBytes, Math.floor(envBudget));
+  }
+  const baseBudget = intent === "impact" ? DEFAULT_STRUCTURED_PAYLOAD_BUDGET_IMPACT : DEFAULT_STRUCTURED_PAYLOAD_BUDGET_STANDARD;
+  if (resultLimit <= 20) {
+    return baseBudget;
+  }
+  return Math.min(maxOutputBytes, Math.round(baseBudget * (resultLimit / 20)));
+}
+
+export function isAffectedSourceModule(match: StructuredSearchMatch): boolean {
+  if (match.group !== "references") return false;
+  return (match.reasons ?? []).some((r) =>
+    r.includes("dependent module") ||
+    r.includes("transitive dependent") ||
+    r.includes("imports")
+  );
+}
+
+function fallbackMeasurePayloadBytes(
+  selected: StructuredSearchMatch[],
+  intent: Exclude<AnalysisSearchIntent, "auto">
+): number {
+  const groups = emptySearchGroups();
+  for (const m of selected) groups[m.group].push(m);
+  const ordered = Object.values(groups).flat();
+  const legacyMatches = ordered.map(({ path, line, text }) => ({ path, line, text }));
+  const payload = {
+    workspace_id: "ws_default_workspace",
+    root: ".",
+    matches: legacyMatches,
+    truncated: true,
+    used: 1,
+    analysis: {
+      schemaVersion: 2,
+      query: "query",
+      intent,
+      groups,
+      matches: ordered,
+      coverage: {
+        inventoryFiles: 100,
+        analyzedFiles: 100,
+        scannedBytes: 1000,
+        symbolCount: 100,
+        relationshipCount: 100,
+        truncated: true,
+        warnings: [BUDGET_TRUNCATION_WARNING]
+      },
+      warnings: [BUDGET_TRUNCATION_WARNING],
+      cache: { hit: false }
+    }
+  };
+  return Buffer.byteLength(JSON.stringify(payload), "utf8");
+}
+
+export interface ScheduleStructuredMatchesOptions {
+  intent: Exclude<AnalysisSearchIntent, "auto">;
+  resultLimit: number;
+  includeHidden?: boolean;
+  includeTests?: boolean;
+  maxPayloadBytes?: number;
+  calculatePayloadBytes?: (selected: StructuredSearchMatch[]) => number;
+}
+
+export interface ScheduleStructuredMatchesResult {
+  matches: StructuredSearchMatch[];
+  budgetTruncated: boolean;
+}
+
 export function scheduleStructuredMatches(
   matches: StructuredSearchMatch[],
-  options: {
-    intent: Exclude<AnalysisSearchIntent, "auto">;
-    resultLimit: number;
-    includeHidden?: boolean;
-    includeTests?: boolean;
-  }
-): StructuredSearchMatch[] {
-  if (matches.length <= options.resultLimit) {
-    return sortStructuredMatches([...matches]);
+  options: ScheduleStructuredMatchesOptions
+): ScheduleStructuredMatchesResult {
+  if (matches.length === 0) {
+    return { matches: [], budgetTruncated: false };
   }
 
   const sorted = sortStructuredMatches([...matches]);
@@ -148,7 +222,10 @@ export function scheduleStructuredMatches(
     return true;
   };
 
-  // Visibility fairness reservation:
+  const maxPayloadBytes = options.maxPayloadBytes ?? defaultStructuredPayloadBudget(options.intent, options.resultLimit);
+  const measure = options.calculatePayloadBytes ?? ((cand) => fallbackMeasurePayloadBytes(cand, options.intent));
+
+  // 1. Visibility fairness reservation:
   // With include_hidden=true and capacity >= 2, reserve at least one result for each
   // visibility class if both classes have relevant candidates available.
   if (options.includeHidden === true && options.resultLimit >= 2) {
@@ -158,86 +235,108 @@ export function scheduleStructuredMatches(
     if (bestHidden) select(bestHidden);
   }
 
-  // Bounded class reservation based on intent:
-  // Definitions for orientation, primary category for intent, tests when requested, config/docs supplements.
-  const classQuotas: Record<AnalysisResultGroup, number> = {
-    definitions: 0,
-    references: 0,
-    tests: 0,
-    configuration: 0,
-    documentation: 0,
-    other: 0
-  };
+  let budgetTruncated = false;
 
-  if (options.intent === "references") {
-    classQuotas.definitions = 2;
-    classQuotas.references = 8;
-    classQuotas.tests = options.includeTests ? 3 : 0;
-    classQuotas.configuration = 1;
-    classQuotas.documentation = 1;
-    classQuotas.other = 1;
-  } else if (options.intent === "impact") {
-    classQuotas.definitions = 1;
-    classQuotas.references = 6;
-    classQuotas.tests = options.includeTests ? 1 : 0;
-    classQuotas.configuration = 1;
-    classQuotas.documentation = 1;
-    classQuotas.other = 1;
+  // 2. Mandatory semantic envelope reservation based on intent:
+  if (options.intent === "impact") {
+    // a) Definition orientation
+    const def = sorted.find((m) => m.group === "definitions");
+    if (def) select(def);
+
+    // b) Relevant requested test (reserve space for the required test)
+    if (options.includeTests) {
+      const test = sorted.find((m) => m.group === "tests");
+      if (test) select(test);
+    }
+
+    // c) Highest-value direct/transitive affected source modules
+    const affectedModules = sorted.filter(isAffectedSourceModule);
+    for (const m of affectedModules) {
+      if (selected.filter(isAffectedSourceModule).length >= 6 || selected.length >= options.resultLimit) break;
+      const trialBytes = measure([...selected, m]);
+      if (trialBytes > maxPayloadBytes) {
+        budgetTruncated = true;
+        break;
+      }
+      select(m);
+    }
   } else if (options.intent === "symbol") {
-    classQuotas.definitions = 8;
-    classQuotas.references = 2;
-    classQuotas.tests = options.includeTests ? 1 : 0;
-    classQuotas.configuration = 1;
-    classQuotas.documentation = 1;
-    classQuotas.other = 1;
-  } else {
-    classQuotas.definitions = 2;
-    classQuotas.references = 6;
-    classQuotas.tests = options.includeTests ? 3 : 0;
-    classQuotas.configuration = 2;
-    classQuotas.documentation = 2;
-    classQuotas.other = 1;
-  }
-
-  // Reserve bounded representation for each available class
-  for (const group of GROUPS) {
-    const quota = classQuotas[group];
-    if (quota <= 0) continue;
-    let count = selected.filter((m) => m.group === group).length;
+    // Definitions for orientation & symbol family (up to 8)
     for (const m of sorted) {
-      if (count >= quota || selected.length >= options.resultLimit) break;
-      if (m.group === group && select(m)) {
-        count += 1;
+      if (selected.filter((s) => s.group === "definitions").length >= 8 || selected.length >= options.resultLimit) break;
+      if (m.group === "definitions") {
+        if (measure([...selected, m]) <= maxPayloadBytes) select(m);
+        else break;
+      }
+    }
+    // References (up to 2)
+    for (const m of sorted) {
+      if (selected.filter((s) => s.group === "references").length >= 2 || selected.length >= options.resultLimit) break;
+      if (m.group === "references") {
+        if (measure([...selected, m]) <= maxPayloadBytes) select(m);
+        else break;
+      }
+    }
+    // Test if requested
+    if (options.includeTests) {
+      const test = sorted.find((m) => m.group === "tests");
+      if (test && measure([...selected, test]) <= maxPayloadBytes) select(test);
+    }
+  } else if (options.intent === "references") {
+    // Definitions for orientation (up to 2)
+    for (const m of sorted) {
+      if (selected.filter((s) => s.group === "definitions").length >= 2 || selected.length >= options.resultLimit) break;
+      if (m.group === "definitions") {
+        if (measure([...selected, m]) <= maxPayloadBytes) select(m);
+        else break;
+      }
+    }
+    // Source references (up to 8)
+    for (const m of sorted) {
+      if (selected.filter((s) => s.group === "references").length >= 8 || selected.length >= options.resultLimit) break;
+      if (m.group === "references") {
+        if (measure([...selected, m]) <= maxPayloadBytes) select(m);
+        else break;
+      }
+    }
+    // Test if requested (up to 3)
+    if (options.includeTests) {
+      for (const m of sorted) {
+        if (selected.filter((s) => s.group === "tests").length >= 3 || selected.length >= options.resultLimit) break;
+        if (m.group === "tests") {
+          if (measure([...selected, m]) <= maxPayloadBytes) select(m);
+          else break;
+        }
+      }
+    }
+  } else {
+    // Text intent: reserve bounded representation for definitions (2), references (6), tests (3 if includeTests)
+    for (const group of ["definitions", "references", ...(options.includeTests ? ["tests" as const] : [])] as const) {
+      const quota = group === "definitions" ? 2 : group === "references" ? 6 : 3;
+      for (const m of sorted) {
+        if (selected.filter((s) => s.group === group).length >= quota || selected.length >= options.resultLimit) break;
+        if (m.group === group) {
+          if (measure([...selected, m]) <= maxPayloadBytes) select(m);
+          else break;
+        }
       }
     }
   }
 
-  // Fill remaining capacity by global score, bounded by maximum class caps for structured intents
-  const maxClassCaps: Partial<Record<AnalysisResultGroup, number>> = {};
-  if (options.intent === "impact") {
-    maxClassCaps.definitions = 2;
-    maxClassCaps.references = 6;
-    maxClassCaps.tests = options.includeTests ? 1 : 0;
-    maxClassCaps.configuration = 1;
-    maxClassCaps.documentation = 1;
-    maxClassCaps.other = 1;
-  } else if (options.intent === "symbol") {
-    maxClassCaps.definitions = 10;
-    maxClassCaps.references = 2;
-    maxClassCaps.tests = options.includeTests ? 1 : 0;
-    maxClassCaps.configuration = 1;
-    maxClassCaps.documentation = 1;
-    maxClassCaps.other = 1;
-  }
+  // 3. Fill remaining capacity by global score, bounded by deterministic payload byte budget
   for (const m of sorted) {
     if (selected.length >= options.resultLimit) break;
-    const cap = maxClassCaps[m.group];
-    if (cap !== undefined) {
-      const currentClassCount = selected.filter((s) => s.group === m.group).length;
-      if (currentClassCount >= cap) continue;
+    const key = matchKey(m);
+    if (selectedKeys.has(key)) continue;
+
+    const trialBytes = measure([...selected, m]);
+    if (trialBytes > maxPayloadBytes) {
+      budgetTruncated = true;
+      break;
     }
     select(m);
   }
 
-  return sortStructuredMatches(selected);
+  const finalBudgetTruncated = budgetTruncated && selected.length < options.resultLimit && selected.length < sorted.length;
+  return { matches: sortStructuredMatches(selected), budgetTruncated: finalBudgetTruncated };
 }

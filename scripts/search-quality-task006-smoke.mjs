@@ -105,10 +105,11 @@ try {
     await writeFixture(`zz-zcoverage/ordinary-${suffix}.py`, `# ordinary coverage file ${suffix}\n`);
   }
 
-  const [{ loadConfig }, { PathGuard, WorkspaceManager }, { searchWorkspace }] = await Promise.all([
+  const [{ loadConfig }, { PathGuard, WorkspaceManager }, { searchWorkspace }, { invalidateWorkspaceAnalysis }] = await Promise.all([
     importBuilt('config.js'),
     importBuilt('guard.js'),
-    importBuilt('searchOps.js')
+    importBuilt('searchOps.js'),
+    importBuilt('analysis/index.js')
   ]);
   const config = loadConfig(['--root', fixtureRoot, '--allow-root', fixtureRoot, '--bash', 'off', '--write', 'off']);
   const guard = new PathGuard(config);
@@ -260,6 +261,132 @@ try {
   assert(textAnalysis.warnings.some((warning) => warning.includes('Source analysis reached its file or byte limit.')), 'Text occurrence regression lost the coverage warning');
   console.log(`RAW_OBSERVATION: explicit text fixture has ${lexicalOnlyText.matches.length} lexical occurrences and ${textAnalysis.matches.length} compressed structured record; legacy text matches/text retain every occurrence.`);
   console.log('SANITY_VERDICT: MATCH — explicit text output preserves the nineteen visible path/line/text occurrences while analysis retains compressed occurrence metadata, provenance, and coverage warning.');
+
+  // Test 6: Controlled anti-gaming test with non-Threadmark fixtures.
+  // Proves:
+  // - byte-budget underfill is generic;
+  // - ranking is preserved;
+  // - mandatory classes survive;
+  // - truncation warning appears exactly when appropriate;
+  // - changing query/repository names does not change the algorithmic rule;
+  // - hidden participation/boundary laws remain correct.
+  const genericQuery = 'PipelineProcessorCore';
+  await writeFixture('packages/core/pipeline_processor_core.py', [
+    'class PipelineProcessorCore:',
+    '    """Core pipeline definition."""',
+    '    pass'
+  ].join('\n') + '\n');
+  await writeFixture('packages/core/stage_dispatcher.py', [
+    'from packages.core.pipeline_processor_core import PipelineProcessorCore',
+    'class StageDispatcher:',
+    '    processor = PipelineProcessorCore'
+  ].join('\n') + '\n');
+  await writeFixture('packages/core/event_router.py', [
+    longComment('PipelineProcessorCore', 'transitive router'),
+    'from packages.core.stage_dispatcher import StageDispatcher',
+    'class EventRouter:',
+    '    dispatcher = StageDispatcher'
+  ].join('\n') + '\n');
+  await writeFixture('tests/test_pipeline_processor.py', [
+    'from packages.core.pipeline_processor_core import PipelineProcessorCore',
+    'def test_pipeline():',
+    '    assert True'
+  ].join('\n') + '\n');
+  await writeFixture('packages/.hidden_pipeline/secret_worker.py', [
+    'from packages.core.pipeline_processor_core import PipelineProcessorCore',
+    'class SecretWorker:',
+    '    pass'
+  ].join('\n') + '\n');
+
+  // Add multiple supplemental candidate files to induce overflow/underfill
+  for (let index = 0; index < 15; index += 1) {
+    const pad = String(index).padStart(2, '0');
+    await writeFixture(`packages/supplements/extra_ref_${pad}.py`, `# extra reference ${pad} to PipelineProcessorCore\nconst ref${pad} = "PipelineProcessorCore";\n`);
+  }
+  invalidateWorkspaceAnalysis(workspace.root);
+
+  // 6a: Underfill with small custom budget
+  process.env.CODEXPRO_SEARCH_PAYLOAD_BUDGET = '7000';
+  const underfillResult = await searchWorkspace(config, guard, workspace, {
+    query: genericQuery,
+    intent: 'impact',
+    includeTests: true,
+    maxResults: 20
+  });
+  delete process.env.CODEXPRO_SEARCH_PAYLOAD_BUDGET;
+  const underfillAnalysis = analysisOf(underfillResult, 'generic underfill');
+  const underfillSC = supportingStructuredContent(workspace, underfillResult);
+  const underfillBytes = Buffer.byteLength(JSON.stringify(underfillSC), 'utf8');
+  console.log(`RAW_OBSERVATION: Generic underfill bytes=${underfillBytes}, matches=${underfillAnalysis.matches.length}`);
+
+  // Verify generic underfill behavior
+  assert(underfillBytes <= 7000, `Generic underfill exceeded budget: ${underfillBytes} > 7000`);
+  assert(underfillAnalysis.matches.length < 20, 'Generic underfill did not return fewer than max_results records');
+  assert(underfillAnalysis.matches.length >= 3, 'Generic underfill omitted mandatory envelope');
+
+  // Mandatory classes survive
+  const underfillPaths = underfillAnalysis.matches.map((m) => m.path);
+  assert(underfillPaths.includes('packages/core/pipeline_processor_core.py'), 'Definition missing in generic underfill');
+  assert(underfillPaths.includes('packages/core/stage_dispatcher.py'), 'Affected source module missing in generic underfill');
+  assert(underfillPaths.includes('tests/test_pipeline_processor.py'), 'Relevant test missing in generic underfill');
+
+  // Ranking is preserved within each semantic group
+  for (const group of Object.values(underfillAnalysis.groups)) {
+    for (let i = 1; i < group.length; i += 1) {
+      assert(group[i - 1].score >= group[i].score, 'Ranking was not preserved within group in underfill');
+    }
+  }
+
+  // Truncation warning appears when appropriate
+  assert(underfillAnalysis.warnings.some((w) => w.includes('Structured search results were truncated to fit the structured payload budget.')), 'Budget truncation warning was missing in underfill');
+  assert.equal(underfillAnalysis.coverage.truncated, true, 'Coverage should be marked truncated when underfilled');
+
+  // 6b: No underfill when all candidates naturally fit
+  await writeFixture('packages/core/isolated_singleton.py', 'class IsolatedSingleton:\n    pass\n');
+  const exactFitResult = await searchWorkspace(config, guard, workspace, {
+    query: 'IsolatedSingleton',
+    intent: 'symbol',
+    maxResults: 20
+  });
+  const exactFitAnalysis = analysisOf(exactFitResult, 'exact fit without underfill');
+  assert.equal(exactFitAnalysis.matches.length, 1, 'Expected exactly 1 match for isolated symbol');
+  assert(!exactFitAnalysis.warnings.some((w) => w.includes('Structured search results were truncated to fit the structured payload budget.')), 'Budget truncation warning should NOT appear when all candidates fit');
+
+  // 6c: Hidden participation / boundary laws in generic fixture
+  const hiddenFixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-search-hidden-'));
+  try {
+    await fs.writeFile(path.join(hiddenFixtureRoot, 'package.json'), '{}\n');
+    await fs.mkdir(path.join(hiddenFixtureRoot, 'src'), { recursive: true });
+    await fs.mkdir(path.join(hiddenFixtureRoot, 'src/.hidden'), { recursive: true });
+    for (let i = 0; i < 5; i++) {
+      await fs.writeFile(path.join(hiddenFixtureRoot, `src/worker_${i}.ts`), `export const PipelineWorker${i} = "PipelineProcessorCore";\n`);
+      await fs.writeFile(path.join(hiddenFixtureRoot, `src/.hidden/secret_${i}.ts`), `export const SecretPipelineWorker${i} = "PipelineProcessorCore";\n`);
+    }
+    const hiddenConfig = loadConfig(['--root', hiddenFixtureRoot, '--allow-root', hiddenFixtureRoot, '--bash', 'off', '--write', 'off']);
+    const hiddenGuard = new PathGuard(hiddenConfig);
+    const hiddenWorkspace = new WorkspaceManager(hiddenConfig).defaultWorkspace();
+
+    const hiddenOffResult = await searchWorkspace(hiddenConfig, hiddenGuard, hiddenWorkspace, {
+      query: genericQuery,
+      intent: 'text',
+      includeHidden: false,
+      maxResults: 20
+    });
+    assert(!hiddenOffResult.matches.some((m) => m.path.includes('.hidden')), 'Hidden candidate leaked when includeHidden=false');
+
+    const hiddenOnResult = await searchWorkspace(hiddenConfig, hiddenGuard, hiddenWorkspace, {
+      query: genericQuery,
+      intent: 'text',
+      includeHidden: true,
+      maxResults: 20
+    });
+    const hiddenOnAnalysis = analysisOf(hiddenOnResult, 'generic hidden on');
+    assert(hiddenOnAnalysis.matches.some((m) => m.path.includes('.hidden')), 'Hidden candidate starved when includeHidden=true');
+    assert(hiddenOnAnalysis.matches.some((m) => !m.path.includes('.hidden')), 'Visible candidates starved when includeHidden=true');
+  } finally {
+    await fs.rm(hiddenFixtureRoot, { recursive: true, force: true });
+  }
+  console.log('PASS: Test 6: Controlled non-Threadmark fixture proves generic byte-budget underfill, ranking preservation, mandatory class survival, exact truncation warning timing, and hidden boundary correctness.');
 
   console.log('PASS: SUPPORTING_ONLY public/structured payload remains bounded with required definitions, affected source modules, tests, reasons, provenance, and warnings.');
   console.log('AP-012 production thresholds remain unproven here; real public-route evidence is required separately.');

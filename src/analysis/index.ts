@@ -9,7 +9,7 @@ import { getCachedWorkspaceAnalysis, invalidateWorkspaceAnalysis, setCachedWorks
 import { extractWorkspaceFiles } from "./extract.js";
 import { buildRelationshipsWithCoverage, IMPACT_TRAVERSAL_TRUNCATION_WARNING, traverseImpactGraph } from "./graph.js";
 import { inventoryWorkspace } from "./inventory.js";
-import { classifyDefinitionMatch, classifySearchIntent, emptySearchGroups, groupForFile, scheduleStructuredMatches, sortStructuredMatches } from "./rank.js";
+import { BUDGET_TRUNCATION_WARNING, classifyDefinitionMatch, classifySearchIntent, emptySearchGroups, groupForFile, scheduleStructuredMatches, sortStructuredMatches } from "./rank.js";
 import { resolveSearchScope, searchScopeCacheKey } from "./scope.js";
 import type { AnalysisSearchIntent, StructuredSearchMatch, StructuredSearchResult, WorkspaceAnalysis } from "./types.js";
 
@@ -527,13 +527,74 @@ export async function searchWorkspaceStructured(
 
   const matches = accumulator.finalize();
   const eligibleMatches = matches.filter((match) => includePath(match.path));
-  const scheduled = scheduleStructuredMatches(eligibleMatches, {
+
+  const measureStructuredPayloadBytes = (candidateMatches: StructuredSearchMatch[]): number => {
+    const candidateGroups = emptySearchGroups();
+    for (const m of candidateMatches) {
+      const reasons = m.reasons.includes("lexical exact match")
+        ? m.reasons
+        : [...m.reasons, "lexical exact match"].sort((a, b) => a.localeCompare(b));
+      const provenance = m.provenance
+        ? (m.provenance.includes("lexical") ? m.provenance : [...m.provenance, "lexical"].sort((a, b) => a.localeCompare(b)))
+        : [m.source, "lexical"].sort((a, b) => a.localeCompare(b));
+      candidateGroups[m.group].push({
+        ...m,
+        reasons,
+        provenance
+      });
+    }
+    const candidateOrdered = Object.values(candidateGroups).flat();
+    const candidateLegacyMatches = candidateOrdered.map(({ path, line, text, source, reasons }) => ({
+      path,
+      line,
+      text: source === "built-in analysis" && reasons.includes("exact text match")
+        ? text
+        : redactSensitiveTextPreservingLines(text, {
+          context: "source",
+          language: sourceLanguageForPath(path)
+        })
+    }));
+    const trialWarnings = [...warnings];
+    if (!trialWarnings.includes(BUDGET_TRUNCATION_WARNING)) {
+      trialWarnings.push(BUDGET_TRUNCATION_WARNING);
+    }
+    const trialEnvelope: Record<string, unknown> = {
+      codexpro_tool: "search",
+      codexpro_title: "Search Workspace",
+      workspace_id: workspace.id,
+      root: workspace.root,
+      matches: candidateLegacyMatches,
+      truncated: true,
+      used: 1,
+      analysis: {
+        schemaVersion: 2,
+        query: redactSearchQuery(query, candidateOrdered.map((m) => m.text)),
+        intent,
+        groups: candidateGroups,
+        matches: candidateOrdered,
+        coverage: {
+          ...analysis.coverage,
+          truncated: true,
+          warnings: trialWarnings
+        },
+        warnings: trialWarnings,
+        cache
+      }
+    };
+    return Buffer.byteLength(JSON.stringify(trialEnvelope), "utf8") + 128;
+  };
+
+  const { matches: scheduled, budgetTruncated } = scheduleStructuredMatches(eligibleMatches, {
     intent,
     resultLimit,
     includeHidden: Boolean(options.includeHidden),
-    includeTests: Boolean(options.includeTests)
+    includeTests: Boolean(options.includeTests),
+    calculatePayloadBytes: measureStructuredPayloadBytes
   });
   for (const match of scheduled) groups[match.group].push(match);
+  if (budgetTruncated) {
+    warnings.push(BUDGET_TRUNCATION_WARNING);
+  }
   const orderedMatches = Object.values(groups).flat();
   return {
     schemaVersion: 2,
@@ -543,7 +604,7 @@ export async function searchWorkspaceStructured(
     matches: orderedMatches,
     coverage: {
       ...analysis.coverage,
-      truncated: analysis.coverage.truncated || searchBudgetReached || candidateLimitReached || impactTraversalTruncated || skippedFiles > 0,
+      truncated: analysis.coverage.truncated || searchBudgetReached || candidateLimitReached || impactTraversalTruncated || budgetTruncated || skippedFiles > 0,
       warnings
     },
     warnings,

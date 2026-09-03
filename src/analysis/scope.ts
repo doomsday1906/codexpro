@@ -5,6 +5,7 @@ export interface SearchScopeOptions {
   root?: string;
   glob?: string;
   includeHidden?: boolean;
+  includeTests?: boolean;
 }
 
 export interface SearchScope {
@@ -32,9 +33,15 @@ export function resolveSearchScope(
     : "";
   const glob = options.glob || undefined;
   const includeHidden = options.includeHidden === true;
+  const includeTests = options.includeTests === true;
   const matches = (relativePath: string): boolean => {
     if (!includeHidden && isHiddenRelativePath(relativePath)) return false;
-    if (root && relativePath !== root && !relativePath.startsWith(`${root}/`)) return false;
+    if (root && relativePath !== root && !relativePath.startsWith(`${root}/`)) {
+      if (includeTests && (relativePath.startsWith("test/") || relativePath.startsWith("tests/"))) {
+        return matchesSearchGlob(relativePath, glob);
+      }
+      return false;
+    }
     return matchesSearchGlob(relativePath, glob);
   };
   return { root, glob, includeHidden, matches };
