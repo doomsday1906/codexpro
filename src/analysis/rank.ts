@@ -177,16 +177,16 @@ export function scheduleStructuredMatches(
     classQuotas.documentation = 1;
     classQuotas.other = 1;
   } else if (options.intent === "impact") {
-    classQuotas.definitions = 2;
-    classQuotas.references = 8;
-    classQuotas.tests = options.includeTests ? 4 : 0;
+    classQuotas.definitions = 1;
+    classQuotas.references = 6;
+    classQuotas.tests = options.includeTests ? 1 : 0;
     classQuotas.configuration = 1;
     classQuotas.documentation = 1;
     classQuotas.other = 1;
   } else if (options.intent === "symbol") {
-    classQuotas.definitions = 6;
-    classQuotas.references = 6;
-    classQuotas.tests = options.includeTests ? 3 : 0;
+    classQuotas.definitions = 8;
+    classQuotas.references = 2;
+    classQuotas.tests = options.includeTests ? 1 : 0;
     classQuotas.configuration = 1;
     classQuotas.documentation = 1;
     classQuotas.other = 1;
@@ -212,9 +212,30 @@ export function scheduleStructuredMatches(
     }
   }
 
-  // Fill remaining capacity by global score
+  // Fill remaining capacity by global score, bounded by maximum class caps for structured intents
+  const maxClassCaps: Partial<Record<AnalysisResultGroup, number>> = {};
+  if (options.intent === "impact") {
+    maxClassCaps.definitions = 2;
+    maxClassCaps.references = 6;
+    maxClassCaps.tests = options.includeTests ? 1 : 0;
+    maxClassCaps.configuration = 1;
+    maxClassCaps.documentation = 1;
+    maxClassCaps.other = 1;
+  } else if (options.intent === "symbol") {
+    maxClassCaps.definitions = 10;
+    maxClassCaps.references = 2;
+    maxClassCaps.tests = options.includeTests ? 1 : 0;
+    maxClassCaps.configuration = 1;
+    maxClassCaps.documentation = 1;
+    maxClassCaps.other = 1;
+  }
   for (const m of sorted) {
     if (selected.length >= options.resultLimit) break;
+    const cap = maxClassCaps[m.group];
+    if (cap !== undefined) {
+      const currentClassCount = selected.filter((s) => s.group === m.group).length;
+      if (currentClassCount >= cap) continue;
+    }
     select(m);
   }
 

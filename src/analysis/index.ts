@@ -43,11 +43,15 @@ function mergeEvidenceMatches(a: StructuredSearchMatch, b: StructuredSearchMatch
     ...(a.provenance ?? [a.source]),
     ...(b.provenance ?? [b.source])
   ]);
+  const allReasons = [...a.reasons, ...b.reasons];
+  const hasRelationship = allReasons.some((r) => r.includes("dependent") || r.includes("imports") || r.includes("tests"));
+  const hasTextMatch = allReasons.some((r) => r.includes("exact text match") || r.includes("symbol definition"));
+  const boost = (hasRelationship && hasTextMatch) ? 5 : 0;
   const merged: StructuredSearchMatch = {
     ...winner,
-    score: Math.max(a.score, b.score),
+    score: Math.max(a.score, b.score) + boost,
     confidence: CONFIDENCE_RANK[a.confidence] >= CONFIDENCE_RANK[b.confidence] ? a.confidence : b.confidence,
-    reasons: orderedUnique([...a.reasons, ...b.reasons])
+    reasons: orderedUnique(allReasons)
   };
   if (sources.length > 1) merged.provenance = sources;
   else if (winner.provenance?.length) merged.provenance = sources;
@@ -138,7 +142,9 @@ class StructuredEvidenceAccumulator {
       if (lines.length > 1) {
         merged.occurrenceCount = lines.length;
         merged.additionalLines = extraLines.slice(0, MAX_ADDITIONAL_OCCURRENCE_LINES);
-        merged.additionalLinesTruncated = extraLines.length > MAX_ADDITIONAL_OCCURRENCE_LINES;
+        if (extraLines.length > MAX_ADDITIONAL_OCCURRENCE_LINES) {
+          merged.additionalLinesTruncated = true;
+        }
       }
       compressed.push(merged);
     }
@@ -411,7 +417,7 @@ export async function searchWorkspaceStructured(
       const admitted = accumulator.add({
         path: res.path,
         line: 1,
-        text: `${res.kind} ${res.via ?? [...definitionPaths][0] ?? query}`,
+        text: `${res.kind} ${res.target ?? res.via ?? [...definitionPaths][0] ?? query}`,
         group,
         score,
         reasons: res.reasons,

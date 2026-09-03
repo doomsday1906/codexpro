@@ -59,6 +59,7 @@ export interface ImpactTraversalResult {
   depth: number;
   kind: "imports" | "tests";
   reasons: string[];
+  target?: string;
   via?: string;
 }
 
@@ -107,17 +108,17 @@ export function traverseImpactGraph(
       const isDirect = nextDepth === 1;
       const isTest = rel.kind === "tests";
 
+      const targetDisplay = current.rootDef.split("/").length > 2 ? current.rootDef.split("/").pop()! : current.rootDef;
+      const viaDisplay = current.via && current.via.split("/").length > 2 ? current.via.split("/").pop()! : current.via;
       const reasons: string[] = [];
       if (isTest) {
         reasons.push(isDirect ? "dependent test" : "transitive test dependent");
-        reasons.push(`${rel.kind} relationship`);
-        if (isDirect) reasons.push(`tests ${current.rootDef}`);
-        else if (current.via) reasons.push(`tests via ${current.via}`);
+        if (isDirect) reasons.push(`tests ${targetDisplay}`);
+        else if (viaDisplay) reasons.push(`tests via ${viaDisplay}`);
       } else {
         reasons.push(isDirect ? "dependent module" : "transitive dependent module");
-        reasons.push(`${rel.kind} relationship`);
-        if (isDirect) reasons.push(`imports ${current.rootDef}`);
-        else if (current.via) reasons.push(`transitive dependent via ${current.via}`);
+        if (isDirect) reasons.push(`imports ${targetDisplay}`);
+        else if (viaDisplay) reasons.push(`transitive dependent via ${viaDisplay}`);
       }
 
       results.push({
@@ -125,17 +126,20 @@ export function traverseImpactGraph(
         depth: nextDepth,
         kind: rel.kind === "tests" ? "tests" : "imports",
         reasons,
+        target: rel.to,
         via: isDirect ? rel.from : current.via
       });
 
       if (results.length >= maxCandidates) break;
 
-      queue.push({
-        path: rel.from,
-        depth: nextDepth,
-        rootDef: current.rootDef,
-        via: isDirect ? rel.from : current.via
-      });
+      if (!rel.from.endsWith("/__init__.py") && rel.from !== "__init__.py") {
+        queue.push({
+          path: rel.from,
+          depth: nextDepth,
+          rootDef: current.rootDef,
+          via: isDirect ? rel.from : current.via
+        });
+      }
     }
   }
 
