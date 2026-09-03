@@ -232,6 +232,35 @@ try {
   console.log(`RAW_OBSERVATION: overflow fixture has ${lexicalOnlyOverflow.matches.length} raw lexical records but ${overflowAnalysis.matches.length} scheduled structured records; legacy projection count/text exactly match the scheduled set.`);
   console.log('SANITY_VERDICT: MATCH — the outward structured-search list and text show only the selected path/line/text records while analysis retains provenance and coverage warning fields.');
 
+  // Test 5: Explicit text intent preserves every lexical occurrence even when
+  // structured analysis compresses same-file lines into one evidence record.
+  const textOccurrenceQuery = 'TextOccurrenceNeedle';
+  await writeFixture('src/structured-text-occurrences.ts', Array.from({ length: 19 }, (_, index) => (
+    `const occurrence${String(index).padStart(2, '0')} = "${textOccurrenceQuery}";`
+  )).join('\n') + '\n');
+  const lexicalOnlyText = await searchWorkspace(config, guard, workspace, {
+    query: textOccurrenceQuery,
+    maxResults: 20
+  });
+  const structuredTextResult = await searchWorkspace(config, guard, workspace, {
+    query: textOccurrenceQuery,
+    intent: 'text',
+    maxResults: 20
+  });
+  const textAnalysis = analysisOf(structuredTextResult, 'explicit text occurrence compatibility');
+  assert.equal(lexicalOnlyText.matches.length, 19, 'Text occurrence fixture did not produce all lexical occurrences');
+  assert.equal(textAnalysis.intent, 'text', 'Explicit text intent was not retained');
+  assert.equal(textAnalysis.matches.length, 1, 'Text analysis did not compress same-file occurrences into one structured record');
+  assert.equal(textAnalysis.matches[0].occurrenceCount, 19, 'Text analysis lost same-file occurrence cardinality');
+  assert(textAnalysis.matches[0].additionalLinesTruncated, 'Text analysis did not retain bounded additional-line truth');
+  assert(textAnalysis.matches[0].provenance?.includes('lexical'), 'Text analysis lost lexical provenance');
+  assert.deepEqual(structuredTextResult.matches, lexicalOnlyText.matches, 'Explicit text search changed legacy lexical occurrence matches');
+  assert.equal(structuredTextResult.text, lexicalOnlyText.text, 'Explicit text search changed legacy lexical occurrence text');
+  assert(textAnalysis.coverage.truncated, 'Text occurrence regression lost truthful coverage truncation');
+  assert(textAnalysis.warnings.some((warning) => warning.includes('Source analysis reached its file or byte limit.')), 'Text occurrence regression lost the coverage warning');
+  console.log(`RAW_OBSERVATION: explicit text fixture has ${lexicalOnlyText.matches.length} lexical occurrences and ${textAnalysis.matches.length} compressed structured record; legacy text matches/text retain every occurrence.`);
+  console.log('SANITY_VERDICT: MATCH — explicit text output preserves the nineteen visible path/line/text occurrences while analysis retains compressed occurrence metadata, provenance, and coverage warning.');
+
   console.log('PASS: SUPPORTING_ONLY public/structured payload remains bounded with required definitions, affected source modules, tests, reasons, provenance, and warnings.');
   console.log('AP-012 production thresholds remain unproven here; real public-route evidence is required separately.');
   console.log('ALL TASK-006 SMOKE CHECKS PASSED.');

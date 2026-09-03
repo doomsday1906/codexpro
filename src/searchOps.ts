@@ -439,15 +439,30 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
       ...lexical.matches.map((match) => match.text),
       ...structured.matches.map((match) => match.text)
     ]);
-    // Structured scheduling is the authoritative result set for structured
+    // Structured scheduling is the authoritative result set for semantic
     // searches. Keep the legacy projection aligned with that same set instead
     // of exposing an independently truncated lexical window alongside it.
+    // Text intent intentionally retains lexical occurrence cardinality: its
+    // structured records may compress multiple same-file lines into one
+    // evidence record while the legacy contract exposes every occurrence.
     // Regex searches intentionally return no grouped records and retain their
     // lexical ripgrep output as the supported fallback. The same fallback is
     // needed when structured analysis has no scheduled records (for example,
     // an eligible lexical producer can be independent of the analyzed source).
-    if (!options.regex && structured.matches.length > 0) {
-      lexical.matches = structured.matches.map(({ path, line, text }) => ({ path, line, text }));
+    if (!options.regex && structured.intent !== "text" && structured.matches.length > 0) {
+      lexical.matches = structured.matches.map(({ path, line, text, source, reasons }) => ({
+        path,
+        line,
+        // Relationship producers synthesize text from graph paths rather than
+        // a complete source line. Keep that derived text redacted before the
+        // server's compatibility-preserving text restoration pass.
+        text: source === "built-in analysis" && reasons.includes("exact text match")
+          ? text
+          : redactSensitiveTextPreservingLines(text, {
+            context: "source",
+            language: sourceLanguageForPath(path)
+          })
+      }));
       lexical.text = lexical.matches.map((match) => `${match.path}:${match.line}: ${match.text}`).join("\n") || "No matches.";
     }
     lexical.analysis = structured;
