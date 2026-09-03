@@ -9,6 +9,7 @@ import { CodexProError, PathGuard } from "./guard.js";
 import { isHiddenRelativePath, listFiles, textScanByteLimit } from "./fsOps.js";
 import { redactDiagnosticText, redactSearchQuery, redactSensitiveTextPreservingLines, sourceLanguageForPath, truncateUtf8 } from "./redact.js";
 import { searchWorkspaceStructured, type AnalysisSearchIntent, type StructuredSearchMatch, type StructuredSearchResult } from "./analysis/index.js";
+import { resolveSearchScope } from "./analysis/scope.js";
 
 export interface SearchOptions {
   query: string;
@@ -127,6 +128,13 @@ function mergeLexicalProvenance(structured: StructuredSearchResult, lexical: Sea
     structuredMatch.reasons = [...new Set([...structuredMatch.reasons, "lexical exact match"])].sort((a, b) => a.localeCompare(b));
     const provenance = [...new Set([...(structuredMatch.provenance ?? [structuredMatch.source]), "lexical"])].sort((a, b) => a.localeCompare(b));
     structuredMatch.provenance = provenance;
+  }
+}
+
+function enforceStructuredSearchScope(structured: StructuredSearchResult, scope: ReturnType<typeof resolveSearchScope>): void {
+  structured.matches = structured.matches.filter((match) => scope.matches(match.path));
+  for (const group of Object.keys(structured.groups) as Array<keyof StructuredSearchResult["groups"]>) {
+    structured.groups[group] = structured.groups[group].filter((match) => scope.matches(match.path));
   }
 }
 
@@ -429,8 +437,13 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
       includeHidden: options.includeHidden,
       regex: Boolean(rawOptions.regex),
       root: options.root,
+      glob: options.glob,
       maxResults: options.maxResults
     });
+    // Keep the public projection behind the same request-local scope predicate
+    // as the structured producers, even if a future producer adds a record
+    // through a path not covered by its own admission loop.
+    enforceStructuredSearchScope(structured, resolveSearchScope(guard, workspace, options));
     mergeLexicalProvenance(structured, lexical);
     // Binary/NUL files may be found by lexical ripgrep while analysis has no
     // decodable inventory or structured matches. Use both redacted producers

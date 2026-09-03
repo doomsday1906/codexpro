@@ -55,6 +55,22 @@ try {
   await write('src/smoke.ts', 'const proofMarker = "SmokeNeedle";\n');
   await write('src/widget-smoke.ts', 'const proofMarker = "SmokeNeedle";\n');
 
+  // Search-scope fixtures: stronger definitions/dependents/tests live in a
+  // nearby directory and must not influence a scoped structured query.
+  await write('scope/allowed/ScopeOnlyAuto.txt', 'ScopeOnlyAuto appears as text in the requested root.\n');
+  await write('scope/nearby/ScopeOnlyAuto.ts', 'export class ScopeOnlyAuto {}\n');
+  await write('scope/allowed/scoped_target.py', 'class ScopedTarget:\n    pass\n');
+  await write('scope/allowed/allowed_dependent.py', 'from scope.allowed.scoped_target import ScopedTarget\nclass AllowedDependent:\n    pass\n');
+  await write('scope/nearby/nearby_dependent.py', 'from scope.allowed.scoped_target import ScopedTarget\nclass NearbyDependent:\n    pass\n');
+  await write('scope/allowed/tests/test_scoped_target.py', 'from scope.allowed.scoped_target import ScopedTarget\ndef test_scoped_target():\n    assert ScopedTarget\n');
+  await write('scope/nearby/tests/test_scoped_target.py', 'from scope.allowed.scoped_target import ScopedTarget\ndef test_nearby_scoped_target():\n    assert ScopedTarget\n');
+  await write('scope/allowed/scoped_glob.py', 'class ScopedGlob:\n    pass\n');
+  await write('scope/allowed/scoped_glob.ts', 'const scopedGlob = "ScopedGlob";\n');
+  await write('scope/nearby/scoped_glob.py', 'class ScopedGlob:\n    pass\n');
+  await write('scope/allowed/fallback_target.py', 'class FallbackTarget:\n    pass\n');
+  await write('scope/allowed/tests/test_fallback_target.py', '# filename-only fallback evidence\n');
+  await write('scope/nearby/tests/test_fallback_target.py', '# nearby filename-only fallback must stay out of scope\n');
+
   const [
     { loadConfig },
     { PathGuard, WorkspaceManager },
@@ -187,6 +203,91 @@ try {
   const testIdx = testsTrueAnalysis.matches.findIndex((m) => m.path === 'scripts/search-evidence-smoke.mjs');
   assert(srcIdx < testIdx, `source reference at ${srcIdx} did not precede test at ${testIdx}`);
   console.log('PASS: AP-006: smoke proof scripts classify as tests; tests do not starve source references.');
+
+  // Test 7: one exact root/glob/visibility predicate gates auto, definitions,
+  // graph impact, filename fallback, scheduling, and the public projection.
+  const scopedAutoResult = await searchWorkspace(config, guard, workspace, {
+    query: 'ScopeOnlyAuto',
+    intent: 'auto',
+    root: 'scope/allowed',
+    includeTests: true,
+    maxResults: 20
+  });
+  const scopedAutoAnalysis = analysisOf(scopedAutoResult);
+  console.log(`RAW_OBSERVATION: scoped auto payload intent=${scopedAutoAnalysis.intent}; analysis paths=${JSON.stringify(scopedAutoAnalysis.matches.map((match) => match.path))}; public paths=${JSON.stringify(scopedAutoResult.matches.map((match) => match.path))}`);
+  assert.equal(scopedAutoAnalysis.intent, 'text', 'out-of-scope symbol evidence incorrectly selected auto=symbol');
+  assert(scopedAutoAnalysis.matches.some((match) => match.path === 'scope/allowed/ScopeOnlyAuto.txt'), 'in-scope lexical fallback evidence was missing');
+  assert(scopedAutoAnalysis.matches.every((match) => match.path === 'scope/allowed/ScopeOnlyAuto.txt'), 'scoped auto admitted an out-of-scope candidate');
+  assert(scopedAutoResult.matches.every((match) => match.path === 'scope/allowed/ScopeOnlyAuto.txt'), 'public scoped auto projection escaped the requested root');
+
+  const scopedImpactResult = await searchWorkspace(config, guard, workspace, {
+    query: 'ScopedTarget',
+    intent: 'impact',
+    root: 'scope/allowed',
+    includeTests: true,
+    maxResults: 20
+  });
+  const scopedImpactAnalysis = analysisOf(scopedImpactResult);
+  const scopedImpactPaths = scopedImpactAnalysis.matches.map((match) => match.path);
+  console.log(`RAW_OBSERVATION: scoped impact analysis paths=${JSON.stringify(scopedImpactPaths)}; public paths=${JSON.stringify(scopedImpactResult.matches.map((match) => match.path))}`);
+  assert(scopedImpactPaths.includes('scope/allowed/scoped_target.py'), 'scoped impact lost the in-scope definition');
+  assert(scopedImpactPaths.includes('scope/allowed/allowed_dependent.py'), 'scoped impact lost the in-scope dependent');
+  assert(scopedImpactPaths.includes('scope/allowed/tests/test_scoped_target.py'), 'scoped impact lost the in-scope test');
+  assert(scopedImpactPaths.every((matchPath) => matchPath.startsWith('scope/allowed/')), 'structured impact returned a path outside the requested root');
+  assert(scopedImpactResult.matches.every((match) => match.path.startsWith('scope/allowed/')), 'public impact projection returned a path outside the requested root');
+  assert(!scopedImpactPaths.some((matchPath) => matchPath.startsWith('scope/nearby/')), 'nearby dependent/test influenced or appeared in scoped impact');
+
+  const scopedGlobResult = await searchWorkspace(config, guard, workspace, {
+    query: 'ScopedGlob',
+    intent: 'auto',
+    root: 'scope/allowed',
+    glob: '**/*.py',
+    includeTests: true,
+    maxResults: 20
+  });
+  const scopedGlobAnalysis = analysisOf(scopedGlobResult);
+  console.log(`RAW_OBSERVATION: scoped glob payload intent=${scopedGlobAnalysis.intent}; paths=${JSON.stringify(scopedGlobAnalysis.matches.map((match) => match.path))}; cache keys differ=${scopedGlobAnalysis.cache.key !== scopedImpactAnalysis.cache.key}`);
+  assert.equal(scopedGlobAnalysis.intent, 'symbol', 'in-glob definition did not drive auto=symbol');
+  assert(scopedGlobAnalysis.matches.some((match) => match.path === 'scope/allowed/scoped_glob.py'), 'glob-eligible in-scope definition was missing');
+  assert(scopedGlobAnalysis.matches.every((match) => match.path.endsWith('.py')), 'structured glob scope admitted a non-matching extension');
+  assert(!scopedGlobAnalysis.matches.some((match) => match.path.startsWith('scope/nearby/')), 'glob-scoped search admitted a nearby path');
+  assert.notEqual(scopedGlobAnalysis.cache.key, scopedImpactAnalysis.cache.key, 'root/glob scope variants reused one public cache identity');
+
+  const originalPath = process.env.PATH;
+  let nodeScopedGlobResult;
+  try {
+    process.env.PATH = '/nonexistent';
+    nodeScopedGlobResult = await searchWorkspace(config, guard, workspace, {
+      query: 'ScopedGlob',
+      intent: 'auto',
+      root: 'scope/allowed',
+      glob: '**/*.py',
+      includeTests: true,
+      maxResults: 20
+    });
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+  }
+  const nodeScopedGlobAnalysis = analysisOf(nodeScopedGlobResult);
+  console.log(`RAW_OBSERVATION: Node fallback scoped glob backend=${nodeScopedGlobResult.used}; paths=${JSON.stringify(nodeScopedGlobAnalysis.matches.map((match) => match.path))}`);
+  assert.equal(nodeScopedGlobResult.used, 'node', 'Node fallback scope proof did not disable ripgrep');
+  assert(nodeScopedGlobAnalysis.matches.every((match) => match.path === 'scope/allowed/scoped_glob.py'), 'Node fallback scoped glob escaped root or glob');
+
+  const scopedFallbackResult = await searchWorkspace(config, guard, workspace, {
+    query: 'FallbackTarget',
+    intent: 'impact',
+    root: 'scope/allowed',
+    includeTests: true,
+    maxResults: 20
+  });
+  const scopedFallbackAnalysis = analysisOf(scopedFallbackResult);
+  console.log(`RAW_OBSERVATION: scoped fallback analysis paths=${JSON.stringify(scopedFallbackAnalysis.matches.map((match) => match.path))}; public paths=${JSON.stringify(scopedFallbackResult.matches.map((match) => match.path))}`);
+  console.log('SANITY_VERDICT: MATCH — each scoped raw result contains only paths under scope/allowed, and the glob result contains only .py paths.');
+  assert(scopedFallbackAnalysis.matches.some((match) => match.path === 'scope/allowed/tests/test_fallback_target.py'), 'in-scope filename fallback test was missing');
+  assert(!scopedFallbackAnalysis.matches.some((match) => match.path === 'scope/nearby/tests/test_fallback_target.py'), 'out-of-scope filename fallback test appeared');
+  assert(scopedFallbackResult.matches.every((match) => match.path.startsWith('scope/allowed/')), 'public fallback projection escaped the requested root');
+  console.log('PASS: root/path and glob scope remains authoritative for auto, definitions, graph impact, filename fallback, scheduling, cache identity, and public matches.');
 
   console.log('ALL TASK-003 SMOKE CHECKS PASSED.');
 } finally {

@@ -10,6 +10,7 @@ import { extractWorkspaceFiles } from "./extract.js";
 import { buildRelationshipsWithCoverage, traverseImpactGraph } from "./graph.js";
 import { inventoryWorkspace } from "./inventory.js";
 import { classifyDefinitionMatch, classifySearchIntent, emptySearchGroups, groupForFile, scheduleStructuredMatches, sortStructuredMatches } from "./rank.js";
+import { resolveSearchScope, searchScopeCacheKey } from "./scope.js";
 import type { AnalysisSearchIntent, StructuredSearchMatch, StructuredSearchResult, WorkspaceAnalysis } from "./types.js";
 
 const REDACTED_SEARCH_CONTEXT = "[REDACTED_SECRET]";
@@ -230,13 +231,18 @@ export async function searchWorkspaceStructured(
   config: CodexProConfig,
   guard: PathGuard,
   workspace: Workspace,
-  options: { query: string; intent?: AnalysisSearchIntent; includeTests?: boolean; includeHidden?: boolean; regex?: boolean; root?: string; maxResults?: number }
+  options: { query: string; intent?: AnalysisSearchIntent; includeTests?: boolean; includeHidden?: boolean; regex?: boolean; root?: string; glob?: string; maxResults?: number }
 ): Promise<StructuredSearchResult> {
   const query = options.query.trim();
   if (!query) throw new Error("query is required.");
   const analysis = await inspectWorkspace(config, guard, workspace);
   const lowered = query.toLowerCase();
-  const includePath = (filePath: string) => options.includeHidden === true || !isHiddenRelativePath(filePath);
+  const scope = resolveSearchScope(guard, workspace, options);
+  const includePath = scope.matches;
+  const scopedCacheKey = searchScopeCacheKey(scope);
+  const cache = scopedCacheKey
+    ? { hit: analysis.cache.hit, key: `${analysis.cache.key}:scope:${scopedCacheKey}` }
+    : analysis.cache;
   const hasSymbolEvidence = analysis.symbols.some((symbol) => {
     if (!includePath(symbol.path)) return false;
     const nameLower = symbol.name.toLowerCase();
@@ -249,9 +255,7 @@ export async function searchWorkspaceStructured(
   const resultLimit = Math.max(1, Math.min(options.maxResults ?? config.maxSearchResults, config.maxSearchResults));
   const candidateLimit = Math.max(resultLimit, Math.min(resultLimit * 4, 20_000));
   const testCandidateLimit = candidateLimit;
-  const resolvedRoot = options.root?.trim() ? guard.resolve(workspace, options.root).relPath.replace(/^\.\/?$/, "") : "";
-  const inScope = (filePath: string) => !resolvedRoot || filePath === resolvedRoot || filePath.startsWith(`${resolvedRoot}/`);
-  if (resolvedRoot && options.includeHidden !== true && isHiddenRelativePath(resolvedRoot)) {
+  if (scope.root && !scope.includeHidden && isHiddenRelativePath(scope.root)) {
     return {
       schemaVersion: 2,
       query: redactSearchQuery(query),
@@ -260,7 +264,7 @@ export async function searchWorkspaceStructured(
       matches: [],
       coverage: { ...analysis.coverage, warnings },
       warnings,
-      cache: analysis.cache
+      cache
     };
   }
   const definitionsByPath = new Map<string, Map<number, WorkspaceAnalysis["symbols"][number][]>>();
@@ -282,7 +286,7 @@ export async function searchWorkspaceStructured(
       matches: [],
       coverage: { ...analysis.coverage, truncated: true, warnings },
       warnings,
-      cache: analysis.cache
+      cache
     };
   }
   let scannedFiles = 0;
@@ -293,11 +297,12 @@ export async function searchWorkspaceStructured(
   let testCandidateLimitReached = false;
   let skippedFiles = 0;
 
+  const scopedFiles = analysis.files.filter((file) => includePath(file.path));
+
   scan:
-  for (const file of analysis.files) {
-    if (!includePath(file.path) || file.generated) continue;
+  for (const file of scopedFiles) {
+    if (file.generated) continue;
     if (!options.includeTests && file.role === "test") continue;
-    if (!inScope(file.path) && !(options.includeTests && file.role === "test")) continue;
     if (file.role === "test" && testCandidateLimitReached) continue;
     if (file.role !== "test" && sourceCandidateLimitReached) {
       if (!options.includeTests || testCandidateLimitReached) break scan;
@@ -433,7 +438,7 @@ export async function searchWorkspaceStructured(
     if (options.includeTests) {
       const defBasenames = [...definitionPaths].map((p) => p.split("/").pop()?.replace(/\.[^.]+$/, "").toLowerCase()).filter(Boolean) as string[];
       const queryStem = query.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
-      for (const file of analysis.files) {
+      for (const file of scopedFiles) {
         if (!includePath(file.path) || file.role !== "test" || file.generated) continue;
         const fileLower = (file.path.split("/").pop() ?? "").toLowerCase();
         const matchesDef = defBasenames.some((stem) => stem.length > 3 && fileLower.includes(stem));
@@ -494,7 +499,8 @@ export async function searchWorkspaceStructured(
   }
 
   const matches = accumulator.finalize();
-  const scheduled = scheduleStructuredMatches(matches, {
+  const eligibleMatches = matches.filter((match) => includePath(match.path));
+  const scheduled = scheduleStructuredMatches(eligibleMatches, {
     intent,
     resultLimit,
     includeHidden: Boolean(options.includeHidden),
@@ -514,7 +520,7 @@ export async function searchWorkspaceStructured(
       warnings
     },
     warnings,
-    cache: analysis.cache
+    cache
   };
 }
 

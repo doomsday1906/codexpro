@@ -352,6 +352,17 @@ export function isHiddenRelativePath(relPath: string): boolean {
   return normalizeRelPath(relPath).split("/").some(isHiddenName);
 }
 
+/**
+ * Match a repository-relative path using the same glob contract as the
+ * lexical search/list-files route. Ripgrep treats a pattern without a slash
+ * as a basename pattern, which is represented by minimatch's matchBase mode;
+ * path-qualified patterns continue to match the complete repository path.
+ */
+export function matchesSearchGlob(relativePath: string, glob?: string): boolean {
+  if (!glob) return true;
+  return minimatch(normalizeRelPath(relativePath).replace(/^\.\//, ""), glob, { dot: true, matchBase: true });
+}
+
 export async function repoTree(config: CodexProConfig, guard: PathGuard, workspace: Workspace, options: TreeOptions): Promise<TreeResult> {
   const target = guard.resolve(workspace, options.path ?? ".");
   const stat = await fsp.stat(target.absPath);
@@ -509,7 +520,7 @@ export async function listFilesDetailed<TPrepared = never>(
     const rel = displayPath(absFile, workspace.root);
     if (guard.isBlockedRelativePath(rel)) return false;
     if (!options.includeHidden && isHiddenRelativePath(rel)) return false;
-    if (options.glob && !minimatch(rel, options.glob, { dot: true })) return false;
+    if (!matchesSearchGlob(rel, options.glob)) return false;
     const prepared = await options.admitFile?.({ absPath: absFile, relPath: rel });
     if (options.admitFile && prepared == null) return false;
     files.push(rel);
