@@ -388,6 +388,177 @@ try {
   }
   console.log('PASS: Test 6: Controlled non-Threadmark fixture proves generic byte-budget underfill, ranking preservation, mandatory class survival, exact truncation warning timing, and hidden boundary correctness.');
 
+  // Test 7: Direct falsifiers for HIGH-LIMIT-001 and HIGH-MANDATORY-001
+  // 7a: HIGH-LIMIT-001 hard max_results boundary with disjoint hidden/visible/definition/test candidates
+  const limitFixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-search-limit-'));
+  try {
+    await fs.writeFile(path.join(limitFixtureRoot, 'package.json'), '{}\n');
+    await fs.mkdir(path.join(limitFixtureRoot, 'src'), { recursive: true });
+    await fs.mkdir(path.join(limitFixtureRoot, 'src/.hidden'), { recursive: true });
+    await fs.mkdir(path.join(limitFixtureRoot, 'tests'), { recursive: true });
+
+    // Disjoint candidates:
+    // 1. Visible definition
+    await fs.writeFile(path.join(limitFixtureRoot, 'src/core_target.py'), 'class CoreTargetProcessor:\n    pass\n');
+    // 2. Visible affected module
+    await fs.writeFile(path.join(limitFixtureRoot, 'src/visible_consumer.py'), 'from src.core_target import CoreTargetProcessor\nclass VisibleConsumer:\n    pass\n');
+    // 3. Hidden affected module
+    await fs.writeFile(path.join(limitFixtureRoot, 'src/.hidden/hidden_consumer.py'), 'from src.core_target import CoreTargetProcessor\nclass HiddenConsumer:\n    pass\n');
+    // 4. Visible test
+    await fs.writeFile(path.join(limitFixtureRoot, 'tests/test_core_target.py'), 'from src.core_target import CoreTargetProcessor\ndef test_core():\n    assert CoreTargetProcessor\n');
+
+    const limitConfig = loadConfig(['--root', limitFixtureRoot, '--allow-root', limitFixtureRoot, '--bash', 'off', '--write', 'off']);
+    const limitGuard = new PathGuard(limitConfig);
+    const limitWorkspace = new WorkspaceManager(limitConfig).defaultWorkspace();
+
+    // 7a-1: max_results=2, include_hidden=true, intent=impact, include_tests=true
+    // Disjoint candidates exist: visible def, visible consumer, hidden consumer, visible test.
+    // Capacity 2 MUST NOT be exceeded, AND visibility fairness MUST be honored (1 visible, 1 hidden).
+    const limit2HiddenTrueResult = await searchWorkspace(limitConfig, limitGuard, limitWorkspace, {
+      query: 'CoreTargetProcessor',
+      intent: 'impact',
+      includeTests: true,
+      includeHidden: true,
+      maxResults: 2
+    });
+    const limit2Analysis = analysisOf(limit2HiddenTrueResult, 'limit=2 hidden=true');
+    assert.equal(limit2HiddenTrueResult.matches.length, 2, 'Legacy matches exceeded max_results=2');
+    assert.equal(limit2Analysis.matches.length, 2, 'Structured matches exceeded max_results=2');
+    const limit2Paths = limit2Analysis.matches.map((m) => m.path);
+    assert(limit2Paths.includes('src/core_target.py'), 'Definition orientation was lost in max_results=2');
+    assert(limit2Paths.includes('src/.hidden/hidden_consumer.py'), 'Visibility fairness was not honored in max_results=2');
+    assert(!limit2Paths.includes('tests/test_core_target.py'), 'Test should not be admitted when capacity 2 is exhausted by def and hidden fairness');
+    assert.equal(limit2Analysis.groups.definitions.length, 1);
+    assert.equal(limit2Analysis.groups.references.length, 1);
+    assert.equal(limit2Analysis.groups.tests.length, 0);
+
+    // 7a-2: max_results=2, include_hidden=false, intent=impact, include_tests=true
+    // With hidden off, capacity 2 holds visible def + visible test.
+    const limit2HiddenFalseResult = await searchWorkspace(limitConfig, limitGuard, limitWorkspace, {
+      query: 'CoreTargetProcessor',
+      intent: 'impact',
+      includeTests: true,
+      includeHidden: false,
+      maxResults: 2
+    });
+    const limit2FalseAnalysis = analysisOf(limit2HiddenFalseResult, 'limit=2 hidden=false');
+    assert.equal(limit2FalseAnalysis.matches.length, 2, 'Structured matches exceeded max_results=2 with hidden=false');
+    assert(!limit2FalseAnalysis.matches.some((m) => m.path.includes('.hidden')), 'Hidden candidate leaked with hidden=false');
+    const limit2FalsePaths = limit2FalseAnalysis.matches.map((m) => m.path);
+    assert(limit2FalsePaths.includes('src/core_target.py'), 'Definition orientation lost with hidden=false');
+    assert(limit2FalsePaths.includes('tests/test_core_target.py'), 'Test lost with hidden=false when capacity permits');
+
+    // 7a-3: max_results=1, include_hidden=true, intent=impact, include_tests=true
+    // Capacity 1 cannot represent both visibility classes; definition orientation wins.
+    const limit1Result = await searchWorkspace(limitConfig, limitGuard, limitWorkspace, {
+      query: 'CoreTargetProcessor',
+      intent: 'impact',
+      includeTests: true,
+      includeHidden: true,
+      maxResults: 1
+    });
+    const limit1Analysis = analysisOf(limit1Result, 'limit=1');
+    assert.equal(limit1Analysis.matches.length, 1, 'Structured matches exceeded max_results=1');
+    assert.equal(limit1Analysis.matches[0].path, 'src/core_target.py', 'Definition orientation did not win for max_results=1');
+
+    // 7a-4: max_results=3, include_hidden=true, intent=impact, include_tests=true
+    // Capacity 3 holds def, hidden fairness, and test.
+    const limit3Result = await searchWorkspace(limitConfig, limitGuard, limitWorkspace, {
+      query: 'CoreTargetProcessor',
+      intent: 'impact',
+      includeTests: true,
+      includeHidden: true,
+      maxResults: 3
+    });
+    const limit3Analysis = analysisOf(limit3Result, 'limit=3');
+    assert.equal(limit3Analysis.matches.length, 3, 'Structured matches exceeded max_results=3');
+    const limit3Paths = limit3Analysis.matches.map((m) => m.path);
+    assert(limit3Paths.includes('src/core_target.py'), 'Definition missing in max_results=3');
+    assert(limit3Paths.includes('src/.hidden/hidden_consumer.py'), 'Hidden fairness missing in max_results=3');
+    assert(limit3Paths.includes('tests/test_core_target.py'), 'Test missing in max_results=3');
+
+    console.log('PASS: HIGH-LIMIT-001: Hard max_results boundary enforced across visibility and semantic reservations; visibility fairness honored when capacity permits.');
+  } finally {
+    await fs.rm(limitFixtureRoot, { recursive: true, force: true });
+  }
+
+  // 7b: HIGH-MANDATORY-001 mandatory impact envelope preserved under tight/overflowing payload budget
+  const mandatoryFixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-search-mandatory-'));
+  try {
+    await fs.writeFile(path.join(mandatoryFixtureRoot, 'package.json'), '{}\n');
+    await fs.mkdir(path.join(mandatoryFixtureRoot, 'packages/heavy'), { recursive: true });
+    await fs.mkdir(path.join(mandatoryFixtureRoot, 'tests'), { recursive: true });
+
+    // Deliberately large definition, affected modules, and test matching lines that together exceed ordinary byte budget (9,400)
+    const linePad = (size) => ' # ' + 'X'.repeat(size);
+    await fs.writeFile(path.join(mandatoryFixtureRoot, 'packages/heavy/heavy_target.py'), [
+      `class HeavyTargetProcessor:${linePad(350)}`,
+      `    pass`,
+      `class HeavyTargetProcessorWorker:${linePad(350)}`,
+      `    pass`,
+      `class HeavyTargetProcessorConfig:${linePad(350)}`,
+      `    pass`
+    ].join('\n') + '\n');
+
+    for (let i = 0; i < 4; i++) {
+      await fs.writeFile(path.join(mandatoryFixtureRoot, `packages/heavy/heavy_dependent_${i}.py`), [
+        `from packages.heavy.heavy_target import HeavyTargetProcessor${linePad(350)}`,
+        `class HeavyDependent${i}:`,
+        `    pass`,
+        `class HeavyConsumer${i}:${linePad(350)}`,
+        `    processor = HeavyTargetProcessor`
+      ].join('\n') + '\n');
+    }
+
+    await fs.writeFile(path.join(mandatoryFixtureRoot, 'tests/test_heavy_target.py'), [
+      `from packages.heavy.heavy_target import HeavyTargetProcessor${linePad(350)}`,
+      `def test_heavy_target_processor_1():${linePad(350)}`,
+      `    assert HeavyTargetProcessor`,
+      `def test_heavy_target_processor_2():${linePad(350)}`,
+      `    assert HeavyTargetProcessor`
+    ].join('\n') + '\n');
+
+    // Add supplemental candidates that must NOT squeeze into the overflowing budget
+    for (let i = 0; i < 5; i++) {
+      await fs.writeFile(path.join(mandatoryFixtureRoot, `packages/heavy/extra_ref_${i}.py`), `# extra ref ${i}\nconst ref${i} = "HeavyTargetProcessor";\n`);
+    }
+
+    const mandatoryConfig = loadConfig(['--root', mandatoryFixtureRoot, '--allow-root', mandatoryFixtureRoot, '--bash', 'off', '--write', 'off']);
+    const mandatoryGuard = new PathGuard(mandatoryConfig);
+    const mandatoryWorkspace = new WorkspaceManager(mandatoryConfig).defaultWorkspace();
+
+    const heavyResult = await searchWorkspace(mandatoryConfig, mandatoryGuard, mandatoryWorkspace, {
+      query: 'HeavyTargetProcessor',
+      intent: 'impact',
+      includeTests: true,
+      maxResults: 20
+    });
+    const heavyAnalysis = analysisOf(heavyResult, 'heavy mandatory envelope');
+    const heavyPaths = heavyAnalysis.matches.map((m) => m.path);
+    const heavySC = supportingStructuredContent(mandatoryWorkspace, heavyResult);
+    const heavyBytes = Buffer.byteLength(JSON.stringify(heavySC), 'utf8');
+    console.log(`RAW_OBSERVATION: heavyBytes=${heavyBytes}, matches=${heavyAnalysis.matches.length}`);
+
+    // Mandatory impact envelope MUST NOT be discarded to meet the byte budget
+    assert(heavyPaths.includes('packages/heavy/heavy_target.py'), 'Heavy definition was dropped for byte budget');
+    for (let i = 0; i < 4; i++) {
+      assert(heavyPaths.includes(`packages/heavy/heavy_dependent_${i}.py`), `Heavy affected module ${i} was dropped for byte budget`);
+    }
+    assert(heavyPaths.includes('tests/test_heavy_target.py'), 'Heavy test was dropped for byte budget');
+
+    // Supplemental candidates were properly underfilled (mandatory envelope exceeded budget)
+    assert(!heavyPaths.some((p) => p.includes('extra_ref_')), 'Supplemental references were unexpectedly added to overflowing budget');
+
+    // Budget truncation condition is truthfully exposed
+    assert.equal(heavyAnalysis.coverage.truncated, true, 'Coverage should be marked truncated when mandatory envelope exceeds budget');
+    assert(heavyAnalysis.warnings.some((w) => w.includes('Structured search results were truncated to fit the structured payload budget.')), 'Budget truncation warning was missing');
+    assert(heavyBytes > 9400, `Expected heavy mandatory envelope to exceed 9400 bytes, got ${heavyBytes}`);
+
+    console.log('PASS: HIGH-MANDATORY-001: Required impact modules are not discarded to meet the byte budget; budget conflict is truthfully exposed.');
+  } finally {
+    await fs.rm(mandatoryFixtureRoot, { recursive: true, force: true });
+  }
+
   console.log('PASS: SUPPORTING_ONLY public/structured payload remains bounded with required definitions, affected source modules, tests, reasons, provenance, and warnings.');
   console.log('AP-012 production thresholds remain unproven here; real public-route evidence is required separately.');
   console.log('ALL TASK-006 SMOKE CHECKS PASSED.');

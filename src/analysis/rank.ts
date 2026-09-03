@@ -205,7 +205,7 @@ export function scheduleStructuredMatches(
   matches: StructuredSearchMatch[],
   options: ScheduleStructuredMatchesOptions
 ): ScheduleStructuredMatchesResult {
-  if (matches.length === 0) {
+  if (matches.length === 0 || options.resultLimit <= 0) {
     return { matches: [], budgetTruncated: false };
   }
 
@@ -215,6 +215,7 @@ export function scheduleStructuredMatches(
 
   const matchKey = (m: StructuredSearchMatch) => `${m.path}\u0000${m.line}\u0000${m.group}`;
   const select = (m: StructuredSearchMatch): boolean => {
+    if (selected.length >= options.resultLimit) return false;
     const key = matchKey(m);
     if (selectedKeys.has(key)) return false;
     selectedKeys.add(key);
@@ -225,105 +226,104 @@ export function scheduleStructuredMatches(
   const maxPayloadBytes = options.maxPayloadBytes ?? defaultStructuredPayloadBudget(options.intent, options.resultLimit);
   const measure = options.calculatePayloadBytes ?? ((cand) => fallbackMeasurePayloadBytes(cand, options.intent));
 
-  // 1. Visibility fairness reservation:
-  // With include_hidden=true and capacity >= 2, reserve at least one result for each
-  // visibility class if both classes have relevant candidates available.
-  if (options.includeHidden === true && options.resultLimit >= 2) {
-    const bestVisible = sorted.find((m) => !isHiddenRelativePath(m.path));
-    const bestHidden = sorted.find((m) => isHiddenRelativePath(m.path));
-    if (bestVisible) select(bestVisible);
-    if (bestHidden) select(bestHidden);
-  }
+  // Helper for visibility fairness:
+  // With include_hidden=true and capacity >= 2, ensure both visibility classes are represented
+  // if both have relevant candidates available.
+  const ensureVisibilityFairness = () => {
+    if (options.includeHidden === true && options.resultLimit >= 2) {
+      const hasVisible = selected.some((m) => !isHiddenRelativePath(m.path));
+      const hasHidden = selected.some((m) => isHiddenRelativePath(m.path));
+      if (!hasVisible) {
+        const bestVisible = sorted.find((m) => !isHiddenRelativePath(m.path));
+        if (bestVisible) select(bestVisible);
+      }
+      if (!hasHidden) {
+        const bestHidden = sorted.find((m) => isHiddenRelativePath(m.path));
+        if (bestHidden) select(bestHidden);
+      }
+    }
+  };
 
-  let budgetTruncated = false;
-
-  // 2. Mandatory semantic envelope reservation based on intent:
+  // 1. Mandatory semantic envelope reservation based on intent:
+  // These records define the core semantic answer for the query and are selected
+  // independently of the supplemental byte budget.
   if (options.intent === "impact") {
     // a) Definition orientation
     const def = sorted.find((m) => m.group === "definitions");
     if (def) select(def);
 
-    // b) Relevant requested test (reserve space for the required test)
+    // b) Visibility fairness (if capacity >= 2 and includeHidden)
+    ensureVisibilityFairness();
+
+    // c) Relevant requested test
     if (options.includeTests) {
       const test = sorted.find((m) => m.group === "tests");
       if (test) select(test);
     }
 
-    // c) Highest-value direct/transitive affected source modules
+    // d) Highest-value direct/transitive affected source modules (mandatory impact envelope)
     const affectedModules = sorted.filter(isAffectedSourceModule);
     for (const m of affectedModules) {
-      if (selected.filter(isAffectedSourceModule).length >= 6 || selected.length >= options.resultLimit) break;
-      const trialBytes = measure([...selected, m]);
-      if (trialBytes > maxPayloadBytes) {
-        budgetTruncated = true;
-        break;
-      }
+      if (selected.filter(isAffectedSourceModule).length >= 4 || selected.length >= options.resultLimit) break;
       select(m);
     }
   } else if (options.intent === "symbol") {
     // Definitions for orientation & symbol family (up to 8)
     for (const m of sorted) {
       if (selected.filter((s) => s.group === "definitions").length >= 8 || selected.length >= options.resultLimit) break;
-      if (m.group === "definitions") {
-        if (measure([...selected, m]) <= maxPayloadBytes) select(m);
-        else break;
-      }
+      if (m.group === "definitions") select(m);
     }
+    ensureVisibilityFairness();
     // References (up to 2)
     for (const m of sorted) {
       if (selected.filter((s) => s.group === "references").length >= 2 || selected.length >= options.resultLimit) break;
-      if (m.group === "references") {
-        if (measure([...selected, m]) <= maxPayloadBytes) select(m);
-        else break;
-      }
+      if (m.group === "references") select(m);
     }
     // Test if requested
     if (options.includeTests) {
       const test = sorted.find((m) => m.group === "tests");
-      if (test && measure([...selected, test]) <= maxPayloadBytes) select(test);
+      if (test) select(test);
     }
   } else if (options.intent === "references") {
     // Definitions for orientation (up to 2)
     for (const m of sorted) {
       if (selected.filter((s) => s.group === "definitions").length >= 2 || selected.length >= options.resultLimit) break;
-      if (m.group === "definitions") {
-        if (measure([...selected, m]) <= maxPayloadBytes) select(m);
-        else break;
-      }
+      if (m.group === "definitions") select(m);
     }
+    ensureVisibilityFairness();
     // Source references (up to 8)
     for (const m of sorted) {
       if (selected.filter((s) => s.group === "references").length >= 8 || selected.length >= options.resultLimit) break;
-      if (m.group === "references") {
-        if (measure([...selected, m]) <= maxPayloadBytes) select(m);
-        else break;
-      }
+      if (m.group === "references") select(m);
     }
     // Test if requested (up to 3)
     if (options.includeTests) {
       for (const m of sorted) {
         if (selected.filter((s) => s.group === "tests").length >= 3 || selected.length >= options.resultLimit) break;
-        if (m.group === "tests") {
-          if (measure([...selected, m]) <= maxPayloadBytes) select(m);
-          else break;
-        }
+        if (m.group === "tests") select(m);
       }
     }
   } else {
     // Text intent: reserve bounded representation for definitions (2), references (6), tests (3 if includeTests)
-    for (const group of ["definitions", "references", ...(options.includeTests ? ["tests" as const] : [])] as const) {
-      const quota = group === "definitions" ? 2 : group === "references" ? 6 : 3;
+    for (const m of sorted) {
+      if (selected.filter((s) => s.group === "definitions").length >= 2 || selected.length >= options.resultLimit) break;
+      if (m.group === "definitions") select(m);
+    }
+    ensureVisibilityFairness();
+    for (const m of sorted) {
+      if (selected.filter((s) => s.group === "references").length >= 6 || selected.length >= options.resultLimit) break;
+      if (m.group === "references") select(m);
+    }
+    if (options.includeTests) {
       for (const m of sorted) {
-        if (selected.filter((s) => s.group === group).length >= quota || selected.length >= options.resultLimit) break;
-        if (m.group === group) {
-          if (measure([...selected, m]) <= maxPayloadBytes) select(m);
-          else break;
-        }
+        if (selected.filter((s) => s.group === "tests").length >= 3 || selected.length >= options.resultLimit) break;
+        if (m.group === "tests") select(m);
       }
     }
   }
 
-  // 3. Fill remaining capacity by global score, bounded by deterministic payload byte budget
+  // 2. Supplemental evidence fill, bounded by deterministic payload byte budget
+  let budgetTruncated = measure(selected) > maxPayloadBytes;
   for (const m of sorted) {
     if (selected.length >= options.resultLimit) break;
     const key = matchKey(m);
@@ -337,6 +337,6 @@ export function scheduleStructuredMatches(
     select(m);
   }
 
-  const finalBudgetTruncated = budgetTruncated && selected.length < options.resultLimit && selected.length < sorted.length;
+  const finalBudgetTruncated = budgetTruncated && (selected.length < options.resultLimit || measure(selected) > maxPayloadBytes) && selected.length < sorted.length;
   return { matches: sortStructuredMatches(selected), budgetTruncated: finalBudgetTruncated };
 }
