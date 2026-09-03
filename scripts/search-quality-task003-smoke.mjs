@@ -52,6 +52,8 @@ try {
   await write('e2e/app-smoke.ts', 'const proofMarker = "SmokeNeedle";\n');
   await write('tests/unit.test.ts', 'const proofMarker = "SmokeNeedle";\n');
   await write('src/ordinarySource.ts', 'const proofMarker = "SmokeNeedle";\n');
+  await write('src/smoke.ts', 'const proofMarker = "SmokeNeedle";\n');
+  await write('src/widget-smoke.ts', 'const proofMarker = "SmokeNeedle";\n');
 
   const [
     { loadConfig },
@@ -71,14 +73,16 @@ try {
   const guard = new PathGuard(config);
   const workspace = new WorkspaceManager(config).defaultWorkspace();
 
-  // Test 1: File role classification including *-smoke.* and e2e
+  // Test 1: File role classification including scripts/*-smoke.* and e2e
   assert.equal(classifyFileRole('scripts/search-evidence-smoke.mjs'), 'test', 'search-evidence-smoke.mjs was not classified as test');
   assert.equal(classifyFileRole('scripts/smoke.mjs'), 'test', 'smoke.mjs was not classified as test');
   assert.equal(classifyFileRole('scripts/analysis-smoke.mjs'), 'test', 'analysis-smoke.mjs was not classified as test');
   assert.equal(classifyFileRole('e2e/app-smoke.ts'), 'test', 'e2e/app-smoke.ts was not classified as test');
   assert.equal(classifyFileRole('tests/unit.test.ts'), 'test', 'tests/unit.test.ts was not classified as test');
   assert.equal(classifyFileRole('src/ordinarySource.ts'), 'source', 'src/ordinarySource.ts was misclassified');
-  console.log('PASS: File role classification correctly identifies *-smoke.* and e2e proof scripts as tests.');
+  assert.equal(classifyFileRole('src/smoke.ts'), 'source', 'src/smoke.ts was misclassified as test');
+  assert.equal(classifyFileRole('src/widget-smoke.ts'), 'source', 'src/widget-smoke.ts was misclassified as test');
+  console.log('PASS: File role classification correctly identifies scripts/*-smoke.* and e2e proof scripts as tests.');
 
   // Test 2: Definition ranking tiers
   const exactClassTier = classifyDefinitionMatch({ name: 'ExactMatchTarget', kind: 'class' }, 'ExactMatchTarget');
@@ -160,6 +164,8 @@ try {
   const testsFalseAnalysis = analysisOf(testsFalseResult);
   assert.equal(testsFalseAnalysis.groups.tests.length, 0, 'include_tests=false returned test matches');
   assert(testsFalseAnalysis.matches.some((m) => m.path === 'src/ordinarySource.ts'), 'source reference was not returned');
+  assert(testsFalseAnalysis.matches.some((m) => m.path === 'src/smoke.ts'), 'src/smoke.ts source reference was not returned');
+  assert(testsFalseAnalysis.matches.some((m) => m.path === 'src/widget-smoke.ts'), 'src/widget-smoke.ts source reference was not returned');
   assert(!testsFalseAnalysis.matches.some((m) => m.path.startsWith('scripts/')), 'smoke scripts leaked into include_tests=false');
 
   // 6b: include_tests=true includes tests without starving source
@@ -173,6 +179,8 @@ try {
   assert(testsTrueAnalysis.groups.tests.length > 0, 'include_tests=true returned 0 tests');
   assert(testsTrueAnalysis.groups.tests.some((m) => m.path === 'scripts/search-evidence-smoke.mjs'), 'search-evidence-smoke.mjs missing from tests');
   assert(testsTrueAnalysis.groups.references.some((m) => m.path === 'src/ordinarySource.ts'), 'ordinary source reference was starved by tests');
+  assert(testsTrueAnalysis.groups.references.some((m) => m.path === 'src/smoke.ts'), 'src/smoke.ts source reference was misclassified');
+  assert(testsTrueAnalysis.groups.references.some((m) => m.path === 'src/widget-smoke.ts'), 'src/widget-smoke.ts source reference was misclassified');
 
   // Source reference has score 150, test has score 130 -> source ranks before tests
   const srcIdx = testsTrueAnalysis.matches.findIndex((m) => m.path === 'src/ordinarySource.ts');

@@ -39,7 +39,7 @@ const TEST_PATTERNS = [
   /\.(test|spec)\.[^.]+$/i,
   /_test\.go$/i,
   /Tests?\.swift$/i,
-  /(^|\/)([^/]+-)?smoke\.[^.]+$/i
+  /(^|\/)scripts\/(?:[^/]+-)?smoke\.[^.]+$/i
 ];
 const GENERATED_PATTERNS = [/(^|\/)(generated|vendor|vendors|third_party)\//i, /\.generated\./i, /\.g\.(cs|dart)$/i];
 const INFRA_PATTERNS = [/(^|\/)(\.github|infra|infrastructure|terraform|deploy|k8s|helm)\//i, /(^|\/)Dockerfile$/i];
