@@ -99,7 +99,7 @@ try {
     { PathGuard, WorkspaceManager },
     { searchWorkspace },
     { inspectWorkspace },
-    { traverseImpactGraph }
+    { traverseImpactGraph, IMPACT_TRAVERSAL_TRUNCATION_WARNING }
   ] = await Promise.all([
     importBuilt('config.js'),
     importBuilt('guard.js'),
@@ -143,26 +143,44 @@ try {
     maxDepth: 3,
     includeTests: true
   });
-  assert(impactTraversed.some((t) => t.path === 'pkg/direct.py' && t.depth === 1), 'direct dependent missing at depth 1');
-  assert(impactTraversed.some((t) => t.path === 'pkg/transitive.py' && t.depth === 2), 'transitive dependent missing at depth 2');
-  assert(impactTraversed.some((t) => t.path === 'tests/test_base.py' && t.depth === 1 && t.kind === 'tests'), 'test dependent missing at depth 1');
+  assert(impactTraversed.results.some((t) => t.path === 'pkg/direct.py' && t.depth === 1), 'direct dependent missing at depth 1');
+  assert(impactTraversed.results.some((t) => t.path === 'pkg/transitive.py' && t.depth === 2), 'transitive dependent missing at depth 2');
+  assert(impactTraversed.results.some((t) => t.path === 'tests/test_base.py' && t.depth === 1 && t.kind === 'tests'), 'test dependent missing at depth 1');
   // Cycle safety: cycle_a and cycle_b are visited at most once
-  const cycleACount = impactTraversed.filter((t) => t.path === 'pkg/cycle_a.py').length;
-  const cycleBCount = impactTraversed.filter((t) => t.path === 'pkg/cycle_b.py').length;
+  const cycleACount = impactTraversed.results.filter((t) => t.path === 'pkg/cycle_a.py').length;
+  const cycleBCount = impactTraversed.results.filter((t) => t.path === 'pkg/cycle_b.py').length;
   assert.equal(cycleACount, 1, 'cycle_a was visited more than once');
   assert.equal(cycleBCount, 1, 'cycle_b was visited more than once');
   const depthBounded = traverseImpactGraph(baseDefPaths, analysis.relationships, {
     maxDepth: 1,
     includeTests: true
   });
-  assert.equal(depthBounded.some((t) => t.path === 'pkg/transitive.py'), false, 'impact exceeded the configured depth bound');
+  assert.equal(depthBounded.results.some((t) => t.path === 'pkg/transitive.py'), false, 'impact exceeded the configured depth bound');
   const candidateBounded = traverseImpactGraph(baseDefPaths, analysis.relationships, {
     maxDepth: 3,
     maxCandidates: 1,
     includeTests: true
   });
-  assert.equal(candidateBounded.length, 1, 'impact exceeded the configured candidate bound');
-  console.log('PASS: Reverse dependency traversal handles depth, transitive dependencies, and cycles.');
+  assert.equal(candidateBounded.results.length, 1, 'impact exceeded the configured candidate bound');
+  assert.equal(candidateBounded.truncated, true, 'candidate bound did not report remaining reachable impact work');
+
+  const exactBoundGraph = [
+    { from: 'direct.py', to: 'base.py', kind: 'imports', confidence: 'strong', source: 'fixture', line: 1 }
+  ];
+  const exactBound = traverseImpactGraph(new Set(['base.py']), exactBoundGraph, { maxDepth: 3, maxCandidates: 1 });
+  assert.equal(exactBound.results.length, 1, 'exact-bound graph did not return its only candidate');
+  assert.equal(exactBound.truncated, false, 'naturally exhausted exact-bound graph was marked truncated');
+
+  const cycleOnlyGraph = [
+    { from: 'cycle-a.py', to: 'base.py', kind: 'imports', confidence: 'strong', source: 'fixture', line: 1 },
+    { from: 'cycle-b.py', to: 'cycle-a.py', kind: 'imports', confidence: 'strong', source: 'fixture', line: 1 },
+    { from: 'cycle-a.py', to: 'cycle-b.py', kind: 'imports', confidence: 'strong', source: 'fixture', line: 2 }
+  ];
+  const cycleBounded = traverseImpactGraph(new Set(['base.py']), cycleOnlyGraph, { maxDepth: 3, maxCandidates: 2 });
+  assert.equal(cycleBounded.results.length, 2, 'cycle graph did not return both unique candidates');
+  assert.equal(cycleBounded.truncated, false, 'cycle closure was mistaken for remaining impact work');
+  console.log(`RAW_OBSERVATION: bounded graph returned ${candidateBounded.results.length} candidate and reported truncated=${candidateBounded.truncated}; exact-bound graph returned ${exactBound.results.length} candidate and reported truncated=${exactBound.truncated}; cycle graph reported truncated=${cycleBounded.truncated}.`);
+  console.log('PASS: Reverse dependency traversal handles depth, transitive dependencies, cycles, and exact truncation truth.');
 
   // Test 3: AP-008: End-to-end impact search returns direct/transitive modules and tests
   const impactResult = await searchWorkspace(config, guard, workspace, {
@@ -201,6 +219,18 @@ try {
   const fallbackTest = impactAnalysis.groups.tests.find((m) => m.path === 'tests/test_base_service_fallback.py');
   assert(fallbackTest, 'fallback test missing from groups.tests');
   assert(fallbackTest.reasons.includes('test filename matches definition'));
+
+  const boundedImpactResult = await searchWorkspace(config, guard, workspace, {
+    query: 'BaseService',
+    intent: 'impact',
+    includeTests: true,
+    maxResults: 1
+  });
+  const boundedImpactAnalysis = analysisOf(boundedImpactResult);
+  assert(boundedImpactAnalysis.warnings.includes(IMPACT_TRAVERSAL_TRUNCATION_WARNING), 'public structured impact omitted traversal truncation warning');
+  assert(boundedImpactAnalysis.coverage.warnings.includes(IMPACT_TRAVERSAL_TRUNCATION_WARNING), 'coverage omitted traversal truncation warning');
+  assert.equal(boundedImpactAnalysis.coverage.truncated, true, 'public structured impact omitted traversal truncation state');
+  console.log(`RAW_OBSERVATION: bounded public impact warnings=${JSON.stringify(boundedImpactAnalysis.warnings.filter((warning) => warning === IMPACT_TRAVERSAL_TRUNCATION_WARNING))}; coverage.truncated=${boundedImpactAnalysis.coverage.truncated}.`);
 
   console.log('PASS: AP-008: impact returns direct/transitive affected modules and relevant tests with reasons.');
   console.log('ALL TASK-004 SMOKE CHECKS PASSED.');

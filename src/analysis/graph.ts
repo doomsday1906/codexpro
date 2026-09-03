@@ -72,6 +72,36 @@ export interface ImpactTraversalResult {
   via?: string;
 }
 
+export interface ImpactTraversalOutput {
+  results: ImpactTraversalResult[];
+  /** True only when the candidate bound prevented more eligible work from being evaluated. */
+  truncated: boolean;
+}
+
+export const IMPACT_TRAVERSAL_TRUNCATION_WARNING =
+  "Impact traversal reached its configured candidate limit; additional reachable candidates may be omitted.";
+
+type ImpactQueueItem = { path: string; depth: number; rootDef: string; via?: string };
+
+function hasEligibleReachableCandidate(
+  incomingByTarget: Map<string, AnalysisRelationship[]>,
+  frontier: ImpactQueueItem[],
+  visited: Set<string>,
+  maxDepth: number,
+  includeTests: boolean
+): boolean {
+  for (const current of frontier) {
+    if (current.depth >= maxDepth) continue;
+    const incoming = incomingByTarget.get(current.path) ?? [];
+    for (const rel of incoming) {
+      if (rel.kind === "tests" && !includeTests) continue;
+      if (visited.has(rel.from)) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
 export function traverseImpactGraph(
   definitionPaths: Set<string>,
   relationships: AnalysisRelationship[],
@@ -81,9 +111,9 @@ export function traverseImpactGraph(
     includeTests?: boolean;
     includePath?: (filePath: string) => boolean;
   } = {}
-): ImpactTraversalResult[] {
+): ImpactTraversalOutput {
   const maxDepth = options.maxDepth ?? 3;
-  const maxCandidates = options.maxCandidates ?? 200;
+  const maxCandidates = Math.max(0, options.maxCandidates ?? 200);
   const includePath = options.includePath ?? (() => true);
 
   const incomingByTarget = new Map<string, AnalysisRelationship[]>();
@@ -97,11 +127,19 @@ export function traverseImpactGraph(
   const results: ImpactTraversalResult[] = [];
   const visited = new Set<string>(definitionPaths);
 
-  type QueueItem = { path: string; depth: number; rootDef: string; via?: string };
-  const queue: QueueItem[] = [];
+  const queue: ImpactQueueItem[] = [];
   for (const defPath of definitionPaths) {
     queue.push({ path: defPath, depth: 0, rootDef: defPath });
   }
+
+  if (maxCandidates === 0) {
+    return {
+      results,
+      truncated: hasEligibleReachableCandidate(incomingByTarget, queue, visited, maxDepth, Boolean(options.includeTests))
+    };
+  }
+
+  let truncated = false;
 
   while (queue.length > 0 && results.length < maxCandidates) {
     const current = queue.shift()!;
@@ -142,18 +180,36 @@ export function traverseImpactGraph(
         via: isDirect ? rel.from : current.via
       });
 
-      if (results.length >= maxCandidates) break;
+      const next = {
+        path: rel.from,
+        depth: nextDepth,
+        rootDef: current.rootDef,
+        via: isDirect ? rel.from : current.via
+      };
+      const canExpand = !rel.from.endsWith("/__init__.py") && rel.from !== "__init__.py";
+      if (results.length >= maxCandidates) {
+        // The current node was popped from the queue, so retain it in the
+        // look-ahead frontier. The last admitted candidate is also pending
+        // expansion when the normal traversal would enqueue it. This lets us
+        // distinguish a naturally exhausted exact-bound traversal from one
+        // that really has more eligible reachable work.
+        const pending = [...queue, current];
+        if (canExpand) pending.push(next);
+        truncated = hasEligibleReachableCandidate(
+          incomingByTarget,
+          pending,
+          visited,
+          maxDepth,
+          Boolean(options.includeTests)
+        );
+        break;
+      }
 
-      if (!rel.from.endsWith("/__init__.py") && rel.from !== "__init__.py") {
-        queue.push({
-          path: rel.from,
-          depth: nextDepth,
-          rootDef: current.rootDef,
-          via: isDirect ? rel.from : current.via
-        });
+      if (canExpand) {
+        queue.push(next);
       }
     }
   }
 
-  return results;
+  return { results, truncated };
 }

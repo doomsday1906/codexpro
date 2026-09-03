@@ -7,7 +7,7 @@ import { redactSearchQuery, redactSensitiveTextPreservingLines, sourceLanguageFo
 import { detectProjectTypes } from "./classify.js";
 import { getCachedWorkspaceAnalysis, invalidateWorkspaceAnalysis, setCachedWorkspaceAnalysis } from "./cache.js";
 import { extractWorkspaceFiles } from "./extract.js";
-import { buildRelationshipsWithCoverage, traverseImpactGraph } from "./graph.js";
+import { buildRelationshipsWithCoverage, IMPACT_TRAVERSAL_TRUNCATION_WARNING, traverseImpactGraph } from "./graph.js";
 import { inventoryWorkspace } from "./inventory.js";
 import { classifyDefinitionMatch, classifySearchIntent, emptySearchGroups, groupForFile, scheduleStructuredMatches, sortStructuredMatches } from "./rank.js";
 import { resolveSearchScope, searchScopeCacheKey } from "./scope.js";
@@ -299,6 +299,7 @@ export async function searchWorkspaceStructured(
   let candidateLimitReached = false;
   let sourceCandidateLimitReached = false;
   let testCandidateLimitReached = false;
+  let impactTraversalTruncated = false;
   let skippedFiles = 0;
   const firstTestLineText = new Map<string, string>();
 
@@ -422,13 +423,15 @@ export async function searchWorkspaceStructured(
         .filter((symbol) => includePath(symbol.path) && classifyDefinitionMatch(symbol, query) !== null)
         .map((symbol) => symbol.path)
     );
-    const impactResults = traverseImpactGraph(definitionPaths, analysis.relationships, {
+    const impactTraversal = traverseImpactGraph(definitionPaths, analysis.relationships, {
       maxDepth: 3,
       maxCandidates: candidateLimit,
       includeTests: Boolean(options.includeTests),
       includePath
     });
-    for (const res of impactResults) {
+    impactTraversalTruncated = impactTraversal.truncated;
+    if (impactTraversal.truncated) warnings.push(IMPACT_TRAVERSAL_TRUNCATION_WARNING);
+    for (const res of impactTraversal.results) {
       const group = res.kind === "tests" ? "tests" : "references";
       const score = res.kind === "tests"
         ? (res.depth === 1 ? 166 : 158)
@@ -540,7 +543,7 @@ export async function searchWorkspaceStructured(
     matches: orderedMatches,
     coverage: {
       ...analysis.coverage,
-      truncated: analysis.coverage.truncated || searchBudgetReached || candidateLimitReached || skippedFiles > 0,
+      truncated: analysis.coverage.truncated || searchBudgetReached || candidateLimitReached || impactTraversalTruncated || skippedFiles > 0,
       warnings
     },
     warnings,
