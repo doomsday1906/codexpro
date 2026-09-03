@@ -18,7 +18,11 @@ export function buildRelationshipsWithCoverage(
   const hiddenRelationships: AnalysisRelationship[] = [];
   let candidateCount = 0;
   for (const file of extractedFiles) {
-    for (const target of file.imports) {
+    const imports = file.importRecords?.length
+      ? file.importRecords
+      : file.imports.map((target) => ({ target, line: undefined, text: undefined }));
+    for (const imported of imports) {
+      const target = imported.target;
       candidateCount += 1;
       const relationship: AnalysisRelationship = {
         from: file.path,
@@ -27,6 +31,8 @@ export function buildRelationshipsWithCoverage(
         confidence: "strong",
         source: "built-in import extraction"
       };
+      if (typeof imported.line === "number" && imported.line > 0) relationship.line = imported.line;
+      if (typeof imported.text === "string") relationship.text = imported.text;
       const visibleToVisible = !isHiddenRelativePath(file.path) && !isHiddenRelativePath(target);
       if (visibleToVisible) {
         if (visibleRelationships.length < limit) visibleRelationships.push(relationship);
@@ -59,6 +65,9 @@ export interface ImpactTraversalResult {
   depth: number;
   kind: "imports" | "tests";
   reasons: string[];
+  line?: number;
+  text?: string;
+  source?: string;
   target?: string;
   via?: string;
 }
@@ -126,6 +135,9 @@ export function traverseImpactGraph(
         depth: nextDepth,
         kind: rel.kind === "tests" ? "tests" : "imports",
         reasons,
+        line: rel.line,
+        text: rel.text,
+        source: rel.source,
         target: rel.to,
         via: isDirect ? rel.from : current.via
       });

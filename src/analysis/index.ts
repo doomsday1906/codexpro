@@ -115,6 +115,10 @@ class StructuredEvidenceAccumulator {
     return this.logicalKeys.has(`${path}\u0000${group}`);
   }
 
+  entriesFor(path: string, group: string): StructuredSearchMatch[] {
+    return [...this.byIdentity.values()].filter((match) => match.path === path && match.group === group);
+  }
+
   finalize(): StructuredSearchMatch[] {
     const definitions: StructuredSearchMatch[] = [];
     const nonDefinitions = new Map<string, StructuredSearchMatch[]>();
@@ -296,6 +300,7 @@ export async function searchWorkspaceStructured(
   let sourceCandidateLimitReached = false;
   let testCandidateLimitReached = false;
   let skippedFiles = 0;
+  const firstTestLineText = new Map<string, string>();
 
   const scopedFiles = analysis.files.filter((file) => includePath(file.path));
 
@@ -336,6 +341,15 @@ export async function searchWorkspaceStructured(
     const definitions = definitionsByPath.get(file.path) ?? new Map();
     const lines = text.split(/\r?\n/);
     let redactedLines: string[] | null | undefined = contextAvailable ? undefined : null;
+    if (file.role === "test") {
+      if (contextAvailable) {
+        redactedLines = redactSensitiveTextPreservingLines(text, {
+          context: "source",
+          language: sourceLanguageForPath(file.path)
+        }).split(/\r?\n/);
+      }
+      firstTestLineText.set(file.path, (redactedLines?.[0] ?? REDACTED_SEARCH_CONTEXT).trim().slice(0, 400));
+    }
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index];
       if (!line.toLowerCase().includes(lowered)) continue;
@@ -419,15 +433,17 @@ export async function searchWorkspaceStructured(
       const score = res.kind === "tests"
         ? (res.depth === 1 ? 166 : 158)
         : (res.depth === 1 ? 170 : 162);
+      const line = res.line;
+      if (typeof line !== "number" || !Number.isInteger(line) || line < 1) continue;
       const admitted = accumulator.add({
         path: res.path,
-        line: 1,
-        text: `${res.kind} ${res.target ?? res.via ?? [...definitionPaths][0] ?? query}`,
+        line,
+        text: res.text ?? `${res.kind} ${res.target ?? res.via ?? [...definitionPaths][0] ?? query}`,
         group,
         score,
         reasons: res.reasons,
         confidence: "strong",
-        source: "built-in import extraction"
+        source: res.source ?? "built-in import extraction"
       }, candidateLimit, testCandidateLimit);
       if (!admitted) {
         if (group === "tests") testCandidateLimitReached = true;
@@ -444,16 +460,22 @@ export async function searchWorkspaceStructured(
         const matchesDef = defBasenames.some((stem) => stem.length > 3 && fileLower.includes(stem));
         const matchesQuery = queryStem.length > 3 && fileLower.replace(/[^a-z0-9]/g, "").includes(queryStem);
         if (matchesDef || matchesQuery) {
-          accumulator.add({
-            path: file.path,
-            line: 1,
-            text: `related test for ${query}`,
-            group: "tests",
-            score: 150,
-            reasons: ["dependent test", "related test", "test filename matches definition"],
-            confidence: "inferred",
-            source: "built-in analysis"
-          }, candidateLimit, testCandidateLimit);
+          const physicalEntries = accumulator.entriesFor(file.path, "tests");
+          const fallbackEntries = physicalEntries.length > 0
+            ? physicalEntries
+            : [{ line: 1, text: firstTestLineText.get(file.path) ?? REDACTED_SEARCH_CONTEXT }];
+          for (const physical of fallbackEntries) {
+            accumulator.add({
+              path: file.path,
+              line: physical.line,
+              text: physical.text,
+              group: "tests",
+              score: 150,
+              reasons: ["dependent test", "related test", "test filename matches definition"],
+              confidence: "inferred",
+              source: "built-in analysis"
+            }, candidateLimit, testCandidateLimit);
+          }
         }
       }
     }
@@ -468,12 +490,14 @@ export async function searchWorkspaceStructured(
       if (!definitionPaths.has(relationship.to)) continue;
       const group = relationship.kind === "tests" ? "tests" : "references";
       if (group === "tests" && !options.includeTests) continue;
+      const line = relationship.line;
+      if (typeof line !== "number" || !Number.isInteger(line) || line < 1) continue;
       const reason = relationship.kind === "tests" ? "dependent test" : "dependent module";
       const score = relationship.kind === "tests" ? 140 : 165;
       const admitted = accumulator.add({
         path: relationship.from,
-        line: 1,
-        text: `${relationship.kind} ${relationship.to}`,
+        line,
+        text: relationship.text ?? `${relationship.kind} ${relationship.to}`,
         group,
         score,
         reasons: [reason, `${relationship.kind} relationship`],

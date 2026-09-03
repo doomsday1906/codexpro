@@ -1,8 +1,10 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { parser as pythonParser } from "@lezer/python";
 import type { CodexProConfig } from "../config.js";
 import { isHiddenRelativePath } from "../fsOps.js";
 import type { PathGuard, Workspace } from "../guard.js";
+import { redactSensitiveTextPreservingLines, sourceLanguageForPath } from "../redact.js";
 import type { AnalysisLanguage, AnalysisSymbol, AnalysisSymbolKind, InventoryFile } from "./types.js";
 
 type Pattern = { regex: RegExp; kind: AnalysisSymbolKind };
@@ -63,64 +65,182 @@ export interface ExtractedFile {
   path: string;
   text: string;
   symbols: AnalysisSymbol[];
+  /** Legacy target-only view retained for internal compatibility. */
   imports: string[];
+  /** Complete bounded import occurrences with physical source provenance. */
+  importRecords?: ExtractedImport[];
 }
 
-function importSpecifiers(language: AnalysisLanguage, line: string): string[] {
+export interface ExtractedImport {
+  target: string;
+  line: number;
+  text: string;
+}
+
+interface ParsedImportStatement {
+  specifier: string;
+  names?: string[];
+}
+
+function splitPythonNames(value: string): string[] {
+  const withoutComment = value.replace(/\s+#.*$/u, "").trim();
+  const unwrapped = withoutComment.replace(/^\(\s*/u, "").replace(/\s*\)$/u, "").trim();
+  if (!unwrapped) return [];
+  return unwrapped
+    .split(",")
+    .map((part) => part.trim().replace(/\s+as\s+[A-Za-z_]\w*$/iu, "").trim())
+    .filter((part) => part === "*" || /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$/u.test(part));
+}
+
+function parsePythonImportStatement(statement: string): ParsedImportStatement[] {
+  const normalized = statement
+    .split(/\r?\n/gu)
+    .map((line) => line.replace(/#.*$/u, ""))
+    .join(" ")
+    .replace(/\\[ \t]*/gu, " ")
+    .replace(/[ \t]+/gu, " ")
+    .trim();
+  const fromMatch = normalized.match(/^from\s+([.\w]+)\s+import(?:\s+([\s\S]*))?$/u);
+  if (fromMatch?.[1]) {
+    return [{ specifier: fromMatch[1], names: splitPythonNames(fromMatch[2] ?? "") }];
+  }
+  const importMatch = normalized.match(/^import\s+([\s\S]+)$/u);
+  if (!importMatch?.[1]) return [];
+  return importMatch[1]
+    .replace(/\s+#.*$/u, "")
+    .split(",")
+    .map((part) => part.trim().replace(/\s+as\s+[A-Za-z_]\w*$/iu, "").trim())
+    .filter((part) => /^[.\w]+$/u.test(part))
+    .map((specifier) => ({ specifier }));
+}
+
+function lineStartsFor(text: string): number[] {
+  const starts = [0];
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "\n") starts.push(index + 1);
+  }
+  return starts;
+}
+
+function lineAtOffset(starts: number[], offset: number): number {
+  let low = 0;
+  let high = starts.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (starts[middle] <= offset) low = middle + 1;
+    else high = middle;
+  }
+  return Math.max(1, low);
+}
+
+function pythonImportStatements(text: string): Map<number, ParsedImportStatement[]> {
+  const byLine = new Map<number, ParsedImportStatement[]>();
+  const starts = lineStartsFor(text);
+  try {
+    const tree = pythonParser.parse(text);
+    const cursor = tree.cursor();
+    for (;;) {
+      if (cursor.name === "ImportStatement") {
+        const line = lineAtOffset(starts, cursor.from);
+        const parsed = parsePythonImportStatement(text.slice(cursor.from, cursor.to));
+        if (parsed.length > 0) byLine.set(line, [...(byLine.get(line) ?? []), ...parsed]);
+      }
+      if (!cursor.next(true)) break;
+    }
+    return byLine;
+  } catch {
+    // A malformed source file still gets conservative line-level extraction.
+    const lines = text.split(/\r?\n/);
+    for (let index = 0; index < lines.length; index += 1) {
+      const parsed = parsePythonImportStatement(lines[index]);
+      if (parsed.length > 0) byLine.set(index + 1, parsed);
+    }
+    return byLine;
+  }
+}
+
+function importSpecifiers(language: AnalysisLanguage, line: string): ParsedImportStatement[] {
   if (language === "typescript" || language === "javascript") {
     const match = line.match(/\b(?:import|export)\b[^"']*?["']([^"']+)["']|\brequire\(\s*["']([^"']+)["']\s*\)/);
-    return match ? [match[1] ?? match[2]].filter(Boolean) : [];
+    return match?.[1] || match?.[2] ? [{ specifier: match[1] ?? match[2] ?? "" }] : [];
   }
   if (language === "c" || language === "cpp") {
     const match = line.match(/^\s*#include\s*["<]([^">]+)[">]/);
-    return match ? [match[1]] : [];
-  }
-  if (language === "python") {
-    const fromMatch = line.match(/^\s*from\s+([.\w]+)\s+import/);
-    if (fromMatch?.[1]) return [fromMatch[1]];
-    const importMatch = line.match(/^\s*import\s+([.\w]+)/);
-    if (importMatch?.[1]) return [importMatch[1]];
+    return match?.[1] ? [{ specifier: match[1] }] : [];
   }
   return [];
 }
 
-function resolveInternalImport(fromPath: string, specifier: string, files: Set<string>, language?: AnalysisLanguage): string | undefined {
-  if (language === "python") {
-    const dotMatch = specifier.match(/^(\.+)(.*)$/);
-    if (dotMatch) {
-      const dotCount = dotMatch[1].length;
-      const rest = dotMatch[2];
-      let baseDir = path.posix.dirname(fromPath);
-      for (let i = 1; i < dotCount; i++) baseDir = path.posix.dirname(baseDir);
-      const subPath = rest ? rest.split(".").join("/") : "";
-      const targetBase = subPath ? path.posix.normalize(path.posix.join(baseDir, subPath)) : baseDir;
-      const candidates = [`${targetBase}.py`, `${targetBase}/__init__.py`];
-      return candidates.find((c) => files.has(c));
-    }
-    const asPath = specifier.split(".").join("/");
-    const candidates = [
-      `${asPath}.py`,
-      `${asPath}/__init__.py`,
-      `src/${asPath}.py`,
-      `src/${asPath}/__init__.py`
-    ];
-    const found = candidates.find((c) => files.has(c));
-    if (found) return found;
-    const parts = fromPath.split("/");
-    if (parts.length > 1) {
-      const topDir = parts[0];
-      const topCandidates = [`${topDir}/${asPath}.py`, `${topDir}/${asPath}/__init__.py`];
-      const topFound = topCandidates.find((c) => files.has(c));
-      if (topFound) return topFound;
-    }
-    return undefined;
-  }
+function safeInventoryPath(candidate: string, files: Set<string>): string | undefined {
+  const normalized = path.posix.normalize(candidate);
+  if (path.posix.isAbsolute(candidate) || normalized === "." || normalized === ".." || normalized.startsWith("../")) return undefined;
+  return files.has(normalized) ? normalized : undefined;
+}
 
+function resolvePythonModuleAtBase(base: string, files: Set<string>): string | undefined {
+  if (base === "." || base === ".." || base.startsWith("../") || path.posix.isAbsolute(base)) return undefined;
+  return [safeInventoryPath(`${base}.py`, files), safeInventoryPath(`${base}/__init__.py`, files)].find(Boolean);
+}
+
+function pythonModuleBases(fromPath: string, specifier: string): string[] {
+  const dotMatch = specifier.match(/^(\.+)(.*)$/u);
+  if (dotMatch) {
+    const dotCount = dotMatch[1].length;
+    const rest = dotMatch[2];
+    let baseDir = path.posix.dirname(fromPath);
+    for (let index = 1; index < dotCount; index += 1) {
+      if (baseDir === "." || baseDir === ".." || baseDir.startsWith("../")) return [];
+      baseDir = path.posix.dirname(baseDir);
+    }
+    const subPath = rest ? rest.split(".").join("/") : "";
+    return [subPath ? path.posix.normalize(path.posix.join(baseDir, subPath)) : baseDir];
+  }
+  const asPath = specifier.split(".").join("/");
+  const bases = [asPath, `src/${asPath}`];
+  const parts = fromPath.split("/");
+  if (parts.length > 1) bases.push(`${parts[0]}/${asPath}`);
+  return bases;
+}
+
+function resolvePythonModule(fromPath: string, specifier: string, files: Set<string>): { target: string; base: string } | undefined {
+  for (const base of pythonModuleBases(fromPath, specifier)) {
+    const target = resolvePythonModuleAtBase(base, files);
+    if (target) return { target, base };
+  }
+  return undefined;
+}
+
+function resolvePythonImports(fromPath: string, statement: ParsedImportStatement, files: Set<string>): string[] {
+  const resolved = resolvePythonModule(fromPath, statement.specifier, files);
+  const names = statement.names ?? [];
+  if (names.length === 0 || names.includes("*")) return resolved ? [resolved.target] : [];
+  const packageBase = resolved?.target.endsWith("/__init__.py")
+    ? resolved.base
+    : resolved
+      ? undefined
+      : pythonModuleBases(fromPath, statement.specifier)[0];
+  const targets: string[] = [];
+  for (const name of names) {
+    const nestedBase = packageBase ? path.posix.normalize(path.posix.join(packageBase, name.split(".").join("/"))) : "";
+    const nested = nestedBase ? resolvePythonModuleAtBase(nestedBase, files) : undefined;
+    if (nested) targets.push(nested);
+    else if (resolved) targets.push(resolved.target);
+  }
+  return [...new Set(targets)];
+}
+
+function resolveInternalImport(fromPath: string, specifier: string, files: Set<string>): string | undefined {
   if (!specifier.startsWith(".")) return undefined;
   const raw = path.posix.normalize(path.posix.join(path.posix.dirname(fromPath), specifier));
   const withoutRuntimeExtension = raw.replace(/\.(js|mjs|cjs)$/, "");
   const candidates = [raw, withoutRuntimeExtension, ...[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".rs", ".swift", ".java", ".cs", ".c", ".cpp", ".h", ".hpp"].map((ext) => `${withoutRuntimeExtension}${ext}`), ...["index.ts", "index.tsx", "index.js", "index.py"].map((name) => `${withoutRuntimeExtension}/${name}`)];
   return candidates.find((candidate) => files.has(candidate));
+}
+
+function resolveInternalImports(fromPath: string, statement: ParsedImportStatement, files: Set<string>, language: AnalysisLanguage): string[] {
+  if (language === "python") return resolvePythonImports(fromPath, statement, files);
+  const target = resolveInternalImport(fromPath, statement.specifier, files);
+  return target ? [target] : [];
 }
 
 export async function extractWorkspaceFiles(
@@ -159,6 +279,9 @@ export async function extractWorkspaceFiles(
     scannedBytes += actualBytes;
     const symbols: AnalysisSymbol[] = [];
     const imports: string[] = [];
+    const importRecords: ExtractedImport[] = [];
+    let redactedLines: string[] | undefined;
+    const pythonImports = file.language === "python" ? pythonImportStatements(text) : undefined;
     const lines = text.split(/\r?\n/);
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index];
@@ -172,12 +295,25 @@ export async function extractWorkspaceFiles(
         symbols.push({ name: match[1], kind: pattern.kind, path: file.path, line: index + 1, exported: /\b(export|public|pub)\b/.test(line), confidence: "strong" });
         symbolCount += 1;
       }
-      for (const specifier of importSpecifiers(file.language, line)) {
-        const target = resolveInternalImport(file.path, specifier, fileSet, file.language);
-        if (target && target !== file.path && !imports.includes(target)) imports.push(target);
+      const statements = file.language === "python"
+        ? pythonImports?.get(index + 1) ?? []
+        : importSpecifiers(file.language, line);
+      for (const statement of statements) {
+        for (const target of resolveInternalImports(file.path, statement, fileSet, file.language)) {
+          if (!target || target === file.path) continue;
+          redactedLines ??= redactSensitiveTextPreservingLines(text, {
+            context: "source",
+            language: sourceLanguageForPath(file.path)
+          }).split(/\r?\n/);
+          const sourceLine = (redactedLines[index] ?? line).trim().slice(0, 400);
+          if (!importRecords.some((record) => record.target === target && record.line === index + 1)) {
+            importRecords.push({ target, line: index + 1, text: sourceLine });
+          }
+          if (!imports.includes(target)) imports.push(target);
+        }
       }
     }
-    extracted.push({ path: file.path, text, symbols, imports });
+    extracted.push({ path: file.path, text, symbols, imports, importRecords });
   }
   const warnings = [
     ...(sourceBudgetReached ? ["Source analysis reached its file or byte limit."] : []),

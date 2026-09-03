@@ -56,6 +56,34 @@ try {
     'from pkg.cycle_a import BaseService'
   ].join('\n') + '\n');
 
+  await write('pkg/sibling.py', 'class Sibling:\n    pass\n');
+  await write('pkg/submodule.py', 'class Submodule:\n    pass\n');
+  await write('pkg/multi.py', [
+    'import pkg.base as base, pkg.direct as direct',
+    'from . import sibling, submodule',
+    'from pkg.base import BaseService, DirectService'
+  ].join('\n') + '\n');
+  await write('pkg/multiline.py', [
+    'from pkg import (',
+    '    # comments do not hide imported names',
+    '    submodule, # trailing comment',
+    '    sibling,',
+    ')'
+  ].join('\n') + '\n');
+  await write('pkg/continued.py', [
+    'import pkg.base, \\',
+    '    pkg.direct'
+  ].join('\n') + '\n');
+  await write('pkg/submodule_consumer.py', [
+    'from pkg import submodule'
+  ].join('\n') + '\n');
+  await write('pkg/package_export_consumer.py', [
+    'from pkg import BaseService'
+  ].join('\n') + '\n');
+  await write('pkg/sub/escape.py', [
+    'from ....outside import NotARealModule'
+  ].join('\n') + '\n');
+
   await write('tests/test_base.py', [
     'from pkg.base import BaseService',
     'def test_base(): pass'
@@ -91,6 +119,22 @@ try {
   assert(pythonRels.some((r) => r.from === 'pkg/direct.py' && r.to === 'pkg/base.py' && r.kind === 'imports'), 'direct import relationship missing');
   assert(pythonRels.some((r) => r.from === 'pkg/transitive.py' && r.to === 'pkg/direct.py' && r.kind === 'imports'), 'transitive import relationship missing');
   assert(pythonRels.some((r) => r.from === 'tests/test_base.py' && r.to === 'pkg/base.py' && r.kind === 'tests'), 'test relationship missing');
+  const multiLine = pythonRels.filter((r) => r.from === 'pkg/multi.py');
+  assert(multiLine.some((r) => r.to === 'pkg/base.py' && r.line === 1 && r.text === 'import pkg.base as base, pkg.direct as direct'), 'aliased multi-import provenance missing');
+  assert(multiLine.some((r) => r.to === 'pkg/direct.py' && r.line === 1), 'second aliased import missing');
+  assert(multiLine.some((r) => r.to === 'pkg/sibling.py' && r.line === 2), 'dot-only relative sibling import missing');
+  assert(multiLine.some((r) => r.to === 'pkg/submodule.py' && r.line === 2), 'dot-only relative submodule import missing');
+  assert(multiLine.some((r) => r.to === 'pkg/base.py' && r.line === 3), 'multiple from-import names missing');
+  const multilineImports = pythonRels.filter((r) => r.from === 'pkg/multiline.py');
+  assert(multilineImports.some((r) => r.to === 'pkg/submodule.py' && r.line === 1), 'commented multiline package import missing submodule');
+  assert(multilineImports.some((r) => r.to === 'pkg/sibling.py' && r.line === 1), 'commented multiline package import missing sibling');
+  const continuedImports = pythonRels.filter((r) => r.from === 'pkg/continued.py');
+  assert(continuedImports.some((r) => r.to === 'pkg/base.py' && r.line === 1), 'continued import missing first module');
+  assert(continuedImports.some((r) => r.to === 'pkg/direct.py' && r.line === 1), 'continued import missing second module');
+  const submoduleImport = pythonRels.filter((r) => r.from === 'pkg/submodule_consumer.py');
+  assert.deepEqual(submoduleImport.map((r) => r.to), ['pkg/submodule.py'], 'from-package submodule created a false __init__ edge');
+  assert(pythonRels.some((r) => r.from === 'pkg/package_export_consumer.py' && r.to === 'pkg/__init__.py'), 'from-package exported name lost package edge');
+  assert.equal(pythonRels.some((r) => r.from === 'pkg/sub/escape.py'), false, 'relative import escaped the guarded inventory');
   console.log('PASS: AP-007: Python relationship extraction cleanly produces internal graph edges.');
 
   // Test 2: Graph traversal with cycle avoidance and depth tracking
@@ -107,6 +151,17 @@ try {
   const cycleBCount = impactTraversed.filter((t) => t.path === 'pkg/cycle_b.py').length;
   assert.equal(cycleACount, 1, 'cycle_a was visited more than once');
   assert.equal(cycleBCount, 1, 'cycle_b was visited more than once');
+  const depthBounded = traverseImpactGraph(baseDefPaths, analysis.relationships, {
+    maxDepth: 1,
+    includeTests: true
+  });
+  assert.equal(depthBounded.some((t) => t.path === 'pkg/transitive.py'), false, 'impact exceeded the configured depth bound');
+  const candidateBounded = traverseImpactGraph(baseDefPaths, analysis.relationships, {
+    maxDepth: 3,
+    maxCandidates: 1,
+    includeTests: true
+  });
+  assert.equal(candidateBounded.length, 1, 'impact exceeded the configured candidate bound');
   console.log('PASS: Reverse dependency traversal handles depth, transitive dependencies, and cycles.');
 
   // Test 3: AP-008: End-to-end impact search returns direct/transitive modules and tests
@@ -126,6 +181,10 @@ try {
   assert(directMatch, 'direct dependent module missing from matches');
   assert(directMatch.reasons.includes('dependent module'));
   assert(directMatch.reasons.some((r) => r.includes('imports pkg/base.py')));
+  assert.equal(directMatch.line, 1, 'impact relationship did not retain its physical import line');
+  assert.equal(directMatch.text, 'from pkg.base import BaseService', 'impact relationship did not retain its source text');
+  assert.equal(directMatch.occurrenceCount, 2, 'impact did not retain both physical evidence lines');
+  assert.deepEqual(directMatch.additionalLines, [2], 'impact occurrence provenance included an invented or missing line');
 
   // Verify transitive dependent module
   const transitiveMatch = impactAnalysis.matches.find((m) => m.path === 'pkg/transitive.py');

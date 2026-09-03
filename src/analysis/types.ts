@@ -80,6 +80,10 @@ export interface AnalysisRelationship {
   kind: AnalysisRelationshipKind;
   confidence: AnalysisConfidence;
   source: string;
+  /** Physical source line that produced this relationship, when available. */
+  line?: number;
+  /** Redacted, bounded source text for the relationship's physical line. */
+  text?: string;
 }
 
 export interface AnalysisArea {
