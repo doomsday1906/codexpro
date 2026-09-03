@@ -198,6 +198,40 @@ try {
     }
   }
 
+  // Test 4: A structured scheduler may intentionally retain fewer records than
+  // the raw lexical max-results window. The legacy projection must follow the
+  // scheduled structured records exactly, including their text and order.
+  const overflowQuery = 'BodyFormSourceV2';
+  for (let index = 0; index < 30; index += 1) {
+    const suffix = String(index).padStart(2, '0');
+    await writeFixture(`src/structured-overflow/overflow-${suffix}.ts`, `const marker${index} = "${overflowQuery}";\n`);
+  }
+  const lexicalOnlyOverflow = await searchWorkspace(config, guard, workspace, {
+    query: overflowQuery,
+    maxResults: 20
+  });
+  const overflowResult = await searchWorkspace(config, guard, workspace, {
+    query: overflowQuery,
+    intent: 'impact',
+    includeTests: true,
+    maxResults: 20
+  });
+  const overflowAnalysis = analysisOf(overflowResult, 'structured overflow');
+  assert.equal(lexicalOnlyOverflow.matches.length, 20, 'Overflow fixture did not produce the raw lexical max-results window');
+  assert(lexicalOnlyOverflow.matches.length > overflowAnalysis.matches.length, 'Overflow fixture did not exercise fewer scheduled structured matches');
+  const expectedLegacyMatches = overflowAnalysis.matches.map(({ path, line, text }) => ({ path, line, text }));
+  assert.deepEqual(overflowResult.matches, expectedLegacyMatches, 'Legacy structured-search matches diverged from scheduled structured matches');
+  const expectedLegacyText = expectedLegacyMatches.map((match) => `${match.path}:${match.line}: ${match.text}`).join('\n') || 'No matches.';
+  assert.equal(overflowResult.text, expectedLegacyText, 'Legacy structured-search text was not rebuilt from scheduled matches');
+  assert.equal(overflowAnalysis.schemaVersion, 2, 'Structured overflow regression lost schema v2');
+  assert(overflowAnalysis.groups.definitions.length > 0, 'Structured overflow regression lost the definition evidence');
+  assert(overflowAnalysis.groups.references.length > 0, 'Structured overflow regression lost reference evidence');
+  assert(overflowAnalysis.matches.some((match) => match.provenance?.includes('lexical')), 'Structured overflow regression lost lexical provenance');
+  assert(overflowAnalysis.coverage.truncated, 'Structured overflow regression lost truthful coverage truncation');
+  assert(overflowAnalysis.warnings.some((warning) => warning.includes('Source analysis reached its file or byte limit.')), 'Structured overflow regression lost the coverage warning');
+  console.log(`RAW_OBSERVATION: overflow fixture has ${lexicalOnlyOverflow.matches.length} raw lexical records but ${overflowAnalysis.matches.length} scheduled structured records; legacy projection count/text exactly match the scheduled set.`);
+  console.log('SANITY_VERDICT: MATCH — the outward structured-search list and text show only the selected path/line/text records while analysis retains provenance and coverage warning fields.');
+
   console.log('PASS: SUPPORTING_ONLY public/structured payload remains bounded with required definitions, affected source modules, tests, reasons, provenance, and warnings.');
   console.log('AP-012 production thresholds remain unproven here; real public-route evidence is required separately.');
   console.log('ALL TASK-006 SMOKE CHECKS PASSED.');

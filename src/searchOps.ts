@@ -439,6 +439,17 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
       ...lexical.matches.map((match) => match.text),
       ...structured.matches.map((match) => match.text)
     ]);
+    // Structured scheduling is the authoritative result set for structured
+    // searches. Keep the legacy projection aligned with that same set instead
+    // of exposing an independently truncated lexical window alongside it.
+    // Regex searches intentionally return no grouped records and retain their
+    // lexical ripgrep output as the supported fallback. The same fallback is
+    // needed when structured analysis has no scheduled records (for example,
+    // an eligible lexical producer can be independent of the analyzed source).
+    if (!options.regex && structured.matches.length > 0) {
+      lexical.matches = structured.matches.map(({ path, line, text }) => ({ path, line, text }));
+      lexical.text = lexical.matches.map((match) => `${match.path}:${match.line}: ${match.text}`).join("\n") || "No matches.";
+    }
     lexical.analysis = structured;
   } catch (error) {
     lexical.analysis = {
