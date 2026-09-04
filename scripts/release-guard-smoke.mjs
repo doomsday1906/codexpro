@@ -14,6 +14,8 @@ assert.equal(manifest.scripts.prepublishOnly, "node scripts/release-guard.mjs");
 assert.equal(manifest.scripts["release:guard"], "node scripts/release-guard.mjs");
 assert.equal(manifest.scripts["release:pack"], "node scripts/release-pack.mjs");
 assert.equal(manifest.scripts["release:publish"], "node scripts/release-publish.mjs");
+assert.equal(manifest.scripts["release:reproducibility"], "node scripts/release-reproducibility.mjs");
+assert.equal(manifest.scripts["release:drift-falsifier"], "node scripts/release-content-drift-falsifier.mjs");
 
 function run(command, args, { cwd, env = {} } = {}) {
   const result = spawnSync(command, args, {

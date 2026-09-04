@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { resolve, join, relative, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CODEXPRO_ROOT, assertCodexProReleaseEnvironment, assertReleaseDependencyClosure } from "./release-guard.mjs";
+import { packLockDerivedRelease } from "./release-pack.mjs";
 
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 const npmCli = process.env.npm_execpath;
@@ -188,25 +189,22 @@ async function main() {
   mkdirSync(cacheB, { recursive: true });
 
   try {
-    console.log("==> Step 3: Packing bundled candidate artifact...");
-    const packCmd = npmCli ? [process.execPath, npmCli] : [npm];
-    const packArgs = ["pack", "--ignore-scripts", "--json", `--pack-destination=${packDir}`];
-    const packRes = spawnSync(packCmd[0], [...packCmd.slice(1), ...packArgs], {
-      cwd: CODEXPRO_ROOT,
-      encoding: "utf8",
-      env: { ...process.env, INIT_CWD: CODEXPRO_ROOT }
+    console.log("==> Step 3: Staging clean lock-derived dependencies and packing candidate artifact...");
+    const packResult = packLockDerivedRelease({
+      root: CODEXPRO_ROOT,
+      outDir: packDir,
+      dryRun: false
     });
-    assert.equal(packRes.status, 0, `npm pack failed: ${packRes.stderr}`);
-    const packData = JSON.parse(packRes.stdout)[0];
-    const tarballPath = join(packDir, packData.filename);
-    const tarballSha256 = sha256File(tarballPath);
+    const packData = packResult.tarball;
+    const tarballPath = packResult.tarballPath;
+    const tarballSha256 = packResult.tarballSha256;
 
-    console.log(`    Candidate tarball: ${packData.filename}`);
+    console.log(`    Candidate tarball: ${packResult.filename}`);
     console.log(`    Tarball SHA-256:   ${tarballSha256}`);
-    console.log(`    Compressed size:   ${packData.size} bytes`);
-    console.log(`    Unpacked size:     ${packData.unpackedSize} bytes`);
-    console.log(`    Entry count:       ${packData.entryCount}`);
-    console.log(`    Bundled count:     ${packData.bundled?.length ?? 0}`);
+    console.log(`    Compressed size:   ${packResult.size} bytes`);
+    console.log(`    Unpacked size:     ${packResult.unpackedSize} bytes`);
+    console.log(`    Entry count:       ${packResult.entryCount}`);
+    console.log(`    Bundled count:     ${packResult.bundledDependenciesCount}`);
 
     assert.ok(Array.isArray(packData.bundled) && packData.bundled.length > 0, "No bundled packages reported by npm pack");
 
@@ -365,7 +363,7 @@ async function main() {
       const summaryMd = `# TASK-005 Evidence Summary — Candidate Bundled-Artifact Reproducibility
 
 Status: **ACCEPTED — AP-009 PASS / AP-010 PASS**
-Execution Authority: A002 / P002 / L006 / TR-006
+Execution Authority: COR-001 CLOSED_ACCEPT / A002 ACCEPTED / P002 ACCEPTED / L007 / TR-007
 Execution Owner: \`repoconnect-m007-root\` (ACTIVE)
 
 ## Pass 1 (Direct Physical Observation)
@@ -401,7 +399,7 @@ Direct Physical Verdict: **MATCH**.
 
 ## Pass 2 (Technical Evaluation)
 
-1. The candidate bundled tarball was generated directly from the candidate worktree, where \`node_modules\` was verified against \`package-lock.json\`.
+1. The candidate bundled tarball was generated from a clean disposable staging tree physically derived from the repository package-lock.json via npm ci --omit=dev --ignore-scripts, ensuring zero dependence on or contamination from worktree node_modules.
 2. Both offline global installations succeeded without accessing external networks or registry endpoints.
 3. The installed runtime environment in both prefixes exactly reproduces the 100-node production closure with zero drift and bit-identical file contents.
 

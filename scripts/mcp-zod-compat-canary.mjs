@@ -98,7 +98,12 @@ async function runCanary({ falsify = false } = {}) {
   pureServer.tool("canary_probe", "Probe tool for zod validation", {
     name: z.string().min(2),
     kind: z.enum(["alpha", "beta"]),
-    limit: z.number().int().min(1).max(50).default(10),
+    // Controlled falsifier: in falsify mode, inject a real schema definition mismatch
+    // (registering limit as string instead of integer) to prove that the canary's
+    // schema inspection and validation assertions detect schema/runtime incompatibility.
+    limit: falsify
+      ? z.string()
+      : z.number().int().min(1).max(50).default(10),
     tags: z.array(z.string()).optional()
   }, async (args) => {
     return { content: [{ type: "text", text: `ok:${args.name}:${args.kind}:${args.limit}` }] };
@@ -115,16 +120,23 @@ async function runCanary({ falsify = false } = {}) {
   const probeTool = pureTools.tools.find((t) => t.name === "canary_probe");
   assert.ok(probeTool, "pure canary_probe tool must be registered");
   assert.deepEqual(probeTool.inputSchema.properties.kind.enum, ["alpha", "beta"]);
+
+  // Schema generation verification: detects schema generation incompatibility
+  assert.equal(
+    probeTool.inputSchema.properties.limit.type,
+    "integer",
+    `Schema generation incompatibility: expected limit type to be "integer", received "${probeTool.inputSchema.properties.limit.type}"`
+  );
   assert.equal(probeTool.inputSchema.properties.limit.minimum, 1);
   assert.equal(probeTool.inputSchema.properties.limit.maximum, 50);
   assert.equal(probeTool.inputSchema.properties.limit.default, 10);
 
-  // Valid pure call
+  // Valid pure call acceptance: detects runtime argument/schema validation incompatibility
   const validPure = await pureClient.callTool({
     name: "canary_probe",
     arguments: { name: "test", kind: "alpha", limit: 20 }
   });
-  assert.equal(validPure.isError, undefined);
+  assert.equal(validPure.isError, undefined, "Valid runtime call must succeed without validation error");
   assert.equal(validPure.content[0].text, "ok:test:alpha:20");
 
   // Invalid pure call: enum mismatch
@@ -132,28 +144,30 @@ async function runCanary({ falsify = false } = {}) {
     name: "canary_probe",
     arguments: { name: "test", kind: "invalid-kind" }
   });
-  assert.equal(invalidEnum.isError, true);
+  assert.equal(invalidEnum.isError, true, "Invalid enum call must fail validation");
   assert.match(invalidEnum.content[0].text, /Invalid enum value|Input validation error/);
-
-  // --- Section 5: Controlled falsifier (AP-008) ---
-  if (falsify) {
-    throw new Error("CONTROLLED_FALSIFIER: Deliberately induced failure to prove canary sensitivity.");
-  }
 }
 
-// Self-test controlled falsifier
+// Verify that canary assertions detect controlled schema/runtime incompatibility
 async function verifyFalsifier() {
-  let caught = false;
+  let caught = null;
   try {
     await runCanary({ falsify: true });
   } catch (err) {
-    if (err.message.includes("CONTROLLED_FALSIFIER")) {
-      caught = true;
-    } else {
-      throw err;
-    }
+    caught = err;
   }
-  assert.ok(caught, "Controlled falsifier was not detected!");
+  assert.ok(caught, "Controlled schema/runtime incompatibility was not detected by canary!");
+  assert.equal(caught.name, "AssertionError", `Expected AssertionError but received ${caught.name}`);
+  assert.match(
+    caught.message,
+    /Schema generation incompatibility|expected limit type/i,
+    `AssertionError must reflect schema incompatibility detection; received: ${caught.message}`
+  );
+  return {
+    detected: true,
+    error_name: caught.name,
+    error_message: caught.message
+  };
 }
 
 const isDirect = Boolean(process.argv[1]) && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
@@ -161,11 +175,12 @@ const isDirect = Boolean(process.argv[1]) && resolve(process.argv[1]) === resolv
 if (isDirect) {
   const isFalsifyMode = process.argv.includes("--falsify");
   if (isFalsifyMode) {
-    console.log("Running in controlled falsifier mode...");
+    console.log("Running in controlled falsifier mode (injecting schema/runtime incompatibility)...");
+    // Directly invoke runCanary({ falsify: true }) WITHOUT catching, so process terminates with non-zero exit code and AssertionError
     await runCanary({ falsify: true });
   } else {
     await runCanary();
-    await verifyFalsifier();
+    const falsifierReport = await verifyFalsifier();
     console.log(JSON.stringify({
       mcp_sdk_version: sdkPkg.version,
       zod_version: zodPkg.version,
@@ -173,6 +188,7 @@ if (isDirect) {
       valid_runtime_call: "PASS",
       invalid_shape_rejection: "PASS",
       controlled_falsifier_detected: "PASS",
+      falsifier_failure_mode: falsifierReport.error_message,
       gates: {
         "AP-007": "PASS",
         "AP-008": "PASS"

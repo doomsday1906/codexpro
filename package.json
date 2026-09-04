@@ -124,9 +124,10 @@
     "pro:apply": "node scripts/pro-apply.mjs",
     "mcp-zod:compat": "node scripts/mcp-zod-compat-canary.mjs",
     "release:reproducibility": "node scripts/release-reproducibility.mjs",
+    "release:drift-falsifier": "node scripts/release-content-drift-falsifier.mjs",
     "release:guard": "node scripts/release-guard.mjs",
     "release:pack": "node scripts/release-pack.mjs",
-    "release:check": "npm run release:guard && npm run build && npm run smoke && npm run stress && npm audit --audit-level=high && npm run release:pack",
+    "release:check": "npm run release:guard && npm run build && npm run smoke && npm run stress && npm run release:reproducibility && npm audit --audit-level=high",
     "release:publish": "node scripts/release-publish.mjs"
   },
   "dependencies": {
