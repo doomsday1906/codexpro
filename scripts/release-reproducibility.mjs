@@ -363,7 +363,7 @@ async function main() {
       const summaryMd = `# TASK-005 Evidence Summary — Candidate Bundled-Artifact Reproducibility
 
 Status: **ACCEPTED — AP-009 PASS / AP-010 PASS**
-Execution Authority: COR-001 CLOSED_ACCEPT / A002 ACCEPTED / P002 ACCEPTED / L007 / TR-007
+Execution Authority: COR-001 CLOSED_ACCEPT / A002 ACCEPTED / P002 ACCEPTED / L008 / TR-008
 Execution Owner: \`repoconnect-m007-root\` (ACTIVE)
 
 ## Pass 1 (Direct Physical Observation)
