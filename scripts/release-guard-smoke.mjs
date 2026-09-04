@@ -51,6 +51,44 @@ try {
   assert.equal(tarball.name, "codexpro");
   assert.match(tarball.version, /^\d+\.\d+\.\d+$/);
   assert.equal(tarball.filename, `codexpro-${tarball.version}.tgz`);
+  assert.equal(typeof tarball.bundledDependenciesCount, "number");
+  assert.ok(tarball.bundledDependenciesCount > 0, "expected bundledDependenciesCount > 0");
+  assert.equal(typeof tarball.bundledFilesCount, "number");
+  assert.ok(tarball.bundledFilesCount > 0, "expected bundledFilesCount > 0");
+  assert.equal(tarball.productionClosureNodeCount, 100);
+
+  // Test closure failure mode on incomplete/corrupted dependency tree
+  const { assertReleaseDependencyClosure } = await import("./release-guard.mjs");
+  const testDir = mkdtempSync(join(tmpdir(), "codexpro-closure-test-"));
+  try {
+    const fs = await import("node:fs");
+    fs.writeFileSync(join(testDir, "package-lock.json"), JSON.stringify({
+      name: "test-pkg",
+      lockfileVersion: 3,
+      packages: {
+        "": { name: "test-pkg" },
+        "node_modules/fake-dep": { name: "fake-dep", version: "1.0.0" }
+      }
+    }));
+    // Missing node_modules directory
+    assert.throws(
+      () => assertReleaseDependencyClosure(testDir),
+      /Release dependency closure check failed: missing installed package/
+    );
+
+    // Mismatched version
+    fs.mkdirSync(join(testDir, "node_modules", "fake-dep"), { recursive: true });
+    fs.writeFileSync(join(testDir, "node_modules", "fake-dep", "package.json"), JSON.stringify({
+      name: "fake-dep",
+      version: "0.9.0"
+    }));
+    assert.throws(
+      () => assertReleaseDependencyClosure(testDir),
+      /expected version "1.0.0" but found "0.9.0"/
+    );
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
+  }
 } finally {
   rmSync(wrongCwd, { recursive: true, force: true });
 }

@@ -21,7 +21,58 @@ function releaseRootError(actualPath) {
   );
 }
 
-export function assertCodexProReleaseEnvironment({ cwd = process.cwd(), env = process.env } = {}) {
+export function assertReleaseDependencyClosure(root = CODEXPRO_ROOT) {
+  const lockPath = resolve(root, "package-lock.json");
+  let lockData;
+  try {
+    lockData = JSON.parse(readFileSync(lockPath, "utf8"));
+  } catch (err) {
+    throw new Error(`Release dependency closure check failed: cannot read package-lock.json at ${lockPath}: ${err.message}`);
+  }
+
+  const packages = lockData.packages ?? {};
+  const expectedPackages = [];
+  for (const [key, meta] of Object.entries(packages)) {
+    if (key === "" || meta.dev) continue;
+    const name = meta.name || key.split("node_modules/").pop();
+    expectedPackages.push({
+      path: key,
+      name,
+      version: meta.version
+    });
+  }
+
+  if (expectedPackages.length === 0) {
+    throw new Error("Release dependency closure check failed: no production dependencies found in package-lock.json.");
+  }
+
+  for (const pkg of expectedPackages) {
+    const pkgJsonPath = resolve(root, pkg.path, "package.json");
+    let installedPkg;
+    try {
+      installedPkg = JSON.parse(readFileSync(pkgJsonPath, "utf8"));
+    } catch {
+      throw new Error(
+        `Release dependency closure check failed: missing installed package "${pkg.name}" at "${pkg.path}". ` +
+        `Stale or incomplete node_modules detected; run "npm ci" before release packaging.`
+      );
+    }
+    if (installedPkg.name !== pkg.name || installedPkg.version !== pkg.version) {
+      throw new Error(
+        `Release dependency closure check failed: package "${pkg.name}" at "${pkg.path}" ` +
+        `expected version "${pkg.version}" but found "${installedPkg.version}". ` +
+        `Stale node_modules detected; run "npm ci" before release packaging.`
+      );
+    }
+  }
+
+  return {
+    packageCount: expectedPackages.length,
+    packages: expectedPackages
+  };
+}
+
+export function assertCodexProReleaseEnvironment({ cwd = process.cwd(), env = process.env, verifyClosure = true } = {}) {
   const actualCwd = canonicalPath(cwd);
   if (actualCwd !== CODEXPRO_ROOT) throw releaseRootError(actualCwd);
 
@@ -44,11 +95,20 @@ export function assertCodexProReleaseEnvironment({ cwd = process.cwd(), env = pr
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(packageJson.version ?? "")) {
     throw new Error("CodexPro package.json has an invalid release version.");
   }
+  if (packageJson.bundleDependencies !== true && packageJson.bundledDependencies !== true) {
+    throw new Error("CodexPro release packaging requires bundleDependencies: true in package.json.");
+  }
+
+  let productionClosure = null;
+  if (verifyClosure) {
+    productionClosure = assertReleaseDependencyClosure(CODEXPRO_ROOT);
+  }
 
   return {
     root: CODEXPRO_ROOT,
     name: packageJson.name,
-    version: packageJson.version
+    version: packageJson.version,
+    productionClosure
   };
 }
 
@@ -59,7 +119,7 @@ function isDirectInvocation() {
 if (isDirectInvocation()) {
   try {
     const release = assertCodexProReleaseEnvironment();
-    console.log(`CodexPro release guard: ${release.name}@${release.version}`);
+    console.log(`CodexPro release guard: ${release.name}@${release.version} (production closure: ${release.productionClosure.packageCount} packages verified)`);
   } catch (error) {
     console.error(`[release guard] ${error.message}`);
     process.exitCode = 1;

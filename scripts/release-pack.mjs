@@ -40,12 +40,24 @@ try {
     fail(`Internal planning files entered the public tarball: ${forbiddenInternal.join(", ")}.`);
   }
 
+  if (!Array.isArray(tarball.bundled) || tarball.bundled.length === 0) {
+    fail("npm pack did not include bundled dependencies. Ensure bundleDependencies: true is set and node_modules is populated.");
+  }
+  const bundledFiles = (tarball.files ?? []).filter((entry) => entry.path.startsWith("node_modules/"));
+  if (bundledFiles.length === 0) {
+    fail("npm pack did not include bundled dependency files in the package archive.");
+  }
+
   console.log(JSON.stringify({
     name: tarball.name,
     version: tarball.version,
     filename: tarball.filename,
     size: tarball.size,
-    unpackedSize: tarball.unpackedSize
+    unpackedSize: tarball.unpackedSize,
+    entryCount: tarball.entryCount,
+    bundledDependenciesCount: tarball.bundled.length,
+    bundledFilesCount: bundledFiles.length,
+    productionClosureNodeCount: release.productionClosure.packageCount
   }, null, 2));
 } catch (error) {
   console.error(`[release pack] ${error.message}`);
