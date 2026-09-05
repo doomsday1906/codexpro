@@ -101,6 +101,59 @@ if (unclosedKeyIdx !== -1 && args[unclosedKeyIdx + 1]) {
   }
 }
 
+const overlongCredIdx = args.indexOf('--emit-overlong-credential');
+if (overlongCredIdx !== -1) {
+  let label = 'MY_CUSTOM_SECRET_KEY';
+  let val = 'syntheticordinarysecret999';
+  let prefixLen = 2030;
+  let suffixLen = 2500;
+  if (args[overlongCredIdx + 1]?.includes('=')) {
+    const eqIdx = args[overlongCredIdx + 1].indexOf('=');
+    label = args[overlongCredIdx + 1].slice(0, eqIdx);
+    val = args[overlongCredIdx + 1].slice(eqIdx + 1);
+    prefixLen = args[overlongCredIdx + 2] ? parseInt(args[overlongCredIdx + 2], 10) : 2030;
+    suffixLen = args[overlongCredIdx + 3] ? parseInt(args[overlongCredIdx + 3], 10) : 2500;
+  } else if (args[overlongCredIdx + 1] && !args[overlongCredIdx + 1].startsWith('-') && args[overlongCredIdx + 2] && !args[overlongCredIdx + 2].startsWith('-')) {
+    label = args[overlongCredIdx + 1];
+    val = args[overlongCredIdx + 2];
+    prefixLen = args[overlongCredIdx + 3] ? parseInt(args[overlongCredIdx + 3], 10) : 2030;
+    suffixLen = args[overlongCredIdx + 4] ? parseInt(args[overlongCredIdx + 4], 10) : 2500;
+  }
+  process.stdout.write('A'.repeat(prefixLen) + ' ' + label + '=' + val + ' ' + 'B'.repeat(suffixLen));
+}
+
+const overlongAuthIdx = args.indexOf('--emit-overlong-authorization');
+if (overlongAuthIdx !== -1) {
+  let val = 'syntheticauthsecret789';
+  let prefixLen = 2030;
+  let suffixLen = 2500;
+  if (args[overlongAuthIdx + 1] && !args[overlongAuthIdx + 1].startsWith('-')) {
+    const raw = args[overlongAuthIdx + 1];
+    const match = raw.match(/Authorization:\s*Bearer\s+(.*)/i);
+    val = match ? match[1] : raw;
+    prefixLen = args[overlongAuthIdx + 2] ? parseInt(args[overlongAuthIdx + 2], 10) : 2030;
+    suffixLen = args[overlongAuthIdx + 3] ? parseInt(args[overlongAuthIdx + 3], 10) : 2500;
+  }
+  process.stdout.write('A'.repeat(prefixLen) + ' Authorization: Bearer ' + val + ' ' + 'B'.repeat(suffixLen));
+}
+
+const overlongRepeatedIdx = args.indexOf('--emit-overlong-repeated');
+if (overlongRepeatedIdx !== -1) {
+  const extractVal = (arg, defaultVal) => {
+    if (!arg || arg.startsWith('-')) return defaultVal;
+    if (arg.includes('=')) return arg.slice(arg.indexOf('=') + 1);
+    const m = arg.match(/Authorization:\s*Bearer\s+(.*)/i);
+    if (m) return m[1];
+    return arg;
+  };
+  const val1 = extractVal(args[overlongRepeatedIdx + 1], 'repeatedsecretone111');
+  const val2 = extractVal(args[overlongRepeatedIdx + 2], 'repeatedsecrettwo222');
+  const val3 = extractVal(args[overlongRepeatedIdx + 3], 'repeatedsecretthree333');
+  process.stdout.write('A'.repeat(2030) + ' MY_TOKEN1=' + val1 + ' ' + 'B'.repeat(3000));
+  process.stdout.write('C'.repeat(1000) + ' Authorization: Bearer ' + val2 + '\n' + 'D'.repeat(3000));
+  process.stdout.write('E'.repeat(1000) + ' ADMIN_PASSWORD=' + val3 + ' ' + 'F'.repeat(4000));
+}
+
 if (sleepMs <= 0) {
   process.exit(exitCode);
 }
