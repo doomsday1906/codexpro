@@ -44,6 +44,7 @@ export interface CodexProConfig {
   connectionTest: boolean;
   analysisEnabled: boolean;
   analysisLimits: AnalysisLimits;
+  containmentWrapper?: string[];
 }
 
 const DEFAULT_BLOCKED_GLOBS = [
@@ -240,6 +241,18 @@ function boolFrom(value: string | undefined, fallback = false): boolean {
   return ["1", "true", "yes", "y", "on"].includes(value.toLowerCase());
 }
 
+export function parseContainmentWrapper(raw: string | undefined): string[] | undefined {
+  if (!raw?.trim()) return undefined;
+  const tokens = raw.trim().match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
+  const unquoted = tokens.map((t) => {
+    if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+      return t.slice(1, -1);
+    }
+    return t;
+  }).filter(Boolean);
+  return unquoted.length > 0 ? unquoted : undefined;
+}
+
 function isLoopbackHost(host: string): boolean {
   return host === "127.0.0.1" || host === "localhost" || host === "::1";
 }
@@ -288,6 +301,11 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
         ? args["tool-cards"]
         : undefined;
   const gitPushPolicyArg = typeof args["git-push-policy"] === "string" ? args["git-push-policy"] : undefined;
+  const containmentWrapperArg =
+    typeof args["containment-wrapper"] === "string" ? args["containment-wrapper"] : undefined;
+  const containmentWrapper = parseContainmentWrapper(
+    containmentWrapperArg ?? process.env.CODEXPRO_CONTAINMENT_WRAPPER
+  );
   const extraBlockedGlobs = splitList(process.env.CODEXPRO_BLOCKED_GLOBS, ",");
   const host = hostArg ?? process.env.CODEXPRO_HOST ?? process.env.HOST ?? "127.0.0.1";
   const authToken = process.env.CODEXPRO_HTTP_TOKEN ?? process.env.CODEBASE_BRIDGE_HTTP_TOKEN;
@@ -349,6 +367,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
       maxScannedBytes: numberFrom(process.env.CODEXPRO_ANALYSIS_MAX_SCANNED_BYTES, DEFAULT_ANALYSIS_LIMITS.maxScannedBytes, 1_000_000, 512 * 1024 * 1024),
       maxSymbols: numberFrom(process.env.CODEXPRO_ANALYSIS_MAX_SYMBOLS, DEFAULT_ANALYSIS_LIMITS.maxSymbols, 100, 1_000_000),
       maxRelationships: numberFrom(process.env.CODEXPRO_ANALYSIS_MAX_RELATIONSHIPS, DEFAULT_ANALYSIS_LIMITS.maxRelationships, 100, 2_000_000)
-    }
+    },
+    containmentWrapper
   };
 }

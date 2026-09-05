@@ -24,12 +24,15 @@ import { createDiagnosticContext, type CodexProDiagnosticContext, type HttpDiagn
 import type { WorkspaceDiagnosticReader } from "./guard.js";
 import { createCodexProServer } from "./server.js";
 import { defaultGitPushPolicy, normalizeGitPushPolicy, sanitizeGitPushPolicy, summarizeGitPushPolicy, type GitPushPolicy } from "./gitPushPolicy.js";
+import { VerificationManager } from "./verificationOps.js";
 
 export interface CodexProHttpAppOptions {
   /** Internal observer for the real server instances created by HTTP sessions. */
   readonly onDiagnosticContext?: (context: Readonly<CodexProDiagnosticContext>) => void;
   /** Internal observer for each session's read-only workspace diagnostic reader. */
   readonly onWorkspaceDiagnosticReader?: (reader: Readonly<WorkspaceDiagnosticReader>) => void;
+  /** Process-scoped verification manager shared across all HTTP sessions. */
+  readonly verificationManager?: VerificationManager;
 }
 
 function escapeHtml(value: unknown): string {
@@ -1478,6 +1481,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
   }
 
   const app = express();
+  const verificationManager = options.verificationManager ?? new VerificationManager(config);
   const logRequests = process.env.CODEXPRO_LOG_REQUESTS === "1";
   const authFailureWindow = new Map<string, { count: number; resetAt: number }>();
   const authFailureLimit = 10;
@@ -1773,7 +1777,8 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
         });
         const server = createCodexProServer(config, {
           diagnosticContext,
-          onWorkspaceDiagnosticReader: options.onWorkspaceDiagnosticReader
+          onWorkspaceDiagnosticReader: options.onWorkspaceDiagnosticReader,
+          verificationManager
         });
         options.onDiagnosticContext?.(diagnosticContext);
         await server.connect(transport);

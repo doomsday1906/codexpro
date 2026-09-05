@@ -19,6 +19,10 @@ import { viewWorkspaceImage } from "./imageOps.js";
 import { importAttachmentFile } from "./importOps.js";
 import { searchWorkspace } from "./searchOps.js";
 import { runBash } from "./bashOps.js";
+import {
+  VerificationManager,
+  type VerificationJobRecord
+} from "./verificationOps.js";
 import { gitDiff, gitDiffStatus, gitLog, gitStatus } from "./gitOps.js";
 import { gitDiffRange } from "./gitDiffRange.js";
 import { gitLogStructured, gitMergeBase, gitResolveRef, gitShowCommit } from "./gitHistoryOps.js";
@@ -304,6 +308,96 @@ const GIT_DIFF_RANGE_TRANSPORT_SCHEMA = z.object({
 const GIT_DIFF_RANGE_PUBLIC_SCHEMA = z.object(GIT_DIFF_RANGE_ARGUMENTS_SCHEMA.shape).strict();
 GIT_DIFF_RANGE_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_DIFF_RANGE_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_DIFF_RANGE_PUBLIC_SCHEMA.safeParse;
 GIT_DIFF_RANGE_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_DIFF_RANGE_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_DIFF_RANGE_PUBLIC_SCHEMA.safeParseAsync;
+
+const START_VERIFICATION_RUNNER_SCHEMA = z.enum([
+  "package_script",
+  "pytest",
+  "go_test",
+  "cargo",
+  "tsc",
+  "eslint",
+  "biome_check"
+]).describe("Structured verification runner family.");
+
+const START_VERIFICATION_PACKAGE_MANAGER_SCHEMA = z.enum(["npm", "pnpm", "yarn", "bun"])
+  .optional()
+  .describe("Package manager for package_script runner. Default: npm.");
+
+const START_VERIFICATION_SCRIPT_SCHEMA = z.string()
+  .min(1)
+  .max(128)
+  .optional()
+  .describe("Package script name for package_script runner. Obvious daemon/dev/serve/start/publish/deploy scripts are blocked.");
+
+const START_VERIFICATION_ARGS_SCHEMA = z.array(z.string().max(1024))
+  .max(64)
+  .optional()
+  .describe("Bounded plain arguments passed to the runner. Raw shell commands and metacharacters are rejected.");
+
+const START_VERIFICATION_CWD_SCHEMA = z.string()
+  .max(1024)
+  .optional()
+  .describe("Working directory relative to workspace root. Default: .");
+
+const START_VERIFICATION_LIFETIME_MS_SCHEMA = z.number()
+  .int()
+  .positive()
+  .optional()
+  .describe("Maximum execution lifetime in milliseconds (clamped between 10,000 ms and 3,600,000 ms). Default: 1,800,000 ms (30 min).");
+
+const START_VERIFICATION_ARGUMENTS_SCHEMA = z.object({
+  workspace_id: SESSION_WORKSPACE_DIAGNOSTICS_WORKSPACE_ID_SCHEMA,
+  runner: START_VERIFICATION_RUNNER_SCHEMA,
+  package_manager: START_VERIFICATION_PACKAGE_MANAGER_SCHEMA,
+  script: START_VERIFICATION_SCRIPT_SCHEMA,
+  args: START_VERIFICATION_ARGS_SCHEMA,
+  cwd: START_VERIFICATION_CWD_SCHEMA,
+  lifetime_ms: START_VERIFICATION_LIFETIME_MS_SCHEMA
+}).strict();
+
+const START_VERIFICATION_TRANSPORT_SCHEMA = z.object({
+  workspace_id: z.unknown().optional(),
+  runner: z.unknown().optional(),
+  package_manager: z.unknown().optional(),
+  script: z.unknown().optional(),
+  args: z.unknown().optional(),
+  cwd: z.unknown().optional(),
+  lifetime_ms: z.unknown().optional()
+}).passthrough();
+
+const START_VERIFICATION_PUBLIC_SCHEMA = z.object(START_VERIFICATION_ARGUMENTS_SCHEMA.shape);
+START_VERIFICATION_PUBLIC_SCHEMA.safeParse = ((args: unknown) => START_VERIFICATION_TRANSPORT_SCHEMA.safeParse(args)) as typeof START_VERIFICATION_PUBLIC_SCHEMA.safeParse;
+START_VERIFICATION_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => START_VERIFICATION_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof START_VERIFICATION_PUBLIC_SCHEMA.safeParseAsync;
+
+const VERIFICATION_JOB_ID_SCHEMA = z.string()
+  .regex(/^vjob_[0-9a-f]{24}$/, "job_id must match the managed verification job ID grammar.")
+  .describe("Opaque managed verification job ID returned by start_verification.");
+
+const WAIT_VERIFICATION_ARGUMENTS_SCHEMA = z.object({
+  job_id: VERIFICATION_JOB_ID_SCHEMA,
+  max_wait_seconds: z.number().int().min(1).max(60).optional().describe("Maximum seconds to wait for completion before returning current state. Default: 20, max: 60.")
+}).strict();
+
+const WAIT_VERIFICATION_TRANSPORT_SCHEMA = z.object({
+  job_id: z.unknown().optional(),
+  max_wait_seconds: z.unknown().optional()
+}).passthrough();
+
+const WAIT_VERIFICATION_PUBLIC_SCHEMA = z.object(WAIT_VERIFICATION_ARGUMENTS_SCHEMA.shape);
+WAIT_VERIFICATION_PUBLIC_SCHEMA.safeParse = ((args: unknown) => WAIT_VERIFICATION_TRANSPORT_SCHEMA.safeParse(args)) as typeof WAIT_VERIFICATION_PUBLIC_SCHEMA.safeParse;
+WAIT_VERIFICATION_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => WAIT_VERIFICATION_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof WAIT_VERIFICATION_PUBLIC_SCHEMA.safeParseAsync;
+
+const CANCEL_VERIFICATION_ARGUMENTS_SCHEMA = z.object({
+  job_id: VERIFICATION_JOB_ID_SCHEMA
+}).strict();
+
+const CANCEL_VERIFICATION_TRANSPORT_SCHEMA = z.object({
+  job_id: z.unknown().optional()
+}).passthrough();
+
+const CANCEL_VERIFICATION_PUBLIC_SCHEMA = z.object(CANCEL_VERIFICATION_ARGUMENTS_SCHEMA.shape);
+CANCEL_VERIFICATION_PUBLIC_SCHEMA.safeParse = ((args: unknown) => CANCEL_VERIFICATION_TRANSPORT_SCHEMA.safeParse(args)) as typeof CANCEL_VERIFICATION_PUBLIC_SCHEMA.safeParse;
+CANCEL_VERIFICATION_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => CANCEL_VERIFICATION_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof CANCEL_VERIFICATION_PUBLIC_SCHEMA.safeParseAsync;
 
 const GIT_COMMIT_PATH_SCHEMA = z.string()
   .min(1)
@@ -875,6 +969,49 @@ function bashTextResult(config: CodexProConfig, result: Awaited<ReturnType<typeo
   ].join("\n");
 }
 
+function verificationTextResult(config: CodexProConfig, record: VerificationJobRecord, action: "started" | "status" | "cancelled"): string {
+  if (action === "started") {
+    return [
+      "# Managed Verification Started",
+      "",
+      `Job ID: \`${record.jobId}\``,
+      `State: ${record.state}`,
+      `Runner: ${record.runner}${record.script ? ` (${record.script})` : ""}`,
+      `Workspace ID: \`${record.workspaceId}\``,
+      `Root: ${record.workspaceRoot}`,
+      `CWD: ${record.cwd}`,
+      `Command: \`${record.commandSummary}\``,
+      `Lifetime: ${record.lifetimeMs} ms`,
+      "",
+      `Call wait_verification(job_id="${record.jobId}") to check progress or wait for completion.`,
+      `Call cancel_verification(job_id="${record.jobId}") to terminate.`
+    ].join("\n");
+  }
+
+  const lines = [
+    `# Managed Verification ${action === "cancelled" ? "Cancelled" : "Status"}`,
+    "",
+    `Job ID: \`${record.jobId}\``,
+    `State: ${record.state}`,
+    `Runner: ${record.runner}${record.script ? ` (${record.script})` : ""}`,
+    `Exit: ${record.exitCode ?? "none"}${record.signal ? ` (${record.signal})` : ""}`,
+    record.durationMs !== undefined ? `Duration: ${record.durationMs} ms` : undefined,
+    record.terminalReason ? `Reason: ${record.terminalReason}` : undefined,
+    `Output: stdout ${record.observedStdoutBytes} bytes, stderr ${record.observedStderrBytes} bytes${record.truncated ? " (truncated)" : ""}.`
+  ].filter(Boolean) as string[];
+
+  if (config.bashTranscript === "full" || record.state !== "running") {
+    if (record.stdout) {
+      lines.push("", "## stdout", "", "```text", record.stdout, "```");
+    }
+    if (record.stderr) {
+      lines.push("", "## stderr", "", "```text", record.stderr, "```");
+    }
+  }
+
+  return lines.join("\n");
+}
+
 function errorResult(error: unknown): any {
   const message = errorText(error);
   return {
@@ -1197,6 +1334,9 @@ const MINIMAL_TOOL_NAMES = [
 
 const STANDARD_TOOL_NAMES = [
   ...MINIMAL_TOOL_NAMES,
+  "start_verification",
+  "wait_verification",
+  "cancel_verification",
   "inspect_workspace",
   "tree",
   "search",
@@ -1235,6 +1375,9 @@ const FULL_TOOL_NAMES = [
   "apply_patch",
   "import_file",
   "bash",
+  "start_verification",
+  "wait_verification",
+  "cancel_verification",
   "git_resolve_ref",
   "git_merge_base",
   "git_log",
@@ -1264,6 +1407,9 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "git_commit",
   "git_push",
   "bash",
+  "start_verification",
+  "wait_verification",
+  "cancel_verification",
   "export_pro_context",
   "handoff_to_agent",
   "handoff_to_codex"
@@ -1286,6 +1432,10 @@ function toolNamesForMode(config: CodexProConfig): string[] {
   if (config.bashMode === "off") {
     const bashIndex = names.indexOf("bash");
     if (bashIndex !== -1) names.splice(bashIndex, 1);
+    for (const vTool of ["start_verification", "wait_verification", "cancel_verification"]) {
+      const idx = names.indexOf(vTool);
+      if (idx !== -1) names.splice(idx, 1);
+    }
   }
   if (config.writeMode !== "workspace") {
     for (const writeTool of ["write", "edit", "apply_patch", "import_file", "git_commit", "git_push"]) {
@@ -1331,7 +1481,7 @@ function registeredToolNames(server: McpServer): string[] {
 
 function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
   if (config.connectionTest && CONNECTION_TEST_HIDDEN_TOOLS.has(name)) return false;
-  if (name === "bash" && config.bashMode === "off") return false;
+  if ((name === "bash" || name === "start_verification" || name === "wait_verification" || name === "cancel_verification") && config.bashMode === "off") return false;
   if ((name === "write" || name === "edit" || name === "apply_patch" || name === "import_file") && config.writeMode !== "workspace") return false;
   if (name === "git_commit" && (config.toolMode !== "full" || config.writeMode !== "workspace")) return false;
   if (name === "git_push" && !hasEnabledGitPushPolicy(config)) return false;
@@ -2305,6 +2455,8 @@ export interface CodexProServerOptions {
   readonly diagnosticContext?: CodexProDiagnosticContext;
   /** Internal observer for the read-only workspace state of this server/session. */
   readonly onWorkspaceDiagnosticReader?: (reader: Readonly<WorkspaceDiagnosticReader>) => void;
+  /** Process-scoped verification manager shared across all HTTP sessions or owned by stdio. */
+  readonly verificationManager?: VerificationManager;
 }
 
 export type {
@@ -2318,6 +2470,7 @@ export type {
 
 export function createCodexProServer(config: CodexProConfig, options: CodexProServerOptions = {}): McpServer {
   const workspaces = new WorkspaceManager(config);
+  const verificationManager = options.verificationManager ?? new VerificationManager(config);
   const reviewCheckpoints = new Map<string, string>();
   const guard = new PathGuard(config);
   const readAtRefSchemas = readAtRefPublicSchemas(config.maxReadBytes);
@@ -3684,6 +3837,90 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
       });
       const text = bashTextResult(config, result);
       return diagnosticTextResult(text, { workspace_id: workspace.id, root: workspace.root, ...result, bash_session_id: result.bashSessionId ?? null });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "start_verification",
+    {
+      title: "Start Managed Verification",
+      description:
+        "Start a bounded long-running verification job in the workspace (survives MCP session churn in the same CodexPro process). Requires explicit workspace_id and a structured runner (package_script, pytest, go_test, cargo, tsc, eslint, biome_check). Non-verification scripts (start, dev, serve, watch, publish, deploy) are rejected. Returns immediately with job_id.",
+      inputSchema: START_VERIFICATION_PUBLIC_SCHEMA,
+      runtimeInputSchema: START_VERIFICATION_ARGUMENTS_SCHEMA,
+      annotations: BASH_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Starting managed verification job...",
+        "openai/toolInvocation/invoked": "Managed verification job started"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      if (workspace.id !== args.workspace_id) {
+        throw new CodexProError("workspace_id mismatch.");
+      }
+      const record = await verificationManager.startVerification(workspace, guard, {
+        workspace_id: workspace.id,
+        runner: args.runner,
+        package_manager: args.package_manager,
+        script: args.script,
+        args: args.args,
+        cwd: args.cwd,
+        lifetime_ms: args.lifetime_ms
+      });
+      const text = verificationTextResult(config, record, "started");
+      return diagnosticTextResult(text, { workspace_id: workspace.id, root: workspace.root, ...record });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "wait_verification",
+    {
+      title: "Wait Managed Verification",
+      description:
+        "Wait on a running managed verification job by job_id (up to max_wait_seconds, default 20s, max 60s). Returns the current status or final terminal result if completed, failed, cancelled, timed out, or output limit exceeded.",
+      inputSchema: WAIT_VERIFICATION_PUBLIC_SCHEMA,
+      runtimeInputSchema: WAIT_VERIFICATION_ARGUMENTS_SCHEMA,
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false, idempotentHint: true },
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Waiting on managed verification job...",
+        "openai/toolInvocation/invoked": "Managed verification status received"
+      }
+    },
+    async (args) => {
+      const record = await verificationManager.waitVerification(args.job_id, args.max_wait_seconds);
+      const text = verificationTextResult(config, record, "status");
+      return diagnosticTextResult(text, { ...record });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "cancel_verification",
+    {
+      title: "Cancel Managed Verification",
+      description:
+        "Cancel a running managed verification job by job_id. Terminates the process tree with SIGTERM and SIGKILL escalation. Idempotent for already-terminal jobs.",
+      inputSchema: CANCEL_VERIFICATION_PUBLIC_SCHEMA,
+      runtimeInputSchema: CANCEL_VERIFICATION_ARGUMENTS_SCHEMA,
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: true },
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Cancelling managed verification job...",
+        "openai/toolInvocation/invoked": "Managed verification job cancelled"
+      }
+    },
+    async (args) => {
+      const record = await verificationManager.cancelVerification(args.job_id);
+      const text = verificationTextResult(config, record, "cancelled");
+      return diagnosticTextResult(text, { ...record });
     }
   );
 

@@ -246,7 +246,7 @@ function trimOutput(value: string, maxBytes: number): { value: string; truncated
   return { value: `${sliced}\n...[output truncated to ${maxBytes} bytes]`, truncated: true };
 }
 
-function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+export function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
   if (!child.pid) return;
   if (process.platform === "win32") {
     // Windows does not provide Unix-style cooperative signals to process trees.

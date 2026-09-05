@@ -67,6 +67,7 @@ With workspace write mode (the normal agent setup):
 - edit with `write`, `edit`, or guarded `apply_patch`
 - import ChatGPT attachments with `import_file`
 - run allowlisted checks with `bash`
+- run bounded managed verification jobs that survive session churn with `start_verification`, `wait_verification`, and `cancel_verification`
 - review diffs with `show_changes`
 - write plans under `.ai-bridge`
 - export a context bundle for chats that cannot call tools

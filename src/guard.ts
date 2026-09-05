@@ -64,9 +64,11 @@ export interface WorkspaceDiagnosticReader {
 }
 
 export class CodexProError extends Error {
-  constructor(message: string) {
+  code?: string;
+  constructor(message: string, code?: string) {
     super(message);
     this.name = "CodexProError";
+    if (code) this.code = code;
   }
 }
 
