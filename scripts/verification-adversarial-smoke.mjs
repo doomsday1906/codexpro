@@ -343,6 +343,16 @@ async function runTests() {
     "serve", // blocked token
     "publish", // blocked token
     "deploy",  // blocked token
+    "test.watch", // blocked dot-delimited watch
+    "lint.fix",   // blocked dot-delimited fix
+    "test:watch", // blocked colon-delimited watch
+    "test-watch", // blocked dash-delimited watch
+    "test_watch", // blocked underscore-delimited watch
+    "test.watchall", // blocked watchall
+    "lint:fix",   // blocked mutating fix
+    "lint_fix",   // blocked underscore mutating fix
+    "format",     // blocked mutating token
+    "write",      // blocked mutating token
     "test`whoami`",
     "test|cat",
     "test$(whoami)"
@@ -372,7 +382,19 @@ async function runTests() {
     ["foo&bar"],
     ["<input"],
     [">output"],
-    ["arg\nwith\nnewline"]
+    ["arg\nwith\nnewline"],
+    ["--watchAll=true"],
+    ["--watchall=true"],
+    ["--watch-all=true"],
+    ["--watch"],
+    ["-w"],
+    ["--watch=true"],
+    ["--fix"],
+    ["--write"],
+    ["--output", "foo.txt"],
+    ["/etc/passwd"],
+    ["../parent-traversal"],
+    ["~/home-traversal"]
   ];
 
   for (const args of maliciousArgLists) {

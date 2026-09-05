@@ -196,8 +196,9 @@ async function runTests() {
   assert.equal(jobA.workspace_id, fixtureWsId);
   assert.equal(jobA.state, "running");
   assert.match(jobA.jobId, /^vjob_[0-9a-f]{24}$/);
+  assert.match(jobA.generationId, /^vgen_[0-9a-f]{32}$/, "jobA must have generationId");
   assert.match(startResA.content[0].text, /# Managed Verification Started/);
-  console.log(`  PASS: Session A started job ${jobA.jobId} on workspace ${fixtureWsId}`);
+  console.log(`  PASS: Session A started job ${jobA.jobId} (gen: ${jobA.generationId}) on workspace ${fixtureWsId}`);
 
   // Disconnect Client A
   console.log("\n[Test 3] Session A closes/disconnects...");
@@ -223,8 +224,9 @@ async function runTests() {
   const jobObservedB = waitResB.structuredContent;
   assert.equal(jobObservedB.jobId, jobA.jobId, "Job ID must match");
   assert.equal(jobObservedB.workspaceId, fixtureWsId, "Workspace ID must match Session A's frozen workspace");
+  assert.equal(jobObservedB.generationId, jobA.generationId, "Session B must observe the same generation identity as Session A");
   assert.equal(jobObservedB.state, "running");
-  console.log("  PASS: Session B observed active job with frozen workspace root/id");
+  console.log("  PASS: Session B observed active job with frozen workspace and matching generationId");
 
   // Test 5: Selecting/opening another workspace in B does NOT retarget the job
   console.log("\n[Test 5] Selecting another workspace in Session B does not retarget the job...");
@@ -240,6 +242,7 @@ async function runTests() {
   });
   const jobObservedB2 = waitResB2.structuredContent;
   assert.equal(jobObservedB2.workspaceId, fixtureWsId, "Workspace must remain strictly frozen to fixtureWsId");
+  assert.equal(jobObservedB2.generationId, jobA.generationId, "Generation ID must remain strictly frozen");
   console.log("  PASS: Job workspace binding remains strictly frozen");
 
   // Test 6: Starting a verification in B without explicit workspace_id fails
@@ -277,10 +280,85 @@ async function runTests() {
   assert.equal(cancelJobB.jobId, jobA.jobId);
   assert.equal(cancelJobB.state, "cancelled");
   assert.equal(cancelJobB.workspaceId, fixtureWsId);
+  assert.equal(cancelJobB.generationId, jobA.generationId);
   console.log("  PASS: Session B cancelled job started by Session A");
 
   await transportB.close();
   httpChild.kill("SIGTERM");
+
+  // Test 7b: Fresh HTTP process has different generation identity and does not resume old job
+  console.log("\n[Test 7b] Fresh HTTP process generation identity and non-resumption...");
+  const freshPort = await freePort();
+  const freshChild = spawn(process.execPath, [path.join(repoRoot, "dist", "http.js")], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      CODEXPRO_ROOT: realFixtureRoot,
+      CODEXPRO_ALLOWED_ROOTS: `${realFixtureRoot}:${realAltRoot}`,
+      CODEXPRO_PORT: String(freshPort),
+      CODEXPRO_HOST: "127.0.0.1",
+      CODEXPRO_BASH_MODE: "safe",
+      CODEXPRO_HTTP_TOKEN: AUTH_TOKEN,
+      CODEXPRO_ALLOW_NO_HTTP_TOKEN: "0"
+    },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  let freshStderr = "";
+  freshChild.stderr.on("data", (chunk) => { freshStderr += String(chunk); });
+
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      freshChild.kill("SIGTERM");
+      reject(new Error(`Timed out waiting for fresh HTTP server:\n${freshStderr}`));
+    }, 15000);
+    timer.unref();
+    const interval = setInterval(() => {
+      if (freshStderr.includes("HTTP MCP listening")) {
+        clearInterval(interval);
+        clearTimeout(timer);
+        resolve();
+      }
+    }, 50);
+    interval.unref();
+  });
+
+  const clientC = new Client({ name: "client-C", version: "1.0.0" });
+  const transportC = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${freshPort}/mcp`), {
+    requestInit: { headers: { authorization: `Bearer ${AUTH_TOKEN}` } }
+  });
+  await clientC.connect(transportC);
+
+  const startResC = await clientC.callTool({
+    name: "start_verification",
+    arguments: {
+      workspace_id: fixtureWsId,
+      runner: "package_script",
+      package_manager: "npm",
+      script: "verification:fixture",
+      args: ["--sleep", "5000"]
+    }
+  });
+  assert.ok(startResC && !startResC.isError);
+  const jobC = startResC.structuredContent;
+  assert.match(jobC.generationId, /^vgen_[0-9a-f]{32}$/);
+  assert.notEqual(jobC.generationId, jobA.generationId, "Fresh process must have a different generation identity");
+  console.log(`  PASS: Fresh process generation (${jobC.generationId}) differs from prior process (${jobA.generationId})`);
+
+  // Querying old job ID in fresh process must fail closed (unknown/not resumed)
+  const waitOldRes = await clientC.callTool({
+    name: "wait_verification",
+    arguments: {
+      job_id: jobA.jobId
+    }
+  });
+  assert.ok(waitOldRes.isError, "Old job from previous process must not be found/resumed in fresh process");
+  assert.match(waitOldRes.content[0]?.text, /not found/i);
+  console.log("  PASS: Old job from previous process fails closed (not resumed) in fresh process");
+
+  await clientC.callTool({ name: "cancel_verification", arguments: { job_id: jobC.jobId } });
+  await transportC.close();
+  freshChild.kill("SIGTERM");
 
   // Test 8: Stdio server continuity and teardown
   console.log("\n[Test 8] Stdio server verification tools and process teardown...");

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +19,7 @@ console.log("# RepoConnect M009 TASK-006 Security Envelope & Redaction Smoke");
 // Create temporary fixture workspace
 const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codexpro-m009-sec-"));
 const realFixtureRoot = await fs.realpath(fixtureRoot);
+const realWsId = `ws_${createHash("sha256").update(realFixtureRoot).digest("hex").slice(0, 24)}`;
 
 // Link node_modules into fixtureRoot
 try {
@@ -31,7 +33,8 @@ await fs.writeFile(
   JSON.stringify({
     name: "sec-fixture",
     scripts: {
-      "leak-secret": `node -e "${secretScript}"`
+      "leak-secret": `node -e "${secretScript}"`,
+      "quick": "node -e 'process.exit(0);'"
     }
   }, null, 2)
 );
@@ -81,6 +84,9 @@ async function runTests() {
     "biome_check"
   ]);
   assert.deepEqual(startSchema.properties.package_manager.enum, ["npm", "pnpm", "yarn", "bun"]);
+  // session_id field in start_verification schema
+  assert.equal(startSchema.properties.session_id.type, "string");
+  assert.equal(startSchema.properties.session_id.maxLength, 64);
   // Strict non-existence of arbitrary command or caller wrapper override
   assert.equal(startSchema.properties.command, undefined, "Strictly NO raw command field");
   assert.equal(startSchema.properties.cmd, undefined, "Strictly NO cmd field");
@@ -94,13 +100,127 @@ async function runTests() {
   assert.deepEqual(waitSchema.required, ["job_id"]);
   assert.equal(waitSchema.properties.job_id.pattern, "^vjob_[0-9a-f]{24}$");
   assert.equal(waitSchema.properties.max_wait_seconds.type, "integer");
+  assert.equal(waitSchema.properties.session_id.type, "string");
+  assert.equal(waitSchema.properties.session_id.maxLength, 64);
   console.log("  PASS: wait_verification schema strictly conforms to frozen specification");
 
   // cancel_verification schema
   const cancelSchema = cancelTool.inputSchema;
   assert.deepEqual(cancelSchema.required, ["job_id"]);
   assert.equal(cancelSchema.properties.job_id.pattern, "^vjob_[0-9a-f]{24}$");
+  assert.equal(cancelSchema.properties.session_id.type, "string");
+  assert.equal(cancelSchema.properties.session_id.maxLength, 64);
   console.log("  PASS: cancel_verification schema strictly conforms to frozen specification");
+
+  // Test 2b: session_id enforcement under requireBashSession=true
+  console.log("\n[Test 2b] session_id enforcement under requireBashSession=true...");
+  const validSessionId = "test-session-1234567890";
+  const { client: clientSession } = await createClientServer({
+    bashMode: "safe",
+    toolMode: "full",
+    requireBashSession: true,
+    bashSessionId: validSessionId
+  });
+
+  // Missing session_id must fail on start_verification
+  let missingRes = await clientSession.callTool({
+    name: "start_verification",
+    arguments: {
+      workspace_id: realWsId,
+      runner: "package_script",
+      package_manager: "npm",
+      script: "quick"
+    }
+  });
+  assert.ok(missingRes.isError, "Missing session_id must fail when requireBashSession=true");
+  assert.match(missingRes.content[0]?.text, /bash session id is required/i);
+
+  // Mismatched session_id must fail on start_verification
+  let mismatchRes = await clientSession.callTool({
+    name: "start_verification",
+    arguments: {
+      workspace_id: realWsId,
+      runner: "package_script",
+      package_manager: "npm",
+      script: "quick",
+      session_id: "wrong-session-id"
+    }
+  });
+  assert.ok(mismatchRes.isError, "Mismatched session_id must fail when requireBashSession=true");
+  assert.match(mismatchRes.content[0]?.text, /bash session id mismatch/i);
+
+  // Matching session_id must succeed on start_verification
+  let matchRes = await clientSession.callTool({
+    name: "start_verification",
+    arguments: {
+      workspace_id: realWsId,
+      runner: "package_script",
+      package_manager: "npm",
+      script: "quick",
+      session_id: validSessionId
+    }
+  });
+  assert.ok(!matchRes.isError, "Matching session_id must succeed on start_verification");
+  const startedJob = matchRes.structuredContent;
+
+  // wait_verification missing session_id must fail
+  let waitMissingRes = await clientSession.callTool({
+    name: "wait_verification",
+    arguments: {
+      job_id: startedJob.jobId
+    }
+  });
+  assert.ok(waitMissingRes.isError, "wait_verification missing session_id must fail");
+
+  // wait_verification mismatched session_id must fail
+  let waitMismatchRes = await clientSession.callTool({
+    name: "wait_verification",
+    arguments: {
+      job_id: startedJob.jobId,
+      session_id: "wrong-session-id"
+    }
+  });
+  assert.ok(waitMismatchRes.isError, "wait_verification mismatched session_id must fail");
+
+  // wait_verification matching session_id must succeed
+  let waitMatchRes = await clientSession.callTool({
+    name: "wait_verification",
+    arguments: {
+      job_id: startedJob.jobId,
+      session_id: validSessionId
+    }
+  });
+  assert.ok(!waitMatchRes.isError, "wait_verification matching session_id must succeed");
+
+  // cancel_verification missing session_id must fail
+  let cancelMissingRes = await clientSession.callTool({
+    name: "cancel_verification",
+    arguments: {
+      job_id: startedJob.jobId
+    }
+  });
+  assert.ok(cancelMissingRes.isError, "cancel_verification missing session_id must fail");
+
+  // cancel_verification mismatched session_id must fail
+  let cancelMismatchRes = await clientSession.callTool({
+    name: "cancel_verification",
+    arguments: {
+      job_id: startedJob.jobId,
+      session_id: "wrong-session-id"
+    }
+  });
+  assert.ok(cancelMismatchRes.isError, "cancel_verification mismatched session_id must fail");
+
+  // cancel_verification matching session_id must succeed
+  let cancelMatchRes = await clientSession.callTool({
+    name: "cancel_verification",
+    arguments: {
+      job_id: startedJob.jobId,
+      session_id: validSessionId
+    }
+  });
+  assert.ok(!cancelMatchRes.isError, "cancel_verification matching session_id must succeed");
+  console.log("  PASS: session_id required/mismatch/match behavior verified across start/wait/cancel");
 
   // Test 3: bashMode=off disables verification tools
   console.log("\n[Test 3] bashMode=off hides verification tools from tools/list and fails closed...");

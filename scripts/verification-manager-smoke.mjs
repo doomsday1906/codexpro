@@ -42,6 +42,8 @@ async function runTests() {
   });
 
   assert.match(startRecord1.jobId, /^vjob_[0-9a-f]{24}$/, "jobId must match vjob grammar");
+  assert.match(startRecord1.generationId, /^vgen_[0-9a-f]{32}$/, "generationId must match vgen grammar");
+  assert.equal(startRecord1.generationId, mgr1.generationId, "job generationId must match manager generationId");
   assert.equal(startRecord1.state, "running");
   assert.equal(startRecord1.workspaceId, fakeWorkspace.id);
   assert.equal(startRecord1.runner, "package_script");
@@ -49,6 +51,7 @@ async function runTests() {
 
   const waitRecord1 = await mgr1.waitVerification(startRecord1.jobId, 10);
   assert.equal(waitRecord1.jobId, startRecord1.jobId);
+  assert.equal(waitRecord1.generationId, mgr1.generationId, "waitRecord generationId must match manager generationId");
   assert.equal(waitRecord1.state, "succeeded");
   assert.equal(waitRecord1.exitCode, 0);
   assert.ok(waitRecord1.durationMs >= 0, "durationMs must be recorded");
@@ -62,6 +65,7 @@ async function runTests() {
     minLifetimeMs: 500,
     defaultLifetimeMs: 30000
   });
+  assert.notEqual(mgr2.generationId, mgr1.generationId, "different manager must have different generationId");
 
   // Use verification:fixture as a lawful finite process to test cancellation, concurrency, and timeouts
   const startRecord2 = await mgr2.startVerification(fakeWorkspace, guard, {

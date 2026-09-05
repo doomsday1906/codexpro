@@ -39,6 +39,7 @@ export interface VerificationStartInput {
 
 export interface VerificationJobRecord {
   jobId: string;
+  generationId: string;
   state: VerificationJobState;
   workspaceId: string;
   workspaceRoot: string;
@@ -100,10 +101,10 @@ const VALID_RUNNERS = new Set<string>([
 const VALID_PACKAGE_MANAGERS = new Set<string>(["npm", "pnpm", "yarn", "bun"]);
 
 const FORBIDDEN_SCRIPT_TOKENS = new Set<string>([
-  "start", "dev", "serve", "server", "watch", "publish", "deploy",
+  "start", "dev", "serve", "server", "watch", "watchall", "publish", "deploy",
   "install", "preinstall", "postinstall", "prepublish", "prepare",
   "prepack", "postpack", "listen", "daemon", "preview",
-  "fix", "mutate", "format", "write", "update", "upgrade"
+  "fix", "autofix", "mutate", "format", "write", "update", "upgrade"
 ]);
 
 const SCRIPT_NAME_REGEX = /^[A-Za-z0-9._:-]+$/;
@@ -124,7 +125,7 @@ export function validatePackageScriptName(script: unknown): string {
   if (!SCRIPT_NAME_REGEX.test(trimmed)) {
     throw new CodexProError(`Script name contains invalid characters: '${trimmed}'. Allowed: letters, numbers, dot, dash, underscore, colon.`);
   }
-  const tokens = trimmed.toLowerCase().split(/[:_\-\/]+/);
+  const tokens = trimmed.toLowerCase().split(/[:_\-\./]+/);
   for (const token of tokens) {
     if (FORBIDDEN_SCRIPT_TOKENS.has(token)) {
       throw new CodexProError(`Package script '${trimmed}' is blocked: non-verification lifecycle/daemon/deployment/mutating token '${token}' is not allowed.`);
@@ -170,8 +171,29 @@ export function validateArgs(args: unknown): string[] {
 
     // Block long-lived watch flags across all runners
     const lower = arg.toLowerCase();
-    if (lower === "--watch" || lower === "-w" || lower === "--watchall" || lower.startsWith("--watch=") || lower.startsWith("-w=")) {
+    if (
+      lower === "--watch" ||
+      lower === "-w" ||
+      lower === "--watchall" ||
+      lower === "--watch-all" ||
+      lower.startsWith("--watch=") ||
+      lower.startsWith("-w=") ||
+      lower.startsWith("--watchall=") ||
+      lower.startsWith("--watch-all=")
+    ) {
       throw new CodexProError(`Argument '${arg}' is blocked: watch mode is forbidden for verification jobs.`);
+    }
+
+    // Block daemon/server flags across all runners
+    if (
+      lower === "--daemon" ||
+      lower === "--serve" ||
+      lower === "--server" ||
+      lower.startsWith("--daemon=") ||
+      lower.startsWith("--serve=") ||
+      lower.startsWith("--server=")
+    ) {
+      throw new CodexProError(`Argument '${arg}' is blocked: daemon/server flags are forbidden for verification jobs.`);
     }
 
     // Block write/fix/mutate flags across all runners
@@ -457,6 +479,7 @@ export class CombinedRollingTailBuffer {
 
 export class ManagedVerificationJob {
   public readonly jobId: string;
+  public readonly generationId: string;
   public readonly workspaceId: string;
   public readonly workspaceRoot: string;
   public readonly cwd: string; // workspace-relative
@@ -499,6 +522,7 @@ export class ManagedVerificationJob {
 
   constructor(options: {
     jobId: string;
+    generationId: string;
     workspace: Workspace;
     cwd: string;
     absCwd: string;
@@ -515,6 +539,7 @@ export class ManagedVerificationJob {
     retainedTailBytes?: number;
   }) {
     this.jobId = options.jobId;
+    this.generationId = options.generationId;
     this.workspaceId = options.workspace.id;
     this.workspaceRoot = options.workspace.root;
     this.cwd = options.cwd;
@@ -733,6 +758,7 @@ export class ManagedVerificationJob {
 
     return {
       jobId: this.jobId,
+      generationId: this.generationId,
       state: this.state,
       workspaceId: this.workspaceId,
       workspaceRoot: this.workspaceRoot,
@@ -766,6 +792,7 @@ export class ManagedVerificationJob {
 }
 
 export class VerificationManager {
+  public readonly generationId: string;
   private readonly jobs = new Map<string, ManagedVerificationJob>();
   private readonly config: CodexProConfig;
   private readonly limits: VerificationManagerLimits;
@@ -776,6 +803,7 @@ export class VerificationManager {
     options: Partial<VerificationManagerLimits> & { containmentWrapper?: string[] } = {}
   ) {
     this.config = config;
+    this.generationId = `vgen_${randomBytes(16).toString("hex")}`;
     this.limits = {
       ...DEFAULT_VERIFICATION_LIMITS,
       ...options
@@ -866,6 +894,7 @@ export class VerificationManager {
     const jobId = `vjob_${randomBytes(12).toString("hex")}`;
     const job = new ManagedVerificationJob({
       jobId,
+      generationId: this.generationId,
       workspace,
       cwd: relativeCwd,
       absCwd: cwdResolved.absPath,
