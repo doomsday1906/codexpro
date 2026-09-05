@@ -13,8 +13,19 @@ const {
   redactUnifiedDiff: policyRedactUnifiedDiff,
   extractDiffFileBlocks: policyExtractDiffFileBlocks,
   sourceLanguageForPath: policySourceLanguageForPath,
-  truncateUtf8: policyTruncateUtf8
+  truncateUtf8: policyTruncateUtf8,
+  createPrivateKeyScanner: policyCreatePrivateKeyScanner
 } = policy;
+
+export interface PrivateKeyScanner {
+  push(input?: string, final?: boolean): string;
+  spans(): readonly { readonly start: number; readonly end: number }[];
+  reset(): void;
+}
+
+export function createPrivateKeyScanner(): PrivateKeyScanner {
+  return policyCreatePrivateKeyScanner();
+}
 
 export type RedactionContext = "source" | "diagnostic";
 export type SourceLanguage = "python";

@@ -1,11 +1,12 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 import fs from "node:fs";
 import path from "node:path";
 import type { CodexProConfig } from "./config.js";
 import { CodexProError, PathGuard, type Workspace } from "./guard.js";
 import { terminateProcessTree, makeRestrictedBashEnv, assertBashSession, SAFE_BLOCKED_PATTERNS } from "./bashOps.js";
-import { redactDiagnosticText } from "./redact.js";
+import { redactDiagnosticText, createPrivateKeyScanner } from "./redact.js";
 
 export type VerificationRunnerFamily =
   | "package_script"
@@ -442,25 +443,88 @@ interface StreamChunk {
   buf: Buffer;
 }
 
+export class StreamingRedactor {
+  private readonly decoder = new StringDecoder("utf8");
+  private readonly keyScanner = createPrivateKeyScanner();
+  private linePending = "";
+
+  public push(chunk: Buffer): Buffer[] {
+    const text = this.decoder.write(chunk);
+    if (!text) return [];
+    return this.processText(text, false);
+  }
+
+  public flush(): Buffer[] {
+    const trailingText = this.decoder.end();
+    return this.processText(trailingText, true);
+  }
+
+  public peekPending(): string {
+    if (!this.linePending) return "";
+    return redactDiagnosticText(this.linePending);
+  }
+
+  private processText(text: string, final: boolean): Buffer[] {
+    const afterKeys = this.keyScanner.push(text, final);
+    const combined = this.linePending + afterKeys;
+    if (!combined) return [];
+
+    if (final) {
+      this.linePending = "";
+      const redacted = redactDiagnosticText(combined);
+      return redacted ? [Buffer.from(redacted, "utf8")] : [];
+    }
+
+    const lastNewline = Math.max(combined.lastIndexOf("\n"), combined.lastIndexOf("\r"));
+    if (lastNewline === -1) {
+      if (combined.length > 4096) {
+        const splitIdx = 2048;
+        const chunkToRedact = combined.slice(0, splitIdx);
+        this.linePending = combined.slice(splitIdx);
+        const redacted = redactDiagnosticText(chunkToRedact);
+        return redacted ? [Buffer.from(redacted, "utf8")] : [];
+      }
+      this.linePending = combined;
+      return [];
+    }
+
+    const ready = combined.slice(0, lastNewline + 1);
+    this.linePending = combined.slice(lastNewline + 1);
+    const redacted = redactDiagnosticText(ready);
+    return redacted ? [Buffer.from(redacted, "utf8")] : [];
+  }
+}
+
 export class CombinedRollingTailBuffer {
   private chunks: StreamChunk[] = [];
   private retainedBytes = 0;
+  public hasDroppedBytes = false;
 
   constructor(public readonly maxBytes: number) {}
 
   append(stream: "stdout" | "stderr", buf: Buffer): void {
+    if (buf.byteLength === 0) return;
     this.chunks.push({ stream, buf });
     this.retainedBytes += buf.byteLength;
     while (this.chunks.length > 0 && this.retainedBytes > this.maxBytes) {
-      const excess = this.retainedBytes - this.maxBytes;
+      this.hasDroppedBytes = true;
+      let excess = this.retainedBytes - this.maxBytes;
       const first = this.chunks[0];
       if (first.buf.byteLength <= excess) {
         this.retainedBytes -= first.buf.byteLength;
         this.chunks.shift();
       } else {
-        first.buf = first.buf.subarray(excess);
-        this.retainedBytes -= excess;
-        break;
+        while (excess < first.buf.byteLength && (first.buf[excess] & 0xc0) === 0x80) {
+          excess++;
+        }
+        if (excess >= first.buf.byteLength) {
+          this.retainedBytes -= first.buf.byteLength;
+          this.chunks.shift();
+        } else {
+          first.buf = first.buf.subarray(excess);
+          this.retainedBytes -= excess;
+          break;
+        }
       }
     }
   }
@@ -533,6 +597,8 @@ export class ManagedVerificationJob {
 
   private observedStdoutBytes = 0;
   private observedStderrBytes = 0;
+  private readonly stdoutRedactor = new StreamingRedactor();
+  private readonly stderrRedactor = new StreamingRedactor();
   private combinedBuffer: CombinedRollingTailBuffer;
 
   private readonly waiters = new Set<() => void>();
@@ -612,21 +678,31 @@ export class ManagedVerificationJob {
     this.child.stdout?.on("data", (chunk: Buffer) => {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       this.observedStdoutBytes += buf.byteLength;
-      this.combinedBuffer.append("stdout", buf);
+      const rChunks = this.stdoutRedactor.push(buf);
+      for (const rc of rChunks) {
+        this.combinedBuffer.append("stdout", rc);
+      }
       this.checkOutputCeiling();
     });
 
     this.child.stderr?.on("data", (chunk: Buffer) => {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       this.observedStderrBytes += buf.byteLength;
-      this.combinedBuffer.append("stderr", buf);
+      const rChunks = this.stderrRedactor.push(buf);
+      for (const rc of rChunks) {
+        this.combinedBuffer.append("stderr", rc);
+      }
       this.checkOutputCeiling();
     });
 
     this.child.on("error", (err: Error) => {
       const errBuf = Buffer.from(`\n[codexpro] Spawn error: ${err.message}`);
       this.observedStderrBytes += errBuf.byteLength;
-      this.combinedBuffer.append("stderr", errBuf);
+      const rChunks = this.stderrRedactor.push(errBuf);
+      for (const rc of rChunks) {
+        this.combinedBuffer.append("stderr", rc);
+      }
+      this.flushRedactors();
       this.transitionToTerminal("failed", {
         exitCode: 1,
         signal: null,
@@ -637,6 +713,7 @@ export class ManagedVerificationJob {
     this.child.on("close", (code, sig) => {
       this.closed = true;
       this.cleanupTimers();
+      this.flushRedactors();
 
       let targetState: VerificationJobState = "succeeded";
       let reason: string | undefined;
@@ -655,6 +732,17 @@ export class ManagedVerificationJob {
         reason
       });
     });
+  }
+
+  private flushRedactors(): void {
+    const outChunks = this.stdoutRedactor.flush();
+    for (const c of outChunks) {
+      this.combinedBuffer.append("stdout", c);
+    }
+    const errChunks = this.stderrRedactor.flush();
+    for (const c of errChunks) {
+      this.combinedBuffer.append("stderr", c);
+    }
   }
 
   private checkOutputCeiling(): void {
@@ -767,7 +855,13 @@ export class ManagedVerificationJob {
   }
 
   public toRecord(): VerificationJobRecord {
-    const { stdout: rawStdout, stderr: rawStderr } = this.combinedBuffer.getOutputs();
+    const { stdout: committedStdout, stderr: committedStderr } = this.combinedBuffer.getOutputs();
+    const pendingOut = this.state === "running" ? this.stdoutRedactor.peekPending() : "";
+    const pendingErr = this.state === "running" ? this.stderrRedactor.peekPending() : "";
+
+    const rawStdout = committedStdout + pendingOut;
+    const rawStderr = committedStderr + pendingErr;
+
     const redactedStdout = redactDiagnosticText(rawStdout);
     const redactedStderr = redactDiagnosticText(rawStderr);
     const observedTotal = this.observedStdoutBytes + this.observedStderrBytes;
@@ -803,7 +897,7 @@ export class ManagedVerificationJob {
       finalStderr = trimUtf8Tail(redactedStderr, remainingForErr);
     }
 
-    const truncated = rawTruncated || postRedactionTruncated;
+    const truncated = rawTruncated || this.combinedBuffer.hasDroppedBytes || postRedactionTruncated;
 
     return {
       jobId: this.jobId,
