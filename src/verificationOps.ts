@@ -66,6 +66,8 @@ export interface VerificationJobRecord {
   containmentWrapper?: string[];
 }
 
+export type VerificationManagerLifecycleState = "open" | "closing" | "closed";
+
 export interface VerificationManagerLimits {
   minLifetimeMs: number;
   defaultLifetimeMs: number;
@@ -477,6 +479,21 @@ export class CombinedRollingTailBuffer {
   }
 }
 
+export function trimUtf8Tail(str: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  const buf = Buffer.from(str, "utf8");
+  if (buf.byteLength <= maxBytes) return str;
+  let start = buf.byteLength - maxBytes;
+  // If the byte at `start` is a UTF-8 continuation byte (10xxxxxx),
+  // advance forward until we reach a valid UTF-8 lead byte or ASCII byte.
+  // This drops the partial/split codepoint cleanly without inserting replacement characters.
+  while (start < buf.byteLength && (buf[start] & 0xc0) === 0x80) {
+    start++;
+  }
+  if (start >= buf.byteLength) return "";
+  return buf.subarray(start).toString("utf8");
+}
+
 export class ManagedVerificationJob {
   public readonly jobId: string;
   public readonly generationId: string;
@@ -754,7 +771,39 @@ export class ManagedVerificationJob {
     const redactedStdout = redactDiagnosticText(rawStdout);
     const redactedStderr = redactDiagnosticText(rawStderr);
     const observedTotal = this.observedStdoutBytes + this.observedStderrBytes;
-    const truncated = observedTotal > this.retainedTailBytes;
+    const rawTruncated = observedTotal > this.retainedTailBytes;
+
+    const budget = this.retainedTailBytes;
+    const outBytes = Buffer.byteLength(redactedStdout, "utf8");
+    const errBytes = Buffer.byteLength(redactedStderr, "utf8");
+
+    let finalStdout = redactedStdout;
+    let finalStderr = redactedStderr;
+    let postRedactionTruncated = false;
+
+    if (outBytes + errBytes > budget) {
+      postRedactionTruncated = true;
+      const halfBudget = Math.floor(budget / 2);
+      let targetOutBytes: number;
+      let targetErrBytes: number;
+
+      if (outBytes <= halfBudget) {
+        targetOutBytes = outBytes;
+        targetErrBytes = budget - targetOutBytes;
+      } else if (errBytes <= halfBudget) {
+        targetErrBytes = errBytes;
+        targetOutBytes = budget - targetErrBytes;
+      } else {
+        targetOutBytes = halfBudget;
+        targetErrBytes = budget - targetOutBytes;
+      }
+
+      finalStdout = trimUtf8Tail(redactedStdout, targetOutBytes);
+      const remainingForErr = budget - Buffer.byteLength(finalStdout, "utf8");
+      finalStderr = trimUtf8Tail(redactedStderr, remainingForErr);
+    }
+
+    const truncated = rawTruncated || postRedactionTruncated;
 
     return {
       jobId: this.jobId,
@@ -774,8 +823,8 @@ export class ManagedVerificationJob {
       ...(this.durationMs !== undefined ? { durationMs: this.durationMs } : {}),
       exitCode: this.exitCode,
       signal: this.signal,
-      stdout: redactedStdout,
-      stderr: redactedStderr,
+      stdout: finalStdout,
+      stderr: finalStderr,
       truncated,
       observedStdoutBytes: this.observedStdoutBytes,
       observedStderrBytes: this.observedStderrBytes,
@@ -797,6 +846,8 @@ export class VerificationManager {
   private readonly config: CodexProConfig;
   private readonly limits: VerificationManagerLimits;
   private readonly containmentWrapper?: string[];
+  private lifecycleState: VerificationManagerLifecycleState = "open";
+  private closePromise: Promise<void> | null = null;
 
   constructor(
     config: CodexProConfig,
@@ -859,11 +910,21 @@ export class VerificationManager {
     }
   }
 
+  public get state(): VerificationManagerLifecycleState {
+    return this.lifecycleState;
+  }
+
   public async startVerification(
     workspace: Workspace,
     guard: PathGuard,
     input: VerificationStartInput
   ): Promise<VerificationJobRecord> {
+    if (this.lifecycleState !== "open") {
+      throw new CodexProError(
+        "Verification manager is closing or closed. Cannot start new verification jobs.",
+        "verification_manager_closing"
+      );
+    }
     if (this.config.bashMode === "off") {
       throw new CodexProError("bash tool is disabled. Start with CODEXPRO_BASH_MODE=safe or CODEXPRO_BASH_MODE=full to enable verification jobs.");
     }
@@ -954,12 +1015,26 @@ export class VerificationManager {
   }
 
   public async close(): Promise<void> {
-    const activeJobs: ManagedVerificationJob[] = [];
-    for (const job of this.jobs.values()) {
-      if (job.state === "running") {
-        activeJobs.push(job);
-      }
+    if (this.lifecycleState === "closed") {
+      return;
     }
-    await Promise.all(activeJobs.map((j) => j.cancel()));
+    if (this.closePromise) {
+      return this.closePromise;
+    }
+    this.lifecycleState = "closing";
+    this.closePromise = (async () => {
+      try {
+        const activeJobs: ManagedVerificationJob[] = [];
+        for (const job of this.jobs.values()) {
+          if (job.state === "running") {
+            activeJobs.push(job);
+          }
+        }
+        await Promise.all(activeJobs.map((j) => j.cancel()));
+      } finally {
+        this.lifecycleState = "closed";
+      }
+    })();
+    return this.closePromise;
   }
 }

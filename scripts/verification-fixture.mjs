@@ -36,6 +36,22 @@ if (stderrIdx !== -1 && args[stderrIdx + 1]) {
   }
 }
 
+const credIdx = args.indexOf('--emit-credentials');
+if (credIdx !== -1 && args[credIdx + 1]) {
+  const count = parseInt(args[credIdx + 1], 10);
+  for (let i = 0; i < count; i++) {
+    process.stdout.write('secret=abc\n');
+  }
+}
+
+const utf8Idx = args.indexOf('--emit-utf8');
+if (utf8Idx !== -1 && args[utf8Idx + 1]) {
+  const count = parseInt(args[utf8Idx + 1], 10);
+  for (let i = 0; i < count; i++) {
+    process.stdout.write('🌟🌟🌟\n');
+  }
+}
+
 if (sleepMs <= 0) {
   process.exit(exitCode);
 }

@@ -81,6 +81,7 @@
     "verification:smoke": "npm run build && node scripts/verification-manager-smoke.mjs && node scripts/http-session-continuity-smoke.mjs && node scripts/verification-adversarial-smoke.mjs && node scripts/verification-security-envelope-smoke.mjs",
     "verification:fixture": "node scripts/verification-fixture.mjs",
     "verification:r2-falsifier": "node scripts/verification-r2-falsifier.mjs",
+    "verification:r3-falsifier": "node scripts/verification-r3-falsifier.mjs",
     "source-redaction:smoke": "npm run build && node scripts/source-redaction-smoke.mjs",
     "apply-patch:smoke": "npm run build && node scripts/apply-patch-matrix-smoke.mjs",
     "diagnostic-output:smoke": "npm run build && node scripts/diagnostic-output-smoke.mjs",
