@@ -69,7 +69,7 @@ const SAFE_ALLOWED_PREFIXES = [
   "npx biome check"
 ];
 
-const SAFE_BLOCKED_PATTERNS = [
+export const SAFE_BLOCKED_PATTERNS = [
   /(^|\s)rm\s+/,
   /(^|\s)mv\s+/,
   /(^|\s)cp\s+/,
@@ -154,7 +154,7 @@ function assertSafeCommand(config: CodexProConfig, command: string): void {
   }
 }
 
-function assertBashSession(config: CodexProConfig, sessionId?: string): string | undefined {
+export function assertBashSession(config: CodexProConfig, sessionId?: string): string | undefined {
   const requested = sessionId?.trim();
   if (!config.bashSessionId) {
     if (config.requireBashSession) {

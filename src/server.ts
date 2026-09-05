@@ -352,7 +352,8 @@ const START_VERIFICATION_ARGUMENTS_SCHEMA = z.object({
   script: START_VERIFICATION_SCRIPT_SCHEMA,
   args: START_VERIFICATION_ARGS_SCHEMA,
   cwd: START_VERIFICATION_CWD_SCHEMA,
-  lifetime_ms: START_VERIFICATION_LIFETIME_MS_SCHEMA
+  lifetime_ms: START_VERIFICATION_LIFETIME_MS_SCHEMA,
+  session_id: z.string().max(64).optional().describe("Bash session id required when CODEXPRO_REQUIRE_BASH_SESSION=1 is configured.")
 }).strict();
 
 const START_VERIFICATION_TRANSPORT_SCHEMA = z.object({
@@ -362,7 +363,8 @@ const START_VERIFICATION_TRANSPORT_SCHEMA = z.object({
   script: z.unknown().optional(),
   args: z.unknown().optional(),
   cwd: z.unknown().optional(),
-  lifetime_ms: z.unknown().optional()
+  lifetime_ms: z.unknown().optional(),
+  session_id: z.unknown().optional()
 }).passthrough();
 
 const START_VERIFICATION_PUBLIC_SCHEMA = z.object(START_VERIFICATION_ARGUMENTS_SCHEMA.shape);
@@ -375,12 +377,14 @@ const VERIFICATION_JOB_ID_SCHEMA = z.string()
 
 const WAIT_VERIFICATION_ARGUMENTS_SCHEMA = z.object({
   job_id: VERIFICATION_JOB_ID_SCHEMA,
-  max_wait_seconds: z.number().int().min(1).max(60).optional().describe("Maximum seconds to wait for completion before returning current state. Default: 20, max: 60.")
+  max_wait_seconds: z.number().int().min(1).max(60).optional().describe("Maximum seconds to wait for completion before returning current state. Default: 20, max: 60."),
+  session_id: z.string().max(64).optional().describe("Bash session id required when CODEXPRO_REQUIRE_BASH_SESSION=1 is configured.")
 }).strict();
 
 const WAIT_VERIFICATION_TRANSPORT_SCHEMA = z.object({
   job_id: z.unknown().optional(),
-  max_wait_seconds: z.unknown().optional()
+  max_wait_seconds: z.unknown().optional(),
+  session_id: z.unknown().optional()
 }).passthrough();
 
 const WAIT_VERIFICATION_PUBLIC_SCHEMA = z.object(WAIT_VERIFICATION_ARGUMENTS_SCHEMA.shape);
@@ -388,11 +392,13 @@ WAIT_VERIFICATION_PUBLIC_SCHEMA.safeParse = ((args: unknown) => WAIT_VERIFICATIO
 WAIT_VERIFICATION_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => WAIT_VERIFICATION_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof WAIT_VERIFICATION_PUBLIC_SCHEMA.safeParseAsync;
 
 const CANCEL_VERIFICATION_ARGUMENTS_SCHEMA = z.object({
-  job_id: VERIFICATION_JOB_ID_SCHEMA
+  job_id: VERIFICATION_JOB_ID_SCHEMA,
+  session_id: z.string().max(64).optional().describe("Bash session id required when CODEXPRO_REQUIRE_BASH_SESSION=1 is configured.")
 }).strict();
 
 const CANCEL_VERIFICATION_TRANSPORT_SCHEMA = z.object({
-  job_id: z.unknown().optional()
+  job_id: z.unknown().optional(),
+  session_id: z.unknown().optional()
 }).passthrough();
 
 const CANCEL_VERIFICATION_PUBLIC_SCHEMA = z.object(CANCEL_VERIFICATION_ARGUMENTS_SCHEMA.shape);
@@ -3869,7 +3875,8 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         script: args.script,
         args: args.args,
         cwd: args.cwd,
-        lifetime_ms: args.lifetime_ms
+        lifetime_ms: args.lifetime_ms,
+        session_id: args.session_id
       });
       const text = verificationTextResult(config, record, "started");
       return diagnosticTextResult(text, { workspace_id: workspace.id, root: workspace.root, ...record });
@@ -3894,7 +3901,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
       }
     },
     async (args) => {
-      const record = await verificationManager.waitVerification(args.job_id, args.max_wait_seconds);
+      const record = await verificationManager.waitVerification(args.job_id, args.max_wait_seconds, args.session_id);
       const text = verificationTextResult(config, record, "status");
       return diagnosticTextResult(text, { ...record });
     }
@@ -3918,7 +3925,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
       }
     },
     async (args) => {
-      const record = await verificationManager.cancelVerification(args.job_id);
+      const record = await verificationManager.cancelVerification(args.job_id, args.session_id);
       const text = verificationTextResult(config, record, "cancelled");
       return diagnosticTextResult(text, { ...record });
     }

@@ -133,6 +133,8 @@ Options:
   --yes                     Confirm settings delete/reset without prompting.
   --install-cloudflared     Install/reinstall cloudflared into ~/.codexpro/bin.
   --no-install-cloudflared  Do not auto-install cloudflared when missing.
+  --containment-wrapper <cmd>
+                             Optional server-owned containment wrapper argv for verification jobs.
   --copy-url                Copy the ChatGPT Server URL to clipboard. Default for public HTTPS URLs.
   --no-copy-url             Do not copy the Server URL.
   --open-chatgpt            Open ChatGPT connector settings after the URL is ready.
@@ -4265,11 +4267,14 @@ async function main() {
   if (codexDir) serverEnv.CODEXPRO_CODEX_DIR = codexDir;
   if (args.logRequests || process.env.CODEXPRO_LOG_REQUESTS === '1') serverEnv.CODEXPRO_LOG_REQUESTS = '1';
   if (args.allowHome) serverEnv.CODEXPRO_ALLOW_HOME = '1';
+  const containmentWrapper = optionValue(args, profile, 'containmentWrapper', ['CODEXPRO_CONTAINMENT_WRAPPER'], '');
+  if (containmentWrapper) serverEnv.CODEXPRO_CONTAINMENT_WRAPPER = containmentWrapper;
   if (token) serverEnv.CODEXPRO_HTTP_TOKEN = token;
   else delete serverEnv.CODEXPRO_HTTP_TOKEN;
 
   if (args.printEnv) {
     console.log(JSON.stringify(redactEnvObject(serverEnv), null, 2));
+    return;
   }
 
   const httpPath = path.join(projectRoot, 'dist', 'http.js');

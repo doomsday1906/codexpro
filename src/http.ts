@@ -1482,6 +1482,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
 
   const app = express();
   const verificationManager = options.verificationManager ?? new VerificationManager(config);
+  (app as any).verificationManager = verificationManager;
   const logRequests = process.env.CODEXPRO_LOG_REQUESTS === "1";
   const authFailureWindow = new Map<string, { count: number; resetAt: number }>();
   const authFailureLimit = 10;
@@ -1862,8 +1863,9 @@ async function main(): Promise<void> {
   }
 
   const config = loadConfig();
-  const app = createCodexProHttpApp(config);
-  app.listen(config.port, config.host, () => {
+  const verificationManager = new VerificationManager(config);
+  const app = createCodexProHttpApp(config, { verificationManager });
+  const server = app.listen(config.port, config.host, () => {
     console.error(`[CodexPro] HTTP MCP listening on http://${config.host}:${config.port}/mcp`);
     console.error(`[CodexPro] defaultRoot=${config.defaultRoot}`);
     console.error(`[CodexPro] allowedRoots=${config.allowedRoots.join(", ")}`);
@@ -1871,6 +1873,28 @@ async function main(): Promise<void> {
     console.error(`[CodexPro] writeMode=${config.writeMode}`);
     console.error(`[CodexPro] widgetDomain=${config.widgetDomain}`);
   });
+
+  let isClosing = false;
+  const gracefulShutdown = (signal: string) => {
+    if (isClosing) return;
+    isClosing = true;
+    console.error(`[CodexPro] Received ${signal}, closing HTTP server and terminating managed verification jobs...`);
+    server.close();
+    verificationManager
+      .close()
+      .catch((err) => {
+        console.error(`[CodexPro] Error during verification manager shutdown: ${err instanceof Error ? err.message : String(err)}`);
+      })
+      .finally(() => {
+        process.exit(0);
+      });
+    setTimeout(() => {
+      process.exit(0);
+    }, 5000).unref();
+  };
+
+  process.once("SIGINT", () => gracefulShutdown("SIGINT"));
+  process.once("SIGTERM", () => gracefulShutdown("SIGTERM"));
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {

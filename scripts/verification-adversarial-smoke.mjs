@@ -168,18 +168,24 @@ async function runTests() {
 
   const jA = await mgr4.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
-    runner: "tsc",
-    args: ["--watch"]
+    runner: "package_script",
+    package_manager: "npm",
+    script: "verification:fixture",
+    args: ["--sleep", "20000"]
   });
   const jB = await mgr4.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
-    runner: "tsc",
-    args: ["--watch"]
+    runner: "package_script",
+    package_manager: "npm",
+    script: "verification:fixture",
+    args: ["--sleep", "20000"]
   });
   const jC = await mgr4.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
-    runner: "tsc",
-    args: ["--watch"]
+    runner: "package_script",
+    package_manager: "npm",
+    script: "verification:fixture",
+    args: ["--sleep", "20000"]
   });
   assert.equal(mgr4.getActiveCount(), 3);
 
@@ -187,8 +193,10 @@ async function runTests() {
   try {
     await mgr4.startVerification(fakeWorkspace, guard, {
       workspace_id: fakeWorkspace.id,
-      runner: "tsc",
-      args: ["--watch"]
+      runner: "package_script",
+      package_manager: "npm",
+      script: "verification:fixture",
+      args: ["--sleep", "20000"]
     });
   } catch (err) {
     capError = err;
@@ -211,13 +219,17 @@ async function runTests() {
 
   const s1 = await mgr5.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
-    runner: "tsc",
-    args: ["--watch"]
+    runner: "package_script",
+    package_manager: "npm",
+    script: "verification:fixture",
+    args: ["--sleep", "20000"]
   });
   const s2 = await mgr5.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
-    runner: "tsc",
-    args: ["--watch"]
+    runner: "package_script",
+    package_manager: "npm",
+    script: "verification:fixture",
+    args: ["--sleep", "20000"]
   });
   assert.equal(mgr5.getActiveCount(), 2);
 

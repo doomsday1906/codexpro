@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { CodexProConfig } from "./config.js";
 import { CodexProError, PathGuard, type Workspace } from "./guard.js";
-import { terminateProcessTree, makeRestrictedBashEnv } from "./bashOps.js";
+import { terminateProcessTree, makeRestrictedBashEnv, assertBashSession, SAFE_BLOCKED_PATTERNS } from "./bashOps.js";
 import { redactDiagnosticText } from "./redact.js";
 
 export type VerificationRunnerFamily =
@@ -34,6 +34,7 @@ export interface VerificationStartInput {
   args?: string[];
   cwd?: string;
   lifetime_ms?: number;
+  session_id?: string;
 }
 
 export interface VerificationJobRecord {
@@ -101,7 +102,8 @@ const VALID_PACKAGE_MANAGERS = new Set<string>(["npm", "pnpm", "yarn", "bun"]);
 const FORBIDDEN_SCRIPT_TOKENS = new Set<string>([
   "start", "dev", "serve", "server", "watch", "publish", "deploy",
   "install", "preinstall", "postinstall", "prepublish", "prepare",
-  "prepack", "postpack", "listen", "daemon", "preview"
+  "prepack", "postpack", "listen", "daemon", "preview",
+  "fix", "mutate", "format", "write", "update", "upgrade"
 ]);
 
 const SCRIPT_NAME_REGEX = /^[A-Za-z0-9._:-]+$/;
@@ -125,7 +127,7 @@ export function validatePackageScriptName(script: unknown): string {
   const tokens = trimmed.toLowerCase().split(/[:_\-\/]+/);
   for (const token of tokens) {
     if (FORBIDDEN_SCRIPT_TOKENS.has(token)) {
-      throw new CodexProError(`Package script '${trimmed}' is blocked: non-verification lifecycle/daemon/deployment token '${token}' is not allowed.`);
+      throw new CodexProError(`Package script '${trimmed}' is blocked: non-verification lifecycle/daemon/deployment/mutating token '${token}' is not allowed.`);
     }
   }
   return trimmed;
@@ -154,6 +156,70 @@ export function validateArgs(args: unknown): string[] {
     if (SHELL_META_PATTERN.test(arg)) {
       throw new CodexProError(`Argument contains forbidden shell metacharacter: '${arg}'`);
     }
+
+    // Path safety: block absolute paths, home paths, and parent traversal
+    if (arg.startsWith("/") || arg.startsWith("\\") || /^[A-Za-z]:[/\\]/.test(arg)) {
+      throw new CodexProError(`Argument contains forbidden absolute path: '${arg}'. Arguments must be workspace-relative.`);
+    }
+    if (arg === "~" || arg.startsWith("~/") || arg.startsWith("~\\")) {
+      throw new CodexProError(`Argument contains forbidden home path: '${arg}'. Arguments must be workspace-relative.`);
+    }
+    if (/(^|[/\\])\.\.([/\\]|$)/.test(arg)) {
+      throw new CodexProError(`Argument contains forbidden parent directory traversal: '${arg}'.`);
+    }
+
+    // Block long-lived watch flags across all runners
+    const lower = arg.toLowerCase();
+    if (lower === "--watch" || lower === "-w" || lower === "--watchall" || lower.startsWith("--watch=") || lower.startsWith("-w=")) {
+      throw new CodexProError(`Argument '${arg}' is blocked: watch mode is forbidden for verification jobs.`);
+    }
+
+    // Block write/fix/mutate flags across all runners
+    if (
+      lower === "--fix" ||
+      lower === "--fix-dry-run" ||
+      lower === "--fix-type" ||
+      lower === "--write" ||
+      lower === "--apply" ||
+      lower === "--apply-unsafe" ||
+      lower.startsWith("--fix=") ||
+      lower.startsWith("--write=") ||
+      lower.startsWith("--apply=")
+    ) {
+      throw new CodexProError(`Argument '${arg}' is blocked: source-mutating flags are forbidden for verification jobs.`);
+    }
+
+    // Block file output redirection / delegation flags
+    if (
+      lower === "--output" ||
+      lower === "--output-file" ||
+      lower === "-o" ||
+      lower === "--outfile" ||
+      lower === "--outdir" ||
+      lower.startsWith("--output=") ||
+      lower.startsWith("--output-file=") ||
+      lower.startsWith("-o=") ||
+      lower.startsWith("--outfile=") ||
+      lower.startsWith("--outdir=") ||
+      lower === "-exec" ||
+      lower === "-execdir" ||
+      lower === "-delete" ||
+      lower === "-ok" ||
+      lower === "-okdir" ||
+      lower === "-fprint" ||
+      lower === "-fprintf" ||
+      lower === "-fls"
+    ) {
+      throw new CodexProError(`Argument '${arg}' is blocked: output writing or execution delegation is forbidden.`);
+    }
+
+    // Sensitive file protection (from SAFE_BLOCKED_PATTERNS)
+    for (const pattern of SAFE_BLOCKED_PATTERNS) {
+      if (pattern.test(arg) || pattern.test(` ${arg} `)) {
+        throw new CodexProError(`Argument contains blocked or unsafe pattern: '${arg}'`);
+      }
+    }
+
     totalBytes += Buffer.byteLength(arg, "utf8");
     if (totalBytes > MAX_TOTAL_ARG_BYTES) {
       throw new CodexProError(`Total arguments size exceeds ${MAX_TOTAL_ARG_BYTES} bytes.`);
@@ -187,9 +253,30 @@ export function compileRunnerArgv(input: {
       return args.length > 0 ? [pm, "run", script, "--", ...args] : [pm, "run", script];
     }
     case "pytest": {
+      for (const arg of args) {
+        const lower = arg.toLowerCase();
+        if (lower === "--watch" || lower === "-w" || lower.startsWith("--watch=")) {
+          throw new CodexProError(`pytest option '${arg}' is blocked: watch mode is forbidden.`);
+        }
+        if (lower === "--pdb" || lower === "--capture=no") {
+          throw new CodexProError(`pytest option '${arg}' is blocked: interactive debugging flags are forbidden.`);
+        }
+        if (lower === "-o" || lower === "--override-ini" || lower.startsWith("-o=") || lower.startsWith("--override-ini=")) {
+          throw new CodexProError(`pytest option '${arg}' is blocked: configuration override flags are forbidden.`);
+        }
+      }
       return ["pytest", ...args];
     }
     case "go_test": {
+      for (const arg of args) {
+        const lower = arg.toLowerCase();
+        if (lower === "-exec" || lower.startsWith("-exec=")) {
+          throw new CodexProError(`go test option '${arg}' is blocked: arbitrary execution delegation is forbidden.`);
+        }
+        if (lower === "-o" || lower.startsWith("-o=")) {
+          throw new CodexProError(`go test option '${arg}' is blocked: binary output writing is forbidden.`);
+        }
+      }
       return ["go", "test", ...args];
     }
     case "cargo": {
@@ -200,15 +287,48 @@ export function compileRunnerArgv(input: {
       if (!CARGO_ALLOWED_SUBCOMMANDS.has(subcommand)) {
         throw new CodexProError(`Forbidden cargo subcommand: '${args[0]}'. Allowed: ${[...CARGO_ALLOWED_SUBCOMMANDS].join(", ")}`);
       }
+      for (const arg of args.slice(1)) {
+        const lower = arg.toLowerCase();
+        if (lower === "--target-dir" || lower.startsWith("--target-dir=") || lower === "--config" || lower.startsWith("--config=")) {
+          throw new CodexProError(`cargo option '${arg}' is blocked.`);
+        }
+      }
       return ["cargo", ...args];
     }
     case "tsc": {
+      for (const arg of args) {
+        const lower = arg.toLowerCase();
+        if (lower === "--watch" || lower === "-w" || lower.startsWith("--watch=") || lower.startsWith("-w=")) {
+          throw new CodexProError(`tsc option '${arg}' is blocked: long-lived watch mode is forbidden for verification jobs.`);
+        }
+        if (lower === "--outfile" || lower.startsWith("--outfile=") || lower === "--outdir" || lower.startsWith("--outdir=")) {
+          throw new CodexProError(`tsc option '${arg}' is blocked: output writing is forbidden for verification jobs.`);
+        }
+      }
       return ["tsc", ...args];
     }
     case "eslint": {
+      for (const arg of args) {
+        const lower = arg.toLowerCase();
+        if (lower === "--fix" || lower === "--fix-dry-run" || lower === "--fix-type" || lower.startsWith("--fix=")) {
+          throw new CodexProError(`eslint option '${arg}' is blocked: mutating source files is forbidden for verification jobs.`);
+        }
+        if (lower === "-o" || lower === "--output-file" || lower.startsWith("--output-file=")) {
+          throw new CodexProError(`eslint option '${arg}' is blocked: output writing is forbidden for verification jobs.`);
+        }
+        if (lower === "--rulesdir" || lower.startsWith("--rulesdir=") || lower === "--rule" || lower.startsWith("--rule=")) {
+          throw new CodexProError(`eslint option '${arg}' is blocked: arbitrary rule/plugin delegation is forbidden.`);
+        }
+      }
       return ["eslint", ...args];
     }
     case "biome_check": {
+      for (const arg of args) {
+        const lower = arg.toLowerCase();
+        if (lower === "--write" || lower.startsWith("--write=") || lower === "--fix" || lower === "--apply" || lower === "--apply-unsafe") {
+          throw new CodexProError(`biome check option '${arg}' is blocked: mutating source files is forbidden for verification jobs.`);
+        }
+      }
       return ["biome", "check", ...args];
     }
     default:
@@ -216,13 +336,56 @@ export function compileRunnerArgv(input: {
   }
 }
 
-export function validateContainmentWrapper(wrapperArgv?: string[]): string[] | undefined {
+export function isExecutableAvailable(executable: string, envPath?: string): boolean {
+  if (path.isAbsolute(executable) || (process.platform === "win32" && path.win32.isAbsolute(executable))) {
+    try {
+      if (!fs.existsSync(executable)) return false;
+      const stat = fs.statSync(executable);
+      if (!stat.isFile()) return false;
+      if (process.platform !== "win32") {
+        fs.accessSync(executable, fs.constants.X_OK);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  const searchPath = envPath ?? process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin";
+  const dirs = searchPath.split(path.delimiter);
+  const exts = process.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""];
+  for (const dir of dirs) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const candidate = path.join(dir, executable.endsWith(ext) ? executable : executable + ext);
+      try {
+        if (fs.existsSync(candidate)) {
+          const stat = fs.statSync(candidate);
+          if (stat.isFile()) {
+            if (process.platform !== "win32") {
+              fs.accessSync(candidate, fs.constants.X_OK);
+            }
+            return true;
+          }
+        }
+      } catch {
+        // continue searching
+      }
+    }
+  }
+  return false;
+}
+
+export function validateContainmentWrapper(wrapperArgv?: string[], envPath?: string): string[] | undefined {
   if (!wrapperArgv || wrapperArgv.length === 0) return undefined;
   const executable = wrapperArgv[0];
   if (typeof executable !== "string" || !executable.trim()) {
     throw new CodexProError("Configured containment wrapper executable is empty or invalid.");
   }
-  for (const part of wrapperArgv) {
+  if (!isExecutableAvailable(executable, envPath)) {
+    throw new CodexProError(`Configured containment wrapper executable '${executable}' was not found or is not executable (containment wrapper path does not exist).`);
+  }
+  for (let i = 1; i < wrapperArgv.length; i++) {
+    const part = wrapperArgv[i];
     if (path.isAbsolute(part) && !fs.existsSync(part)) {
       throw new CodexProError(`Configured containment wrapper path does not exist: ${part}`);
     }
@@ -250,28 +413,45 @@ export function clampLifetime(
   return Math.max(minMs, Math.min(Math.floor(requestedMs), maxMs));
 }
 
-class RollingTailBuffer {
-  private chunks: Buffer[] = [];
-  private totalBytes = 0;
+interface StreamChunk {
+  stream: "stdout" | "stderr";
+  buf: Buffer;
+}
 
-  constructor(private readonly maxBytes: number) {}
+export class CombinedRollingTailBuffer {
+  private chunks: StreamChunk[] = [];
+  private retainedBytes = 0;
 
-  append(chunk: Buffer): void {
-    this.chunks.push(chunk);
-    this.totalBytes += chunk.byteLength;
-    while (this.chunks.length > 0 && this.totalBytes - this.chunks[0].byteLength >= this.maxBytes) {
-      const removed = this.chunks.shift()!;
-      this.totalBytes -= removed.byteLength;
+  constructor(public readonly maxBytes: number) {}
+
+  append(stream: "stdout" | "stderr", buf: Buffer): void {
+    this.chunks.push({ stream, buf });
+    this.retainedBytes += buf.byteLength;
+    while (this.chunks.length > 0 && this.retainedBytes > this.maxBytes) {
+      const excess = this.retainedBytes - this.maxBytes;
+      const first = this.chunks[0];
+      if (first.buf.byteLength <= excess) {
+        this.retainedBytes -= first.buf.byteLength;
+        this.chunks.shift();
+      } else {
+        first.buf = first.buf.subarray(excess);
+        this.retainedBytes -= excess;
+        break;
+      }
     }
   }
 
-  toString(): string {
-    const combined = Buffer.concat(this.chunks);
-    if (combined.byteLength <= this.maxBytes) {
-      return combined.toString("utf8");
+  getOutputs(): { stdout: string; stderr: string } {
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    for (const item of this.chunks) {
+      if (item.stream === "stdout") stdoutChunks.push(item.buf);
+      else stderrChunks.push(item.buf);
     }
-    const sliced = combined.subarray(combined.byteLength - this.maxBytes);
-    return sliced.toString("utf8");
+    return {
+      stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+      stderr: Buffer.concat(stderrChunks).toString("utf8")
+    };
   }
 }
 
@@ -313,8 +493,7 @@ export class ManagedVerificationJob {
 
   private observedStdoutBytes = 0;
   private observedStderrBytes = 0;
-  private stdoutBuffer: RollingTailBuffer;
-  private stderrBuffer: RollingTailBuffer;
+  private combinedBuffer: CombinedRollingTailBuffer;
 
   private readonly waiters = new Set<() => void>();
 
@@ -357,8 +536,7 @@ export class ManagedVerificationJob {
     this.startedAt = now.toISOString();
     this.startTimeMs = now.getTime();
 
-    this.stdoutBuffer = new RollingTailBuffer(this.retainedTailBytes);
-    this.stderrBuffer = new RollingTailBuffer(this.retainedTailBytes);
+    this.combinedBuffer = new CombinedRollingTailBuffer(this.retainedTailBytes);
   }
 
   public start(): void {
@@ -392,19 +570,21 @@ export class ManagedVerificationJob {
     this.child.stdout?.on("data", (chunk: Buffer) => {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       this.observedStdoutBytes += buf.byteLength;
-      this.stdoutBuffer.append(buf);
+      this.combinedBuffer.append("stdout", buf);
       this.checkOutputCeiling();
     });
 
     this.child.stderr?.on("data", (chunk: Buffer) => {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       this.observedStderrBytes += buf.byteLength;
-      this.stderrBuffer.append(buf);
+      this.combinedBuffer.append("stderr", buf);
       this.checkOutputCeiling();
     });
 
     this.child.on("error", (err: Error) => {
-      this.stderrBuffer.append(Buffer.from(`\n[codexpro] Spawn error: ${err.message}`));
+      const errBuf = Buffer.from(`\n[codexpro] Spawn error: ${err.message}`);
+      this.observedStderrBytes += errBuf.byteLength;
+      this.combinedBuffer.append("stderr", errBuf);
       this.transitionToTerminal("failed", {
         exitCode: 1,
         signal: null,
@@ -545,14 +725,11 @@ export class ManagedVerificationJob {
   }
 
   public toRecord(): VerificationJobRecord {
-    const rawStdout = this.stdoutBuffer.toString();
-    const rawStderr = this.stderrBuffer.toString();
+    const { stdout: rawStdout, stderr: rawStderr } = this.combinedBuffer.getOutputs();
     const redactedStdout = redactDiagnosticText(rawStdout);
     const redactedStderr = redactDiagnosticText(rawStderr);
     const observedTotal = this.observedStdoutBytes + this.observedStderrBytes;
-    const truncated =
-      this.observedStdoutBytes > this.retainedTailBytes ||
-      this.observedStderrBytes > this.retainedTailBytes;
+    const truncated = observedTotal > this.retainedTailBytes;
 
     return {
       jobId: this.jobId,
@@ -603,8 +780,9 @@ export class VerificationManager {
       ...DEFAULT_VERIFICATION_LIMITS,
       ...options
     };
+    const envPath = makeRestrictedBashEnv(config).PATH;
     const wrapper = options.containmentWrapper ?? config.containmentWrapper;
-    this.containmentWrapper = validateContainmentWrapper(wrapper);
+    this.containmentWrapper = validateContainmentWrapper(wrapper, envPath);
   }
 
   public getJob(jobId: string): ManagedVerificationJob | undefined {
@@ -661,6 +839,7 @@ export class VerificationManager {
     if (this.config.bashMode === "off") {
       throw new CodexProError("bash tool is disabled. Start with CODEXPRO_BASH_MODE=safe or CODEXPRO_BASH_MODE=full to enable verification jobs.");
     }
+    assertBashSession(this.config, input.session_id);
 
     this.prune();
 
@@ -708,8 +887,15 @@ export class VerificationManager {
     return job.toRecord();
   }
 
-  public async waitVerification(jobId: string, maxWaitSeconds = 20): Promise<VerificationJobRecord> {
+  public async waitVerification(
+    jobId: string,
+    maxWaitSeconds = 20,
+    sessionId?: string
+  ): Promise<VerificationJobRecord> {
     this.prune();
+    if (this.config.requireBashSession || sessionId !== undefined) {
+      assertBashSession(this.config, sessionId);
+    }
     const cleanId = String(jobId ?? "").trim();
     const job = this.jobs.get(cleanId);
     if (!job) {
@@ -720,8 +906,11 @@ export class VerificationManager {
     return job.wait(clampedWaitSec * 1000);
   }
 
-  public async cancelVerification(jobId: string): Promise<VerificationJobRecord> {
+  public async cancelVerification(jobId: string, sessionId?: string): Promise<VerificationJobRecord> {
     this.prune();
+    if (this.config.requireBashSession || sessionId !== undefined) {
+      assertBashSession(this.config, sessionId);
+    }
     const cleanId = String(jobId ?? "").trim();
     const job = this.jobs.get(cleanId);
     if (!job) {

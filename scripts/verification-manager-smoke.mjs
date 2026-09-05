@@ -63,11 +63,13 @@ async function runTests() {
     defaultLifetimeMs: 30000
   });
 
-  // Use tsc --watch as a long-running process to test cancellation, concurrency, and timeouts
+  // Use verification:fixture as a lawful finite process to test cancellation, concurrency, and timeouts
   const startRecord2 = await mgr2.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
-    runner: "tsc",
-    args: ["--watch"]
+    runner: "package_script",
+    package_manager: "npm",
+    script: "verification:fixture",
+    args: ["--sleep", "30000"]
   });
 
   assert.equal(startRecord2.state, "running");
@@ -91,13 +93,17 @@ async function runTests() {
 
   const j1 = await mgr3.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
-    runner: "tsc",
-    args: ["--watch"]
+    runner: "package_script",
+    package_manager: "npm",
+    script: "verification:fixture",
+    args: ["--sleep", "15000"]
   });
   const j2 = await mgr3.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
-    runner: "tsc",
-    args: ["--watch"]
+    runner: "package_script",
+    package_manager: "npm",
+    script: "verification:fixture",
+    args: ["--sleep", "15000"]
   });
   assert.equal(mgr3.getActiveCount(), 2);
 
@@ -106,8 +112,10 @@ async function runTests() {
   try {
     await mgr3.startVerification(fakeWorkspace, guard, {
       workspace_id: fakeWorkspace.id,
-      runner: "tsc",
-      args: ["--watch"]
+      runner: "package_script",
+      package_manager: "npm",
+      script: "verification:fixture",
+      args: ["--sleep", "15000"]
     });
   } catch (err) {
     capacityError = err;
@@ -130,8 +138,10 @@ async function runTests() {
 
   const jTimeout = await mgr4.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
-    runner: "tsc",
-    args: ["--watch"],
+    runner: "package_script",
+    package_manager: "npm",
+    script: "verification:fixture",
+    args: ["--sleep", "10000"],
     lifetime_ms: 300
   });
 
@@ -197,13 +207,17 @@ async function runTests() {
   });
   const shut1 = await mgr7.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
-    runner: "tsc",
-    args: ["--watch"]
+    runner: "package_script",
+    package_manager: "npm",
+    script: "verification:fixture",
+    args: ["--sleep", "20000"]
   });
   const shut2 = await mgr7.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
-    runner: "tsc",
-    args: ["--watch"]
+    runner: "package_script",
+    package_manager: "npm",
+    script: "verification:fixture",
+    args: ["--sleep", "20000"]
   });
   assert.equal(mgr7.getActiveCount(), 2);
   await mgr7.close();

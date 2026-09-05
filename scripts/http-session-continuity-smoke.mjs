@@ -27,7 +27,19 @@ try {
 } catch (e) {
   // Ignore if already exists or fails
 }
-await fs.writeFile(path.join(realFixtureRoot, "package.json"), JSON.stringify({ name: "fixture-pkg" }));
+await fs.copyFile(
+  path.join(repoRoot, "scripts", "verification-fixture.mjs"),
+  path.join(realFixtureRoot, "verification-fixture.mjs")
+);
+await fs.writeFile(
+  path.join(realFixtureRoot, "package.json"),
+  JSON.stringify({
+    name: "fixture-pkg",
+    scripts: {
+      "verification:fixture": "node verification-fixture.mjs"
+    }
+  })
+);
 await fs.writeFile(path.join(realFixtureRoot, "tsconfig.json"), JSON.stringify({ compilerOptions: { target: "es2022" } }));
 
 const workspaceIdFor = (root) => `ws_${createHash("sha256").update(root).digest("hex").slice(0, 24)}`;
@@ -172,8 +184,10 @@ async function runTests() {
     name: "start_verification",
     arguments: {
       workspace_id: fixtureWsId,
-      runner: "tsc",
-      args: ["--watch"]
+      runner: "package_script",
+      package_manager: "npm",
+      script: "verification:fixture",
+      args: ["--sleep", "30000"]
     }
   });
 
@@ -235,8 +249,10 @@ async function runTests() {
     const res = await clientB.callTool({
       name: "start_verification",
       arguments: {
-        runner: "tsc",
-        args: ["--watch"]
+        runner: "package_script",
+        package_manager: "npm",
+        script: "verification:fixture",
+        args: ["--sleep", "30000"]
       }
     });
     if (res.isError) {
@@ -291,8 +307,10 @@ async function runTests() {
     name: "start_verification",
     arguments: {
       workspace_id: fixtureWsId,
-      runner: "tsc",
-      args: ["--watch"]
+      runner: "package_script",
+      package_manager: "npm",
+      script: "verification:fixture",
+      args: ["--sleep", "30000"]
     }
   });
   const stdioJob = stdioStartRes.structuredContent;
