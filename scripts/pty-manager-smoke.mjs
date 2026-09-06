@@ -9,7 +9,13 @@ import { execSync } from "node:child_process";
 import { loadConfig } from "../dist/config.js";
 import { PathGuard, WorkspaceManager, CodexProError } from "../dist/guard.js";
 import { PTY_LIMITS, validatePtyRunInput } from "../dist/ptyValidator.js";
-import { PtyRunManager, terminatePtyProcessTree } from "../dist/ptyRunManager.js";
+import {
+  PtyRunManager,
+  terminatePtyProcessTree,
+  isPidAlive,
+  isProcessTreeAlive,
+  trimMatcherBuffer
+} from "../dist/ptyRunManager.js";
 import * as zigpty from "zigpty";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -246,7 +252,7 @@ await test("synthetic prompt CLI succeeds under real PTY with fixed profile", as
   assert.equal(result.steps[0].step_index, 0);
   assert.equal(result.steps[0].matched, true);
   assert.equal(result.steps[0].submit, true);
-  assert.equal(result.steps[0].input_bytes_sent, Buffer.byteLength("CONFIRM_42", "utf8") + 1); // +1 for \r
+  assert.equal(result.steps[0].input_bytes_sent, Buffer.byteLength("CONFIRM_42", "utf8")); // LAW-011: caller send bytes only, without Enter
   assert.ok(result.steps[0].elapsed_ms >= 0);
 
   assert.equal(manager.getActiveCount(), 0, "No active runs should remain in manager after completion");
@@ -325,7 +331,8 @@ await test("wait-only step matches without writing input", async () => {
   assert.equal(result.steps[0].input_bytes_sent, 0, "Wait-only step must send 0 bytes");
   assert.equal(result.steps[0].submit, false);
   assert.equal(result.steps[1].matched, true);
-  assert.equal(result.steps[1].input_bytes_sent, 2);
+  assert.equal(result.steps[1].input_bytes_sent, 1, "Must count only 1 byte from 'y' without Enter byte");
+  assert.equal(result.steps[1].submit, true);
 });
 
 // --------------------------------------------------------------------------
@@ -367,7 +374,8 @@ await test("caller send text is strictly absent from step and result metadata", 
   // Exact step metadata shape
   const step0 = result.steps[0];
   assert.deepEqual(Object.keys(step0).sort(), ["elapsed_ms", "input_bytes_sent", "matched", "step_index", "submit"].sort());
-  assert.equal(step0.input_bytes_sent, Buffer.byteLength(secretText, "utf8") + 1);
+  assert.equal(step0.input_bytes_sent, Buffer.byteLength(secretText, "utf8"), "Must count only caller send bytes");
+  assert.equal(step0.submit, true);
 });
 
 // --------------------------------------------------------------------------
@@ -397,6 +405,7 @@ await test("manager fails closed before spawn when backend hasNative is false", 
     },
     (err) => {
       assert.ok(err instanceof CodexProError);
+      assert.equal(err.code, "pty_backend_unavailable");
       assert.match(err.message, /PTY backend is unavailable: native PTY bindings are missing/);
       return true;
     }
@@ -424,6 +433,7 @@ await test("manager fails closed before spawn on unproven platforms", async () =
     },
     (err) => {
       assert.ok(err instanceof CodexProError);
+      assert.equal(err.code, "pty_platform_unsupported");
       assert.match(err.message, /PTY execution is only supported on Linux\/WSL x64/);
       return true;
     }
@@ -482,6 +492,7 @@ await test("capacity limit maxActive=2 rejects 3rd run immediately with no queue
     },
     (err) => {
       assert.ok(err instanceof CodexProError);
+      assert.equal(err.code, "pty_capacity_reached");
       assert.match(err.message, /PTY concurrency limit reached: maximum 2 active PTY runs/);
       return true;
     }
@@ -538,6 +549,7 @@ await test("lifecycle transitions open -> closing -> closed with immediate admis
     },
     (err) => {
       assert.ok(err instanceof CodexProError);
+      assert.equal(err.code, "pty_shutting_down");
       assert.match(err.message, /PTY execution rejected: manager is closing/);
       return true;
     }
@@ -553,6 +565,7 @@ await test("lifecycle transitions open -> closing -> closed with immediate admis
     },
     (err) => {
       assert.ok(err instanceof CodexProError);
+      assert.equal(err.code, "pty_shutting_down");
       assert.match(err.message, /PTY execution rejected: manager is closed/);
       return true;
     }
@@ -606,6 +619,7 @@ await test("invalid containment wrapper fails closed before spawn", async () => 
     },
     (err) => {
       assert.ok(err instanceof CodexProError);
+      assert.equal(err.code, "pty_containment_wrapper_invalid");
       assert.match(err.message, /containment wrapper/);
       return true;
     }
@@ -762,6 +776,300 @@ await test("release model staging with npm ci --omit=dev --ignore-scripts loads 
   } finally {
     await fs.rm(staging, { recursive: true, force: true });
   }
+});
+
+// --------------------------------------------------------------------------
+// Test 18: Physical proof of cleanup on shutdown with TERM/SIGHUP-resistant leader and descendant
+// --------------------------------------------------------------------------
+await test("shutdown cleanly awaits termination of TERM/SIGHUP-resistant leader and descendant", async () => {
+  const leaderPidFile = path.join(realFixtureRoot, "shutdown_leader.pid");
+  const descPidFile = path.join(realFixtureRoot, "shutdown_desc.pid");
+  const testScript = path.join(realFixtureRoot, "term_hup_resistant_shutdown.sh");
+
+  await fs.writeFile(
+    testScript,
+    `#!/bin/bash
+trap '' TERM HUP
+(
+  trap '' TERM HUP
+  echo "$BASHPID" > "${descPidFile}"
+  while true; do sleep 0.05; done
+) &
+echo "$$" > "${leaderPidFile}"
+while true; do sleep 0.05; done
+`
+  );
+  await fs.chmod(testScript, 0o755);
+
+  const manager = new PtyRunManager(baseConfig, {
+    processGraceTimeoutMs: 300,
+    processKillWaitTimeoutMs: 500
+  });
+
+  const runPromise = manager.run(
+    {
+      workspace_id: validWorkspaceId,
+      argv: [testScript],
+      steps: [
+        {
+          wait_for: "NEVER_HAPPENING_PROMPT",
+          timeout_ms: 10000
+        }
+      ],
+      timeout_ms: 10000
+    },
+    context
+  );
+
+  let leaderPid = 0;
+  let descPid = 0;
+  for (let i = 0; i < 100; i++) {
+    try {
+      const lText = (await fs.readFile(leaderPidFile, "utf8")).trim();
+      const dText = (await fs.readFile(descPidFile, "utf8")).trim();
+      if (lText && dText) {
+        leaderPid = parseInt(lText, 10);
+        descPid = parseInt(dText, 10);
+        break;
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 20));
+  }
+
+  assert.ok(leaderPid > 0, "Leader PID must be established");
+  assert.ok(descPid > 0, "Descendant PID must be established");
+  assert.equal(isPidAlive(leaderPid), true, "Leader must be initially alive");
+  assert.equal(isPidAlive(descPid), true, "Descendant must be initially alive");
+
+  // Call close() on manager
+  const closePromise = manager.close();
+  assert.equal(manager.state, "closing", "Manager must immediately transition to closing");
+
+  // Await close and run
+  await closePromise;
+  const result = await runPromise;
+
+  // Assert IMMEDIATELY that both leader and descendant are physically dead
+  assert.equal(isPidAlive(leaderPid), false, "Leader must be dead immediately after close completes");
+  assert.equal(isPidAlive(descPid), false, "Descendant must be dead immediately after close completes");
+  assert.equal(isProcessTreeAlive(leaderPid), false, "Process tree must be dead immediately after close completes");
+  assert.equal(manager.state, "closed", "Manager state must be closed");
+  assert.equal(manager.getActiveCount(), 0, "Active count must be 0");
+  assert.equal(result.state, "terminated_on_shutdown", "Result state must be terminated_on_shutdown");
+
+  // Verify that subsequent waiting does not uncover unhandled delayed kill timers
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal(manager.getActiveCount(), 0);
+});
+
+// --------------------------------------------------------------------------
+// Test 19: Physical proof of cleanup on timeout with TERM/SIGHUP-resistant leader and descendant
+// --------------------------------------------------------------------------
+await test("step timeout cleanly awaits termination of TERM/SIGHUP-resistant leader and descendant", async () => {
+  const leaderPidFile = path.join(realFixtureRoot, "timeout_leader.pid");
+  const descPidFile = path.join(realFixtureRoot, "timeout_desc.pid");
+  const testScript = path.join(realFixtureRoot, "term_hup_resistant_timeout.sh");
+
+  await fs.writeFile(
+    testScript,
+    `#!/bin/bash
+trap '' TERM HUP
+(
+  trap '' TERM HUP
+  echo "$BASHPID" > "${descPidFile}"
+  while true; do sleep 0.05; done
+) &
+echo "$$" > "${leaderPidFile}"
+while true; do sleep 0.05; done
+`
+  );
+  await fs.chmod(testScript, 0o755);
+
+  const manager = new PtyRunManager(baseConfig, {
+    processGraceTimeoutMs: 300,
+    processKillWaitTimeoutMs: 500
+  });
+
+  const runPromise = manager.run(
+    {
+      workspace_id: validWorkspaceId,
+      argv: [testScript],
+      steps: [
+        {
+          wait_for: "NEVER_HAPPENING_PROMPT",
+          timeout_ms: 600
+        }
+      ],
+      timeout_ms: 10000
+    },
+    context
+  );
+
+  let leaderPid = 0;
+  let descPid = 0;
+  for (let i = 0; i < 100; i++) {
+    try {
+      const lText = (await fs.readFile(leaderPidFile, "utf8")).trim();
+      const dText = (await fs.readFile(descPidFile, "utf8")).trim();
+      if (lText && dText) {
+        leaderPid = parseInt(lText, 10);
+        descPid = parseInt(dText, 10);
+        break;
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 20));
+  }
+
+  assert.ok(leaderPid > 0, "Leader PID must be established");
+  assert.ok(descPid > 0, "Descendant PID must be established");
+  assert.equal(isPidAlive(leaderPid), true, "Leader must be initially alive");
+  assert.equal(isPidAlive(descPid), true, "Descendant must be initially alive");
+
+  const result = await runPromise;
+
+  // Assert IMMEDIATELY that both leader and descendant are physically dead
+  assert.equal(isPidAlive(leaderPid), false, "Leader must be dead immediately after timeout resolves");
+  assert.equal(isPidAlive(descPid), false, "Descendant must be dead immediately after timeout resolves");
+  assert.equal(isProcessTreeAlive(leaderPid), false, "Process tree must be dead immediately after timeout resolves");
+  assert.equal(manager.getActiveCount(), 0, "Active count must be 0");
+  assert.equal(result.state, "step_timeout", "Result state must be step_timeout");
+});
+
+// --------------------------------------------------------------------------
+// Test 20: Matcher bound repair with 1-character wait_for
+// --------------------------------------------------------------------------
+await test("one-character wait_for does not retain entire unmatched buffer via slice(-0)", async () => {
+  // 1. Pure unit test on trimMatcherBuffer
+  assert.equal(trimMatcherBuffer("ABC", 1), "", "wait_for length 1 must return empty suffix");
+  assert.equal(trimMatcherBuffer("ABC", 2), "C", "wait_for length 2 must return 1-char suffix");
+  assert.equal(trimMatcherBuffer("ABC", 3), "BC", "wait_for length 3 must return 2-char suffix");
+  assert.equal(trimMatcherBuffer("ABC", 4), "ABC", "wait_for length 4 must return full 3-char buffer");
+
+  // 2. Integration test under PTY execution emitting substantial output
+  const floodNoZScript = path.join(realFixtureRoot, "flood_no_z.mjs");
+  await fs.writeFile(
+    floodNoZScript,
+    `setInterval(() => {
+  process.stdout.write("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\\n");
+}, 5);
+`
+  );
+
+  let observedMaxMatcherLen = 0;
+  const manager = new PtyRunManager(baseConfig, {
+    onMatcherBufferUpdate: (len) => {
+      if (len > observedMaxMatcherLen) {
+        observedMaxMatcherLen = len;
+      }
+    }
+  });
+
+  const result = await manager.run(
+    {
+      workspace_id: validWorkspaceId,
+      argv: ["node", floodNoZScript],
+      steps: [
+        {
+          wait_for: "Z", // 1 character that is never produced
+          timeout_ms: 600
+        }
+      ],
+      timeout_ms: 5000
+    },
+    context
+  );
+
+  assert.equal(result.state, "step_timeout");
+  assert.ok(result.raw_observed_bytes > 1000, "Should have processed substantial output");
+  assert.equal(observedMaxMatcherLen, 0, "For wait_for.length === 1, matcher buffer must remain strictly 0 bytes after trim");
+  assert.equal(manager.getActiveCount(), 0);
+});
+
+// --------------------------------------------------------------------------
+// Test 21: LAW-011 caller-byte metadata accounting and submit separation
+// --------------------------------------------------------------------------
+await test("LAW-011 caller-byte metadata counts only caller send bytes and separates submit", async () => {
+  const metadataCli = path.join(realFixtureRoot, "metadata_test_cli.mjs");
+  await fs.writeFile(
+    metadataCli,
+    `import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+
+process.stdout.write("P1: ");
+rl.question("", (a1) => {
+  process.stdout.write("P2: ");
+  // Do not read for P2; output P3
+  setTimeout(() => {
+    process.stdout.write("P3: ");
+    rl.question("", (a3) => {
+      process.stdout.write("P4: ");
+      setTimeout(() => {
+        console.log("DONE");
+        process.exit(0);
+      }, 50);
+    });
+  }, 50);
+});
+`
+  );
+
+  const manager = new PtyRunManager(baseConfig);
+  const result = await manager.run(
+    {
+      workspace_id: validWorkspaceId,
+      argv: ["node", metadataCli],
+      steps: [
+        {
+          wait_for: "P1: ",
+          send: "HELLO",
+          submit: true,
+          timeout_ms: 3000
+        },
+        {
+          wait_for: "P2: ",
+          send: "WORLD",
+          submit: false,
+          timeout_ms: 3000
+        },
+        {
+          wait_for: "P3: ",
+          send: "",
+          submit: true,
+          timeout_ms: 3000
+        },
+        {
+          wait_for: "P4: ",
+          submit: false,
+          timeout_ms: 3000
+        }
+      ],
+      timeout_ms: 10000
+    },
+    context
+  );
+
+  assert.equal(result.state, "succeeded");
+  assert.equal(result.steps.length, 4);
+
+  // Step 0: "HELLO", submit: true -> input_bytes_sent: 5, submit: true
+  assert.equal(result.steps[0].matched, true);
+  assert.equal(result.steps[0].input_bytes_sent, 5, "Must count exactly 5 bytes from 'HELLO' without Enter byte");
+  assert.equal(result.steps[0].submit, true);
+
+  // Step 1: "WORLD", submit: false -> input_bytes_sent: 5, submit: false
+  assert.equal(result.steps[1].matched, true);
+  assert.equal(result.steps[1].input_bytes_sent, 5, "Must count exactly 5 bytes from 'WORLD'");
+  assert.equal(result.steps[1].submit, false);
+
+  // Step 2: "", submit: true -> input_bytes_sent: 0, submit: true
+  assert.equal(result.steps[2].matched, true);
+  assert.equal(result.steps[2].input_bytes_sent, 0, "Empty send must count 0 bytes even when submit is true");
+  assert.equal(result.steps[2].submit, true);
+
+  // Step 3: undefined send, submit: false -> input_bytes_sent: 0, submit: false
+  assert.equal(result.steps[3].matched, true);
+  assert.equal(result.steps[3].input_bytes_sent, 0, "Omitted send must count 0 bytes");
+  assert.equal(result.steps[3].submit, false);
 });
 
 // Cleanup fixture
