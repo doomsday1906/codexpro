@@ -564,7 +564,7 @@ export class PtyTranscriptPipeline {
       this.collector.append(rChunk);
     }
 
-    return Buffer.concat(redactedChunks).toString("utf8");
+    return sanitizedText;
   }
 
   public peekPendingText(): string {
