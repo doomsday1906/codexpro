@@ -221,6 +221,99 @@ await test("initial ESC disturbance (NUL/BEL/BS/CR/LF/DEL/C1) stripped without l
 });
 
 // --------------------------------------------------------------------------
+// Test 05b: ESC_INTERMEDIATE disturbance (decoded C1, non-C1 Unicode, C0/DEL) stripped without leaking following escape final
+// --------------------------------------------------------------------------
+await test("ESC_INTERMEDIATE disturbance (decoded C1, non-C1 Unicode, C0/DEL) stripped without leaking following escape final", () => {
+  // Required direct falsifiers:
+  // For A + ESC + ( + disturbance + B + B -> expected safe result: AB
+  // The first B must be consumed as escape final; second B remains visible text.
+  const c1Disturbances = [
+    { name: "C1_PAD (U+0080)", raw: "\u0080" },
+    { name: "C1_NEL (U+0085)", raw: "\u0085" },
+    { name: "C1_CSI (U+009B)", raw: "\u009b" },
+    { name: "C1_OSC (U+009D)", raw: "\u009d" },
+  ];
+
+  const otherDisturbances = [
+    { name: "C0_NUL", raw: "\x00" },
+    { name: "C0_BEL", raw: "\x07" },
+    { name: "C0_BS", raw: "\x08" },
+    { name: "C0_CR", raw: "\r" },
+    { name: "C0_LF", raw: "\n" },
+    { name: "DEL", raw: "\x7f" },
+    { name: "Unicode_Cyrillic (U+0410)", raw: "\u0410" },
+    { name: "Unicode_Astral_Emoji (U+1F600)", raw: "\uD83D\uDE00" },
+    { name: "Multi_Disturbance", raw: "\x00\x07\u0085\u009b\u0410" },
+  ];
+
+  const allDisturbances = [...c1Disturbances, ...otherDisturbances];
+
+  for (const { name, raw } of allDisturbances) {
+    const input = `A\x1b(${raw}BB`;
+    const single = runSanitizer(input, false);
+    const byteByByte = runSanitizer(input, true);
+
+    assert.equal(single, "AB", `Single-chunk failure for ${name}: expected 'AB', got ${JSON.stringify(single)}`);
+    assert.equal(byteByByte, "AB", `Byte-by-byte failure for ${name}: expected 'AB', got ${JSON.stringify(byteByByte)}`);
+  }
+
+  // Punctuation-final falsifiers:
+  // Escape finals containing punctuation: ':', ';', '=', '?'
+  // e.g. token-head + ESC + ( + decoded-C1 + punctuation-final + token-tail
+  const punctuationFinals = [":", ";", "=", "?"];
+  for (const punc of punctuationFinals) {
+    for (const { name, raw } of c1Disturbances) {
+      const input = `Pre\x1b(${raw}${punc}Post`;
+      const single = runSanitizer(input, false);
+      const byteByByte = runSanitizer(input, true);
+
+      assert.equal(single, "PrePost", `Punctuation final '${punc}' leaked with disturbance ${name} in single-chunk: got ${JSON.stringify(single)}`);
+      assert.equal(byteByByte, "PrePost", `Punctuation final '${punc}' leaked with disturbance ${name} in byte-by-byte: got ${JSON.stringify(byteByByte)}`);
+      assert.doesNotMatch(single, new RegExp(`\\${punc}`), `Punctuation '${punc}' must not appear in output`);
+      assert.doesNotMatch(byteByByte, new RegExp(`\\${punc}`), `Punctuation '${punc}' must not appear in output`);
+    }
+  }
+
+  // State transitions: verify parser remains in ESC_INTERMEDIATE during disturbance
+  const s = new TerminalSanitizer();
+  s.push(Buffer.from("Prefix\x1b(")); // ESC ( -> intermediate
+  assert.equal(s.getState(), SanitizerState.ESC_INTERMEDIATE);
+  s.push(Buffer.from("\u0085")); // C1 NEL disturbance
+  assert.equal(s.getState(), SanitizerState.ESC_INTERMEDIATE, "C1 NEL must not drop parser to GROUND");
+  s.push(Buffer.from("\u0080")); // C1 PAD disturbance
+  assert.equal(s.getState(), SanitizerState.ESC_INTERMEDIATE, "C1 PAD must not drop parser to GROUND");
+  s.push(Buffer.from("\u009b")); // C1 CSI disturbance
+  assert.equal(s.getState(), SanitizerState.ESC_INTERMEDIATE, "C1 CSI must not drop parser to GROUND");
+  s.push(Buffer.from("\u009d")); // C1 OSC disturbance
+  assert.equal(s.getState(), SanitizerState.ESC_INTERMEDIATE, "C1 OSC must not drop parser to GROUND");
+  s.push(Buffer.from("\u0410")); // Cyrillic disturbance
+  assert.equal(s.getState(), SanitizerState.ESC_INTERMEDIATE, "Out-of-range Unicode must not drop parser to GROUND");
+  s.push(Buffer.from("\x00")); // NUL disturbance
+  assert.equal(s.getState(), SanitizerState.ESC_INTERMEDIATE, "NUL must not drop parser to GROUND");
+  s.push(Buffer.from("\x7f")); // DEL disturbance
+  assert.equal(s.getState(), SanitizerState.ESC_INTERMEDIATE, "DEL must not drop parser to GROUND");
+  s.push(Buffer.from(":")); // Punctuation final
+  assert.equal(s.getState(), SanitizerState.GROUND, "Valid escape final must return parser to GROUND");
+  s.push(Buffer.from("Postfix"));
+  assert.equal(s.getState(), SanitizerState.GROUND);
+  const fin = s.finish();
+  assert.equal(fin, "");
+
+  // Consecutive ESC with disturbance inside ESC_INTERMEDIATE restarts ESCAPE:
+  const consecutiveEscDisturbed = "A\x1b(\u0085\x1b[31mB";
+  assert.equal(runSanitizer(consecutiveEscDisturbed, false), "AB");
+  assert.equal(runSanitizer(consecutiveEscDisturbed, true), "AB");
+
+  // Incomplete sequence with disturbance in ESC_INTERMEDIATE dropped at finish():
+  const sIncomplete = new TerminalSanitizer();
+  const chunkIncomplete = sIncomplete.push(Buffer.from("Visible\x1b(\u0085\u0080"));
+  assert.equal(chunkIncomplete, "Visible");
+  assert.equal(sIncomplete.getState(), SanitizerState.ESC_INTERMEDIATE);
+  assert.equal(sIncomplete.finish(), "");
+  assert.equal(sIncomplete.getState(), SanitizerState.GROUND);
+});
+
+// --------------------------------------------------------------------------
 // Test 05: OSC / BEL removed across chunk splits
 // --------------------------------------------------------------------------
 await test("OSC terminated by BEL removed across chunk splits", () => {
@@ -574,6 +667,75 @@ await test("credential with initial ESC disturbance (NUL/BEL/BS/CR/LF/DEL/C1) be
 });
 
 // --------------------------------------------------------------------------
+// Test 17d: GitHub-token attack with ESC_INTERMEDIATE decoded-C1 and punctuation finals remains redacted
+// --------------------------------------------------------------------------
+await test("credential with ESC_INTERMEDIATE decoded-C1 and punctuation-final attack remains redacted", () => {
+  // Reproduce the exact previously failing attack:
+  // echo ghp_1234567890 + ESC + ( + U+0085 + : + 12345678901234567890 + " is active\n"
+  // Required final truth:
+  //   redacted = true
+  //   leakedColon = false
+  //   plaintext token head absent
+  //   plaintext token tail absent
+  // Expected transcript shape:
+  //   echo [REDACTED_SECRET] is active\n
+  const c1List = [
+    { name: "C1_NEL (U+0085)", raw: "\u0085" },
+    { name: "C1_PAD (U+0080)", raw: "\u0080" },
+    { name: "C1_CSI (U+009B)", raw: "\u009b" },
+    { name: "C1_OSC (U+009D)", raw: "\u009d" },
+    { name: "Unicode_Out_Of_Range", raw: "\u0410" },
+    { name: "Multi_Disturbance", raw: "\u0085\x00\u009b" },
+  ];
+
+  const punctuationFinals = [
+    { punc: ":", name: "colon" },
+    { punc: ";", name: "semicolon" },
+    { punc: "=", name: "equals" },
+    { punc: "?", name: "question" },
+  ];
+
+  for (const { name: distName, raw: distRaw } of c1List) {
+    for (const { punc, name: puncName } of punctuationFinals) {
+      const attack = `echo ghp_1234567890\x1b(${distRaw}${punc}12345678901234567890 is active\n`;
+
+      // 1. Single chunk verification
+      const resSingle = sanitizeAndRedactTerminalOutput(attack, { maxOutputBytes: 120_000 });
+      const transcript = resSingle.transcript;
+
+      const redacted = /\[REDACTED_SECRET\]/.test(transcript);
+      const leakedPunc = transcript.includes(punc);
+      const hasHead = transcript.includes("ghp_1234567890");
+      const hasTail = transcript.includes("12345678901234567890");
+
+      assert.equal(redacted, true, `Expected redacted=true for ${distName} with '${puncName}'`);
+      assert.equal(leakedPunc, false, `Expected leakedPunc=false for ${distName} with '${puncName}'`);
+      assert.equal(hasHead, false, `Expected hasHead=false (token head absent) for ${distName} with '${puncName}'`);
+      assert.equal(hasTail, false, `Expected hasTail=false (token tail absent) for ${distName} with '${puncName}'`);
+      assert.equal(transcript, "echo [REDACTED_SECRET] is active\n", `Expected exact transcript for ${distName} with '${puncName}'`);
+
+      // 2. Byte-by-byte verification
+      const p = new PtyTranscriptPipeline({ maxOutputBytes: 120_000 });
+      const b = Buffer.from(attack, "utf8");
+      for (let i = 0; i < b.length; i++) p.push(b.subarray(i, i + 1));
+      const byteRes = p.finish().transcript;
+      assert.equal(byteRes, transcript, `Byte-by-byte must match single-chunk for ${distName} with '${puncName}'`);
+    }
+  }
+
+  // Also verify different intermediate characters: e.g. ')', '*', '+', '$', '/', ' '
+  const intermediateChars = [")", "*", "+", "$", "/", " "];
+  for (const inter of intermediateChars) {
+    const attack = `echo ghp_1234567890\x1b${inter}\u0085:12345678901234567890 is active\n`;
+    const res = sanitizeAndRedactTerminalOutput(attack, { maxOutputBytes: 120_000 });
+    assert.equal(res.transcript, "echo [REDACTED_SECRET] is active\n");
+    assert.doesNotMatch(res.transcript, /ghp_1234567890/);
+    assert.doesNotMatch(res.transcript, /12345678901234567890/);
+    assert.doesNotMatch(res.transcript, /:/);
+  }
+});
+
+// --------------------------------------------------------------------------
 // Test 18: Credential with inserted OSC remains redacted
 // --------------------------------------------------------------------------
 await test("credential with inserted OSC sequence remains redacted", () => {
@@ -659,6 +821,65 @@ await test("private-key marker with initial ESC C0/DEL/C1 disturbance remains re
     assert.match(single.transcript, /\[REDACTED_PRIVATE_KEY\]/, `Private key not redacted for ${name}`);
     assert.doesNotMatch(single.transcript, /\[1;32m/, `BEGIN CSI leaked for ${name}`);
     assert.doesNotMatch(single.transcript, /\[31m/, `END CSI leaked for ${name}`);
+
+    // Byte by byte
+    const p = new PtyTranscriptPipeline({ maxOutputBytes: 120_000 });
+    const b = Buffer.from(evasionKey, "utf8");
+    for (let i = 0; i < b.length; i++) p.push(b.subarray(i, i + 1));
+    const byteRes = p.finish().transcript;
+    assert.equal(single.transcript, byteRes, `Single-chunk and byte-by-byte must match for ${name}`);
+  }
+});
+
+// --------------------------------------------------------------------------
+// Test 19d: Private-key marker attack with ESC_INTERMEDIATE decoded-C1 and punctuation final
+// --------------------------------------------------------------------------
+await test("private-key marker with ESC_INTERMEDIATE decoded-C1 and punctuation-final attack remains redacted", () => {
+  // Insert ESC + intermediate + decoded-C1 + punctuation-final inside BEGIN and END private-key markers
+  // Example: -----BEGIN + ESC ( U+0085 : + PRIVATE KEY-----
+  const markerAttacks = [
+    {
+      name: "C1_NEL_colon",
+      beginDisturbance: "\x1b(\u0085:",
+      endDisturbance: "\x1b)\u0085;",
+    },
+    {
+      name: "C1_PAD_equals",
+      beginDisturbance: "\x1b*\u0080=",
+      endDisturbance: "\x1b+\u0080?",
+    },
+    {
+      name: "C1_CSI_question",
+      beginDisturbance: "\x1b(\u009b?",
+      endDisturbance: "\x1b(\u009b:",
+    },
+    {
+      name: "C1_OSC_semicolon",
+      beginDisturbance: "\x1b(\u009d;",
+      endDisturbance: "\x1b(\u009d=",
+    },
+    {
+      name: "Unicode_Out_Of_Range",
+      beginDisturbance: "\x1b(\u0410:",
+      endDisturbance: "\x1b(\uD83D\uDE00;",
+    },
+  ];
+
+  for (const { name, beginDisturbance, endDisturbance } of markerAttacks) {
+    const evasionKey = [
+      `-----BEGIN${beginDisturbance} PRIVATE KEY-----\x1b[0m`,
+      "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQD",
+      `-----END${endDisturbance} PRIVATE KEY-----\x1b[0m`,
+      ""
+    ].join("\r\n");
+
+    // Single chunk
+    const single = sanitizeAndRedactTerminalOutput(evasionKey, { maxOutputBytes: 120_000 });
+    assert.doesNotMatch(single.transcript, /MIIEvQIBADANBgkqhki/, `Private key body leaked for ${name}`);
+    assert.match(single.transcript, /\[REDACTED_PRIVATE_KEY\]/, `[REDACTED_PRIVATE_KEY] absent for ${name}`);
+    assert.doesNotMatch(single.transcript, /[:;=?]/, `Punctuation final leaked for ${name}`);
+    assert.doesNotMatch(single.transcript, /\x1b/, `ESC byte leaked for ${name}`);
+    assert.doesNotMatch(single.transcript, /[\u0080\u0085\u009b\u009d]/, `C1 control byte leaked for ${name}`);
 
     // Byte by byte
     const p = new PtyTranscriptPipeline({ maxOutputBytes: 120_000 });
@@ -893,6 +1114,84 @@ await test("chunking invariance for initial-ESC disturbance attacks across key s
     pipeSplit.push(rawBytes.subarray(split));
     const resSplit = pipeSplit.finish().transcript;
     assert.equal(resSplit, resSingle, `Split at offset ${split} must match single chunk output`);
+  }
+});
+
+// --------------------------------------------------------------------------
+// Test 34b: Chunking invariance for ESC_INTERMEDIATE decoded-C1 and punctuation-final attacks
+// --------------------------------------------------------------------------
+await test("chunking invariance for ESC_INTERMEDIATE decoded-C1 and punctuation-final attacks across key split points, random chunking, and exhaustive 2-chunk splits", () => {
+  // Canonical punctuation-token attack string:
+  const attackText = "echo ghp_1234567890\x1b(\u0085:12345678901234567890 is active\n";
+  const rawBytes = Buffer.from(attackText, "utf8");
+
+  // 1. Expected baseline: 1 complete chunk
+  const resSingle = sanitizeAndRedactTerminalOutput(rawBytes, { maxOutputBytes: 120_000 }).transcript;
+  assert.equal(resSingle, "echo [REDACTED_SECRET] is active\n");
+  assert.doesNotMatch(resSingle, /ghp_1234567890/);
+  assert.doesNotMatch(resSingle, /12345678901234567890/);
+  assert.doesNotMatch(resSingle, /:/);
+
+  // 2. One byte per chunk
+  const pipeByte = new PtyTranscriptPipeline({ maxOutputBytes: 120_000 });
+  for (let i = 0; i < rawBytes.length; i++) {
+    pipeByte.push(rawBytes.subarray(i, i + 1));
+  }
+  const resByte = pipeByte.finish().transcript;
+  assert.equal(resByte, resSingle, "1 byte/chunk must match single-chunk output");
+
+  // 3. Deterministic pseudo-random chunk sizes
+  const pipeRand = new PtyTranscriptPipeline({ maxOutputBytes: 120_000 });
+  let offset = 0;
+  let step = 1;
+  while (offset < rawBytes.length) {
+    const nextChunk = rawBytes.subarray(offset, offset + step);
+    pipeRand.push(nextChunk);
+    offset += step;
+    step = ((step * 5 + 3) % 7) + 1; // cycles through 1..7
+  }
+  const resRand = pipeRand.finish().transcript;
+  assert.equal(resRand, resSingle, "Random-chunked output must match single-chunk output");
+
+  // 4. Explicit splits:
+  // - after ESC
+  // - after intermediate byte '('
+  // - before decoded-C1 (note: U+0085 in UTF-8 is 2 bytes: 0xC2 0x85)
+  // - inside decoded-C1 (between 0xC2 and 0x85)
+  // - after decoded-C1
+  // - before punctuation final ':'
+  // - after punctuation final ':'
+  const escIdx = rawBytes.indexOf(0x1b);
+  const interIdx = rawBytes.indexOf(0x28, escIdx); // '(' is 0x28
+  const c1FirstByteIdx = rawBytes.indexOf(0xc2, interIdx); // 0xC2
+  const c1SecondByteIdx = c1FirstByteIdx + 1; // 0x85
+  const colonIdx = rawBytes.indexOf(0x3a, c1FirstByteIdx); // ':' is 0x3A
+
+  const explicitSplits = [
+    escIdx + 1,           // after ESC
+    interIdx + 1,         // after intermediate byte '('
+    c1FirstByteIdx,       // before decoded-C1 (before 0xC2)
+    c1SecondByteIdx,      // inside decoded-C1 (between 0xC2 and 0x85)
+    c1SecondByteIdx + 1,  // after decoded-C1
+    colonIdx,             // before punctuation final ':'
+    colonIdx + 1,         // after punctuation final ':'
+  ];
+
+  for (const split of explicitSplits) {
+    const pipeSplit = new PtyTranscriptPipeline({ maxOutputBytes: 120_000 });
+    pipeSplit.push(rawBytes.subarray(0, split));
+    pipeSplit.push(rawBytes.subarray(split));
+    const resSplit = pipeSplit.finish().transcript;
+    assert.equal(resSplit, resSingle, `Explicit split at offset ${split} must match single-chunk output`);
+  }
+
+  // 5. Exhaustive two-chunk splits across every single byte boundary
+  for (let split = 1; split < rawBytes.length; split++) {
+    const pipeSplit = new PtyTranscriptPipeline({ maxOutputBytes: 120_000 });
+    pipeSplit.push(rawBytes.subarray(0, split));
+    pipeSplit.push(rawBytes.subarray(split));
+    const resSplit = pipeSplit.finish().transcript;
+    assert.equal(resSplit, resSingle, `Exhaustive 2-chunk split at offset ${split} must match single-chunk output`);
   }
 });
 

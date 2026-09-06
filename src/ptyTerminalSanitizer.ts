@@ -196,16 +196,22 @@ export class TerminalSanitizer {
 
         case SanitizerState.ESC_INTERMEDIATE: {
           if (ch >= " " && ch <= "/") {
+            // 0x20..0x2F: Intermediate byte(s) of escape sequence (e.g. ESC ( B)
             this.state = SanitizerState.ESC_INTERMEDIATE;
           } else if (ch >= "0" && ch <= "~") {
-            // Final byte terminates escape sequence; discarded
+            // 0x30..0x7E: Final byte terminates escape sequence; consumed and return to GROUND
             this.state = SanitizerState.GROUND;
           } else if (ch === "\x1b") {
+            // Consecutive ESC; abort prior escape sequence and restart ESCAPE
             this.state = SanitizerState.ESCAPE;
-          } else if (ch.charCodeAt(0) < 0x20 || ch === "\x7f") {
-            // C0/DEL disturbance inside intermediate bytes: strip and stay in ESC_INTERMEDIATE
           } else {
-            this.state = SanitizerState.GROUND;
+            // C0 controls (0x00..0x1F including NUL, BEL, BS, CR, LF), DEL (0x7F),
+            // decoded C1 controls (0x80..0x9F), and any other out-of-range disturbance:
+            // Conservatively strip the disturbance in-place and remain in ESC_INTERMEDIATE
+            // until a valid escape final (0x30..0x7E) is consumed, another ESC restarts parsing,
+            // or stream finalization drops the incomplete sequence.
+            // Do NOT return to GROUND, do NOT emit disturbance text, and do NOT leak following finals.
+            this.state = SanitizerState.ESC_INTERMEDIATE;
           }
           break;
         }
