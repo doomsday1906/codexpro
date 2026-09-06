@@ -1,9 +1,28 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+function findHostProcessesWithToken(token) {
+  const survivors = [];
+  try {
+    const entries = fsSync.readdirSync("/proc");
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = parseInt(entry, 10);
+      try {
+        const cmdline = fsSync.readFileSync(`/proc/${entry}/cmdline`, "utf8");
+        if (cmdline.includes(token)) {
+          survivors.push({ pid, cmdline: cmdline.replace(/\0/g, " ").trim() });
+        }
+      } catch {}
+    }
+  } catch {}
+  return survivors;
+}
 
 import { execSync } from "node:child_process";
 import { loadConfig } from "../dist/config.js";
@@ -782,24 +801,41 @@ await test("release model staging with npm ci --omit=dev --ignore-scripts loads 
 // Test 18: Physical proof of cleanup on shutdown with TERM/SIGHUP-resistant leader and descendant
 // --------------------------------------------------------------------------
 await test("shutdown cleanly awaits termination of TERM/SIGHUP-resistant leader and descendant", async () => {
-  const leaderPidFile = path.join(realFixtureRoot, "shutdown_leader.pid");
-  const descPidFile = path.join(realFixtureRoot, "shutdown_desc.pid");
-  const testScript = path.join(realFixtureRoot, "term_hup_resistant_shutdown.sh");
+  const readyFile = path.join(realFixtureRoot, "shutdown_ready.txt");
+  const testScript = path.join(realFixtureRoot, "term_hup_resistant_shutdown.mjs");
+  const token = `RESIST_SHUTDOWN_${Date.now()}`;
+  const leaderToken = token + "_LEADER";
+  const descToken = token + "_DESC";
 
   await fs.writeFile(
     testScript,
-    `#!/bin/bash
-trap '' TERM HUP
-(
-  trap '' TERM HUP
-  echo "$BASHPID" > "${descPidFile}"
-  while true; do sleep 0.05; done
-) &
-echo "$$" > "${leaderPidFile}"
-while true; do sleep 0.05; done
+    `import cp from "node:child_process";
+import fs from "node:fs";
+
+const leaderToken = process.argv[2];
+const descToken = process.argv[3];
+const readyFile = process.argv[4];
+
+process.on("SIGTERM", () => {});
+process.on("SIGHUP", () => {});
+
+const desc = cp.spawn(
+  process.execPath,
+  [
+    "-e",
+    'process.on("SIGTERM", () => {}); process.on("SIGHUP", () => {}); console.log("DESC_READY"); setInterval(() => {}, 1000);',
+    descToken
+  ],
+  { stdio: ["ignore", "pipe", "inherit"] }
+);
+
+desc.stdout.on("data", () => {
+  fs.writeFileSync(readyFile, "READY\\n");
+});
+
+setInterval(() => {}, 1000);
 `
   );
-  await fs.chmod(testScript, 0o755);
 
   const manager = new PtyRunManager(baseConfig, {
     processGraceTimeoutMs: 300,
@@ -809,7 +845,7 @@ while true; do sleep 0.05; done
   const runPromise = manager.run(
     {
       workspace_id: validWorkspaceId,
-      argv: [testScript],
+      argv: ["node", testScript, leaderToken, descToken, readyFile],
       steps: [
         {
           wait_for: "NEVER_HAPPENING_PROMPT",
@@ -821,25 +857,18 @@ while true; do sleep 0.05; done
     context
   );
 
-  let leaderPid = 0;
-  let descPid = 0;
+  // Wait for readyFile to be written
   for (let i = 0; i < 100; i++) {
     try {
-      const lText = (await fs.readFile(leaderPidFile, "utf8")).trim();
-      const dText = (await fs.readFile(descPidFile, "utf8")).trim();
-      if (lText && dText) {
-        leaderPid = parseInt(lText, 10);
-        descPid = parseInt(dText, 10);
-        break;
-      }
+      const text = (await fs.readFile(readyFile, "utf8")).trim();
+      if (text === "READY") break;
     } catch {}
     await new Promise((r) => setTimeout(r, 20));
   }
 
-  assert.ok(leaderPid > 0, "Leader PID must be established");
-  assert.ok(descPid > 0, "Descendant PID must be established");
-  assert.equal(isPidAlive(leaderPid), true, "Leader must be initially alive");
-  assert.equal(isPidAlive(descPid), true, "Descendant must be initially alive");
+  // Verify leader and descendant are running on host
+  assert.ok(findHostProcessesWithToken(token + "_LEADER").length > 0, "Leader must be initially alive");
+  assert.ok(findHostProcessesWithToken(token + "_DESC").length > 0, "Descendant must be initially alive");
 
   // Call close() on manager
   const closePromise = manager.close();
@@ -850,9 +879,9 @@ while true; do sleep 0.05; done
   const result = await runPromise;
 
   // Assert IMMEDIATELY that both leader and descendant are physically dead
-  assert.equal(isPidAlive(leaderPid), false, "Leader must be dead immediately after close completes");
-  assert.equal(isPidAlive(descPid), false, "Descendant must be dead immediately after close completes");
-  assert.equal(isProcessTreeAlive(leaderPid), false, "Process tree must be dead immediately after close completes");
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(findHostProcessesWithToken(token + "_LEADER"), [], "Leader must be dead immediately after close completes");
+  assert.deepEqual(findHostProcessesWithToken(token + "_DESC"), [], "Descendant must be dead immediately after close completes");
   assert.equal(manager.state, "closed", "Manager state must be closed");
   assert.equal(manager.getActiveCount(), 0, "Active count must be 0");
   assert.equal(result.state, "terminated_on_shutdown", "Result state must be terminated_on_shutdown");
@@ -866,24 +895,41 @@ while true; do sleep 0.05; done
 // Test 19: Physical proof of cleanup on timeout with TERM/SIGHUP-resistant leader and descendant
 // --------------------------------------------------------------------------
 await test("step timeout cleanly awaits termination of TERM/SIGHUP-resistant leader and descendant", async () => {
-  const leaderPidFile = path.join(realFixtureRoot, "timeout_leader.pid");
-  const descPidFile = path.join(realFixtureRoot, "timeout_desc.pid");
-  const testScript = path.join(realFixtureRoot, "term_hup_resistant_timeout.sh");
+  const readyFile = path.join(realFixtureRoot, "timeout_ready.txt");
+  const testScript = path.join(realFixtureRoot, "term_hup_resistant_timeout.mjs");
+  const token = `RESIST_TIMEOUT_${Date.now()}`;
+  const leaderToken = token + "_LEADER";
+  const descToken = token + "_DESC";
 
   await fs.writeFile(
     testScript,
-    `#!/bin/bash
-trap '' TERM HUP
-(
-  trap '' TERM HUP
-  echo "$BASHPID" > "${descPidFile}"
-  while true; do sleep 0.05; done
-) &
-echo "$$" > "${leaderPidFile}"
-while true; do sleep 0.05; done
+    `import cp from "node:child_process";
+import fs from "node:fs";
+
+const leaderToken = process.argv[2];
+const descToken = process.argv[3];
+const readyFile = process.argv[4];
+
+process.on("SIGTERM", () => {});
+process.on("SIGHUP", () => {});
+
+const desc = cp.spawn(
+  process.execPath,
+  [
+    "-e",
+    'process.on("SIGTERM", () => {}); process.on("SIGHUP", () => {}); console.log("DESC_READY"); setInterval(() => {}, 1000);',
+    descToken
+  ],
+  { stdio: ["ignore", "pipe", "inherit"] }
+);
+
+desc.stdout.on("data", () => {
+  fs.writeFileSync(readyFile, "READY\\n");
+});
+
+setInterval(() => {}, 1000);
 `
   );
-  await fs.chmod(testScript, 0o755);
 
   const manager = new PtyRunManager(baseConfig, {
     processGraceTimeoutMs: 300,
@@ -893,7 +939,7 @@ while true; do sleep 0.05; done
   const runPromise = manager.run(
     {
       workspace_id: validWorkspaceId,
-      argv: [testScript],
+      argv: ["node", testScript, leaderToken, descToken, readyFile],
       steps: [
         {
           wait_for: "NEVER_HAPPENING_PROMPT",
@@ -905,32 +951,23 @@ while true; do sleep 0.05; done
     context
   );
 
-  let leaderPid = 0;
-  let descPid = 0;
   for (let i = 0; i < 100; i++) {
     try {
-      const lText = (await fs.readFile(leaderPidFile, "utf8")).trim();
-      const dText = (await fs.readFile(descPidFile, "utf8")).trim();
-      if (lText && dText) {
-        leaderPid = parseInt(lText, 10);
-        descPid = parseInt(dText, 10);
-        break;
-      }
+      const text = (await fs.readFile(readyFile, "utf8")).trim();
+      if (text === "READY") break;
     } catch {}
     await new Promise((r) => setTimeout(r, 20));
   }
 
-  assert.ok(leaderPid > 0, "Leader PID must be established");
-  assert.ok(descPid > 0, "Descendant PID must be established");
-  assert.equal(isPidAlive(leaderPid), true, "Leader must be initially alive");
-  assert.equal(isPidAlive(descPid), true, "Descendant must be initially alive");
+  assert.ok(findHostProcessesWithToken(token + "_LEADER").length > 0, "Leader must be initially alive");
+  assert.ok(findHostProcessesWithToken(token + "_DESC").length > 0, "Descendant must be initially alive");
 
   const result = await runPromise;
 
   // Assert IMMEDIATELY that both leader and descendant are physically dead
-  assert.equal(isPidAlive(leaderPid), false, "Leader must be dead immediately after timeout resolves");
-  assert.equal(isPidAlive(descPid), false, "Descendant must be dead immediately after timeout resolves");
-  assert.equal(isProcessTreeAlive(leaderPid), false, "Process tree must be dead immediately after timeout resolves");
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(findHostProcessesWithToken(token + "_LEADER"), [], "Leader must be dead immediately after timeout resolves");
+  assert.deepEqual(findHostProcessesWithToken(token + "_DESC"), [], "Descendant must be dead immediately after timeout resolves");
   assert.equal(manager.getActiveCount(), 0, "Active count must be 0");
   assert.equal(result.state, "step_timeout", "Result state must be step_timeout");
 });

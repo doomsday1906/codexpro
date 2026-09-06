@@ -63,6 +63,76 @@ export interface PtyBackend {
   spawn: (file: string, args: string[], options: any) => zigpty.IPty;
 }
 
+export interface PtyOwnershipCapability {
+  supported: boolean;
+  executablePath: string;
+  reason?: string;
+}
+
+export const DEFAULT_UNSHARE_PATH = "/usr/bin/unshare";
+
+/**
+ * Validate that kernel-backed descendant ownership is available via unshare (user/PID namespace).
+ * Preferred proven command: unshare --user --map-current-user --pid --fork --kill-child --mount-proc /usr/bin/true
+ */
+export function probePtyOwnershipCapability(options?: {
+  unsharePath?: string;
+  runner?: (file: string, args: string[], opts?: any) => { status: number | null; error?: Error };
+}): PtyOwnershipCapability {
+  const unsharePath = options?.unsharePath ?? DEFAULT_UNSHARE_PATH;
+  try {
+    fs.accessSync(unsharePath, fs.constants.X_OK);
+  } catch (err: any) {
+    return {
+      supported: false,
+      executablePath: unsharePath,
+      reason: `Ownership executable '${unsharePath}' is not accessible or executable: ${err?.message || String(err)}`
+    };
+  }
+
+  const runner = options?.runner ?? ((file: string, args: string[], opts: any) => spawnSync(file, args, opts));
+  try {
+    const res = runner(
+      unsharePath,
+      ["--user", "--map-current-user", "--pid", "--fork", "--kill-child", "--mount-proc", "/usr/bin/true"],
+      { stdio: "ignore", timeout: 3000 }
+    );
+    if (res.error) {
+      return {
+        supported: false,
+        executablePath: unsharePath,
+        reason: `Ownership capability canary failed: ${res.error.message}`
+      };
+    }
+    if (res.status !== 0) {
+      return {
+        supported: false,
+        executablePath: unsharePath,
+        reason: `Ownership capability canary exited with code ${res.status}`
+      };
+    }
+    return {
+      supported: true,
+      executablePath: unsharePath
+    };
+  } catch (err: any) {
+    return {
+      supported: false,
+      executablePath: unsharePath,
+      reason: `Ownership capability canary execution threw: ${err?.message || String(err)}`
+    };
+  }
+}
+
+export interface PtyFaultInjectionHooks {
+  onSpawn?: (context: {
+    pty: zigpty.IPty;
+    pid: number;
+    injectBackendError: (err: Error) => void;
+    triggerTimeout: () => void;
+  }) => void;
+}
+
 export interface PtyRunManagerOptions {
   maxActive?: number;
   containmentWrapper?: string[];
@@ -75,6 +145,10 @@ export interface PtyRunManagerOptions {
   arch?: string;
   onMatcherBufferUpdate?: (bufferLength: number, bufferContent: string) => void;
   isAliveChecker?: (pid: number, knownPids?: Iterable<number>) => boolean;
+  ownershipExecutable?: string;
+  ownershipCapabilityProbe?: () => PtyOwnershipCapability;
+  ownershipCapabilityOverride?: boolean | { supported: boolean; reason?: string };
+  faultInjection?: PtyFaultInjectionHooks;
 }
 
 interface ActiveRunHandle {
@@ -377,6 +451,10 @@ export class PtyRunManager {
   private readonly arch: string;
   private readonly onMatcherBufferUpdate?: (bufferLength: number, bufferContent: string) => void;
   private readonly isAliveChecker?: (pid: number, knownPids?: Iterable<number>) => boolean;
+  private readonly ownershipExecutable: string;
+  private readonly ownershipCapabilityProbe?: () => PtyOwnershipCapability;
+  private readonly ownershipCapabilityOverride?: boolean | { supported: boolean; reason?: string };
+  private readonly faultInjection?: PtyFaultInjectionHooks;
 
   private lifecycleState: "open" | "closing" | "closed" = "open";
   private activeCount = 0;
@@ -395,6 +473,10 @@ export class PtyRunManager {
     this.arch = options.arch ?? process.arch;
     this.onMatcherBufferUpdate = options.onMatcherBufferUpdate;
     this.isAliveChecker = options.isAliveChecker;
+    this.ownershipExecutable = options.ownershipExecutable ?? DEFAULT_UNSHARE_PATH;
+    this.ownershipCapabilityProbe = options.ownershipCapabilityProbe;
+    this.ownershipCapabilityOverride = options.ownershipCapabilityOverride;
+    this.faultInjection = options.faultInjection;
 
     const envPath = makeRestrictedBashEnv(config).PATH;
     const rawWrapper = options.containmentWrapper ?? config.containmentWrapper;
@@ -410,6 +492,27 @@ export class PtyRunManager {
         "pty_containment_wrapper_invalid"
       );
     }
+  }
+
+  public checkOwnershipCapability(): PtyOwnershipCapability {
+    if (this.ownershipCapabilityOverride !== undefined) {
+      if (typeof this.ownershipCapabilityOverride === "boolean") {
+        return {
+          supported: this.ownershipCapabilityOverride,
+          executablePath: this.ownershipExecutable,
+          reason: this.ownershipCapabilityOverride ? undefined : "Injected ownership capability failure"
+        };
+      }
+      return {
+        supported: this.ownershipCapabilityOverride.supported,
+        executablePath: this.ownershipExecutable,
+        reason: this.ownershipCapabilityOverride.reason
+      };
+    }
+    if (this.ownershipCapabilityProbe) {
+      return this.ownershipCapabilityProbe();
+    }
+    return probePtyOwnershipCapability({ unsharePath: this.ownershipExecutable });
   }
 
   public isAlive(pid: number, knownPids?: Iterable<number>): boolean {
@@ -457,7 +560,16 @@ export class PtyRunManager {
       );
     }
 
-    // 4. Native backend gate: zigpty.hasNative === true mandatory
+    // 4. Kernel ownership capability gate (fail closed before reservation, spawn, or target execution)
+    const ownershipCap = this.checkOwnershipCapability();
+    if (!ownershipCap.supported) {
+      throw new CodexProError(
+        `PTY ownership boundary is unavailable: ${ownershipCap.reason ?? "kernel ownership capability check failed."}`,
+        "pty_ownership_unavailable"
+      );
+    }
+
+    // 5. Native backend gate: zigpty.hasNative === true mandatory
     if (!this.backend || this.backend.hasNative !== true) {
       throw new CodexProError(
         "PTY backend is unavailable: native PTY bindings are missing or failed to load on this platform.",
@@ -465,13 +577,22 @@ export class PtyRunManager {
       );
     }
 
-    // 5. Synchronously reserve active slot
+    // 6. Synchronously reserve active slot
     this.activeCount += 1;
 
     // Compose server-owned containment wrapper ahead of target argv
-    const composedArgv = composeExecutionArgv(request.argv, this.containmentWrapper);
-    const spawnExecutable = composedArgv[0];
-    const spawnArgs = composedArgv.slice(1);
+    const innerArgv = composeExecutionArgv(request.argv, this.containmentWrapper);
+    const spawnExecutable = this.ownershipExecutable;
+    const spawnArgs = [
+      "--user",
+      "--map-current-user",
+      "--pid",
+      "--fork",
+      "--kill-child",
+      "--mount-proc",
+      "--",
+      ...innerArgv
+    ];
 
     // Prepare restricted PTY environment
     const baseEnv = makeRestrictedBashEnv(this.config);
@@ -675,6 +796,66 @@ export class PtyRunManager {
       let dataSub: zigpty.IDisposable | undefined;
       let exitSub: zigpty.IDisposable | undefined;
 
+      const handleBackendError = async (err: Error): Promise<void> => {
+        if (finalized) {
+          return donePromise;
+        }
+        finalized = true;
+
+        clearInterval(scanTimer);
+        updateKnownDescendants();
+
+        if (overallTimer) {
+          clearTimeout(overallTimer);
+          overallTimer = undefined;
+        }
+        if (stepTimer) {
+          clearTimeout(stepTimer);
+          stepTimer = undefined;
+        }
+
+        try {
+          dataSub?.dispose();
+        } catch {}
+        try {
+          exitSub?.dispose();
+        } catch {}
+
+        let cleanupError: unknown = null;
+        try {
+          await terminateAndAwaitProcessTree(
+            pid,
+            this.processGraceTimeoutMs,
+            this.processKillWaitTimeoutMs,
+            {
+              knownPids: knownDescendants,
+              isAliveChecker: this.isAliveChecker
+            }
+          );
+        } catch (cleanErr) {
+          cleanupError = cleanErr;
+        }
+
+        try {
+          pty.close();
+        } catch {}
+
+        this.activeRuns.delete(activeHandle);
+        this.activeCount = Math.max(0, this.activeCount - 1);
+        resolveDone();
+
+        if (cleanupError instanceof CodexProError && cleanupError.code === "pty_cleanup_incomplete") {
+          reject(cleanupError);
+        } else {
+          reject(
+            new CodexProError(
+              `PTY backend error after process spawn: ${err.message}`,
+              "pty_backend_error"
+            )
+          );
+        }
+      };
+
       try {
         dataSub = pty.onData((chunk) => {
           if (finalized) return;
@@ -702,7 +883,9 @@ export class PtyRunManager {
                   pty.write(currentStep.send);
                   // LAW-011: input_bytes_sent counts UTF-8 bytes from caller send only
                   inputBytesSent = Buffer.byteLength(currentStep.send, "utf8");
-                } catch {}
+                } catch {
+                  inputBytesSent = 0;
+                }
               }
 
               let submitSucceeded = false;
@@ -710,7 +893,9 @@ export class PtyRunManager {
                 try {
                   pty.write("\r");
                   submitSucceeded = true;
-                } catch {}
+                } catch {
+                  submitSucceeded = false;
+                }
               }
 
               stepResults.push({
@@ -751,41 +936,21 @@ export class PtyRunManager {
           }
         });
       } catch (listenerError) {
-        clearInterval(scanTimer);
-        updateKnownDescendants();
-        void (async () => {
-          let cleanupError: unknown = null;
-          try {
-            await terminateAndAwaitProcessTree(
-              pid,
-              this.processGraceTimeoutMs,
-              this.processKillWaitTimeoutMs,
-              {
-                knownPids: knownDescendants,
-                isAliveChecker: this.isAliveChecker
-              }
-            );
-          } catch (cleanErr) {
-            cleanupError = cleanErr;
-          }
-          try {
-            pty.close();
-          } catch {}
-          this.activeRuns.delete(activeHandle);
-          this.activeCount = Math.max(0, this.activeCount - 1);
-          resolveDone();
-          if (cleanupError instanceof CodexProError && cleanupError.code === "pty_cleanup_incomplete") {
-            reject(cleanupError);
-          } else {
-            reject(
-              new CodexProError(
-                `PTY backend error after process spawn: ${(listenerError as Error).message}`,
-                "pty_backend_error"
-              )
-            );
-          }
-        })();
+        void handleBackendError(listenerError as Error);
         return;
+      }
+
+      if (this.faultInjection?.onSpawn) {
+        this.faultInjection.onSpawn({
+          pty,
+          pid,
+          injectBackendError: (err: Error) => {
+            void handleBackendError(err);
+          },
+          triggerTimeout: () => {
+            void finalize("timed_out").catch(() => {});
+          }
+        });
       }
 
       function startStep(idx: number) {

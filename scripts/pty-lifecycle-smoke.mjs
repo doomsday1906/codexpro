@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,8 +21,28 @@ import {
   terminatePtyProcessTree,
   terminateAndAwaitProcessTree
 } from "../dist/ptyRunManager.js";
-import { createCodexProHttpApp } from "../dist/http.js";
+import { createCodexProHttpApp, createHttpShutdownHandler } from "../dist/http.js";
+import { createStdioShutdownHandler } from "../dist/stdio.js";
+import { VerificationManager } from "../dist/verificationOps.js";
 import * as zigpty from "zigpty";
+
+function findHostProcessesWithToken(token) {
+  const survivors = [];
+  try {
+    const entries = fsSync.readdirSync("/proc");
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = parseInt(entry, 10);
+      try {
+        const cmdline = fsSync.readFileSync(`/proc/${entry}/cmdline`, "utf8");
+        if (cmdline.includes(token)) {
+          survivors.push({ pid, cmdline: cmdline.replace(/\0/g, " ").trim() });
+        }
+      } catch {}
+    }
+  } catch {}
+  return survivors;
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
@@ -45,19 +66,20 @@ await fs.writeFile(
   `import cp from "node:child_process";
 import readline from "node:readline";
 
+const token = process.argv[2] || ("TREE_" + Date.now());
+const childToken = token + "_CHILD";
+const grandchildToken = token + "_GRANDCHILD";
+
 const child = cp.spawn("node", ["-e", \`
   import cp from "node:child_process";
-  const grandchild = cp.spawn("sleep", ["300"], { stdio: "ignore" });
-  console.log("GRANDCHILD:" + grandchild.pid);
+  const grandchild = cp.spawn("sleep", ["300", process.argv[1]], { stdio: "ignore" });
+  console.log("GRANDCHILD_READY");
   setInterval(() => {}, 1000);
-\`], { stdio: ["pipe", "pipe", "inherit"] });
+\`, grandchildToken], { stdio: ["pipe", "pipe", "inherit"] });
 
-let grandchildPid = 0;
 child.stdout.on("data", (data) => {
-  const m = data.toString().match(/GRANDCHILD:(\\d+)/);
-  if (m) {
-    grandchildPid = parseInt(m[1], 10);
-    console.log(\`OWNED_TREE_READY: leader=\${process.pid} child=\${child.pid} grandchild=\${grandchildPid}\`);
+  if (data.toString().includes("GRANDCHILD_READY")) {
+    console.log(\`OWNED_TREE_READY: \${token}\`);
   }
 });
 
@@ -75,18 +97,18 @@ await fs.writeFile(
   `import cp from "node:child_process";
 import readline from "node:readline";
 
+const token = process.argv[2] || ("ESCAPED_" + Date.now());
+const grandchildToken = token + "_GRANDCHILD";
+
 const child = cp.spawn("sh", ["-c", \`
-  setsid sleep 300 &
-  grandchild_pid=$!
-  echo "GRANDCHILD:\$grandchild_pid"
+  setsid sleep 300 "\$1" &
+  echo "GRANDCHILD_READY"
   sleep 300
-\`], { stdio: ["pipe", "pipe", "inherit"] });
+\`, "sh", grandchildToken], { stdio: ["pipe", "pipe", "inherit"] });
 
 child.stdout.on("data", (data) => {
-  const m = data.toString().match(/GRANDCHILD:(\\d+)/);
-  if (m) {
-    const grandchildPid = parseInt(m[1], 10);
-    console.log(\`OWNED_ESCAPED_READY: leader=\${process.pid} child=\${child.pid} grandchild=\${grandchildPid}\`);
+  if (data.toString().includes("GRANDCHILD_READY")) {
+    console.log(\`OWNED_ESCAPED_READY: \${token}\`);
   }
 });
 
@@ -103,8 +125,9 @@ await fs.writeFile(
   normalExitLingeringScript,
   `import cp from "node:child_process";
 
-const child = cp.spawn("sleep", ["300"], { stdio: "ignore" });
-console.log(\`LINGERING_CHILD:\${child.pid}\`);
+const token = process.argv[2] || ("LINGERING_" + Date.now());
+const child = cp.spawn("sleep", ["300", token], { stdio: "ignore" });
+console.log(\`LINGERING_CHILD_READY: \${token}\`);
 setTimeout(() => {
   console.log("LEADER_EXITING_ZERO");
   process.exit(0);
@@ -187,11 +210,11 @@ await test("overall timeout kills full owned tree and preserves unrelated decoy"
     processKillWaitTimeoutMs: 150
   });
 
-  let ownedPids = [];
+  const token = `NESTED_TREE_T1_${Date.now()}`;
   const result = await manager.run(
     {
       workspace_id: validWorkspaceId,
-      argv: ["node", nestedTreeScript],
+      argv: ["node", nestedTreeScript, token],
       steps: [
         {
           wait_for: "OWNED_TREE_READY: ",
@@ -205,16 +228,14 @@ await test("overall timeout kills full owned tree and preserves unrelated decoy"
     context
   );
 
-  const m = result.transcript.match(/OWNED_TREE_READY: leader=(\d+) child=(\d+) grandchild=(\d+)/);
-  assert(m, `Output must announce owned tree PIDs; got: ${result.transcript}`);
-  ownedPids = [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
-
+  assert(result.transcript.includes(`OWNED_TREE_READY: ${token}`), `Output must announce owned tree ready; got: ${result.transcript}`);
   assert.equal(result.state, "timed_out");
   assert.equal(manager.getActiveCount(), 0, "Active count must return to 0");
 
-  for (const pid of ownedPids) {
-    assert.equal(isPidAlive(pid), false, `Owned PID ${pid} must be dead after overall timeout`);
-  }
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(findHostProcessesWithToken(token + "_GRANDCHILD"), [], "Grandchild must be dead after overall timeout");
+  assert.deepEqual(findHostProcessesWithToken(token + "_CHILD"), [], "Child must be dead after overall timeout");
+  assert.deepEqual(findHostProcessesWithToken(token), [], "Leader must be dead after overall timeout");
 
   assertDecoyAliveAndClean(decoy);
 });
@@ -229,11 +250,11 @@ await test("step timeout kills full owned tree and preserves unrelated decoy", a
     processKillWaitTimeoutMs: 150
   });
 
-  let ownedPids = [];
+  const token = `NESTED_TREE_T2_${Date.now()}`;
   const result = await manager.run(
     {
       workspace_id: validWorkspaceId,
-      argv: ["node", nestedTreeScript],
+      argv: ["node", nestedTreeScript, token],
       steps: [
         {
           wait_for: "OWNED_TREE_READY: ",
@@ -249,19 +270,17 @@ await test("step timeout kills full owned tree and preserves unrelated decoy", a
     context
   );
 
-  const m = result.transcript.match(/OWNED_TREE_READY: leader=(\d+) child=(\d+) grandchild=(\d+)/);
-  assert(m, `Output must announce owned tree PIDs; got: ${result.transcript}`);
-  ownedPids = [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
-
+  assert(result.transcript.includes(`OWNED_TREE_READY: ${token}`), `Output must announce owned tree ready; got: ${result.transcript}`);
   assert.equal(result.state, "step_timeout");
   assert.equal(result.steps.length, 2);
   assert.equal(result.steps[0].matched, true);
   assert.equal(result.steps[1].matched, false);
   assert.equal(manager.getActiveCount(), 0, "Active count must return to 0");
 
-  for (const pid of ownedPids) {
-    assert.equal(isPidAlive(pid), false, `Owned PID ${pid} must be dead after step timeout`);
-  }
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(findHostProcessesWithToken(token + "_GRANDCHILD"), [], "Grandchild must be dead after step timeout");
+  assert.deepEqual(findHostProcessesWithToken(token + "_CHILD"), [], "Child must be dead after step timeout");
+  assert.deepEqual(findHostProcessesWithToken(token), [], "Leader must be dead after step timeout");
 
   assertDecoyAliveAndClean(decoy);
 });
@@ -272,6 +291,33 @@ await test("step timeout kills full owned tree and preserves unrelated decoy", a
 await test("output ceiling kills full owned tree with exact state and preserves decoy", async () => {
   const decoy = spawnDecoy();
   const testCeiling = 10_000;
+
+  const grandchildToken = `FLOOD_GRANDCHILD_${Date.now()}`;
+  const childToken = `FLOOD_CHILD_${Date.now()}`;
+  const leaderToken = `FLOOD_LEADER_${Date.now()}`;
+
+  const grandchildScript = path.join(realFixtureRoot, "flood_grandchild_nested.mjs");
+  await fs.writeFile(
+    grandchildScript,
+    `while (true) { process.stdout.write("NESTED_FLOOD_DATA_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\\n"); }`
+  );
+
+  const childScript = path.join(realFixtureRoot, "flood_child_nested.mjs");
+  await fs.writeFile(
+    childScript,
+    `import cp from "node:child_process";
+cp.spawn("node", ["${grandchildScript}", "${grandchildToken}"], { stdio: ["ignore", "inherit", "ignore"] });
+setInterval(() => {}, 1000);`
+  );
+
+  const nestedFloodScript = path.join(realFixtureRoot, "flood_tree_nested.mjs");
+  await fs.writeFile(
+    nestedFloodScript,
+    `import cp from "node:child_process";
+cp.spawn("node", ["${childScript}", "${childToken}"], { stdio: ["ignore", "inherit", "ignore"] });
+setInterval(() => {}, 1000);`
+  );
+
   const manager = new PtyRunManager({ ...baseConfig, maxOutputBytes: 5_000 }, {
     hardOutputCeilingBytes: testCeiling,
     processGraceTimeoutMs: 100,
@@ -281,7 +327,7 @@ await test("output ceiling kills full owned tree with exact state and preserves 
   const result = await manager.run(
     {
       workspace_id: validWorkspaceId,
-      argv: ["node", floodScript],
+      argv: ["node", nestedFloodScript, leaderToken],
       timeout_ms: 10000
     },
     context
@@ -292,6 +338,11 @@ await test("output ceiling kills full owned tree with exact state and preserves 
   assert.equal(result.truncated, true);
   assert(result.raw_observed_bytes >= testCeiling, `raw_observed_bytes ${result.raw_observed_bytes} >= ${testCeiling}`);
   assert.equal(manager.getActiveCount(), 0, "Active count must return to 0");
+
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(findHostProcessesWithToken(grandchildToken), [], "Grandchild must be dead");
+  assert.deepEqual(findHostProcessesWithToken(childToken), [], "Child must be dead");
+  assert.deepEqual(findHostProcessesWithToken(leaderToken), [], "Leader must be dead");
 
   assertDecoyAliveAndClean(decoy);
 });
@@ -306,22 +357,22 @@ await test("normal exit cleans lingering background child before succeeded retur
     processKillWaitTimeoutMs: 150
   });
 
+  const token = `LINGERING_T4_${Date.now()}`;
   const result = await manager.run(
     {
       workspace_id: validWorkspaceId,
-      argv: ["node", normalExitLingeringScript],
+      argv: ["node", normalExitLingeringScript, token],
       timeout_ms: 10000
     },
     context
   );
 
-  const m = result.transcript.match(/LINGERING_CHILD:(\d+)/);
-  assert(m, `Transcript must record child PID; got: ${result.transcript}`);
-  const lingeringPid = parseInt(m[1], 10);
-
+  assert(result.transcript.includes(`LINGERING_CHILD_READY: ${token}`), `Transcript must record child readiness; got: ${result.transcript}`);
   assert.equal(result.state, "succeeded");
   assert.equal(result.exit_code, 0);
-  assert.equal(isPidAlive(lingeringPid), false, `Lingering child ${lingeringPid} must be dead at succeeded return`);
+
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(findHostProcessesWithToken(token), [], "Lingering child must be dead at succeeded return");
   assert.equal(manager.getActiveCount(), 0, "Active count must return to 0");
 
   assertDecoyAliveAndClean(decoy);
@@ -337,11 +388,11 @@ await test("escaped process group / session descendant (setsid) is owned and kil
     processKillWaitTimeoutMs: 150
   });
 
-  let ownedPids = [];
+  const token = `ESCAPED_T5_${Date.now()}`;
   const result = await manager.run(
     {
       workspace_id: validWorkspaceId,
-      argv: ["node", escapedDescendantScript],
+      argv: ["node", escapedDescendantScript, token],
       steps: [
         {
           wait_for: "OWNED_ESCAPED_READY: ",
@@ -353,16 +404,13 @@ await test("escaped process group / session descendant (setsid) is owned and kil
     context
   );
 
-  const m = result.transcript.match(/OWNED_ESCAPED_READY: leader=(\d+) child=(\d+) grandchild=(\d+)/);
-  assert(m, `Output must announce owned tree PIDs; got: ${result.transcript}`);
-  ownedPids = [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
-
+  assert(result.transcript.includes(`OWNED_ESCAPED_READY: ${token}`), `Output must announce escaped tree ready; got: ${result.transcript}`);
   assert.equal(result.state, "timed_out");
   assert.equal(manager.getActiveCount(), 0, "Active count must return to 0");
 
-  for (const pid of ownedPids) {
-    assert.equal(isPidAlive(pid), false, `Escaped descendant ${pid} must be dead after cleanup`);
-  }
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(findHostProcessesWithToken(token + "_GRANDCHILD"), [], "Escaped descendant must be dead after cleanup");
+  assert.deepEqual(findHostProcessesWithToken(token), [], "Leader must be dead after cleanup");
 
   assertDecoyAliveAndClean(decoy);
 });
@@ -432,22 +480,39 @@ await test("capacity cap=2 rejects third start immediately and creates no queued
 });
 
 // --------------------------------------------------------------------------
-// Test 07: Controlled HTTP shutdown seals admission and cleans active PTYs
+// Test 07: Controlled HTTP shutdown seals admission, closes server, cleans active PTYs, and enforces truthful exit code
 // --------------------------------------------------------------------------
-await test("controlled HTTP shutdown synchronously seals admission and cleans active PTYs", async () => {
+await test("controlled HTTP shutdown handler closes server, seals admission, cleans active PTYs, and enforces truthful exit code", async () => {
   const decoy = spawnDecoy();
   const ptyRunManager = new PtyRunManager(baseConfig, {
     processGraceTimeoutMs: 100,
     processKillWaitTimeoutMs: 150
   });
-
-  const app = createCodexProHttpApp(baseConfig, { ptyRunManager });
+  const verificationManager = new VerificationManager(baseConfig);
+  const app = createCodexProHttpApp(baseConfig, { verificationManager, ptyRunManager });
   assert.equal(app.ptyRunManager, ptyRunManager, "HTTP app must carry process-scoped ptyRunManager");
 
+  let serverClosed = false;
+  const mockServer = {
+    close: (cb) => {
+      serverClosed = true;
+      cb?.();
+    }
+  };
+
+  let exitCode = null;
+  const gracefulShutdown = createHttpShutdownHandler({
+    server: mockServer,
+    verificationManager,
+    ptyRunManager,
+    exitFn: (code) => { exitCode = code; }
+  });
+
+  const token = `HTTP_SHUTDOWN_${Date.now()}`;
   const runPromise = ptyRunManager.run(
     {
       workspace_id: validWorkspaceId,
-      argv: ["node", nestedTreeScript],
+      argv: ["node", nestedTreeScript, token],
       steps: [
         {
           wait_for: "OWNED_TREE_READY: ",
@@ -459,14 +524,11 @@ await test("controlled HTTP shutdown synchronously seals admission and cleans ac
     context
   );
 
-  // Wait briefly for tree to spawn and announce PIDs
   await new Promise((r) => setTimeout(r, 200));
-
   assert.equal(ptyRunManager.getActiveCount(), 1, "Run must be active before shutdown");
-  assert.equal(ptyRunManager.state, "open");
 
-  // Initiate shutdown
-  const closePromise = ptyRunManager.close();
+  // Call the actual HTTP shutdown handler with SIGTERM
+  const shutdownPromise = gracefulShutdown("SIGTERM");
 
   // Admission is synchronously sealed
   assert.equal(ptyRunManager.state, "closing");
@@ -485,27 +547,52 @@ await test("controlled HTTP shutdown synchronously seals admission and cleans ac
   } catch (err) {
     lateErr = err;
   }
-
   assert(lateErr instanceof CodexProError);
   assert.equal(lateErr.code, "pty_shutting_down");
 
-  // Await close completion and run completion
-  await closePromise;
+  await shutdownPromise;
   const result = await runPromise;
 
+  assert.equal(serverClosed, true, "HTTP server close() must be invoked");
+  assert.equal(exitCode, 0, "Graceful HTTP shutdown must exit with 0");
   assert.equal(result.state, "terminated_on_shutdown");
   assert.equal(ptyRunManager.state, "closed");
   assert.equal(ptyRunManager.getActiveCount(), 0);
 
-  const m = result.transcript.match(/OWNED_TREE_READY: leader=(\d+) child=(\d+) grandchild=(\d+)/);
-  if (m) {
-    const pids = [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
-    for (const pid of pids) {
-      assert.equal(isPidAlive(pid), false, `PID ${pid} must be dead after shutdown`);
-    }
-  }
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(findHostProcessesWithToken(token + "_GRANDCHILD"), [], "Grandchild must be dead after HTTP shutdown");
+  assert.deepEqual(findHostProcessesWithToken(token + "_CHILD"), [], "Child must be dead after HTTP shutdown");
+  assert.deepEqual(findHostProcessesWithToken(token), [], "Leader must be dead after HTTP shutdown");
 
   assertDecoyAliveAndClean(decoy);
+
+  // Failure path: Cleanup failure during HTTP shutdown must exit 1 (HIGH-SHUTDOWN-FAILURE-TRUTH-001)
+  const faultyManager = new PtyRunManager(baseConfig, {
+    processGraceTimeoutMs: 50,
+    processKillWaitTimeoutMs: 50,
+    isAliveChecker: () => true
+  });
+  let failureExitCode = null;
+  const failureShutdown = createHttpShutdownHandler({
+    server: mockServer,
+    verificationManager,
+    ptyRunManager: faultyManager,
+    exitFn: (code) => { failureExitCode = code; }
+  });
+
+  const lingeringRun = faultyManager.run(
+    {
+      workspace_id: validWorkspaceId,
+      argv: ["node", "-e", "setInterval(() => {}, 1000)"],
+      timeout_ms: 5000
+    },
+    context
+  ).catch(() => {});
+
+  await new Promise((r) => setTimeout(r, 50));
+  await failureShutdown("SIGTERM");
+  assert.equal(failureExitCode, 1, "HTTP shutdown must exit 1 when cleanup fails");
+  await lingeringRun;
 });
 
 // --------------------------------------------------------------------------
@@ -568,19 +655,28 @@ await test("concurrent late starts during closing cannot create children", async
 });
 
 // --------------------------------------------------------------------------
-// Test 09: Stdio shutdown cleanup is equivalent
+// Test 09: Stdio shutdown cleans active PTYs and enforces truthful exit code
 // --------------------------------------------------------------------------
-await test("stdio shutdown cleanup closes process-scoped ptyRunManager", async () => {
+await test("stdio shutdown handler cleans active PTYs and enforces truthful exit code", async () => {
   const decoy = spawnDecoy();
   const ptyRunManager = new PtyRunManager(baseConfig, {
     processGraceTimeoutMs: 100,
     processKillWaitTimeoutMs: 150
   });
+  const verificationManager = new VerificationManager(baseConfig);
 
+  let exitCode = null;
+  const stdioShutdown = createStdioShutdownHandler({
+    verificationManager,
+    ptyRunManager,
+    exitFn: (code) => { exitCode = code; }
+  });
+
+  const token = `STDIO_SHUTDOWN_${Date.now()}`;
   const runPromise = ptyRunManager.run(
     {
       workspace_id: validWorkspaceId,
-      argv: ["node", nestedTreeScript],
+      argv: ["node", nestedTreeScript, token],
       steps: [
         {
           wait_for: "OWNED_TREE_READY: ",
@@ -594,23 +690,48 @@ await test("stdio shutdown cleanup closes process-scoped ptyRunManager", async (
 
   await new Promise((r) => setTimeout(r, 200));
 
-  // Simulate stdio SIGINT/SIGTERM cleanup
-  await ptyRunManager.close();
+  // Trigger stdio shutdown via SIGINT
+  await stdioShutdown("SIGINT");
   const result = await runPromise;
 
+  assert.equal(exitCode, 0, "Graceful stdio shutdown must exit 0");
   assert.equal(result.state, "terminated_on_shutdown");
   assert.equal(ptyRunManager.state, "closed");
   assert.equal(ptyRunManager.getActiveCount(), 0);
 
-  const m = result.transcript.match(/OWNED_TREE_READY: leader=(\d+) child=(\d+) grandchild=(\d+)/);
-  if (m) {
-    const pids = [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
-    for (const pid of pids) {
-      assert.equal(isPidAlive(pid), false, `PID ${pid} must be dead after stdio cleanup`);
-    }
-  }
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(findHostProcessesWithToken(token + "_GRANDCHILD"), [], "Grandchild must be dead after stdio cleanup");
+  assert.deepEqual(findHostProcessesWithToken(token + "_CHILD"), [], "Child must be dead after stdio cleanup");
+  assert.deepEqual(findHostProcessesWithToken(token), [], "Leader must be dead after stdio cleanup");
 
   assertDecoyAliveAndClean(decoy);
+
+  // Failure path: Cleanup failure during stdio shutdown must exit 1 (HIGH-SHUTDOWN-FAILURE-TRUTH-001)
+  const faultyManager = new PtyRunManager(baseConfig, {
+    processGraceTimeoutMs: 50,
+    processKillWaitTimeoutMs: 50,
+    isAliveChecker: () => true
+  });
+  let failureExitCode = null;
+  const failureStdioShutdown = createStdioShutdownHandler({
+    verificationManager,
+    ptyRunManager: faultyManager,
+    exitFn: (code) => { failureExitCode = code; }
+  });
+
+  const lingeringRun = faultyManager.run(
+    {
+      workspace_id: validWorkspaceId,
+      argv: ["node", "-e", "setInterval(() => {}, 1000)"],
+      timeout_ms: 5000
+    },
+    context
+  ).catch(() => {});
+
+  await new Promise((r) => setTimeout(r, 50));
+  await failureStdioShutdown("SIGTERM");
+  assert.equal(failureExitCode, 1, "Stdio shutdown must exit 1 when cleanup fails");
+  await lingeringRun;
 });
 
 // --------------------------------------------------------------------------
@@ -649,32 +770,48 @@ await test("child-exit / final-send race cannot crash host and preserves truthfu
 });
 
 // --------------------------------------------------------------------------
-// Test 11: Backend-error / timeout / exit race yields exactly one terminal result
+// Test 11: Combined backend-error / timeout / exit race yields exactly one terminal result
 // --------------------------------------------------------------------------
-await test("timeout / exit / close race yields exactly one terminal result and clean accounting", async () => {
+await test("combined backend-error + timeout + exit race yields exactly one terminal result and clean accounting", async () => {
+  const decoy = spawnDecoy();
   const manager = new PtyRunManager(baseConfig, {
-    processGraceTimeoutMs: 100,
-    processKillWaitTimeoutMs: 150
+    faultInjection: {
+      onSpawn: ({ injectBackendError, triggerTimeout }) => {
+        setTimeout(() => {
+          injectBackendError(new Error("Injected race backend error in lifecycle test"));
+          triggerTimeout();
+        }, 20);
+      }
+    }
   });
 
-  // Run with 1000ms timeout
-  const runPromise = manager.run(
-    {
-      workspace_id: validWorkspaceId,
-      argv: ["node", "-e", "setTimeout(() => process.exit(0), 1000)"],
-      timeout_ms: 1000
-    },
-    context
-  );
+  let outcomeType = "none";
+  let outcomeVal = null;
+  try {
+    outcomeVal = await manager.run(
+      {
+        workspace_id: validWorkspaceId,
+        argv: ["node", "-e", "setTimeout(() => process.exit(0), 20);"],
+        timeout_ms: 1000
+      },
+      context
+    );
+    outcomeType = "resolved";
+  } catch (err) {
+    outcomeType = "rejected";
+    outcomeVal = err;
+  }
 
-  // Trigger close at ~990ms to race both exit and timeout
-  await new Promise((r) => setTimeout(r, 990));
-  const closePromise = manager.close();
+  assert.ok(outcomeType === "resolved" || outcomeType === "rejected");
+  if (outcomeType === "resolved") {
+    assert.ok(["succeeded", "failed", "timed_out"].includes(outcomeVal.state));
+  } else {
+    assert.ok(outcomeVal instanceof CodexProError);
+    assert.equal(outcomeVal.code, "pty_backend_error");
+  }
 
-  const [result] = await Promise.all([runPromise, closePromise]);
-  assert(["succeeded", "timed_out", "terminated_on_shutdown"].includes(result.state));
   assert.equal(manager.getActiveCount(), 0, "Active count must release exactly once to 0");
-  assert.equal(manager.state, "closed");
+  assertDecoyAliveAndClean(decoy);
 });
 
 // --------------------------------------------------------------------------

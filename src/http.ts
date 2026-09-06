@@ -1857,6 +1857,58 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
   return app;
 }
 
+export interface HttpShutdownOptions {
+  server?: { close: (cb?: (err?: Error) => void) => void };
+  verificationManager: VerificationManager;
+  ptyRunManager: PtyRunManager;
+  emergencyTimeoutMs?: number;
+  exitFn?: (code: number) => void;
+  logger?: { error: (msg: string) => void; log?: (msg: string) => void };
+}
+
+export function createHttpShutdownHandler(options: HttpShutdownOptions): (signal: string) => Promise<void> {
+  let isClosing = false;
+  const exit = options.exitFn ?? ((code: number) => process.exit(code));
+  const logError = options.logger?.error ?? ((msg: string) => console.error(msg));
+  const emergencyTimeoutMs = options.emergencyTimeoutMs ?? 5000;
+
+  return async (signal: string): Promise<void> => {
+    if (isClosing) return;
+    isClosing = true;
+    logError(`[CodexPro] Received ${signal}, closing HTTP server, terminating managed verification jobs, and cleaning active PTYs...`);
+    try {
+      options.server?.close();
+    } catch {}
+
+    const timer = setTimeout(() => {
+      logError("[CodexPro] Emergency shutdown timeout expired before cleanup completed.");
+      exit(1);
+    }, emergencyTimeoutMs);
+    timer.unref?.();
+
+    let failed = false;
+    const results = await Promise.allSettled([
+      options.verificationManager.close(),
+      options.ptyRunManager.close()
+    ]);
+    clearTimeout(timer);
+
+    for (const res of results) {
+      if (res.status === "rejected") {
+        failed = true;
+        const err = res.reason;
+        logError(`[CodexPro] Error during shutdown cleanup: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    if (failed) {
+      exit(1);
+    } else {
+      exit(0);
+    }
+  };
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv.includes("--version") || argv.includes("-v") || argv[0] === "version") {
@@ -1881,33 +1933,14 @@ async function main(): Promise<void> {
     console.error(`[CodexPro] widgetDomain=${config.widgetDomain}`);
   });
 
-  let isClosing = false;
-  const gracefulShutdown = (signal: string) => {
-    if (isClosing) return;
-    isClosing = true;
-    console.error(`[CodexPro] Received ${signal}, closing HTTP server, terminating managed verification jobs, and cleaning active PTYs...`);
-    server.close();
-    Promise.all([
-      verificationManager
-        .close()
-        .catch((err) => {
-          console.error(`[CodexPro] Error during verification manager shutdown: ${err instanceof Error ? err.message : String(err)}`);
-        }),
-      ptyRunManager
-        .close()
-        .catch((err) => {
-          console.error(`[CodexPro] Error during PTY run manager shutdown: ${err instanceof Error ? err.message : String(err)}`);
-        })
-    ]).finally(() => {
-      process.exit(0);
-    });
-    setTimeout(() => {
-      process.exit(0);
-    }, 5000).unref();
-  };
+  const gracefulShutdown = createHttpShutdownHandler({
+    server,
+    verificationManager,
+    ptyRunManager
+  });
 
-  process.once("SIGINT", () => gracefulShutdown("SIGINT"));
-  process.once("SIGTERM", () => gracefulShutdown("SIGTERM"));
+  process.once("SIGINT", () => { void gracefulShutdown("SIGINT"); });
+  process.once("SIGTERM", () => { void gracefulShutdown("SIGTERM"); });
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
