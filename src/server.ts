@@ -23,7 +23,8 @@ import {
   VerificationManager,
   type VerificationJobRecord
 } from "./verificationOps.js";
-import { PtyRunManager } from "./ptyRunManager.js";
+import { PtyRunManager, type PtyRunResult } from "./ptyRunManager.js";
+import { PTY_RUN_ARGUMENTS_SCHEMA } from "./ptyValidator.js";
 import { gitDiff, gitDiffStatus, gitLog, gitStatus } from "./gitOps.js";
 import { gitDiffRange } from "./gitDiffRange.js";
 import { gitLogStructured, gitMergeBase, gitResolveRef, gitShowCommit } from "./gitHistoryOps.js";
@@ -405,6 +406,19 @@ const CANCEL_VERIFICATION_TRANSPORT_SCHEMA = z.object({
 const CANCEL_VERIFICATION_PUBLIC_SCHEMA = z.object(CANCEL_VERIFICATION_ARGUMENTS_SCHEMA.shape);
 CANCEL_VERIFICATION_PUBLIC_SCHEMA.safeParse = ((args: unknown) => CANCEL_VERIFICATION_TRANSPORT_SCHEMA.safeParse(args)) as typeof CANCEL_VERIFICATION_PUBLIC_SCHEMA.safeParse;
 CANCEL_VERIFICATION_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => CANCEL_VERIFICATION_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof CANCEL_VERIFICATION_PUBLIC_SCHEMA.safeParseAsync;
+
+const PTY_RUN_TRANSPORT_SCHEMA = z.object({
+  workspace_id: z.unknown().optional(),
+  argv: z.unknown().optional(),
+  steps: z.unknown().optional(),
+  cwd: z.unknown().optional(),
+  timeout_ms: z.unknown().optional(),
+  session_id: z.unknown().optional()
+}).passthrough();
+
+const PTY_RUN_PUBLIC_SCHEMA_ADAPTER = z.object(PTY_RUN_ARGUMENTS_SCHEMA.shape);
+PTY_RUN_PUBLIC_SCHEMA_ADAPTER.safeParse = ((args: unknown) => PTY_RUN_TRANSPORT_SCHEMA.safeParse(args)) as typeof PTY_RUN_PUBLIC_SCHEMA_ADAPTER.safeParse;
+PTY_RUN_PUBLIC_SCHEMA_ADAPTER.safeParseAsync = ((args: unknown) => PTY_RUN_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof PTY_RUN_PUBLIC_SCHEMA_ADAPTER.safeParseAsync;
 
 const GIT_COMMIT_PATH_SCHEMA = z.string()
   .min(1)
@@ -1021,6 +1035,29 @@ function verificationTextResult(config: CodexProConfig, record: VerificationJobR
   return lines.join("\n");
 }
 
+function ptyTextResult(result: PtyRunResult): string {
+  const lines = [
+    "# Disposable PTY Run",
+    "",
+    `\`${result.command}\``,
+    "",
+    `State: ${result.state}`,
+    `Workspace ID: \`${result.workspace_id}\``,
+    `Root: ${result.workspace_root}`,
+    `CWD: ${result.cwd}`,
+    `Exit: ${result.exit_code ?? "none"}${result.signal ? ` (${result.signal})` : ""}`,
+    `Duration: ${result.duration_ms} ms`,
+    `Containment: ${result.containment_enabled ? "enabled" : "disabled"}`,
+    `Output: ${result.raw_observed_bytes} bytes observed${result.truncated ? " (truncated)" : ""}.`
+  ];
+
+  if (result.transcript) {
+    lines.push("", "## Transcript", "", "```text", result.transcript, "```");
+  }
+
+  return lines.join("\n");
+}
+
 function errorResult(error: unknown): any {
   const message = errorText(error);
   return {
@@ -1346,6 +1383,7 @@ const STANDARD_TOOL_NAMES = [
   "start_verification",
   "wait_verification",
   "cancel_verification",
+  "pty_run",
   "inspect_workspace",
   "tree",
   "search",
@@ -1384,6 +1422,7 @@ const FULL_TOOL_NAMES = [
   "apply_patch",
   "import_file",
   "bash",
+  "pty_run",
   "start_verification",
   "wait_verification",
   "cancel_verification",
@@ -1416,6 +1455,7 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "git_commit",
   "git_push",
   "bash",
+  "pty_run",
   "start_verification",
   "wait_verification",
   "cancel_verification",
@@ -1441,7 +1481,7 @@ function toolNamesForMode(config: CodexProConfig): string[] {
   if (config.bashMode === "off") {
     const bashIndex = names.indexOf("bash");
     if (bashIndex !== -1) names.splice(bashIndex, 1);
-    for (const vTool of ["start_verification", "wait_verification", "cancel_verification"]) {
+    for (const vTool of ["start_verification", "wait_verification", "cancel_verification", "pty_run"]) {
       const idx = names.indexOf(vTool);
       if (idx !== -1) names.splice(idx, 1);
     }
@@ -1490,7 +1530,7 @@ function registeredToolNames(server: McpServer): string[] {
 
 function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
   if (config.connectionTest && CONNECTION_TEST_HIDDEN_TOOLS.has(name)) return false;
-  if ((name === "bash" || name === "start_verification" || name === "wait_verification" || name === "cancel_verification") && config.bashMode === "off") return false;
+  if ((name === "bash" || name === "start_verification" || name === "wait_verification" || name === "cancel_verification" || name === "pty_run") && config.bashMode === "off") return false;
   if ((name === "write" || name === "edit" || name === "apply_patch" || name === "import_file") && config.writeMode !== "workspace") return false;
   if (name === "git_commit" && (config.toolMode !== "full" || config.writeMode !== "workspace")) return false;
   if (name === "git_push" && !hasEnabledGitPushPolicy(config)) return false;
@@ -2482,6 +2522,7 @@ export type {
 export function createCodexProServer(config: CodexProConfig, options: CodexProServerOptions = {}): McpServer {
   const workspaces = new WorkspaceManager(config);
   const verificationManager = options.verificationManager ?? new VerificationManager(config);
+  const ptyRunManager = options.ptyRunManager ?? new PtyRunManager(config);
   const reviewCheckpoints = new Map<string, string>();
   const guard = new PathGuard(config);
   const readAtRefSchemas = readAtRefPublicSchemas(config.maxReadBytes);
@@ -3933,6 +3974,30 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
       const record = await verificationManager.cancelVerification(args.job_id, args.session_id);
       const text = verificationTextResult(config, record, "cancelled");
       return diagnosticTextResult(text, { ...record });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "pty_run",
+    {
+      title: "Disposable PTY Run",
+      description:
+        "Run a command inside a kernel-backed disposable pseudo-terminal (PTY) with an optional fixed script of prompt/response interactions. Shells, multiplexers, remote sessions, and pagers are forbidden. Returns transcript output after terminal process disposal.",
+      inputSchema: PTY_RUN_PUBLIC_SCHEMA_ADAPTER,
+      runtimeInputSchema: PTY_RUN_ARGUMENTS_SCHEMA,
+      annotations: BASH_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Running disposable PTY command...",
+        "openai/toolInvocation/invoked": "Disposable PTY run complete"
+      }
+    },
+    async (args) => {
+      const result = await ptyRunManager.run(args, { guard, workspaces });
+      const text = ptyTextResult(result);
+      return diagnosticTextResult(text, { ...result });
     }
   );
 
