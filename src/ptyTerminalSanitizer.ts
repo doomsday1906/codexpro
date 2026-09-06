@@ -183,10 +183,13 @@ export class TerminalSanitizer {
             // Consecutive ESC; abort prior escape and start new escape sequence
             this.state = SanitizerState.ESCAPE;
           } else {
-            // Non-escape byte: abort escape sequence and return to GROUND
-            this.state = SanitizerState.GROUND;
-            if (ch === "\n") out.push("\n");
-            else if (ch === "\r") this.pendingCr = true;
+            // C0 controls (0x00..0x1F including NUL, BEL, BS, CR, LF), DEL (0x7F),
+            // decoded C1 controls (0x80..0x9F), and other disturbances inside initial ESC:
+            // Strip the disturbance in-place and conservatively remain in ESCAPE
+            // until a valid escape introducer/final is consumed, another ESC restarts/preserves ESCAPE,
+            // or stream finalization drops the incomplete sequence.
+            // Do NOT return to GROUND and do NOT emit CR/LF normalization.
+            this.state = SanitizerState.ESCAPE;
           }
           break;
         }
