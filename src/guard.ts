@@ -92,10 +92,10 @@ function workspaceIdForRoot(realRoot: string): string {
   return `ws_${createHash("sha256").update(realRoot).digest("hex").slice(0, 24)}`;
 }
 
-const WORKSPACE_ID_PATTERN = /^ws_[0-9a-f]{24}$/u;
-const DIAGNOSTIC_WORKSPACE_ID_MAX_CHARS = 128;
+export const WORKSPACE_ID_PATTERN = /^ws_[0-9a-f]{24}$/u;
+export const DIAGNOSTIC_WORKSPACE_ID_MAX_CHARS = 128;
 
-function isWorkspaceId(id: string): boolean {
+export function isWorkspaceId(id: string): boolean {
   return WORKSPACE_ID_PATTERN.test(id);
 }
 

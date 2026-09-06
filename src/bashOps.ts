@@ -19,7 +19,7 @@ export interface BashResult {
   bashSessionId?: string;
 }
 
-const SAFE_ALLOWED_PREFIXES = [
+export const SAFE_ALLOWED_PREFIXES = [
   "pwd",
   "ls",
   "find",
@@ -123,7 +123,7 @@ function startsWithAllowedPrefix(command: string): boolean {
   return isAllowedPackageScript(normalized) || SAFE_ALLOWED_PREFIXES.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix} `));
 }
 
-function isAllowedPackageScript(command: string): boolean {
+export function isAllowedPackageScript(command: string): boolean {
   const packageScriptPattern =
     /^(?:npm|pnpm|yarn|bun)\s+run\s+(?:test|typecheck|lint|build|check)(?::[A-Za-z0-9._-]+)*(?:\s+--\s+[A-Za-z0-9._:= -]+)?$/;
   return packageScriptPattern.test(command);
