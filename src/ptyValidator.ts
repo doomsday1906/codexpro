@@ -13,7 +13,6 @@ export const PTY_LIMITS = Object.freeze({
   maxStepsCount: 16,
   defaultStepTimeoutMs: 10_000,
   maxStepTimeoutMs: 30_000,
-  minStepTimeoutMs: 100,
   maxArgvCount: 64,
   maxArgvElementBytes: 1024,
   maxTotalArgvBytes: 8192,
@@ -36,6 +35,8 @@ export const BLOCKED_SHELLS = new Set<string>([
   "fish",
   "dash",
   "ksh",
+  "csh",
+  "tcsh",
   "nu",
   "cmd",
   "powershell",
@@ -44,7 +45,8 @@ export const BLOCKED_SHELLS = new Set<string>([
 
 export const BLOCKED_MULTIPLEXERS = new Set<string>([
   "tmux",
-  "screen"
+  "screen",
+  "zellij"
 ]);
 
 export const BLOCKED_REMOTE_SESSIONS = new Set<string>([
@@ -64,6 +66,12 @@ export const BLOCKED_EDITORS_PAGERS = new Set<string>([
   "top",
   "htop"
 ]);
+
+/** Security execution context required for pty_run validation. */
+export interface PtyValidationContext {
+  guard: PathGuard;
+  workspaces: WorkspaceManager;
+}
 
 /** Single scripted interaction step shape. */
 export interface PtyStepInput {
@@ -136,11 +144,15 @@ export function assertNotPersistentProgram(argv: string[]): void {
       throw new CodexProError(`Interactive REPL execution is forbidden in pty_run: '${executable}'. Provide a bounded script file or command.`);
     }
     const hasInteractiveFlag = argv.slice(1).some((arg) => arg === "-i" || arg === "--interactive");
+    if (hasInteractiveFlag) {
+      throw new CodexProError(`Interactive REPL flag is forbidden in pty_run: '${argv.join(" ")}'.`);
+    }
+    const hasReplSubcommand = argv.slice(1).some((arg) => arg === "repl");
+    if (hasReplSubcommand) {
+      throw new CodexProError(`Interactive REPL subcommand 'repl' is forbidden in pty_run: '${argv.join(" ")}'.`);
+    }
     const hasEval = argv.slice(1).some((arg) => arg === "-e" || arg === "--eval" || arg === "-p" || arg === "--print");
     const hasPositionalScript = argv.slice(1).some((arg) => !arg.startsWith("-"));
-    if (hasInteractiveFlag && !hasEval && !hasPositionalScript) {
-      throw new CodexProError(`Interactive REPL flag is forbidden in pty_run: '${argv.join(" ")}'. Provide a bounded script file or command.`);
-    }
     if (!hasEval && !hasPositionalScript) {
       throw new CodexProError(`Interactive REPL execution is forbidden in pty_run: '${argv.join(" ")}'. Provide a bounded script file or command.`);
     }
@@ -434,17 +446,17 @@ export function validatePtySteps(steps: unknown): PtyStepInput[] | undefined {
       validatedSubmit = typedStep.submit;
     }
 
-    // step timeout_ms is optional integer
+    // step timeout_ms is optional positive integer
     let validatedStepTimeout: number | undefined = undefined;
     if (typedStep.timeout_ms !== undefined && typedStep.timeout_ms !== null) {
       if (
         typeof typedStep.timeout_ms !== "number" ||
         !Number.isInteger(typedStep.timeout_ms) ||
-        typedStep.timeout_ms < PTY_LIMITS.minStepTimeoutMs ||
+        typedStep.timeout_ms <= 0 ||
         typedStep.timeout_ms > PTY_LIMITS.maxStepTimeoutMs
       ) {
         throw new CodexProError(
-          `Step at index ${i} 'timeout_ms' must be an integer between ${PTY_LIMITS.minStepTimeoutMs} ms and ${PTY_LIMITS.maxStepTimeoutMs} ms.`
+          `Step at index ${i} 'timeout_ms' must be a positive integer not exceeding ${PTY_LIMITS.maxStepTimeoutMs} ms.`
         );
       }
       validatedStepTimeout = typedStep.timeout_ms;
@@ -522,7 +534,7 @@ export const PTY_STEP_ARGUMENTS_SCHEMA = z.object({
     .describe("If true, appends one server-owned Enter event after sending optional text. Default: false."),
   timeout_ms: z.number()
     .int("step timeout_ms must be an integer.")
-    .min(PTY_LIMITS.minStepTimeoutMs, `step timeout_ms must be at least ${PTY_LIMITS.minStepTimeoutMs} ms.`)
+    .positive("step timeout_ms must be a positive integer.")
     .max(PTY_LIMITS.maxStepTimeoutMs, `step timeout_ms must not exceed ${PTY_LIMITS.maxStepTimeoutMs} ms.`)
     .optional()
     .describe(`Per-step timeout in milliseconds. Default: ${PTY_LIMITS.defaultStepTimeoutMs}; max: ${PTY_LIMITS.maxStepTimeoutMs}.`)
@@ -570,11 +582,19 @@ export const PTY_RUN_PUBLIC_SCHEMA = z.object(PTY_RUN_ARGUMENTS_SCHEMA.shape).st
 export async function validatePtyRunInput(
   rawInput: unknown,
   config: CodexProConfig,
-  options: {
-    guard?: PathGuard;
-    workspaces?: WorkspaceManager;
-  } = {}
+  context: PtyValidationContext
 ): Promise<ValidatedPtyRunRequest> {
+  // Runtime fail-closed check for security context (mandatory WorkspaceManager & PathGuard)
+  if (!context || typeof context !== "object") {
+    throw new CodexProError("Security context with PathGuard and WorkspaceManager is mandatory for pty_run validation.");
+  }
+  if (!context.workspaces || typeof context.workspaces.getWorkspace !== "function") {
+    throw new CodexProError("WorkspaceManager is mandatory for pty_run validation.");
+  }
+  if (!context.guard || typeof context.guard.resolve !== "function") {
+    throw new CodexProError("PathGuard is mandatory for pty_run validation.");
+  }
+
   if (typeof rawInput !== "object" || rawInput === null || Array.isArray(rawInput)) {
     throw new CodexProError("pty_run input must be a valid JSON object.");
   }
@@ -606,27 +626,12 @@ export async function validatePtyRunInput(
     throw new CodexProError(`Invalid workspace_id: '${input.workspace_id}'. Must match deterministic format 'ws_<24 hex chars>'.`);
   }
 
-  let resolvedWorkspace: Workspace;
-  if (options.workspaces) {
-    // Explicit workspace_id only - no ambient fallback
-    resolvedWorkspace = options.workspaces.getWorkspace(input.workspace_id);
-  } else {
-    // Structural validation without active manager
-    resolvedWorkspace = {
-      id: input.workspace_id,
-      root: config.defaultRoot,
-      openedAt: new Date().toISOString()
-    };
-  }
+  // Explicit workspace_id resolved through real WorkspaceManager only - no ambient/default-root fallback
+  const resolvedWorkspace = context.workspaces.getWorkspace(input.workspace_id);
 
-  // 2. Guarded cwd (LAW-003)
-  let resolvedCwdAbs: string;
-  if (options.guard) {
-    const resolvedCwd = options.guard.resolve(resolvedWorkspace, input.cwd ?? ".");
-    resolvedCwdAbs = resolvedCwd.absPath;
-  } else {
-    resolvedCwdAbs = input.cwd ?? ".";
-  }
+  // 2. Guarded cwd (LAW-003) - always through PathGuard
+  const resolvedCwd = context.guard.resolve(resolvedWorkspace, input.cwd ?? ".");
+  const resolvedCwdAbs = resolvedCwd.absPath;
 
   // 3. Bash session guard (LAW-005)
   const sessionId = assertBashSession(config, input.session_id);

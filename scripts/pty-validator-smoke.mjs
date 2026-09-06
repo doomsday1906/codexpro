@@ -430,15 +430,20 @@ await test("16. Bash full still rejects persistent shell/session/editor/pager su
 await test("17. plain REPL forms rejected while bounded script/module forms accepted", async () => {
   const fullConfig = { ...baseConfig, bashMode: "full" };
 
-  // Plain REPLs -> MUST REJECT
+  // Plain REPLs & interactive bypasses -> MUST REJECT
   const replForms = [
     ["node"],
     ["/usr/bin/node"],
     ["node", "-i"],
     ["node", "--interactive"],
+    ["node", "-i", "-e", "console.log(1)"],
+    ["node", "--interactive", "script.js"],
+    ["node", "-i", "script.js"],
     ["node", "--experimental-vm-modules"], // flag-only without script
     ["bun"],
+    ["bun", "repl"],
     ["deno"],
+    ["deno", "repl"],
     ["python"],
     ["python3"],
     ["/usr/bin/python3"],
@@ -767,8 +772,8 @@ await test("26. submit type/semantics bounded", async () => {
   }
 });
 
-// 27. step timeout >30s rejected/clamped according to frozen convention
-await test("27. step timeout >30s rejected according to frozen convention", async () => {
+// 27. step timeout positive integer <= 30000ms validated; unaccepted 100ms floor removed
+await test("27. step timeout positive integer <= 30000ms validated", async () => {
   // > 30,000 ms rejected
   await assertRejects(
     () => validatePtyRunInput({
@@ -776,20 +781,38 @@ await test("27. step timeout >30s rejected according to frozen convention", asyn
       argv: ["git", "status"],
       steps: [{ wait_for: "prompt:", timeout_ms: 35_000 }]
     }, baseConfig, { guard, workspaces }),
-    /timeout_ms.*between 100 ms and 30000 ms|30000/i,
+    /30000/i,
     "step timeout 35000 ms"
   );
 
-  // < 100 ms rejected
+  // <= 0 rejected (must be positive integer)
   await assertRejects(
     () => validatePtyRunInput({
       workspace_id: validWorkspaceId,
       argv: ["git", "status"],
-      steps: [{ wait_for: "prompt:", timeout_ms: 50 }]
+      steps: [{ wait_for: "prompt:", timeout_ms: 0 }]
     }, baseConfig, { guard, workspaces }),
-    /timeout_ms.*between 100 ms and 30000 ms|100/i,
-    "step timeout 50 ms"
+    /positive/i,
+    "step timeout 0 ms"
   );
+
+  await assertRejects(
+    () => validatePtyRunInput({
+      workspace_id: validWorkspaceId,
+      argv: ["git", "status"],
+      steps: [{ wait_for: "prompt:", timeout_ms: -50 }]
+    }, baseConfig, { guard, workspaces }),
+    /positive/i,
+    "step timeout -50 ms"
+  );
+
+  // Positive integer < 100 ms accepted (100 ms floor removed)
+  const resSmall = await validatePtyRunInput({
+    workspace_id: validWorkspaceId,
+    argv: ["git", "status"],
+    steps: [{ wait_for: "prompt:", timeout_ms: 50 }]
+  }, baseConfig, { guard, workspaces });
+  assert.equal(resSmall.steps[0].timeout_ms, 50);
 
   // Valid step timeout accepted
   const res = await validatePtyRunInput({
@@ -986,7 +1009,11 @@ await test("32. all blocked shell variants rejected across path variations", () 
     "powershell",
     "powershell.exe",
     "pwsh",
-    "/usr/bin/pwsh"
+    "/usr/bin/pwsh",
+    "csh",
+    "/bin/csh",
+    "tcsh",
+    "/usr/bin/tcsh"
   ];
   for (const s of shellVariants) {
     assert.throws(
@@ -1002,6 +1029,7 @@ await test("33. all blocked multiplexers, remote login, and editors rejected", (
   const apps = [
     ["tmux"], ["/usr/bin/tmux"],
     ["screen"],
+    ["zellij"], ["/usr/bin/zellij"],
     ["ssh"], ["/usr/bin/ssh"],
     ["mosh"], ["telnet"],
     ["vi"], ["vim"], ["/usr/bin/vim"],
@@ -1061,6 +1089,73 @@ await test("35. PTY_RUN_PUBLIC_SCHEMA compiles and strictly validates shapes", (
   };
   const parseHostile = PTY_RUN_PUBLIC_SCHEMA.safeParse(hostilePayload);
   assert.equal(parseHostile.success, false);
+});
+
+// 36. Mandatory security context (PathGuard and WorkspaceManager) fail-closed enforcement
+await test("36. mandatory security context (PathGuard and WorkspaceManager) fail-closed enforcement", async () => {
+  const validPayload = {
+    workspace_id: validWorkspaceId,
+    argv: ["git", "status"]
+  };
+
+  // 1. Omitted validation context cannot yield an execution-ready request
+  await assertRejects(
+    () => validatePtyRunInput(validPayload, baseConfig),
+    /Security context with PathGuard and WorkspaceManager is mandatory/i,
+    "omitted context"
+  );
+  await assertRejects(
+    () => validatePtyRunInput(validPayload, baseConfig, null),
+    /Security context with PathGuard and WorkspaceManager is mandatory/i,
+    "null context"
+  );
+  await assertRejects(
+    () => validatePtyRunInput(validPayload, baseConfig, undefined),
+    /Security context with PathGuard and WorkspaceManager is mandatory/i,
+    "undefined context"
+  );
+
+  // 2. Omitted WorkspaceManager fails closed
+  await assertRejects(
+    () => validatePtyRunInput(validPayload, baseConfig, { guard }),
+    /WorkspaceManager is mandatory/i,
+    "missing WorkspaceManager"
+  );
+
+  // 3. Omitted PathGuard fails closed
+  await assertRejects(
+    () => validatePtyRunInput(validPayload, baseConfig, { workspaces }),
+    /PathGuard is mandatory/i,
+    "missing PathGuard"
+  );
+
+  // 4. Syntactically valid but unknown ws_<24hex> cannot be mapped onto config.defaultRoot
+  const unknownWorkspaceId = "ws_0123456789abcdef01234567";
+  await assertRejects(
+    () => validatePtyRunInput({
+      workspace_id: unknownWorkspaceId,
+      argv: ["git", "status"]
+    }, baseConfig, { guard, workspaces }),
+    /Unknown workspace_id/i,
+    "syntactically valid but unknown workspace_id"
+  );
+
+  // 5. Explicit valid workspace still resolves correctly
+  const okRes = await validatePtyRunInput(validPayload, baseConfig, { guard, workspaces });
+  assert.equal(okRes.workspaceId, validWorkspaceId);
+  assert.equal(okRes.workspaceRoot, realFixtureRoot);
+  assert.equal(okRes.cwd, realFixtureRoot);
+
+  // 6. cwd always passes PathGuard
+  await assertRejects(
+    () => validatePtyRunInput({
+      workspace_id: validWorkspaceId,
+      argv: ["git", "status"],
+      cwd: "../../outside"
+    }, baseConfig, { guard, workspaces }),
+    /Path escapes workspace root/i,
+    "cwd escaping workspace root"
+  );
 });
 
 // Clean up fixture root
