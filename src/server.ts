@@ -23,6 +23,7 @@ import {
   VerificationManager,
   type VerificationJobRecord
 } from "./verificationOps.js";
+import { PtyRunManager } from "./ptyRunManager.js";
 import { gitDiff, gitDiffStatus, gitLog, gitStatus } from "./gitOps.js";
 import { gitDiffRange } from "./gitDiffRange.js";
 import { gitLogStructured, gitMergeBase, gitResolveRef, gitShowCommit } from "./gitHistoryOps.js";
@@ -2465,6 +2466,8 @@ export interface CodexProServerOptions {
   readonly onWorkspaceDiagnosticReader?: (reader: Readonly<WorkspaceDiagnosticReader>) => void;
   /** Process-scoped verification manager shared across all HTTP sessions or owned by stdio. */
   readonly verificationManager?: VerificationManager;
+  /** Process-scoped PTY execution manager shared across all HTTP sessions or owned by stdio. */
+  readonly ptyRunManager?: PtyRunManager;
 }
 
 export type {

@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { loadConfig } from "./config.js";
 import { createCodexProServer } from "./server.js";
 import { VerificationManager } from "./verificationOps.js";
+import { PtyRunManager } from "./ptyRunManager.js";
 
 const CODEXPRO_VERSION = "0.30.0";
 
@@ -31,14 +32,18 @@ async function main(): Promise<void> {
   process.env.CODEXPRO_ALLOW_NO_HTTP_TOKEN ??= "1";
   const config = loadConfig();
   const verificationManager = new VerificationManager(config);
+  const ptyRunManager = new PtyRunManager(config);
   const cleanup = () => {
-    verificationManager.close().catch(() => {}).finally(() => {
+    Promise.all([
+      verificationManager.close().catch(() => {}),
+      ptyRunManager.close().catch(() => {})
+    ]).finally(() => {
       process.exit(0);
     });
   };
   process.once("SIGINT", cleanup);
   process.once("SIGTERM", cleanup);
-  const server = createCodexProServer(config, { verificationManager });
+  const server = createCodexProServer(config, { verificationManager, ptyRunManager });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

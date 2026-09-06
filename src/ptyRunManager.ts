@@ -74,6 +74,7 @@ export interface PtyRunManagerOptions {
   platform?: string;
   arch?: string;
   onMatcherBufferUpdate?: (bufferLength: number, bufferContent: string) => void;
+  isAliveChecker?: (pid: number, knownPids?: Iterable<number>) => boolean;
 }
 
 interface ActiveRunHandle {
@@ -105,46 +106,143 @@ export function isProcessGroupAlive(pid: number): boolean {
   }
 }
 
-export function isProcessTreeAlive(pid: number): boolean {
-  if (!pid || pid <= 0) return false;
-
-  if (isPidAlive(pid)) return true;
-  if (isProcessGroupAlive(pid)) return true;
-
-  if (process.platform === "linux") {
-    try {
-      const entries = fs.readdirSync("/proc");
-      for (const entry of entries) {
-        if (!/^\d+$/.test(entry)) continue;
-        const entryPid = parseInt(entry, 10);
-        if (entryPid === pid) return true;
-        try {
-          const stat = fs.readFileSync(`/proc/${entry}/stat`, "utf8");
-          const lastParen = stat.lastIndexOf(")");
-          if (lastParen !== -1) {
-            const rest = stat.slice(lastParen + 2).trim().split(/\s+/);
-            const ppid = parseInt(rest[1], 10);
-            const pgrp = parseInt(rest[2], 10);
-            const sid = parseInt(rest[3], 10);
-            if (ppid === pid || pgrp === pid || sid === pid) {
-              return true;
-            }
-          }
-        } catch {}
+/**
+ * Discover all descendant processes of rootPid using recursive /proc scanning on Linux.
+ * Recursively resolves parent -> child -> grandchild and expands across process groups and sessions
+ * associated with rootPid or known descendants, while guaranteeing unrelated decoys are preserved.
+ */
+export function getProcessTreePids(rootPid: number, knownPids?: Iterable<number>): number[] {
+  if (!rootPid || rootPid <= 0) return [];
+  if (process.platform !== "linux") {
+    const result: number[] = [];
+    if (isPidAlive(rootPid)) result.push(rootPid);
+    if (knownPids) {
+      for (const p of knownPids) {
+        if (p > 0 && isPidAlive(p) && !result.includes(p)) {
+          result.push(p);
+        }
       }
-    } catch {}
+    }
+    return result;
   }
 
-  return false;
+  try {
+    const entries = fs.readdirSync("/proc");
+    const childrenByPpid = new Map<number, number[]>();
+    const byPgrp = new Map<number, number[]>();
+    const bySid = new Map<number, number[]>();
+    const allAlive = new Set<number>();
+
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = parseInt(entry, 10);
+      try {
+        const stat = fs.readFileSync(`/proc/${entry}/stat`, "utf8");
+        const lastParen = stat.lastIndexOf(")");
+        if (lastParen === -1) continue;
+        const rest = stat.slice(lastParen + 2).trim().split(/\s+/);
+        const ppid = parseInt(rest[1], 10);
+        const pgrp = parseInt(rest[2], 10);
+        const sid = parseInt(rest[3], 10);
+
+        allAlive.add(pid);
+
+        if (!childrenByPpid.has(ppid)) childrenByPpid.set(ppid, []);
+        childrenByPpid.get(ppid)!.push(pid);
+
+        if (!byPgrp.has(pgrp)) byPgrp.set(pgrp, []);
+        byPgrp.get(pgrp)!.push(pid);
+
+        if (!bySid.has(sid)) bySid.set(sid, []);
+        bySid.get(sid)!.push(pid);
+      } catch {}
+    }
+
+    const ownedPids = new Set<number>();
+    const targetPgrps = new Set<number>();
+    const targetSids = new Set<number>();
+
+    if (allAlive.has(rootPid)) {
+      ownedPids.add(rootPid);
+    }
+    targetPgrps.add(rootPid);
+    targetSids.add(rootPid);
+
+    if (knownPids) {
+      for (const p of knownPids) {
+        if (p > 0 && allAlive.has(p)) {
+          ownedPids.add(p);
+          targetPgrps.add(p);
+          targetSids.add(p);
+        }
+      }
+    }
+
+    // Expand through process group and session bindings
+    for (const pgrp of targetPgrps) {
+      const pids = byPgrp.get(pgrp);
+      if (pids) {
+        for (const p of pids) ownedPids.add(p);
+      }
+    }
+    for (const sid of targetSids) {
+      const pids = bySid.get(sid);
+      if (pids) {
+        for (const p of pids) ownedPids.add(p);
+      }
+    }
+
+    // Recursively expand through children
+    const queue = Array.from(ownedPids);
+    if (!ownedPids.has(rootPid)) {
+      queue.push(rootPid);
+    }
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      const children = childrenByPpid.get(current);
+      if (children) {
+        for (const child of children) {
+          if (!ownedPids.has(child)) {
+            ownedPids.add(child);
+            queue.push(child);
+          }
+        }
+      }
+    }
+
+    return Array.from(ownedPids).filter((p) => allAlive.has(p));
+  } catch {
+    return isPidAlive(rootPid) ? [rootPid] : [];
+  }
+}
+
+export function isProcessTreeAlive(pid: number, knownPids?: Iterable<number>): boolean {
+  if (!pid || pid <= 0) return false;
+  if (isPidAlive(pid)) return true;
+  if (isProcessGroupAlive(pid)) return true;
+  if (knownPids) {
+    for (const p of knownPids) {
+      if (p > 0 && (isPidAlive(p) || isProcessGroupAlive(p))) {
+        return true;
+      }
+    }
+  }
+  const tree = getProcessTreePids(pid, knownPids);
+  return tree.length > 0;
 }
 
 /**
  * Terminate a PTY process tree cleanly (LAW-016).
- * On Linux/WSL, zigpty leader is its own process group leader (setsid),
- * so sending the signal to `-pid` terminates leader and all descendants.
+ * On Linux/WSL, signals the primary process group and all recursively discovered
+ * descendants and their process groups.
  */
-export function terminatePtyProcessTree(pid: number, signal: NodeJS.Signals = "SIGTERM"): void {
+export function terminatePtyProcessTree(
+  pid: number,
+  signal: NodeJS.Signals = "SIGTERM",
+  knownPids?: Iterable<number>
+): void {
   if (!pid || pid <= 0) return;
+
   if (process.platform === "win32") {
     const args = ["/pid", String(pid), "/t", "/f"];
     try {
@@ -152,87 +250,85 @@ export function terminatePtyProcessTree(pid: number, signal: NodeJS.Signals = "S
     } catch {}
     return;
   }
+
+  const pids = getProcessTreePids(pid, knownPids);
+
   try {
     process.kill(-pid, signal);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== "ESRCH") {
-      try {
-        process.kill(pid, signal);
-      } catch (innerError) {
-        // ESRCH is expected when child has already exited
-      }
-    }
-  }
-
+  } catch {}
   try {
     process.kill(pid, signal);
   } catch {}
 
-  if (process.platform === "linux") {
+  for (const p of pids) {
+    if (p === pid) continue;
     try {
-      const entries = fs.readdirSync("/proc");
-      for (const entry of entries) {
-        if (!/^\d+$/.test(entry)) continue;
-        const entryPid = parseInt(entry, 10);
-        if (entryPid === pid) continue;
-        try {
-          const stat = fs.readFileSync(`/proc/${entry}/stat`, "utf8");
-          const lastParen = stat.lastIndexOf(")");
-          if (lastParen !== -1) {
-            const rest = stat.slice(lastParen + 2).trim().split(/\s+/);
-            const ppid = parseInt(rest[1], 10);
-            const pgrp = parseInt(rest[2], 10);
-            const sid = parseInt(rest[3], 10);
-            if (ppid === pid || pgrp === pid || sid === pid) {
-              try {
-                process.kill(entryPid, signal);
-              } catch {}
-            }
-          }
-        } catch {}
-      }
+      process.kill(-p, signal);
+    } catch {}
+    try {
+      process.kill(p, signal);
     } catch {}
   }
+}
+
+export interface TerminateProcessTreeOptions {
+  knownPids?: Iterable<number>;
+  isAliveChecker?: (pid: number, knownPids?: Iterable<number>) => boolean;
 }
 
 /**
  * Terminate and await process tree disappearance with bounded grace (LAW-016, LAW-017).
  * Sends SIGTERM, awaits disappearance up to graceTimeoutMs, escalates to SIGKILL if still
  * alive, and awaits post-kill disappearance before returning.
+ *
+ * If post-SIGKILL wait expires and processes remain observed alive, performs one final
+ * best-effort kill and fails closed with pty_cleanup_incomplete rather than silently
+ * claiming cleanup success.
  */
 export async function terminateAndAwaitProcessTree(
   pid: number,
   graceTimeoutMs = 1500,
-  killWaitTimeoutMs = 1000
+  killWaitTimeoutMs = 1000,
+  options: TerminateProcessTreeOptions = {}
 ): Promise<void> {
   if (!pid || pid <= 0) return;
 
-  if (!isProcessTreeAlive(pid)) return;
+  const isAlive = options.isAliveChecker ?? isProcessTreeAlive;
+  const knownPids = options.knownPids;
 
-  terminatePtyProcessTree(pid, "SIGTERM");
+  if (!isAlive(pid, knownPids)) return;
+
+  terminatePtyProcessTree(pid, "SIGTERM", knownPids);
 
   const pollIntervalMs = 25;
   const startGrace = Date.now();
   while (Date.now() - startGrace < graceTimeoutMs) {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
-    if (!isProcessTreeAlive(pid)) {
+    if (!isAlive(pid, knownPids)) {
       return;
     }
   }
 
-  terminatePtyProcessTree(pid, "SIGKILL");
+  terminatePtyProcessTree(pid, "SIGKILL", knownPids);
 
   const startKill = Date.now();
   while (Date.now() - startKill < killWaitTimeoutMs) {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
-    if (!isProcessTreeAlive(pid)) {
+    if (!isAlive(pid, knownPids)) {
       return;
     }
   }
 
-  if (isProcessTreeAlive(pid)) {
-    terminatePtyProcessTree(pid, "SIGKILL");
+  if (isAlive(pid, knownPids)) {
+    terminatePtyProcessTree(pid, "SIGKILL", knownPids);
+  }
+
+  // Final verification: fail closed if descendant processes are still observed alive
+  if (isAlive(pid, knownPids)) {
+    throw new CodexProError(
+      "PTY process tree cleanup incomplete: descendant processes still observed alive after SIGKILL escalation.",
+      "pty_cleanup_incomplete"
+    );
   }
 }
 
@@ -280,6 +376,7 @@ export class PtyRunManager {
   private readonly platform: string;
   private readonly arch: string;
   private readonly onMatcherBufferUpdate?: (bufferLength: number, bufferContent: string) => void;
+  private readonly isAliveChecker?: (pid: number, knownPids?: Iterable<number>) => boolean;
 
   private lifecycleState: "open" | "closing" | "closed" = "open";
   private activeCount = 0;
@@ -297,6 +394,7 @@ export class PtyRunManager {
     this.platform = options.platform ?? process.platform;
     this.arch = options.arch ?? process.arch;
     this.onMatcherBufferUpdate = options.onMatcherBufferUpdate;
+    this.isAliveChecker = options.isAliveChecker;
 
     const envPath = makeRestrictedBashEnv(config).PATH;
     const rawWrapper = options.containmentWrapper ?? config.containmentWrapper;
@@ -312,6 +410,10 @@ export class PtyRunManager {
         "pty_containment_wrapper_invalid"
       );
     }
+  }
+
+  public isAlive(pid: number, knownPids?: Iterable<number>): boolean {
+    return (this.isAliveChecker ?? isProcessTreeAlive)(pid, knownPids);
   }
 
   public get state(): "open" | "closing" | "closed" {
@@ -414,6 +516,17 @@ export class PtyRunManager {
     const startTime = Date.now();
     const pid = pty.pid;
 
+    const knownDescendants = new Set<number>();
+    knownDescendants.add(pid);
+    const updateKnownDescendants = () => {
+      const currentPids = getProcessTreePids(pid, knownDescendants);
+      for (const p of currentPids) {
+        knownDescendants.add(p);
+      }
+    };
+    const scanTimer = setInterval(updateKnownDescendants, 50);
+    scanTimer.unref();
+
     return new Promise<PtyRunResult>((resolve, reject) => {
       const pipeline = new PtyTranscriptPipeline({
         maxOutputBytes: this.config.maxOutputBytes,
@@ -432,7 +545,7 @@ export class PtyRunManager {
       let exitCode: number | null = null;
       let signal: string | null = null;
 
-      let resolveDone: () => void;
+      let resolveDone: () => void = () => {};
       const donePromise = new Promise<void>((r) => {
         resolveDone = r;
       });
@@ -444,6 +557,9 @@ export class PtyRunManager {
         finalized = true;
 
         try {
+          clearInterval(scanTimer);
+          updateKnownDescendants();
+
           // 1. Clear timers synchronously
           if (overallTimer) {
             clearTimeout(overallTimer);
@@ -456,19 +572,33 @@ export class PtyRunManager {
 
           // 2. Detach listeners synchronously
           try {
-            dataSub.dispose();
+            dataSub?.dispose();
           } catch {}
           try {
-            exitSub.dispose();
+            exitSub?.dispose();
           } catch {}
 
           // 3. Process tree termination and bounded await (LAW-016, LAW-017)
+          const cleanupOpts: TerminateProcessTreeOptions = {
+            knownPids: knownDescendants,
+            isAliveChecker: this.isAliveChecker
+          };
           if (terminalState !== "succeeded" && terminalState !== "failed") {
-            await terminateAndAwaitProcessTree(pid, this.processGraceTimeoutMs, this.processKillWaitTimeoutMs);
+            await terminateAndAwaitProcessTree(
+              pid,
+              this.processGraceTimeoutMs,
+              this.processKillWaitTimeoutMs,
+              cleanupOpts
+            );
           } else {
-            // Natural exit: ensure no background children were orphaned in the process group
-            if (isProcessTreeAlive(pid)) {
-              await terminateAndAwaitProcessTree(pid, 200, 500);
+            // Natural exit: ensure no background children were orphaned in the process tree
+            if (this.isAlive(pid, knownDescendants)) {
+              await terminateAndAwaitProcessTree(
+                pid,
+                this.processGraceTimeoutMs,
+                this.processKillWaitTimeoutMs,
+                cleanupOpts
+              );
             }
           }
 
@@ -524,6 +654,7 @@ export class PtyRunManager {
           resolve(result);
         } catch (err) {
           reject(err);
+          throw err;
         } finally {
           // 7. Release capacity and remove from active runs only after tree cleanup
           this.activeRuns.delete(activeHandle);
@@ -541,6 +672,122 @@ export class PtyRunManager {
       };
       this.activeRuns.add(activeHandle);
 
+      let dataSub: zigpty.IDisposable | undefined;
+      let exitSub: zigpty.IDisposable | undefined;
+
+      try {
+        dataSub = pty.onData((chunk) => {
+          if (finalized) return;
+          const sanitizedText = pipeline.push(chunk);
+
+          if (pipeline.isCeilingExceeded()) {
+            void finalize("output_limit_exceeded").catch(() => {});
+            return;
+          }
+
+          if (currentStepIndex < request.steps.length && !finalized) {
+            matcherBuffer += sanitizedText;
+            const currentStep = request.steps[currentStepIndex];
+            const matchIdx = matcherBuffer.indexOf(currentStep.wait_for);
+            if (matchIdx !== -1) {
+              if (stepTimer) {
+                clearTimeout(stepTimer);
+                stepTimer = undefined;
+              }
+              const elapsed = Date.now() - stepStartTime;
+              let inputBytesSent = 0;
+
+              if (currentStep.send) {
+                try {
+                  pty.write(currentStep.send);
+                  // LAW-011: input_bytes_sent counts UTF-8 bytes from caller send only
+                  inputBytesSent = Buffer.byteLength(currentStep.send, "utf8");
+                } catch {}
+              }
+
+              let submitSucceeded = false;
+              if (currentStep.submit === true) {
+                try {
+                  pty.write("\r");
+                  submitSucceeded = true;
+                } catch {}
+              }
+
+              stepResults.push({
+                step_index: currentStepIndex,
+                matched: true,
+                input_bytes_sent: inputBytesSent,
+                submit: submitSucceeded,
+                elapsed_ms: elapsed
+              });
+
+              // Reset matcher state entirely so output produced before this step completed cannot satisfy next step
+              matcherBuffer = "";
+              this.onMatcherBufferUpdate?.(0, "");
+              const nextIdx = currentStepIndex + 1;
+              if (nextIdx < request.steps.length) {
+                startStep(nextIdx);
+              } else {
+                currentStepIndex = nextIdx;
+              }
+            } else {
+              // Keep only needed suffix for potential future boundary match; empty when length is 1
+              matcherBuffer = trimMatcherBuffer(matcherBuffer, currentStep.wait_for.length);
+              this.onMatcherBufferUpdate?.(matcherBuffer.length, matcherBuffer);
+            }
+          }
+        });
+
+        exitSub = pty.onExit((info) => {
+          exitCode = info.exitCode ?? null;
+          const sigNum = typeof info.signal === "number" && info.signal > 0 ? info.signal : null;
+          signal = sigNum !== null ? String(sigNum) : null;
+          if (!finalized) {
+            if (exitCode === 0 && sigNum === null) {
+              void finalize("succeeded").catch(() => {});
+            } else {
+              void finalize("failed").catch(() => {});
+            }
+          }
+        });
+      } catch (listenerError) {
+        clearInterval(scanTimer);
+        updateKnownDescendants();
+        void (async () => {
+          let cleanupError: unknown = null;
+          try {
+            await terminateAndAwaitProcessTree(
+              pid,
+              this.processGraceTimeoutMs,
+              this.processKillWaitTimeoutMs,
+              {
+                knownPids: knownDescendants,
+                isAliveChecker: this.isAliveChecker
+              }
+            );
+          } catch (cleanErr) {
+            cleanupError = cleanErr;
+          }
+          try {
+            pty.close();
+          } catch {}
+          this.activeRuns.delete(activeHandle);
+          this.activeCount = Math.max(0, this.activeCount - 1);
+          resolveDone();
+          if (cleanupError instanceof CodexProError && cleanupError.code === "pty_cleanup_incomplete") {
+            reject(cleanupError);
+          } else {
+            reject(
+              new CodexProError(
+                `PTY backend error after process spawn: ${(listenerError as Error).message}`,
+                "pty_backend_error"
+              )
+            );
+          }
+        })();
+        return;
+      }
+
       function startStep(idx: number) {
         currentStepIndex = idx;
         stepStartTime = Date.now();
@@ -548,7 +795,7 @@ export class PtyRunManager {
         const step = request.steps[idx];
         const stepTimeout = step.timeout_ms ?? PTY_LIMITS.defaultStepTimeoutMs;
         stepTimer = setTimeout(() => {
-          void finalize("step_timeout");
+          void finalize("step_timeout").catch(() => {});
         }, stepTimeout);
         stepTimer.unref();
       }
@@ -559,82 +806,9 @@ export class PtyRunManager {
 
       // Overall execution timeout
       overallTimer = setTimeout(() => {
-        void finalize("timed_out");
+        void finalize("timed_out").catch(() => {});
       }, request.timeoutMs);
       overallTimer.unref();
-
-      const dataSub = pty.onData((chunk) => {
-        if (finalized) return;
-        const sanitizedText = pipeline.push(chunk);
-
-        if (pipeline.isCeilingExceeded()) {
-          void finalize("output_limit_exceeded");
-          return;
-        }
-
-        if (currentStepIndex < request.steps.length && !finalized) {
-          matcherBuffer += sanitizedText;
-          const currentStep = request.steps[currentStepIndex];
-          const matchIdx = matcherBuffer.indexOf(currentStep.wait_for);
-          if (matchIdx !== -1) {
-            if (stepTimer) {
-              clearTimeout(stepTimer);
-              stepTimer = undefined;
-            }
-            const elapsed = Date.now() - stepStartTime;
-            let inputBytesSent = 0;
-
-            if (currentStep.send) {
-              try {
-                pty.write(currentStep.send);
-                // LAW-011: input_bytes_sent counts UTF-8 bytes from caller send only
-                inputBytesSent = Buffer.byteLength(currentStep.send, "utf8");
-              } catch {}
-            }
-
-            if (currentStep.submit === true) {
-              try {
-                pty.write("\r");
-              } catch {}
-            }
-
-            stepResults.push({
-              step_index: currentStepIndex,
-              matched: true,
-              input_bytes_sent: inputBytesSent,
-              submit: currentStep.submit === true,
-              elapsed_ms: elapsed
-            });
-
-            // Reset matcher state entirely so output produced before this step completed cannot satisfy next step
-            matcherBuffer = "";
-            this.onMatcherBufferUpdate?.(0, "");
-            const nextIdx = currentStepIndex + 1;
-            if (nextIdx < request.steps.length) {
-              startStep(nextIdx);
-            } else {
-              currentStepIndex = nextIdx;
-            }
-          } else {
-            // Keep only needed suffix for potential future boundary match; empty when length is 1
-            matcherBuffer = trimMatcherBuffer(matcherBuffer, currentStep.wait_for.length);
-            this.onMatcherBufferUpdate?.(matcherBuffer.length, matcherBuffer);
-          }
-        }
-      });
-
-      const exitSub = pty.onExit((info) => {
-        exitCode = info.exitCode ?? null;
-        const sigNum = typeof info.signal === "number" && info.signal > 0 ? info.signal : null;
-        signal = sigNum !== null ? String(sigNum) : null;
-        if (!finalized) {
-          if (exitCode === 0 && sigNum === null) {
-            void finalize("succeeded");
-          } else {
-            void finalize("failed");
-          }
-        }
-      });
     });
   }
 
@@ -644,10 +818,15 @@ export class PtyRunManager {
    * 2. Snapshot currently owned active runs.
    * 3. Terminate / await bounded cleanup of all active runs.
    * 4. Transition to closed only after all active runs' owned trees have disappeared.
+   *    If cleanup is incomplete, manager does NOT transition to closed.
    */
-  public async close(): Promise<void> {
-    if (this.lifecycleState === "closed") return;
-    if (this.lifecycleState === "closing") return this.closePromise!;
+  public close(): Promise<void> {
+    if (this.lifecycleState === "closed") {
+      return this.closePromise ?? Promise.resolve();
+    }
+    if (this.closePromise) {
+      return this.closePromise;
+    }
 
     this.lifecycleState = "closing";
 

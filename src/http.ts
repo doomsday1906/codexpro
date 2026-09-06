@@ -25,6 +25,7 @@ import type { WorkspaceDiagnosticReader } from "./guard.js";
 import { createCodexProServer } from "./server.js";
 import { defaultGitPushPolicy, normalizeGitPushPolicy, sanitizeGitPushPolicy, summarizeGitPushPolicy, type GitPushPolicy } from "./gitPushPolicy.js";
 import { VerificationManager } from "./verificationOps.js";
+import { PtyRunManager } from "./ptyRunManager.js";
 
 export interface CodexProHttpAppOptions {
   /** Internal observer for the real server instances created by HTTP sessions. */
@@ -33,6 +34,8 @@ export interface CodexProHttpAppOptions {
   readonly onWorkspaceDiagnosticReader?: (reader: Readonly<WorkspaceDiagnosticReader>) => void;
   /** Process-scoped verification manager shared across all HTTP sessions. */
   readonly verificationManager?: VerificationManager;
+  /** Process-scoped PTY execution manager shared across all HTTP sessions. */
+  readonly ptyRunManager?: PtyRunManager;
 }
 
 function escapeHtml(value: unknown): string {
@@ -1483,6 +1486,8 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
   const app = express();
   const verificationManager = options.verificationManager ?? new VerificationManager(config);
   (app as any).verificationManager = verificationManager;
+  const ptyRunManager = options.ptyRunManager ?? new PtyRunManager(config);
+  (app as any).ptyRunManager = ptyRunManager;
   const logRequests = process.env.CODEXPRO_LOG_REQUESTS === "1";
   const authFailureWindow = new Map<string, { count: number; resetAt: number }>();
   const authFailureLimit = 10;
@@ -1779,7 +1784,8 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
         const server = createCodexProServer(config, {
           diagnosticContext,
           onWorkspaceDiagnosticReader: options.onWorkspaceDiagnosticReader,
-          verificationManager
+          verificationManager,
+          ptyRunManager
         });
         options.onDiagnosticContext?.(diagnosticContext);
         await server.connect(transport);
@@ -1864,7 +1870,8 @@ async function main(): Promise<void> {
 
   const config = loadConfig();
   const verificationManager = new VerificationManager(config);
-  const app = createCodexProHttpApp(config, { verificationManager });
+  const ptyRunManager = new PtyRunManager(config);
+  const app = createCodexProHttpApp(config, { verificationManager, ptyRunManager });
   const server = app.listen(config.port, config.host, () => {
     console.error(`[CodexPro] HTTP MCP listening on http://${config.host}:${config.port}/mcp`);
     console.error(`[CodexPro] defaultRoot=${config.defaultRoot}`);
@@ -1878,16 +1885,22 @@ async function main(): Promise<void> {
   const gracefulShutdown = (signal: string) => {
     if (isClosing) return;
     isClosing = true;
-    console.error(`[CodexPro] Received ${signal}, closing HTTP server and terminating managed verification jobs...`);
+    console.error(`[CodexPro] Received ${signal}, closing HTTP server, terminating managed verification jobs, and cleaning active PTYs...`);
     server.close();
-    verificationManager
-      .close()
-      .catch((err) => {
-        console.error(`[CodexPro] Error during verification manager shutdown: ${err instanceof Error ? err.message : String(err)}`);
-      })
-      .finally(() => {
-        process.exit(0);
-      });
+    Promise.all([
+      verificationManager
+        .close()
+        .catch((err) => {
+          console.error(`[CodexPro] Error during verification manager shutdown: ${err instanceof Error ? err.message : String(err)}`);
+        }),
+      ptyRunManager
+        .close()
+        .catch((err) => {
+          console.error(`[CodexPro] Error during PTY run manager shutdown: ${err instanceof Error ? err.message : String(err)}`);
+        })
+    ]).finally(() => {
+      process.exit(0);
+    });
     setTimeout(() => {
       process.exit(0);
     }, 5000).unref();

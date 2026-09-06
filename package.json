@@ -81,6 +81,7 @@
     "pty-validator:smoke": "npm run build && node scripts/pty-validator-smoke.mjs",
     "pty-sanitizer:smoke": "npm run build && node scripts/pty-sanitizer-smoke.mjs",
     "pty-manager:smoke": "npm run build && node scripts/pty-manager-smoke.mjs",
+    "pty-lifecycle:smoke": "npm run build && node scripts/pty-lifecycle-smoke.mjs",
     "verification:smoke": "npm run build && node scripts/verification-manager-smoke.mjs && node scripts/http-session-continuity-smoke.mjs && node scripts/verification-adversarial-smoke.mjs && node scripts/verification-security-envelope-smoke.mjs",
     "verification:fixture": "node scripts/verification-fixture.mjs",
     "verification:r2-falsifier": "node scripts/verification-r2-falsifier.mjs",
