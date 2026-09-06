@@ -65,8 +65,8 @@ export function packLockDerivedRelease({
     if (ciRes.status !== 0) fail(`Clean staging npm ci failed: ${(ciRes.stderr || ciRes.stdout).trim()}`);
 
     const stagedClosure = assertReleaseDependencyClosure(stage);
-    if (stagedClosure.packageCount !== 100) {
-      fail(`Clean staged closure expected 100 packages; found ${stagedClosure.packageCount}`);
+    if (stagedClosure.packageCount !== 101) {
+      fail(`Clean staged closure expected 101 packages; found ${stagedClosure.packageCount}`);
     }
 
     const packArgs = ["pack", "--ignore-scripts", "--json"];

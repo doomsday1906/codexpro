@@ -165,7 +165,7 @@ async function main() {
 
   console.log("==> Step 1: Asserting release environment and lock-derived dependency closure...");
   const release = assertCodexProReleaseEnvironment();
-  assert.equal(release.productionClosure.packageCount, 100, `Expected exactly 100 production packages; found ${release.productionClosure.packageCount}`);
+  assert.equal(release.productionClosure.packageCount, 101, `Expected exactly 101 production packages; found ${release.productionClosure.packageCount}`);
   console.log(`    Release environment valid: ${release.name}@${release.version}`);
   console.log(`    Verified ${release.productionClosure.packageCount} production runtime packages in node_modules against package-lock.json.`);
 
@@ -173,7 +173,7 @@ async function main() {
   const lockGraph = normalizeLockfileGraph(resolve(CODEXPRO_ROOT, "package-lock.json"));
   console.log(`    Lockfile graph nodes: ${lockGraph.node_count}`);
   console.log(`    Lockfile graph SHA-256: ${lockGraph.graph_sha256}`);
-  assert.equal(lockGraph.node_count, 100, `Expected 100 lockfile nodes; found ${lockGraph.node_count}`);
+  assert.equal(lockGraph.node_count, 101, `Expected 101 lockfile nodes; found ${lockGraph.node_count}`);
 
   const workDir = mkdtempSync(join(tmpdir(), "codexpro-repro-"));
   const packDir = join(workDir, "pack");
@@ -244,7 +244,7 @@ async function main() {
     assert.equal(installBRes.status, 0, `Install B failed: ${installBRes.stderr}`);
     console.log(`    Install B succeeded (exit 0).`);
 
-    console.log("==> Step 6: Verifying installed topologies match intended 100-node closure...");
+    console.log("==> Step 6: Verifying installed topologies match intended 101-node closure...");
     const installedPkgA = join(prefixA, "lib/node_modules/codexpro");
     const installedPkgB = join(prefixB, "lib/node_modules/codexpro");
 
@@ -254,8 +254,8 @@ async function main() {
     console.log(`    Installed A node count: ${nodesA.length}`);
     console.log(`    Installed B node count: ${nodesB.length}`);
 
-    assert.equal(nodesA.length, 100, `Expected 100 nodes in A, found ${nodesA.length}`);
-    assert.equal(nodesB.length, 100, `Expected 100 nodes in B, found ${nodesB.length}`);
+    assert.equal(nodesA.length, 101, `Expected 101 nodes in A, found ${nodesA.length}`);
+    assert.equal(nodesB.length, 101, `Expected 101 nodes in B, found ${nodesB.length}`);
 
     const intendedByPath = new Map(lockGraph.nodes.map((n) => [n.path, n]));
     const nodesAByPath = new Map(nodesA.map((n) => [n.path, n]));
@@ -269,7 +269,7 @@ async function main() {
       assert.equal(nodeA.version, intendedNode.version, `Version mismatch in A for ${p}`);
       assert.equal(nodeB.version, intendedNode.version, `Version mismatch in B for ${p}`);
     }
-    console.log("    CONFIRMED: Topology A == Topology B == Intended 100-node topology (0 missing, 0 extra, 0 mismatches)!");
+    console.log("    CONFIRMED: Topology A == Topology B == Intended 101-node topology (0 missing, 0 extra, 0 mismatches)!");
 
     console.log("==> Step 7: Generating and comparing installed runtime byte manifests...");
     const manifestA = buildByteManifest(join(installedPkgA, "node_modules"));
@@ -282,13 +282,26 @@ async function main() {
     assert.equal(manifestA.manifest_sha256, manifestB.manifest_sha256, "Byte manifest digest mismatch between A and B!");
     console.log("    CONFIRMED: Installed runtime byte manifests are 100% IDENTICAL!");
 
-    console.log("==> Step 8: Verifying MCP SDK and Zod versions in installed runtime...");
+    console.log("==> Step 8: Verifying MCP SDK, Zod, and zigpty versions in installed runtime...");
     const sdkA = JSON.parse(readFileSync(join(installedPkgA, "node_modules/@modelcontextprotocol/sdk/package.json"), "utf8"));
     const zodA = JSON.parse(readFileSync(join(installedPkgA, "node_modules/zod/package.json"), "utf8"));
+    const zigptyA = JSON.parse(readFileSync(join(installedPkgA, "node_modules/zigpty/package.json"), "utf8"));
     assert.equal(sdkA.version, "1.30.0", `Installed MCP SDK version mismatch: ${sdkA.version}`);
     assert.equal(zodA.version, "3.25.76", `Installed Zod version mismatch: ${zodA.version}`);
+    assert.equal(zigptyA.version, "0.2.1", `Installed zigpty version mismatch: ${zigptyA.version}`);
     console.log(`    @modelcontextprotocol/sdk: ${sdkA.version}`);
     console.log(`    zod:                      ${zodA.version}`);
+    console.log(`    zigpty:                   ${zigptyA.version}`);
+
+    const zigptyResA = spawnSync(process.execPath, [
+      "-e",
+      "const z = require('zigpty'); if (z.hasNative !== true) { console.error('hasNative !== true'); process.exit(1); }"
+    ], {
+      cwd: installedPkgA,
+      encoding: "utf8"
+    });
+    assert.equal(zigptyResA.status, 0, `Installed zigpty.hasNative check failed: ${zigptyResA.stderr}`);
+    console.log("    zigpty.hasNative:         true");
 
     console.log("==> Step 9: Running CLI checks from isolated global prefixes...");
     const binA = join(prefixA, "bin/codexpro");
@@ -341,6 +354,8 @@ async function main() {
         byte_manifest_identical: true,
         mcp_sdk_preserved: sdkA.version === "1.30.0",
         zod_preserved: zodA.version === "3.25.76",
+        zigpty_preserved: zigptyA.version === "0.2.1",
+        zigpty_has_native: true,
         cli_version_matched: true
       },
       gates: {
@@ -380,10 +395,10 @@ Execution Owner: \`repoconnect-m007-root\` (ACTIVE)
    - Install A exit code: 0
    - Install B exit code: 0
 3. **Topology Comparison**:
-   - Declared intended lockfile closure: 100 nodes (SHA-256 \`${lockGraph.graph_sha256}\`)
-   - Install A topology: 100 nodes (0 missing, 0 extra, 0 mismatches)
-   - Install B topology: 100 nodes (0 missing, 0 extra, 0 mismatches)
-   - Topology A == Topology B == Intended 100-node closure: **MATCH**
+   - Declared intended lockfile closure: 101 nodes (SHA-256 \`${lockGraph.graph_sha256}\`)
+   - Install A topology: 101 nodes (0 missing, 0 extra, 0 mismatches)
+   - Install B topology: 101 nodes (0 missing, 0 extra, 0 mismatches)
+   - Topology A == Topology B == Intended 101-node closure: **MATCH**
 4. **Installed Byte Manifest**:
    - Install A byte manifest: ${manifestA.entry_count} entries, SHA-256 \`${manifestA.manifest_sha256}\`
    - Install B byte manifest: ${manifestB.entry_count} entries, SHA-256 \`${manifestB.manifest_sha256}\`
@@ -391,6 +406,7 @@ Execution Owner: \`repoconnect-m007-root\` (ACTIVE)
 5. **Preserved Baseline Versions**:
    - \`@modelcontextprotocol/sdk\`: \`${sdkA.version}\`
    - \`zod\`: \`${zodA.version}\`
+   - \`zigpty\`: \`${zigptyA.version}\` (hasNative: true)
 6. **CLI Sanity Check**:
    - \`codexpro --version\` in prefix A: \`${runA.stdout.trim()}\`
    - \`codexpro --version\` in prefix B: \`${runB.stdout.trim()}\`
@@ -401,7 +417,7 @@ Direct Physical Verdict: **MATCH**.
 
 1. The candidate bundled tarball was generated from a clean disposable staging tree physically derived from the repository package-lock.json via npm ci --omit=dev --ignore-scripts, ensuring zero dependence on or contamination from worktree node_modules.
 2. Both offline global installations succeeded without accessing external networks or registry endpoints.
-3. The installed runtime environment in both prefixes exactly reproduces the 100-node production closure with zero drift and bit-identical file contents.
+3. The installed runtime environment in both prefixes exactly reproduces the 101-node production closure with zero drift and bit-identical file contents.
 
 ## Acceptance Gates
 

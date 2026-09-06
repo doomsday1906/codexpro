@@ -58,7 +58,7 @@ try {
   assert.ok(tarball.bundledDependenciesCount > 0, "expected bundledDependenciesCount > 0");
   assert.equal(typeof tarball.bundledFilesCount, "number");
   assert.ok(tarball.bundledFilesCount > 0, "expected bundledFilesCount > 0");
-  assert.equal(tarball.productionClosureNodeCount, 100);
+  assert.equal(tarball.productionClosureNodeCount, 101);
 
   // Test closure failure mode on incomplete/corrupted dependency tree
   const { assertReleaseDependencyClosure } = await import("./release-guard.mjs");
