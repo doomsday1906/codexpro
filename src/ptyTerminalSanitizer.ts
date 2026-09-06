@@ -1,6 +1,7 @@
 import { StringDecoder } from "node:string_decoder";
 import { StreamingRedactor } from "./verificationOps.js";
 import { PTY_LIMITS } from "./ptyValidator.js";
+import { CodexProError } from "./guard.js";
 
 /**
  * Internal states of the stateful terminal control sequence parser (LAW-009).
@@ -33,9 +34,13 @@ export interface TerminalSanitizerOptions {
  * - Chunk-aware: handles split ESC/CSI/OSC/DCS/APC/PM/SOS sequences at any byte boundary.
  * - Stateful streaming UTF-8 decoding across multi-byte chunks.
  * - Memory-bounded: unterminated and overlong control strings never exceed maxControlPayloadChars.
- * - Neutralizes CSI, OSC (title, hyperlink/OSC 8, clipboard/OSC 52, arbitrary payloads),
- *   DCS, APC, PM, SOS, and 2-character escape sequences.
- * - Neutralizes 8-bit C1 controls (U+0080..U+009F).
+ * - String-control terminators:
+ *   - OSC: terminated by BEL (\x07), 7-bit ST (ESC \), or decoded 8-bit ST (U+009C).
+ *   - DCS, APC, PM, SOS: terminated by ST only (ESC \ or U+009C). BEL does NOT terminate them.
+ * - Fail-closed malformed control recovery: malformed ESC continuations inside OSC/DCS/APC/PM/SOS
+ *   remain suppressed in control/discard states and never leak trailing payload to GROUND.
+ * - Fail-closed CSI C0 handling: C0/DEL disturbance inside CSI parameters/intermediates is stripped
+ *   without dropping to GROUND early, preventing final CSI control bytes from becoming visible text.
  * - Deterministic normalization: \r\n -> \n, standalone \r -> \n, \t preserved, \n preserved.
  * - All other C0 controls (NUL, BEL, BS, etc.) and DEL (0x7F) are stripped.
  * - Final output is safe printable Unicode text.
@@ -126,7 +131,7 @@ export class TerminalSanitizer {
             if (code < 0x20 || code === 0x7f) {
               // Discard all other C0 controls (0x00..0x1F) and DEL (0x7F)
             } else if (code >= 0x80 && code <= 0x9f) {
-              // 8-bit C1 controls (U+0080..U+009F)
+              // Decoded UTF-8 C1 controls (U+0080..U+009F)
               if (code === 0x9b) {
                 // CSI (0x9B)
                 this.controlPayloadLength = 0;
@@ -194,10 +199,10 @@ export class TerminalSanitizer {
             this.state = SanitizerState.GROUND;
           } else if (ch === "\x1b") {
             this.state = SanitizerState.ESCAPE;
+          } else if (ch.charCodeAt(0) < 0x20 || ch === "\x7f") {
+            // C0/DEL disturbance inside intermediate bytes: strip and stay in ESC_INTERMEDIATE
           } else {
             this.state = SanitizerState.GROUND;
-            if (ch === "\n") out.push("\n");
-            else if (ch === "\r") this.pendingCr = true;
           }
           break;
         }
@@ -222,10 +227,18 @@ export class TerminalSanitizer {
             this.state = SanitizerState.GROUND;
           } else if (ch === "\x1b") {
             this.state = SanitizerState.ESCAPE;
+          } else if (ch.charCodeAt(0) < 0x20 || ch === "\x7f") {
+            // C0/DEL disturbance (e.g. BEL, NUL, BS) inside CSI:
+            // Strip C0 byte and stay in CSI_PARAM to prevent early drop to GROUND
+            // that would expose the final CSI byte as ordinary text.
+            this.controlPayloadLength++;
+            if (this.controlPayloadLength > this.maxControlPayloadChars) {
+              this.state = SanitizerState.CSI_DISCARD;
+            }
           } else {
-            this.state = SanitizerState.GROUND;
-            if (ch === "\n") out.push("\n");
-            else if (ch === "\r") this.pendingCr = true;
+            // Out-of-range unexpected character: move to CSI_DISCARD to suppress until final byte
+            this.controlPayloadLength++;
+            this.state = SanitizerState.CSI_DISCARD;
           }
           break;
         }
@@ -240,10 +253,15 @@ export class TerminalSanitizer {
             this.state = SanitizerState.GROUND;
           } else if (ch === "\x1b") {
             this.state = SanitizerState.ESCAPE;
+          } else if (ch.charCodeAt(0) < 0x20 || ch === "\x7f") {
+            // C0 disturbance inside intermediate bytes: strip and stay
+            this.controlPayloadLength++;
+            if (this.controlPayloadLength > this.maxControlPayloadChars) {
+              this.state = SanitizerState.CSI_DISCARD;
+            }
           } else {
-            this.state = SanitizerState.GROUND;
-            if (ch === "\n") out.push("\n");
-            else if (ch === "\r") this.pendingCr = true;
+            this.controlPayloadLength++;
+            this.state = SanitizerState.CSI_DISCARD;
           }
           break;
         }
@@ -260,7 +278,7 @@ export class TerminalSanitizer {
 
         case SanitizerState.OSC: {
           if (ch === "\x07" || ch === "\u009c") {
-            // BEL (\x07) or 8-bit ST (\u009C) terminates OSC
+            // BEL (\x07) or decoded 8-bit ST (\u009C) terminates OSC
             this.state = SanitizerState.GROUND;
           } else if (ch === "\x1b") {
             this.state = SanitizerState.OSC_ESC;
@@ -274,27 +292,24 @@ export class TerminalSanitizer {
         }
 
         case SanitizerState.OSC_ESC: {
-          if (ch === "\\") {
-            // 7-bit ST (ESC \) terminates OSC
+          if (ch === "\\" || ch === "\u009c") {
+            // 7-bit ST (ESC \) or 8-bit ST terminates OSC
             this.state = SanitizerState.GROUND;
-          } else if (ch === "[" || ch === "]" || ch === "P" || ch === "X" || ch === "^" || ch === "_") {
-            // Aborted prior OSC with new escape introducer
-            if (ch === "[") {
-              this.controlPayloadLength = 0;
-              this.state = SanitizerState.CSI_PARAM;
-            } else if (ch === "]") {
-              this.controlPayloadLength = 0;
-              this.state = SanitizerState.OSC;
-            } else {
-              this.controlPayloadLength = 0;
-              this.state = SanitizerState.STRING_CONTROL;
-            }
+          } else if (ch === "\x07") {
+            // BEL terminates OSC
+            this.state = SanitizerState.GROUND;
           } else if (ch === "\x1b") {
-            this.state = SanitizerState.ESCAPE;
+            // Another ESC: stay in OSC_ESC
+            this.state = SanitizerState.OSC_ESC;
           } else {
-            this.state = SanitizerState.GROUND;
-            if (ch === "\n") out.push("\n");
-            else if (ch === "\r") this.pendingCr = true;
+            // Malformed ESC continuation: fail closed by remaining inside suppressed OSC payload.
+            // Do NOT return to GROUND early.
+            this.controlPayloadLength += ch.length + 1;
+            if (this.controlPayloadLength > this.maxControlPayloadChars) {
+              this.state = SanitizerState.OSC_DISCARD;
+            } else {
+              this.state = SanitizerState.OSC;
+            }
           }
           break;
         }
@@ -310,36 +325,28 @@ export class TerminalSanitizer {
         }
 
         case SanitizerState.OSC_DISCARD_ESC: {
-          if (ch === "\\") {
+          if (ch === "\\" || ch === "\u009c") {
             this.state = SanitizerState.GROUND;
-          } else if (ch === "[" || ch === "]" || ch === "P" || ch === "X" || ch === "^" || ch === "_") {
-            if (ch === "[") {
-              this.controlPayloadLength = 0;
-              this.state = SanitizerState.CSI_PARAM;
-            } else if (ch === "]") {
-              this.controlPayloadLength = 0;
-              this.state = SanitizerState.OSC;
-            } else {
-              this.controlPayloadLength = 0;
-              this.state = SanitizerState.STRING_CONTROL;
-            }
+          } else if (ch === "\x07") {
+            this.state = SanitizerState.GROUND;
           } else if (ch === "\x1b") {
-            this.state = SanitizerState.ESCAPE;
+            this.state = SanitizerState.OSC_DISCARD_ESC;
           } else {
-            this.state = SanitizerState.GROUND;
-            if (ch === "\n") out.push("\n");
-            else if (ch === "\r") this.pendingCr = true;
+            // Malformed continuation: stay in discard state
+            this.state = SanitizerState.OSC_DISCARD;
           }
           break;
         }
 
         case SanitizerState.STRING_CONTROL: {
           // DCS (ESC P), SOS (ESC X), PM (ESC ^), APC (ESC _)
-          if (ch === "\x07" || ch === "\u009c") {
+          // Terminated by ST ONLY (8-bit U+009C or 7-bit ESC \). BEL does NOT terminate!
+          if (ch === "\u009c") {
             this.state = SanitizerState.GROUND;
           } else if (ch === "\x1b") {
             this.state = SanitizerState.STRING_CONTROL_ESC;
           } else {
+            // BEL (\x07) and arbitrary bytes remain suppressed as active string control payload
             this.controlPayloadLength += ch.length;
             if (this.controlPayloadLength > this.maxControlPayloadChars) {
               this.state = SanitizerState.STRING_CONTROL_DISCARD;
@@ -349,33 +356,27 @@ export class TerminalSanitizer {
         }
 
         case SanitizerState.STRING_CONTROL_ESC: {
-          if (ch === "\\") {
-            // ST (ESC \) terminates string control
+          if (ch === "\\" || ch === "\u009c") {
+            // 7-bit ST (ESC \) or 8-bit ST terminates string control
             this.state = SanitizerState.GROUND;
-          } else if (ch === "[" || ch === "]" || ch === "P" || ch === "X" || ch === "^" || ch === "_") {
-            if (ch === "[") {
-              this.controlPayloadLength = 0;
-              this.state = SanitizerState.CSI_PARAM;
-            } else if (ch === "]") {
-              this.controlPayloadLength = 0;
-              this.state = SanitizerState.OSC;
+          } else if (ch === "\x1b") {
+            this.state = SanitizerState.STRING_CONTROL_ESC;
+          } else {
+            // Malformed ESC continuation: fail closed by remaining inside suppressed string control payload.
+            // Do NOT return to GROUND early.
+            this.controlPayloadLength += ch.length + 1;
+            if (this.controlPayloadLength > this.maxControlPayloadChars) {
+              this.state = SanitizerState.STRING_CONTROL_DISCARD;
             } else {
-              this.controlPayloadLength = 0;
               this.state = SanitizerState.STRING_CONTROL;
             }
-          } else if (ch === "\x1b") {
-            this.state = SanitizerState.ESCAPE;
-          } else {
-            this.state = SanitizerState.GROUND;
-            if (ch === "\n") out.push("\n");
-            else if (ch === "\r") this.pendingCr = true;
           }
           break;
         }
 
         case SanitizerState.STRING_CONTROL_DISCARD: {
-          // Bounded overflow state: discard string control payload until terminator
-          if (ch === "\x07" || ch === "\u009c") {
+          // Bounded overflow state: discard string control payload until ST only
+          if (ch === "\u009c") {
             this.state = SanitizerState.GROUND;
           } else if (ch === "\x1b") {
             this.state = SanitizerState.STRING_CONTROL_DISCARD_ESC;
@@ -384,25 +385,12 @@ export class TerminalSanitizer {
         }
 
         case SanitizerState.STRING_CONTROL_DISCARD_ESC: {
-          if (ch === "\\") {
+          if (ch === "\\" || ch === "\u009c") {
             this.state = SanitizerState.GROUND;
-          } else if (ch === "[" || ch === "]" || ch === "P" || ch === "X" || ch === "^" || ch === "_") {
-            if (ch === "[") {
-              this.controlPayloadLength = 0;
-              this.state = SanitizerState.CSI_PARAM;
-            } else if (ch === "]") {
-              this.controlPayloadLength = 0;
-              this.state = SanitizerState.OSC;
-            } else {
-              this.controlPayloadLength = 0;
-              this.state = SanitizerState.STRING_CONTROL;
-            }
           } else if (ch === "\x1b") {
-            this.state = SanitizerState.ESCAPE;
+            this.state = SanitizerState.STRING_CONTROL_DISCARD_ESC;
           } else {
-            this.state = SanitizerState.GROUND;
-            if (ch === "\n") out.push("\n");
-            else if (ch === "\r") this.pendingCr = true;
+            this.state = SanitizerState.STRING_CONTROL_DISCARD;
           }
           break;
         }
@@ -444,8 +432,14 @@ export class BoundedTranscriptCollector {
   private chunks: Buffer[] = [];
   private retainedBytes = 0;
   private truncated = false;
+  public readonly maxBytes: number;
 
-  constructor(public readonly maxBytes: number) {}
+  constructor(maxBytes: number) {
+    if (typeof maxBytes !== "number" || !Number.isFinite(maxBytes) || maxBytes <= 0) {
+      throw new CodexProError("maxBytes must be a positive finite number.");
+    }
+    this.maxBytes = Math.floor(maxBytes);
+  }
 
   public append(chunk: Buffer): void {
     if (chunk.byteLength === 0) return;
@@ -482,7 +476,8 @@ export class BoundedTranscriptCollector {
 }
 
 export interface PtyPipelineOptions {
-  maxOutputBytes?: number;
+  /** Mandatory active server output authority (config.maxOutputBytes); no silent default allowed */
+  maxOutputBytes: number;
   hardOutputCeilingBytes?: number;
   maxControlPayloadChars?: number;
 }
@@ -516,8 +511,19 @@ export class PtyTranscriptPipeline {
   private sanitizedBytes = 0;
   private ceilingExceeded = false;
 
-  constructor(options: PtyPipelineOptions = {}) {
-    this.maxOutputBytes = options.maxOutputBytes ?? 120_000;
+  constructor(options: PtyPipelineOptions) {
+    if (
+      !options ||
+      typeof options !== "object" ||
+      options.maxOutputBytes === undefined ||
+      options.maxOutputBytes === null ||
+      typeof options.maxOutputBytes !== "number" ||
+      !Number.isFinite(options.maxOutputBytes) ||
+      options.maxOutputBytes <= 0
+    ) {
+      throw new CodexProError("maxOutputBytes is mandatory and must be a positive finite number.");
+    }
+    this.maxOutputBytes = Math.floor(options.maxOutputBytes);
     this.hardOutputCeilingBytes = options.hardOutputCeilingBytes ?? PTY_LIMITS.hardOutputCeilingBytes;
     this.sanitizer = new TerminalSanitizer({ maxControlPayloadChars: options.maxControlPayloadChars });
     this.redactor = new StreamingRedactor();
@@ -625,10 +631,11 @@ export function sanitizeTerminalText(input: Buffer | Uint8Array | string): strin
 
 /**
  * Convenience helper for one-shot terminal output pipeline (sanitizer + redaction + output bounding).
+ * Requires explicit active maxOutputBytes authority.
  */
 export function sanitizeAndRedactTerminalOutput(
   input: Buffer | Uint8Array | string,
-  options?: PtyPipelineOptions
+  options: PtyPipelineOptions
 ): PtyPipelineResult {
   const pipeline = new PtyTranscriptPipeline(options);
   pipeline.push(input);
