@@ -520,9 +520,9 @@ await test("18. session guard absent/mismatch/correct behavior matches existing 
   assert.equal(res.sessionId, "session-secret-12345");
 });
 
-// 19. cwd PathGuard behavior remains exact
-await test("19. cwd PathGuard behavior remains exact", async () => {
-  // Valid relative cwd
+// 19. cwd PathGuard behavior remains exact and requires workspace-relative syntax
+await test("19. cwd PathGuard behavior remains exact and requires workspace-relative syntax", async () => {
+  // 1. cwd: "src" -> accepted
   const validRes = await validatePtyRunInput({
     workspace_id: validWorkspaceId,
     argv: ["git", "status"],
@@ -530,7 +530,60 @@ await test("19. cwd PathGuard behavior remains exact", async () => {
   }, baseConfig, { guard, workspaces });
   assert.equal(validRes.cwd, path.join(realFixtureRoot, "src"));
 
-  // Directory traversal escaping workspace root -> rejected
+  // 2. cwd: "." -> accepted
+  const validDotRes = await validatePtyRunInput({
+    workspace_id: validWorkspaceId,
+    argv: ["git", "status"],
+    cwd: "."
+  }, baseConfig, { guard, workspaces });
+  assert.equal(validDotRes.cwd, realFixtureRoot);
+
+  // 3. Absolute path to an existing directory inside the fixture workspace -> rejected
+  const insideAbs = path.join(realFixtureRoot, "src");
+  await assertRejects(
+    () => validatePtyRunInput({
+      workspace_id: validWorkspaceId,
+      argv: ["git", "status"],
+      cwd: insideAbs
+    }, baseConfig, { guard, workspaces }),
+    /cwd must be workspace-relative; absolute and home-expanded paths are forbidden/i,
+    "absolute cwd inside workspace"
+  );
+
+  // 4. Absolute path outside workspace -> rejected
+  await assertRejects(
+    () => validatePtyRunInput({
+      workspace_id: validWorkspaceId,
+      argv: ["git", "status"],
+      cwd: "/tmp"
+    }, baseConfig, { guard, workspaces }),
+    /cwd must be workspace-relative; absolute and home-expanded paths are forbidden/i,
+    "absolute cwd outside workspace"
+  );
+
+  // 5. ~ -> rejected
+  await assertRejects(
+    () => validatePtyRunInput({
+      workspace_id: validWorkspaceId,
+      argv: ["git", "status"],
+      cwd: "~"
+    }, baseConfig, { guard, workspaces }),
+    /cwd must be workspace-relative; absolute and home-expanded paths are forbidden/i,
+    "home path ~"
+  );
+
+  // 6. ~/... value that would resolve to the workspace if expanded -> rejected before PathGuard
+  await assertRejects(
+    () => validatePtyRunInput({
+      workspace_id: validWorkspaceId,
+      argv: ["git", "status"],
+      cwd: "~/some/path"
+    }, baseConfig, { guard, workspaces }),
+    /cwd must be workspace-relative; absolute and home-expanded paths are forbidden/i,
+    "home path ~/some/path"
+  );
+
+  // 7. ../.. and ../../outside remain rejected by PathGuard
   await assertRejects(
     () => validatePtyRunInput({
       workspace_id: validWorkspaceId,
@@ -538,21 +591,20 @@ await test("19. cwd PathGuard behavior remains exact", async () => {
       cwd: "../.."
     }, baseConfig, { guard, workspaces }),
     /Path escapes workspace root/i,
-    "cwd traversal escape"
+    "cwd traversal escape ../.."
   );
 
-  // Absolute path outside workspace -> rejected
   await assertRejects(
     () => validatePtyRunInput({
       workspace_id: validWorkspaceId,
       argv: ["git", "status"],
-      cwd: "/tmp"
+      cwd: "../../outside"
     }, baseConfig, { guard, workspaces }),
     /Path escapes workspace root/i,
-    "cwd absolute outside workspace"
+    "cwd traversal escape ../../outside"
   );
 
-  // Blocked path inside workspace (.git) -> rejected
+  // 8. .git remains rejected by PathGuard
   await assertRejects(
     () => validatePtyRunInput({
       workspace_id: validWorkspaceId,
@@ -562,6 +614,10 @@ await test("19. cwd PathGuard behavior remains exact", async () => {
     /blocked|Cannot access/i,
     "cwd targeting .git"
   );
+
+  // 9. Existing valid relative cwd still returns correct absolute resolved cwd
+  assert.equal(validRes.cwd, path.join(realFixtureRoot, "src"));
+  assert.equal(validDotRes.cwd, realFixtureRoot);
 });
 
 // 20. > 16 steps rejected

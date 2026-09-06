@@ -531,7 +531,7 @@ export const PTY_STEP_ARGUMENTS_SCHEMA = z.object({
     .describe("Optional bounded printable text to send to the PTY stdin once wait_for matches."),
   submit: z.boolean()
     .optional()
-    .describe("If true, appends one server-owned Enter event after sending optional text. Default: false."),
+    .describe("If true, requests that the runner append one server-owned Enter event after sending text. When omitted or false, requests no Enter event."),
   timeout_ms: z.number()
     .int("step timeout_ms must be an integer.")
     .positive("step timeout_ms must be a positive integer.")
@@ -629,7 +629,21 @@ export async function validatePtyRunInput(
   // Explicit workspace_id resolved through real WorkspaceManager only - no ambient/default-root fallback
   const resolvedWorkspace = context.workspaces.getWorkspace(input.workspace_id);
 
-  // 2. Guarded cwd (LAW-003) - always through PathGuard
+  // 2. Guarded cwd (LAW-003) - caller cwd must be workspace-relative; reject absolute and home paths before PathGuard
+  if (input.cwd !== undefined && input.cwd !== null) {
+    if (
+      input.cwd.startsWith("/") ||
+      input.cwd.startsWith("\\") ||
+      /^[A-Za-z]:[/\\]/.test(input.cwd) ||
+      input.cwd === "~" ||
+      input.cwd.startsWith("~/") ||
+      input.cwd.startsWith("~\\")
+    ) {
+      throw new CodexProError(
+        `cwd must be workspace-relative; absolute and home-expanded paths are forbidden: '${input.cwd}'.`
+      );
+    }
+  }
   const resolvedCwd = context.guard.resolve(resolvedWorkspace, input.cwd ?? ".");
   const resolvedCwdAbs = resolvedCwd.absPath;
 
