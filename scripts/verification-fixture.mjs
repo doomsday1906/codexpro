@@ -14,6 +14,9 @@ let exitCode = 0;
 const exitIdx = args.indexOf('--exit');
 if (exitIdx !== -1 && args[exitIdx + 1]) {
   exitCode = parseInt(args[exitIdx + 1], 10);
+  if (sleepIdx === -1) {
+    sleepMs = 0;
+  }
 }
 
 const stdoutIdx = args.indexOf('--stdout');
@@ -152,6 +155,52 @@ if (overlongRepeatedIdx !== -1) {
   process.stdout.write('A'.repeat(2030) + ' MY_TOKEN1=' + val1 + ' ' + 'B'.repeat(3000));
   process.stdout.write('C'.repeat(1000) + ' Authorization: Bearer ' + val2 + '\n' + 'D'.repeat(3000));
   process.stdout.write('E'.repeat(1000) + ' ADMIN_PASSWORD=' + val3 + ' ' + 'F'.repeat(4000));
+}
+
+const longGapIdx = args.indexOf('--emit-long-gap-credential');
+if (longGapIdx !== -1) {
+  let gap = 5000;
+  if (args[longGapIdx + 1] && !args[longGapIdx + 1].startsWith('-')) {
+    gap = parseInt(args[longGapIdx + 1], 10);
+  }
+  const label = 'MY_LONG_GAP_TOKEN';
+  const val = 'syntheticlonggapsecret999';
+  process.stdout.write(label);
+  process.stdout.write(' '.repeat(gap));
+  process.stdout.write('=' + val);
+}
+
+const incompQuotedIdx = args.indexOf('--emit-incomplete-quoted');
+if (incompQuotedIdx !== -1) {
+  let bodyLen = 5000;
+  if (args[incompQuotedIdx + 1] && !args[incompQuotedIdx + 1].startsWith('-')) {
+    bodyLen = parseInt(args[incompQuotedIdx + 1], 10);
+  }
+  const label = 'MY_QUOTED_SECRET';
+  const val = 'syntheticquotedsecret999';
+  process.stdout.write(label + '="');
+  process.stdout.write('X'.repeat(bodyLen));
+  process.stdout.write(val + '"');
+}
+
+const authLongGapIdx = args.indexOf('--emit-auth-long-gap');
+if (authLongGapIdx !== -1) {
+  let gap = 5000;
+  if (args[authLongGapIdx + 1] && !args[authLongGapIdx + 1].startsWith('-')) {
+    gap = parseInt(args[authLongGapIdx + 1], 10);
+  }
+  const val = 'syntheticauthlonggap999';
+  process.stdout.write('Authorization' + ' '.repeat(gap) + ': Bearer ' + val);
+}
+
+const suppRecovIdx = args.indexOf('--emit-suppression-recovery');
+if (suppRecovIdx !== -1) {
+  let normalText = 'NORMAL_OBSERVABLE_OUTPUT_LINE_AFTER_RECOVERY';
+  if (args[suppRecovIdx + 1] && !args[suppRecovIdx + 1].startsWith('-')) {
+    normalText = args[suppRecovIdx + 1];
+  }
+  process.stdout.write('A'.repeat(5000) + ' SECRET_IN_OVERLONG=secretval123 ' + 'B'.repeat(1000) + '\n');
+  process.stdout.write(normalText + '\n');
 }
 
 if (sleepMs <= 0) {

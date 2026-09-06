@@ -447,7 +447,11 @@ export class StreamingRedactor {
   private readonly decoder = new StringDecoder("utf8");
   private readonly keyScanner = createPrivateKeyScanner();
   private linePending = "";
-  private inAuthorizationLine = false;
+  private suppressingOverlongLine = false;
+  public hasSuppressedContent = false;
+
+  public static readonly MAX_PENDING_LINE_CHARS = 4096;
+  public static readonly SUPPRESSION_MARKER = "[REDACTED_SECRET]";
 
   public push(chunk: Buffer): Buffer[] {
     const text = this.decoder.write(chunk);
@@ -461,87 +465,99 @@ export class StreamingRedactor {
   }
 
   public peekPending(): string {
-    if (!this.linePending) return "";
+    if (this.suppressingOverlongLine || !this.linePending) return "";
     return redactDiagnosticText(this.linePending);
   }
 
   private processText(text: string, final: boolean): Buffer[] {
     const afterKeys = this.keyScanner.push(text, final);
-    if (!afterKeys && !this.linePending && !final) return [];
-
     let input = afterKeys;
     const outputChunks: Buffer[] = [];
 
-    // If an earlier chunk began an overlong Authorization header without a newline,
-    // all text up to the next newline is part of that header value and must be redacted/suppressed.
-    if (this.inAuthorizationLine) {
-      const firstNewline = Math.max(input.indexOf("\n"), input.indexOf("\r"));
-      if (firstNewline === -1) {
-        if (final) {
-          this.inAuthorizationLine = false;
-          if (this.linePending) {
-            const redacted = redactDiagnosticText(this.linePending);
-            this.linePending = "";
-            if (redacted) outputChunks.push(Buffer.from(redacted, "utf8"));
-          }
+    while (input.length > 0) {
+      if (this.suppressingOverlongLine) {
+        const nlMatch = this.findFirstNewline(input);
+        if (!nlMatch) {
+          // Entire input chunk is part of the suppressed overlong line.
+          // Discard all characters; keep state bounded (0 chars retained).
+          input = "";
+          break;
         }
-        return outputChunks;
+        // Newline encountered: end suppression
+        this.suppressingOverlongLine = false;
+        outputChunks.push(Buffer.from(nlMatch.separator, "utf8"));
+        input = input.slice(nlMatch.index + nlMatch.separator.length);
+        continue;
+      }
+
+      const nlMatch = this.findFirstNewline(input);
+      if (!nlMatch) {
+        const combined = this.linePending + input;
+        input = "";
+        if (combined.length > StreamingRedactor.MAX_PENDING_LINE_CHARS) {
+          this.hasSuppressedContent = true;
+          this.suppressingOverlongLine = true;
+          this.linePending = "";
+          outputChunks.push(Buffer.from(StreamingRedactor.SUPPRESSION_MARKER, "utf8"));
+        } else {
+          this.linePending = combined;
+        }
+        break;
+      }
+
+      const linePart = input.slice(0, nlMatch.index);
+      const fullLineBody = this.linePending + linePart;
+      this.linePending = "";
+      input = input.slice(nlMatch.index + nlMatch.separator.length);
+
+      if (fullLineBody.length > StreamingRedactor.MAX_PENDING_LINE_CHARS) {
+        this.hasSuppressedContent = true;
+        outputChunks.push(Buffer.from(StreamingRedactor.SUPPRESSION_MARKER + nlMatch.separator, "utf8"));
       } else {
-        input = input.slice(firstNewline);
-        this.inAuthorizationLine = false;
+        const fullLineWithSep = fullLineBody + nlMatch.separator;
+        const redacted = redactDiagnosticText(fullLineWithSep);
+        if (redacted) {
+          outputChunks.push(Buffer.from(redacted, "utf8"));
+        }
       }
     }
-
-    const combined = this.linePending + input;
-    if (!combined) return outputChunks;
 
     if (final) {
-      this.linePending = "";
-      this.inAuthorizationLine = false;
-      const redacted = redactDiagnosticText(combined);
-      if (redacted) outputChunks.push(Buffer.from(redacted, "utf8"));
-      return outputChunks;
-    }
-
-    const lastNewline = Math.max(combined.lastIndexOf("\n"), combined.lastIndexOf("\r"));
-    if (lastNewline !== -1) {
-      const ready = combined.slice(0, lastNewline + 1);
-      this.linePending = combined.slice(lastNewline + 1);
-      this.inAuthorizationLine = false;
-      if (/\bAuthorization\s*:/i.test(this.linePending)) {
-        this.inAuthorizationLine = true;
-      }
-      const redacted = redactDiagnosticText(ready);
-      if (redacted) outputChunks.push(Buffer.from(redacted, "utf8"));
-      return outputChunks;
-    }
-
-    // No newline present in combined text
-    const redacted = redactDiagnosticText(combined);
-    if (/\bAuthorization\s*:/i.test(combined)) {
-      this.inAuthorizationLine = true;
-    }
-
-    const CHUNK_LIMIT = 4096;
-    const LOOKBEHIND = 2048;
-
-    if (redacted.length > CHUNK_LIMIT) {
-      let splitIdx = redacted.length - LOOKBEHIND;
-      // Do not split inside a UTF-16 surrogate pair
-      if (splitIdx > 0 && splitIdx < redacted.length) {
-        const code = redacted.charCodeAt(splitIdx - 1);
-        if (code >= 0xd800 && code <= 0xdbff) {
-          splitIdx--;
+      if (this.suppressingOverlongLine) {
+        this.suppressingOverlongLine = false;
+        this.linePending = "";
+      } else if (this.linePending) {
+        if (this.linePending.length > StreamingRedactor.MAX_PENDING_LINE_CHARS) {
+          this.hasSuppressedContent = true;
+          this.linePending = "";
+          outputChunks.push(Buffer.from(StreamingRedactor.SUPPRESSION_MARKER, "utf8"));
+        } else {
+          const redacted = redactDiagnosticText(this.linePending);
+          this.linePending = "";
+          if (redacted) {
+            outputChunks.push(Buffer.from(redacted, "utf8"));
+          }
         }
       }
-      const chunkToEmit = redacted.slice(0, splitIdx);
-      this.linePending = redacted.slice(splitIdx);
-      if (chunkToEmit) outputChunks.push(Buffer.from(chunkToEmit, "utf8"));
-      return outputChunks;
     }
 
-    this.linePending = redacted;
     return outputChunks;
+  }
+
+  private findFirstNewline(text: string): { index: number; separator: string } | null {
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === "\n") {
+        return { index: i, separator: "\n" };
+      }
+      if (ch === "\r") {
+        if (i + 1 < text.length && text[i + 1] === "\n") {
+          return { index: i, separator: "\r\n" };
+        }
+        return { index: i, separator: "\r" };
+      }
+    }
+    return null;
   }
 }
 
@@ -947,7 +963,12 @@ export class ManagedVerificationJob {
       finalStderr = trimUtf8Tail(redactedStderr, remainingForErr);
     }
 
-    const truncated = rawTruncated || this.combinedBuffer.hasDroppedBytes || postRedactionTruncated;
+    const truncated =
+      rawTruncated ||
+      this.combinedBuffer.hasDroppedBytes ||
+      postRedactionTruncated ||
+      this.stdoutRedactor.hasSuppressedContent ||
+      this.stderrRedactor.hasSuppressedContent;
 
     return {
       jobId: this.jobId,
