@@ -31,6 +31,7 @@ import { gitLogStructured, gitMergeBase, gitResolveRef, gitShowCommit } from "./
 import { readAtRef } from "./gitHistoricalBlob.js";
 import { GIT_COMMIT_MAX_MESSAGE_BYTES, GIT_COMMIT_MAX_PATH_BYTES, GIT_COMMIT_MAX_PATHS, gitCommit } from "./gitCommit.js";
 import { gitPush } from "./gitPush.js";
+import { gitRetireRemoteBranch } from "./gitRetireRemoteBranch.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
@@ -601,6 +602,108 @@ GIT_PUSH_ARGUMENTS_SCHEMA.safeParseAsync = (async (args: unknown) => {
 const GIT_PUSH_PUBLIC_SCHEMA = z.object(GIT_PUSH_ARGUMENTS_SCHEMA.shape).strict();
 GIT_PUSH_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_PUSH_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_PUSH_PUBLIC_SCHEMA.safeParse;
 GIT_PUSH_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_PUSH_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_PUSH_PUBLIC_SCHEMA.safeParseAsync;
+
+const GIT_RETIRE_REMOTE_BRANCH_SHA_SCHEMA = z.string()
+  .max(64)
+  .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu, "value must be a full object-format commit SHA.");
+const GIT_RETIRE_REMOTE_BRANCH_ROUTE_PUBLISHED_SCHEMA = z.object({
+  type: z.literal("published"),
+  remote: z.string().min(1).max(256),
+  branch: z.string().min(1).max(256),
+  expected_head: GIT_RETIRE_REMOTE_BRANCH_SHA_SCHEMA
+}).strict();
+const GIT_RETIRE_REMOTE_BRANCH_ROUTE_INTEGRATED_SCHEMA = z.object({
+  type: z.literal("integrated"),
+  remote: z.string().min(1).max(256),
+  branch: z.string().min(1).max(256),
+  expected_head: GIT_RETIRE_REMOTE_BRANCH_SHA_SCHEMA,
+  integration_mode: z.enum(["FAST_FORWARD", "COMMIT_PRESERVING_MERGE"])
+}).strict();
+const GIT_RETIRE_REMOTE_BRANCH_PRESERVATION_SCHEMA = z.object({
+  accepted_candidate: GIT_RETIRE_REMOTE_BRANCH_SHA_SCHEMA,
+  acceptance_authority: z.string()
+    .min(1)
+    .max(4_096)
+    .refine((value) => value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value), "acceptance_authority must be bounded text without surrounding whitespace or controls."),
+  evidence_sha256: z.string()
+    .regex(/^[0-9a-f]{64}$/iu, "evidence_sha256 must be a full SHA-256 digest."),
+  route: z.discriminatedUnion("type", [
+    GIT_RETIRE_REMOTE_BRANCH_ROUTE_PUBLISHED_SCHEMA,
+    GIT_RETIRE_REMOTE_BRANCH_ROUTE_INTEGRATED_SCHEMA
+  ])
+}).strict();
+const GIT_RETIRE_REMOTE_BRANCH_ARGUMENTS_SCHEMA = z.object({
+  workspace_id: REVIEW_WORKSPACE_ID_SCHEMA,
+  remote: z.string().min(1).max(256)
+    .describe("Exact configured Git remote name; endpoint identity remains policy-owned."),
+  branch: z.string().min(1).max(256)
+    .describe("Explicit non-canonical, non-protected remote working-branch name."),
+  expected_remote_head: GIT_RETIRE_REMOTE_BRANCH_SHA_SCHEMA
+    .describe("Exact full remote target-branch commit SHA used by the deletion CAS."),
+  preservation: GIT_RETIRE_REMOTE_BRANCH_PRESERVATION_SCHEMA
+    .describe("Explicit accepted candidate, authority, evidence digest, and one same-endpoint preservation route.")
+}).strict();
+const GIT_RETIRE_REMOTE_BRANCH_FIELD_NAMES = new Set([
+  "workspace_id",
+  "remote",
+  "branch",
+  "expected_remote_head",
+  "preservation"
+]);
+
+function boundedGitRetireRemoteBranchValidationError(issues: readonly z.ZodIssue[]): z.ZodError {
+  const safeIssues: z.ZodIssue[] = [];
+  const seenMessages = new Set<string>();
+  for (const issue of issues) {
+    if (issue.code === "unrecognized_keys") {
+      if (!seenMessages.has("Unknown keys are not allowed.")) {
+        safeIssues.push({ code: "custom", path: [], message: "Unknown keys are not allowed." });
+        seenMessages.add("Unknown keys are not allowed.");
+      }
+      continue;
+    }
+    const field = issue.path.length === 1 && typeof issue.path[0] === "string" && GIT_RETIRE_REMOTE_BRANCH_FIELD_NAMES.has(issue.path[0])
+      ? issue.path[0]
+      : undefined;
+    const message = field === "workspace_id" && issue.code === "invalid_type" && issue.received === "undefined"
+      ? "Workspace id is required."
+      : field
+        ? "Invalid value."
+        : "Schema constraints were not satisfied.";
+    const path = field ? [field] : [];
+    const key = `${path.join(".")}:${message}`;
+    if (seenMessages.has(key)) continue;
+    seenMessages.add(key);
+    safeIssues.push({ code: "custom", path, message });
+  }
+  if (safeIssues.length === 0) safeIssues.push({ code: "custom", path: [], message: "Schema constraints were not satisfied." });
+  return new z.ZodError(safeIssues);
+}
+
+const GIT_RETIRE_REMOTE_BRANCH_TRANSPORT_SCHEMA = z.object({
+  workspace_id: z.unknown().optional(),
+  remote: z.unknown().optional(),
+  branch: z.unknown().optional(),
+  expected_remote_head: z.unknown().optional(),
+  preservation: z.unknown().optional()
+}).passthrough();
+const rawGitRetireRemoteBranchSafeParse = GIT_RETIRE_REMOTE_BRANCH_ARGUMENTS_SCHEMA.safeParse.bind(GIT_RETIRE_REMOTE_BRANCH_ARGUMENTS_SCHEMA);
+GIT_RETIRE_REMOTE_BRANCH_ARGUMENTS_SCHEMA.safeParse = ((args: unknown) => {
+  const parsed = rawGitRetireRemoteBranchSafeParse(args);
+  return parsed.success
+    ? parsed
+    : { success: false, error: boundedGitRetireRemoteBranchValidationError(parsed.error.issues) };
+}) as typeof GIT_RETIRE_REMOTE_BRANCH_ARGUMENTS_SCHEMA.safeParse;
+const rawGitRetireRemoteBranchSafeParseAsync = GIT_RETIRE_REMOTE_BRANCH_ARGUMENTS_SCHEMA.safeParseAsync.bind(GIT_RETIRE_REMOTE_BRANCH_ARGUMENTS_SCHEMA);
+GIT_RETIRE_REMOTE_BRANCH_ARGUMENTS_SCHEMA.safeParseAsync = (async (args: unknown) => {
+  const parsed = await rawGitRetireRemoteBranchSafeParseAsync(args);
+  return parsed.success
+    ? parsed
+    : { success: false, error: boundedGitRetireRemoteBranchValidationError(parsed.error.issues) };
+}) as typeof GIT_RETIRE_REMOTE_BRANCH_ARGUMENTS_SCHEMA.safeParseAsync;
+const GIT_RETIRE_REMOTE_BRANCH_PUBLIC_SCHEMA = z.object(GIT_RETIRE_REMOTE_BRANCH_ARGUMENTS_SCHEMA.shape).strict();
+GIT_RETIRE_REMOTE_BRANCH_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_RETIRE_REMOTE_BRANCH_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_RETIRE_REMOTE_BRANCH_PUBLIC_SCHEMA.safeParse;
+GIT_RETIRE_REMOTE_BRANCH_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_RETIRE_REMOTE_BRANCH_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_RETIRE_REMOTE_BRANCH_PUBLIC_SCHEMA.safeParseAsync;
 
 const READ_AT_REF_TRANSPORT_SCHEMA = z.object({
   workspace_id: z.unknown().optional(),
@@ -1255,7 +1358,7 @@ const SUPERTOOL_NAME = "codexpro";
 // through the loose, general-purpose supertool wrapper. Keep the explicit
 // registration visible to mode/configuration reporting while excluding it
 // from wrapper actions and the wrapper handler map.
-const SUPERTOOL_EXCLUDED_ACTIONS = new Set<string>(["git_commit", "git_push"]);
+const SUPERTOOL_EXCLUDED_ACTIONS = new Set<string>(["git_commit", "git_push", "git_retire_remote_branch"]);
 const SUPERTOOL_ACTION_ALIASES: Record<string, string> = {
   actions: "list_actions",
   config: "server_config",
@@ -1435,6 +1538,7 @@ const FULL_TOOL_NAMES = [
   "git_diff_range",
   "git_commit",
   "git_push",
+  "git_retire_remote_branch",
   "git_status",
   "git_diff",
   "show_changes",
@@ -1455,6 +1559,7 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "import_file",
   "git_commit",
   "git_push",
+  "git_retire_remote_branch",
   "bash",
   "pty_run",
   "start_verification",
@@ -1488,14 +1593,16 @@ function toolNamesForMode(config: CodexProConfig): string[] {
     }
   }
   if (config.writeMode !== "workspace") {
-    for (const writeTool of ["write", "edit", "apply_patch", "import_file", "git_commit", "git_push"]) {
+    for (const writeTool of ["write", "edit", "apply_patch", "import_file", "git_commit", "git_push", "git_retire_remote_branch"]) {
       const toolIndex = names.indexOf(writeTool);
       if (toolIndex !== -1) names.splice(toolIndex, 1);
     }
   }
   if (!hasEnabledGitPushPolicy(config)) {
-    const gitPushIndex = names.indexOf("git_push");
-    if (gitPushIndex !== -1) names.splice(gitPushIndex, 1);
+    for (const remoteWriteTool of ["git_push", "git_retire_remote_branch"]) {
+      const remoteWriteIndex = names.indexOf(remoteWriteTool);
+      if (remoteWriteIndex !== -1) names.splice(remoteWriteIndex, 1);
+    }
   }
   if (config.writeMode === "handoff" && !names.includes("handoff_to_agent")) names.push("handoff_to_agent");
   if (!config.analysisEnabled) {
@@ -1534,7 +1641,7 @@ function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
   if ((name === "bash" || name === "start_verification" || name === "wait_verification" || name === "cancel_verification" || name === "pty_run") && config.bashMode === "off") return false;
   if ((name === "write" || name === "edit" || name === "apply_patch" || name === "import_file") && config.writeMode !== "workspace") return false;
   if (name === "git_commit" && (config.toolMode !== "full" || config.writeMode !== "workspace")) return false;
-  if (name === "git_push" && !hasEnabledGitPushPolicy(config)) return false;
+  if ((name === "git_push" || name === "git_retire_remote_branch") && !hasEnabledGitPushPolicy(config)) return false;
   if (name === "codex_sessions") return config.codexSessions !== "off";
   if (name === "read_codex_session") return config.codexSessions === "read";
   if (name === "inspect_workspace" && !config.analysisEnabled) return false;
@@ -1578,7 +1685,7 @@ function serverInstructions(config: CodexProConfig): string {
     "Preferred workflow:",
     "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects. A transport or MCP session change can lose the prior session selection; ChatGPT is not required to preserve one connection, and diagnostics cannot force client transport reuse or refresh a stale direct tool catalog.",
     "2. list_workspaces is session-local, not a process-global workspace directory. When continuity is unclear, call session_workspace_diagnostics; it reports runtime/session/catalog truth and can classify an explicit workspace_id without selecting or opening it. A valid explicit-ID recovery targets that workspace without changing ambient or global selection.",
-    "3. For correctness-sensitive Git tools (git_commit, git_push, git_resolve_ref, git_merge_base, git_log, git_show_commit, read_at_ref, git_diff_range), always pass the explicit workspace_id returned by open_current_workspace/open_workspace. Harmless reads may omit it when ambient selection is clear.",
+    "3. For correctness-sensitive Git tools (git_commit, git_push, git_retire_remote_branch, git_resolve_ref, git_merge_base, git_log, git_show_commit, read_at_ref, git_diff_range), always pass the explicit workspace_id returned by open_current_workspace/open_workspace. Harmless reads may omit it when ambient selection is clear.",
     "4. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
     "5. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
     editInstruction.replace(/^5\./u, "6."),
@@ -4072,6 +4179,46 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         `Remote HEAD: ${result.remote_head}`,
         `Push attempts: ${result.push_attempts}`,
         "Status: pushed"
+      ].join("\n");
+      return textResult(text, { ...result });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "git_retire_remote_branch",
+    {
+      title: "Retire Remote Git Branch",
+      description: "Retire one explicitly allowlisted non-canonical remote working branch with an exact expected-head compare-and-swap deletion, only after a complete caller-supplied acceptance receipt is independently observed on the same named remote. Published preservation uses a distinct non-canonical branch at the exact candidate head; integrated preservation uses a canonical/protected destination whose exact remote head contains the candidate by fast-forward or commit-preserving merge ancestry. The operation makes one deletion attempt at most, never mutates local refs, canonical refs, other remotes, the index, the worktree, or configuration, and is available only in full tool mode with CODEXPRO_WRITE_MODE=workspace and an enabled Git push policy.",
+      inputSchema: GIT_RETIRE_REMOTE_BRANCH_PUBLIC_SCHEMA,
+      runtimeInputSchema: GIT_RETIRE_REMOTE_BRANCH_ARGUMENTS_SCHEMA,
+      annotations: GIT_PUSH_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Verifying preservation before retiring one remote branch...",
+        "openai/toolInvocation/invoked": "Remote Git branch retired"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await gitRetireRemoteBranch(config, workspace, args);
+      const route = result.preservation.route;
+      const routeTarget = `${route.remote}/${route.branch}`;
+      const text = [
+        "# Retire Remote Git Branch",
+        "",
+        `Workspace: ${result.root}`,
+        `Remote: ${result.remote}`,
+        `Branch: ${result.branch}`,
+        `Destination: ${result.destination_ref}`,
+        `Expected remote HEAD: ${result.expected_remote_head}`,
+        `Remote HEAD after operation: ${result.remote_head}`,
+        `Accepted candidate: ${result.accepted_candidate}`,
+        `Preservation route: ${route.type} ${routeTarget}`,
+        `Preservation expected HEAD: ${route.expected_head}`,
+        `Acceptance evidence: ${result.evidence_sha256}`,
+        `Push attempts: ${result.push_attempts}`,
+        "Status: retired"
       ].join("\n");
       return textResult(text, { ...result });
     }

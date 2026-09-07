@@ -767,11 +767,20 @@ export async function observeGitPushRemoteHead(
   workspace: Workspace,
   remote: string,
   destinationRef: string,
-  objectFormat: "sha1" | "sha256"
+  objectFormat: "sha1" | "sha256",
+  options: { readonly globalArgs?: readonly string[] } = {}
 ): Promise<GitPushRemoteObservation> {
   let result: GitExecutionResult;
   try {
-    result = await runGitExitAware(config, workspace, ["ls-remote", "--refs", "--heads", "--", remote, destinationRef]);
+    result = await runGitExitAware(config, workspace, [
+      ...(options.globalArgs ?? []),
+      "ls-remote",
+      "--refs",
+      "--heads",
+      "--",
+      remote,
+      destinationRef
+    ]);
   } catch {
     return { status: "execution" };
   }
@@ -825,13 +834,88 @@ async function assertRemoteHead(
   if (observed.head !== expectedRemoteHead) return fail("remote-head-mismatch");
 }
 
+/**
+ * Read the one raw URL configured for a named remote without applying Git's
+ * insteadOf/pushInsteadOf rewriting. A retirement operation may need this
+ * exact source spelling to reproduce Git's ordinary single rewrite step in a
+ * temporary command-line remote, avoiding chained rewrites and local tracking
+ * ref updates. Values are bounded and never leave the internal preflight.
+ */
+async function configuredPushEndpoint(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  remote: string,
+  options: { readonly globalArgs?: readonly string[] } = {}
+): Promise<string> {
+  const readOne = async (key: "pushurl" | "url"): Promise<string | undefined> => {
+    const result = await runGitExitAware(config, workspace, [
+      ...(options.globalArgs ?? []),
+      "config",
+      "--null",
+      "--get-all",
+      `remote.${remote}.${key}`
+    ]);
+    const output = result.copyStdoutBytes();
+    const diagnostics = result.copyStderrBytes();
+    if (
+      result.exitCode === 1
+      && result.signal === null
+      && !result.timedOut
+      && !result.stdoutOverflow
+      && !result.stderrOverflow
+      && output.length === 0
+      && diagnostics.length === 0
+    ) {
+      return undefined;
+    }
+    if (
+      result.exitCode !== 0
+      || result.signal !== null
+      || result.timedOut
+      || result.stdoutOverflow
+      || result.stderrOverflow
+      || diagnostics.length !== 0
+      || output.length === 0
+      || output.length > MAX_REMOTE_OBSERVATION_BYTES
+      || output.at(-1) !== 0
+    ) {
+      return fail("effective-endpoint-unavailable");
+    }
+    let text: string;
+    try {
+      text = UTF8_FATAL.decode(output);
+    } catch {
+      return fail("effective-endpoint-unavailable");
+    }
+    const values = text.slice(0, -1).split("\u0000");
+    if (values.length !== 1 || !values[0] || CONTROL_OR_WHITESPACE.test(values[0])) {
+      return fail(values.length > 1 ? "ambiguous-multiple-effective-push-endpoints" : "effective-endpoint-unavailable");
+    }
+    return values[0];
+  };
+
+  const pushUrl = await readOne("pushurl");
+  if (pushUrl !== undefined) return pushUrl;
+  const url = await readOne("url");
+  if (url === undefined) return fail("zero-effective-push-endpoints");
+  return url;
+}
+
 async function effectivePushEndpoint(
   config: GitPushPreflightConfig,
   workspace: Workspace,
   remote: string,
-  expectedIdentity: string
-): Promise<string> {
-  const result = await runGitChecked(config, workspace, ["remote", "get-url", "--push", "--all", remote]);
+  expectedIdentity: string,
+  options: { readonly globalArgs?: readonly string[] } = {}
+): Promise<{ readonly endpoint: string; readonly identity: string; readonly configured_endpoint: string }> {
+  const result = await runGitChecked(config, workspace, [
+    ...(options.globalArgs ?? []),
+    "remote",
+    "get-url",
+    "--push",
+    "--all",
+    remote
+  ]);
   const bytes = result.copyStdoutBytes();
   if (bytes.length > MAX_REMOTE_OBSERVATION_BYTES) return fail("ambiguous-multiple-effective-push-endpoints");
   const text = decodeUtf8(result);
@@ -844,21 +928,41 @@ async function effectivePushEndpoint(
   const parsed = inspectGitPushEndpoint(rawEndpoint);
   if (!parsed.ok) return fail(policyFailureReason(parsed.reason), parsed.reason);
   if (parsed.identity !== expectedIdentity) return fail("effective-endpoint-not-allowlisted");
-  return parsed.identity;
+  const configuredEndpoint = await configuredPushEndpoint(config, workspace, remote, options);
+  return Object.freeze({ endpoint: rawEndpoint, identity: parsed.identity, configured_endpoint: configuredEndpoint });
 }
 
 /**
  * Re-resolve one credential-free effective push endpoint through the trusted
  * named-remote configuration. Callers receive only its policy identity; the
- * raw endpoint is never reused as a Git repository argument.
+ * raw configured spelling is exposed only to the bounded retirement operation
+ * so it can reproduce the named remote's ordinary single rewrite step without
+ * passing an already-expanded endpoint through a second rewrite.
  */
 export async function resolveGitPushMutationEndpoint(
   config: GitPushPreflightConfig,
   workspace: Workspace,
   remote: string,
-  authorizedIdentity: string
+  authorizedIdentity: string,
+  options: { readonly globalArgs?: readonly string[] } = {}
 ): Promise<string> {
-  return effectivePushEndpoint(config, workspace, remote, authorizedIdentity);
+  return (await effectivePushEndpoint(config, workspace, remote, authorizedIdentity, options)).identity;
+}
+
+/**
+ * Resolve the one policy-authorized effective push URL for an internal
+ * mutation that must avoid Git's named-remote tracking-ref side effects.
+ * Callers must retain the identity check and never accept a caller-supplied
+ * URL; this helper reads only the exact named remote configuration.
+ */
+export async function resolveGitPushMutationEndpointUrl(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  remote: string,
+  authorizedIdentity: string,
+  options: { readonly globalArgs?: readonly string[] } = {}
+): Promise<{ readonly endpoint: string; readonly identity: string; readonly configured_endpoint: string }> {
+  return effectivePushEndpoint(config, workspace, remote, authorizedIdentity, options);
 }
 
 /**
@@ -966,4 +1070,43 @@ export async function revalidateGitPushPreflight(
   const endpointIdentity = await resolveGitPushMutationEndpoint(config, workspace, refreshed.remote, refreshed.endpoint);
   if (endpointIdentity !== refreshed.endpoint || endpointIdentity !== initial.endpoint) return fail("effective-endpoint-not-allowlisted");
   return Object.freeze({ preflight: refreshed });
+}
+
+/**
+ * Shared repository identity inspection for other bounded named-remote
+ * mutation operations. This exposes only the same exact non-bare worktree
+ * layout and object-format facts already used by git_push.
+ */
+export async function inspectGitPushRepository(
+  config: GitPushPreflightConfig,
+  workspace: Workspace
+): Promise<Awaited<ReturnType<typeof repositoryRoot>>> {
+  return repositoryRoot(config, workspace);
+}
+
+/** Enumerate the exact active Git config sources for a mutation lock set. */
+export async function discoverGitPushConfigSourcesForMutation(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  repositoryConfigPath: string,
+  worktreeConfigPath: string
+): Promise<readonly string[]> {
+  return discoverGitPushConfigSources(config, workspace, repositoryConfigPath, worktreeConfigPath);
+}
+
+/** Reuse the existing in-progress-history guard without widening its scope. */
+export async function assertGitPushNoHistoryOperation(
+  config: GitPushPreflightConfig,
+  workspace: Workspace
+): Promise<void> {
+  return assertNoHistoryOperation(config, workspace);
+}
+
+/** Keep named-remote mutation routes on Git's ordinary receive-pack path. */
+export async function assertGitPushDefaultReceivePack(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  remote: string
+): Promise<void> {
+  return assertDefaultReceivePack(config, workspace, remote);
 }

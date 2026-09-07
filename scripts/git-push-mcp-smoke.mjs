@@ -226,6 +226,25 @@ function assertDescriptor(tool) {
   assert.equal(schema.properties?.expected_remote_head?.pattern, "^(?:absent|[0-9a-f]{40}|[0-9a-f]{64})$");
 }
 
+function assertRetirementDescriptor(tool) {
+  assert.ok(tool, "full workspace-write mode omitted git_retire_remote_branch");
+  assert.deepEqual(tool.annotations, {
+    readOnlyHint: false,
+    destructiveHint: true,
+    openWorldHint: true,
+    idempotentHint: false
+  }, "git_retire_remote_branch annotations were not truthful");
+  const schema = tool.inputSchema;
+  assert.equal(schema?.type, "object", "git_retire_remote_branch schema is not an object");
+  assert.equal(schema?.additionalProperties, false, "git_retire_remote_branch schema accepts unknown keys");
+  const fields = ["workspace_id", "remote", "branch", "expected_remote_head", "preservation"];
+  assert.deepEqual(Object.keys(schema.properties ?? {}).sort(), [...fields].sort(), "git_retire_remote_branch schema has optional or missing fields");
+  assert.deepEqual(new Set(schema.required ?? []), new Set(fields), "git_retire_remote_branch schema does not require every field");
+  for (const field of fields.slice(0, 4)) assert.equal(schema.properties?.[field]?.type, "string", `${field} is not a string`);
+  assert.equal(schema.properties?.preservation?.type, "object", "preservation is not an object");
+  assert.equal(schema.properties?.preservation?.additionalProperties, false, "preservation accepts unknown keys");
+}
+
 async function freeHttpServer({ defaultRoot, allowedRoots, policy, toolMode, writeMode }, callback) {
   const port = await freePort();
   const env = {
@@ -354,6 +373,8 @@ try {
     const namesA = listingA.tools.map((tool) => tool.name);
     assert.equal(namesA.filter((name) => name === "git_push").length, 1, "full workspace-write did not expose exactly one git_push");
     assertDescriptor(listingA.tools.find((tool) => tool.name === "git_push"));
+    assert.equal(namesA.filter((name) => name === "git_retire_remote_branch").length, 1, "full workspace-write did not expose exactly one git_retire_remote_branch");
+    assertRetirementDescriptor(listingA.tools.find((tool) => tool.name === "git_retire_remote_branch"));
 
     const opened = expectSuccess(await call(sessionA, "open_workspace", { path: targetCanonical, include_tree: false }), "open explicit target");
     assert.equal(opened.structuredContent.workspace_id, targetWorkspaceId);
@@ -443,6 +464,7 @@ try {
         const listing = await session.client.listTools();
         const names = listing.tools.map((tool) => tool.name);
         assert.equal(names.includes("git_push"), false, `${boundary.label} exposed git_push`);
+        assert.equal(names.includes("git_retire_remote_branch"), false, `${boundary.label} exposed git_retire_remote_branch`);
         const actions = expectSuccess(await call(session, "codexpro", { action: "list_actions" }), `${boundary.label} wrapper actions`);
         assert.equal(actions.structuredContent.actions.includes("git_push"), false, `${boundary.label} wrapper advertised git_push`);
         console.log(`PASS ${boundary.label}: git_push absent from direct and compatibility-wrapper catalogs.`);

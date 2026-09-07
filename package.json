@@ -116,6 +116,7 @@
     "git-push-policy:reuse-smoke": "npm run build && node scripts/git-push-policy-reuse-smoke.mjs",
     "git-push-preflight:smoke": "npm run build && node scripts/git-push-preflight-smoke.mjs",
     "git-push-mcp:smoke": "npm run build && node scripts/git-push-mcp-smoke.mjs",
+    "git-retire-remote-branch:smoke": "npm run build && node scripts/git-retire-remote-branch-smoke.mjs",
     "git-push-task003:tester": "npm run build && node scripts/git-push-task003-tester-smoke.mjs",
     "git-push-task004:smoke": "npm run build && node scripts/git-push-task004-smoke.mjs",
     "git-push-task005:smoke": "npm run build && node scripts/git-push-task005-smoke.mjs",
