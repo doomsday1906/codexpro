@@ -8,6 +8,11 @@ export interface GitPushPolicyRule {
   endpoint: string;
   branches: string[];
   branch_prefixes?: string[];
+  retirement?: {
+    branches: string[];
+    branch_prefixes?: string[];
+    canonical_branches: string[];
+  };
 }
 
 export interface GitPushPolicy {
@@ -32,6 +37,10 @@ export interface GitPushPolicyDecision {
   branch?: string;
   endpoint?: string;
   rule?: GitPushPolicyRule;
+}
+
+export interface GitRetirementPolicyDecision extends GitPushPolicyDecision {
+  canonical_branches?: string[];
 }
 
 export function defaultGitPushPolicy(): GitPushPolicy {
@@ -98,6 +107,16 @@ export function evaluateGitPushPolicy(
   options: { gitBin?: string; timeoutMs?: number } = {}
 ): GitPushPolicyDecision {
   return policy.evaluateGitPushPolicy(repoRoot, value, remote, branch, options) as GitPushPolicyDecision;
+}
+
+export function evaluateGitRetirementPolicy(
+  repoRoot: string,
+  value: unknown,
+  remote: string,
+  branch: string,
+  options: { gitBin?: string; timeoutMs?: number } = {}
+): GitRetirementPolicyDecision {
+  return policy.evaluateGitRetirementPolicy(repoRoot, value, remote, branch, options) as GitRetirementPolicyDecision;
 }
 
 export const resolveGitPushPolicy = evaluateGitPushPolicy;

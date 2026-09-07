@@ -16,6 +16,9 @@ const GLOB_TOKEN = /[*?\[\]]/u;
 // refspec modifiers and have no place in a literal policy prefix.
 const PREFIX_PATTERN_TOKEN = /[+$^()|{}]/u;
 const PROTECTED_BRANCH_PREFIXES = new Set(["main/", "master/", "develop/", "trunk/", "head/", "refs/"]);
+const RETIREMENT_RULE_KEYS = new Set(["branches", "branch_prefixes", "canonical_branches"]);
+const PUBLICATION_RULE_KEYS = new Set(["remote", "endpoint", "branches", "branch_prefixes", "retirement"]);
+const POLICY_KEYS = new Set(["enabled", "rules"]);
 
 export function defaultGitPushPolicy() {
   return { enabled: false, rules: [] };
@@ -96,6 +99,70 @@ function branchPrefixName(value) {
   return prefix;
 }
 
+function exactCanonicalBranches(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_BRANCHES_PER_RULE) {
+    invalidPolicy("retirement.canonical_branches must be a non-empty array.");
+  }
+  const branches = [];
+  for (const rawBranch of value) {
+    const branch = branchName(rawBranch);
+    if (branches.includes(branch)) invalidPolicy("duplicate retirement canonical branch.");
+    branches.push(branch);
+  }
+  return branches;
+}
+
+function normalizeRetirement(value) {
+  if (!isRecord(value)) invalidPolicy("retirement must be an object.");
+  for (const key of Object.keys(value)) {
+    if (!RETIREMENT_RULE_KEYS.has(key)) invalidPolicy("retirement contains an unknown field.");
+  }
+  if (value.branches !== undefined && !Array.isArray(value.branches)) invalidPolicy("retirement.branches must be an array when provided.");
+  if (value.branch_prefixes !== undefined && !Array.isArray(value.branch_prefixes)) invalidPolicy("retirement.branch_prefixes must be an array when provided.");
+  const branches = [];
+  for (const rawBranch of value.branches ?? []) {
+    const branch = branchName(rawBranch);
+    if (["main", "master", "develop", "trunk", "head"].includes(branch.toLowerCase()) || [...PROTECTED_BRANCH_PREFIXES].some((prefix) => branch.toLowerCase().startsWith(prefix))) {
+      invalidPolicy("retirement target may not be canonical or protected.");
+    }
+    if (branches.includes(branch)) invalidPolicy("duplicate retirement exact branch.");
+    branches.push(branch);
+  }
+  const branchPrefixes = [];
+  for (const rawPrefix of value.branch_prefixes ?? []) {
+    const prefix = branchPrefixName(rawPrefix);
+    if (branchPrefixes.includes(prefix)) invalidPolicy("duplicate retirement branch_prefix.");
+    branchPrefixes.push(prefix);
+  }
+  if (branches.length === 0 && branchPrefixes.length === 0) {
+    invalidPolicy("retirement requires an exact branch or literal branch_prefix.");
+  }
+  const canonicalBranches = exactCanonicalBranches(value.canonical_branches);
+  for (const branch of branches) {
+    if (canonicalBranches.includes(branch)) invalidPolicy("retirement target overlaps a canonical branch.");
+  }
+  for (const prefix of branchPrefixes) {
+    if (canonicalBranches.some((branch) => branch.startsWith(prefix))) {
+      invalidPolicy("retirement target prefix overlaps a canonical branch.");
+    }
+  }
+  for (const branch of branches) {
+    if (branchPrefixes.some((prefix) => branch.startsWith(prefix))) {
+      invalidPolicy("retirement exact branch overlaps a branch_prefix.");
+    }
+  }
+  for (let index = 0; index < branchPrefixes.length; index += 1) {
+    for (let otherIndex = index + 1; otherIndex < branchPrefixes.length; otherIndex += 1) {
+      if (branchPrefixes[index].startsWith(branchPrefixes[otherIndex]) || branchPrefixes[otherIndex].startsWith(branchPrefixes[index])) {
+        invalidPolicy("retirement branch_prefixes overlap.");
+      }
+    }
+  }
+  const result = { branches, canonical_branches: canonicalBranches };
+  if (branchPrefixes.length > 0) result.branch_prefixes = branchPrefixes;
+  return result;
+}
+
 function endpointFailure(raw, reason) {
   const diagnostic = typeof raw === "string" && (
     reason === "credential-bearing-endpoint" ||
@@ -174,6 +241,7 @@ function canonicalEndpoint(value) {
 
 function normalizePolicyObject(value) {
   if (!isRecord(value)) invalidPolicy("policy must be an object.");
+  for (const key of Object.keys(value)) if (!POLICY_KEYS.has(key)) invalidPolicy("policy contains an unknown field.");
   const enabled = value.enabled === undefined ? false : value.enabled;
   if (typeof enabled !== "boolean") invalidPolicy("enabled must be boolean.");
   const rawRules = value.rules === undefined ? [] : value.rules;
@@ -186,6 +254,9 @@ function normalizePolicyObject(value) {
   const seenBranchesByRemote = new Map();
   for (const rawRule of rawRules) {
     if (!isRecord(rawRule)) invalidPolicy("each rule must be an object.");
+    for (const key of Object.keys(rawRule)) {
+      if (!PUBLICATION_RULE_KEYS.has(key)) invalidPolicy("rule contains an unknown field.");
+    }
     const remote = remoteName(rawRule.remote);
     const endpoint = canonicalEndpoint(rawRule.endpoint);
     if (rawRule.branches !== undefined && !Array.isArray(rawRule.branches)) {
@@ -254,6 +325,7 @@ function normalizePolicyObject(value) {
 
     const normalizedRule = { remote, endpoint, branches };
     if (rawRule.branch_prefixes !== undefined) normalizedRule.branch_prefixes = branchPrefixes;
+    if (rawRule.retirement !== undefined) normalizedRule.retirement = normalizeRetirement(rawRule.retirement);
     rules.push(normalizedRule);
   }
 
@@ -319,6 +391,15 @@ function sanitizedBranchPrefixes(value) {
   );
 }
 
+function sanitizedRetirement(value) {
+  if (!isRecord(value)) return { branches: [], canonical_branches: [] };
+  return {
+    branches: sanitizedBranches(value.branches),
+    ...(Array.isArray(value.branch_prefixes) ? { branch_prefixes: sanitizedBranchPrefixes(value.branch_prefixes) } : {}),
+    canonical_branches: sanitizedBranches(value.canonical_branches)
+  };
+}
+
 export function sanitizeGitPushPolicy(value) {
   if (!isRecord(value)) return defaultGitPushPolicy();
   const enabled = value.enabled === true;
@@ -332,6 +413,7 @@ export function sanitizeGitPushPolicy(value) {
         branches: sanitizedBranches(rule?.branches)
       };
       if (Array.isArray(rule?.branch_prefixes)) safeRule.branch_prefixes = sanitizedBranchPrefixes(rule.branch_prefixes);
+      if (rule?.retirement !== undefined) safeRule.retirement = sanitizedRetirement(rule.retirement);
       return safeRule;
     })
   };
@@ -465,6 +547,45 @@ export function evaluateGitPushPolicy(repoRoot, policy, remote, branch, options 
     remote: safeRemote,
     branch: safeBranch,
     endpoint: effective.identity,
+    rule: matches[0]
+  };
+}
+
+export function evaluateGitRetirementPolicy(repoRoot, policy, remote, branch, options = {}) {
+  let normalized;
+  try {
+    normalized = normalizeGitPushPolicy(policy);
+  } catch {
+    return { allowed: false, reason: "invalid-policy" };
+  }
+  if (!normalized.enabled) return { allowed: false, reason: "policy-disabled" };
+  let safeRemote;
+  let safeBranch;
+  try {
+    safeRemote = remoteName(remote);
+    safeBranch = branchName(branch);
+  } catch {
+    return { allowed: false, reason: "invalid-remote-or-branch" };
+  }
+  const matches = normalized.rules.filter((rule) => {
+    const retirement = rule.retirement;
+    return rule.remote === safeRemote && retirement !== undefined && (
+      retirement.branches.includes(safeBranch) ||
+      (retirement.branch_prefixes ?? []).some((prefix) => safeBranch.startsWith(prefix))
+    );
+  });
+  if (matches.length !== 1) return { allowed: false, reason: matches.length === 0 ? "remote-or-branch-not-allowlisted" : "ambiguous-policy-rule" };
+  const effective = resolveEffectivePushEndpoint(repoRoot, safeRemote, options);
+  if (!effective.ok) return { allowed: false, reason: effective.reason, endpoint: effective.endpoint };
+  if (effective.identity !== matches[0].endpoint) {
+    return { allowed: false, reason: "effective-endpoint-not-allowlisted", endpoint: effective.identity };
+  }
+  return {
+    allowed: true,
+    remote: safeRemote,
+    branch: safeBranch,
+    endpoint: effective.identity,
+    canonical_branches: matches[0].retirement.canonical_branches,
     rule: matches[0]
   };
 }

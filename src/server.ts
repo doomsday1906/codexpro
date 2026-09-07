@@ -620,6 +620,7 @@ const GIT_RETIRE_REMOTE_BRANCH_ROUTE_INTEGRATED_SCHEMA = z.object({
   integration_mode: z.enum(["FAST_FORWARD", "COMMIT_PRESERVING_MERGE"])
 }).strict();
 const GIT_RETIRE_REMOTE_BRANCH_PRESERVATION_SCHEMA = z.object({
+  schema_version: z.literal(1),
   accepted_candidate: GIT_RETIRE_REMOTE_BRANCH_SHA_SCHEMA,
   acceptance_authority: z.string()
     .min(1)

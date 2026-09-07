@@ -1,4 +1,6 @@
 import { randomBytes } from "node:crypto";
+import fsp from "node:fs/promises";
+import path from "node:path";
 import type { CodexProConfig } from "./config.js";
 import { GitExecutionError, GitExecutionResult, runGitMutation } from "./gitOps.js";
 import { CodexProError, type Workspace } from "./guard.js";
@@ -8,12 +10,12 @@ import {
   discoverGitPushConfigSourcesForMutation,
   inspectGitPushRepository,
   observeGitPushRemoteHead,
-  resolveGitPushMutationEndpointUrl,
+  resolveGitRetirementEndpointUrl,
   GitPushPreflightError,
   type GitPushPreflightConfig,
   type GitPushRemoteObservation
 } from "./gitPushPreflight.js";
-import { evaluateGitPushPolicy } from "./gitPushPolicy.js";
+import { evaluateGitRetirementPolicy, type GitRetirementPolicyDecision } from "./gitPushPolicy.js";
 import { configSourcesCovered, GitPushConfigLockError, withGitPushConfigLocks, type GitPushConfigLock } from "./gitPushConfigLock.js";
 
 const CONTROL_OR_WHITESPACE = /[\u0000-\u001f\u007f\s]/u;
@@ -47,6 +49,7 @@ export type GitRetirePreservationRoute =
     };
 
 export interface GitRetirePreservation {
+  readonly schema_version: 1;
   readonly accepted_candidate: string;
   readonly acceptance_authority: string;
   readonly evidence_sha256: string;
@@ -242,6 +245,7 @@ interface GitRetireRemoteBranchPreflight {
   readonly destination_ref: string;
   readonly expected_remote_head: string;
   readonly preservation: GitRetirePreservation;
+  readonly canonical_branches: readonly string[];
 }
 
 function failPreflight(reason: GitRetirePreflightFailureReason, policyReason?: string): never {
@@ -411,7 +415,7 @@ function parseRequest(rawInput: unknown): GitRetireRemoteBranchRequest {
   ) {
     return failPreflight("invalid-input");
   }
-  if (!isRecord(rawInput.preservation) || !exactKeys(rawInput.preservation, ["accepted_candidate", "acceptance_authority", "evidence_sha256", "route"])) {
+  if (!isRecord(rawInput.preservation) || !exactKeys(rawInput.preservation, ["schema_version", "accepted_candidate", "acceptance_authority", "evidence_sha256", "route"]) || rawInput.preservation.schema_version !== 1) {
     return failPreflight("invalid-receipt");
   }
   const preservation = rawInput.preservation;
@@ -421,6 +425,7 @@ function parseRequest(rawInput: unknown): GitRetireRemoteBranchRequest {
     branch: validateBranch(rawInput.branch),
     expected_remote_head: validateObjectId(rawInput.expected_remote_head),
     preservation: Object.freeze({
+      schema_version: 1 as const,
       accepted_candidate: validateObjectId(preservation.accepted_candidate),
       acceptance_authority: validateAuthority(preservation.acceptance_authority),
       evidence_sha256: validateEvidenceDigest(preservation.evidence_sha256),
@@ -514,13 +519,104 @@ async function assertCandidateAncestry(
   }
 }
 
+async function commitParents(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  objectId: string
+): Promise<readonly string[]> {
+  const result = await runGitExitAware(config, workspace, ["rev-list", "--parents", "-n", "1", objectId]);
+  const line = oneLine(result);
+  if (line === undefined) return failPreflight("execution");
+  const values = line.split(" ");
+  if (values.length < 1 || values[0] !== objectId) return failPreflight("execution");
+  for (const parent of values.slice(1)) assertObjectFormat(parent, objectId.length === 64 ? "sha256" : "sha1");
+  return values.slice(1);
+}
+
+async function firstParentChainContains(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  candidate: string,
+  head: string
+): Promise<boolean> {
+  const result = await runGitExitAware(config, workspace, ["rev-list", "--first-parent", head]);
+  if (result.exitCode !== 0 || result.signal !== null || result.timedOut || result.stdoutOverflow || result.stderrOverflow) return failPreflight("execution");
+  const text = result.copyStdoutBytes().toString("utf8");
+  if (!text.endsWith("\n")) return failPreflight("execution");
+  return text.slice(0, -1).split("\n").includes(candidate);
+}
+
+async function hasAncestor(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  candidate: string,
+  descendant: string
+): Promise<boolean> {
+  const result = await runGitExitAware(config, workspace, ["merge-base", "--is-ancestor", candidate, descendant]);
+  if (result.exitCode === 0 && result.signal === null && !result.timedOut && !result.stdoutOverflow && !result.stderrOverflow) return true;
+  if (result.exitCode === 1 && result.signal === null && !result.timedOut && !result.stdoutOverflow && !result.stderrOverflow) return false;
+  return failPreflight("execution");
+}
+
+async function deriveIntegratedMode(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  candidate: string,
+  canonicalHead: string
+): Promise<"FAST_FORWARD" | "COMMIT_PRESERVING_MERGE"> {
+  const shallow = oneLine(await runGitExitAware(config, workspace, ["rev-parse", "--is-shallow-repository"]));
+  if (shallow !== "false") return failPreflight("preservation-not-ancestor");
+  for (const marker of ["info/grafts", "refs/replace"]) {
+    const markerPath = oneLine(await runGitExitAware(config, workspace, ["rev-parse", "--git-path", marker]));
+    if (markerPath === undefined) return failPreflight("execution");
+    const absoluteMarkerPath = path.isAbsolute(markerPath) ? markerPath : path.resolve(workspace.root, markerPath);
+    try {
+      const stat = await fsp.lstat(absoluteMarkerPath);
+      if (marker === "info/grafts") return failPreflight("preservation-not-ancestor");
+      if (!stat.isDirectory() || (await fsp.readdir(absoluteMarkerPath)).length > 0) return failPreflight("preservation-not-ancestor");
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") return failPreflight("execution");
+    }
+  }
+  await assertLocalCommitObject(config, workspace, candidate);
+  await assertLocalCommitObject(config, workspace, canonicalHead);
+  if (candidate === canonicalHead || await firstParentChainContains(config, workspace, candidate, canonicalHead)) return "FAST_FORWARD";
+
+  const merges = await runGitExitAware(config, workspace, ["rev-list", "--first-parent", "--merges", canonicalHead]);
+  if (merges.exitCode !== 0 || merges.signal !== null || merges.timedOut || merges.stdoutOverflow || merges.stderrOverflow) return failPreflight("execution");
+  const mergeText = merges.copyStdoutBytes().toString("utf8");
+  if (!mergeText.endsWith("\n")) return failPreflight("execution");
+  for (const merge of mergeText.slice(0, -1).split("\n").filter(Boolean)) {
+    const parents = await commitParents(config, workspace, merge);
+    if (parents.length < 2) continue;
+    if (await hasAncestor(config, workspace, candidate, parents[0])) continue;
+    for (const parent of parents.slice(1)) {
+      if (await hasAncestor(config, workspace, candidate, parent)) return "COMMIT_PRESERVING_MERGE";
+    }
+  }
+  return failPreflight("preservation-not-ancestor");
+}
+
+async function assertIntegratedTopology(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  candidate: string,
+  canonicalHead: string,
+  expectedMode: "FAST_FORWARD" | "COMMIT_PRESERVING_MERGE"
+): Promise<void> {
+  const mode = await deriveIntegratedMode(config, workspace, candidate, canonicalHead);
+  if (mode !== expectedMode) return failPreflight("preservation-target-invalid");
+}
+
 async function assertPreservation(
   config: GitRetireRemoteBranchConfig,
   workspace: Workspace,
   request: GitRetireRemoteBranchRequest,
   objectFormat: "sha1" | "sha256",
   mutationRemote: string,
-  mutationGlobalArgs: readonly string[]
+  mutationGlobalArgs: readonly string[],
+  canonicalBranches: readonly string[]
 ): Promise<void> {
   const route = request.preservation.route;
   if (route.remote !== request.remote) return failPreflight("preservation-remote-mismatch");
@@ -531,11 +627,11 @@ async function assertPreservation(
   assertObjectFormat(route.expected_head, objectFormat);
 
   if (route.type === "published") {
-    if (protectedBranch(route.branch) || route.expected_head !== request.preservation.accepted_candidate) {
+    if (protectedBranch(route.branch) || canonicalBranches.includes(route.branch) || route.expected_head !== request.preservation.accepted_candidate) {
       return failPreflight("preservation-target-invalid");
     }
-  } else if (route.branch.toLowerCase().startsWith("refs/") || !protectedBranch(route.branch)) {
-    return failPreflight("preservation-target-invalid");
+  } else if (route.branch.toLowerCase().startsWith("refs/") || !canonicalBranches.includes(route.branch)) {
+      return failPreflight("preservation-target-invalid");
   }
 
   let observed: GitPushRemoteObservation;
@@ -553,9 +649,7 @@ async function assertPreservation(
   }
   if (observed.status !== "head") return failPreflight(observationFailure(observed));
   if (observed.head !== route.expected_head) return failPreflight("preservation-changed");
-  if (route.type === "integrated") {
-    await assertCandidateAncestry(config, workspace, request.preservation.accepted_candidate, route.expected_head);
-  }
+  if (route.type === "integrated") await assertIntegratedTopology(config, workspace, request.preservation.accepted_candidate, route.expected_head, route.integration_mode);
 }
 
 async function preflightRetirement(
@@ -601,9 +695,9 @@ async function preflightRetirement(
   } catch {
     return failPreflight("in-progress");
   }
-  let policy: ReturnType<typeof evaluateGitPushPolicy>;
+  let policy: GitRetirementPolicyDecision;
   try {
-    policy = evaluateGitPushPolicy(repository.root, config.gitPushPolicy, request.remote, request.branch);
+    policy = evaluateGitRetirementPolicy(repository.root, config.gitPushPolicy, request.remote, request.branch);
   } catch {
     return failPreflight("invalid-policy");
   }
@@ -615,7 +709,7 @@ async function preflightRetirement(
     readonly configured_endpoint: string;
   };
   try {
-    mutationEndpoint = await resolveGitPushMutationEndpointUrl(config, workspace, request.remote, policy.endpoint);
+    mutationEndpoint = await resolveGitRetirementEndpointUrl(config, workspace, request.remote, policy.endpoint);
     if (mutationEndpoint.identity !== policy.endpoint) return failPreflight("effective-endpoint-not-allowlisted");
   } catch (error) {
     if (error instanceof GitPushPreflightError) {
@@ -638,7 +732,8 @@ async function preflightRetirement(
     return failPreflight("execution");
   }
 
-  await assertPreservation(config, workspace, request, repository.objectFormat, mutationRemote, mutationGlobalArgs);
+  if (!policy.canonical_branches) return failPreflight("remote-or-branch-not-allowlisted");
+  await assertPreservation(config, workspace, request, repository.objectFormat, mutationRemote, mutationGlobalArgs, policy.canonical_branches);
 
   const targetObservation = await observeGitPushRemoteHead(
     config,
@@ -668,7 +763,8 @@ async function preflightRetirement(
     branch: request.branch,
     destination_ref: `refs/heads/${request.branch}`,
     expected_remote_head: request.expected_remote_head,
-    preservation: request.preservation
+    preservation: request.preservation,
+    canonical_branches: Object.freeze([...policy.canonical_branches])
   });
 }
 
@@ -708,6 +804,7 @@ async function revalidateRetirement(
     || refreshed.branch !== initial.branch
     || refreshed.destination_ref !== initial.destination_ref
     || refreshed.expected_remote_head !== initial.expected_remote_head
+    || JSON.stringify(refreshed.canonical_branches) !== JSON.stringify(initial.canonical_branches)
     || !samePreservation(refreshed.preservation, initial.preservation)
     || !sameConfigSourceSet(refreshed.config_sources, initial.config_sources)
   ) return failPreflight("execution");
@@ -789,9 +886,9 @@ async function postRouteMatchesPolicy(
   preflight: GitRetireRemoteBranchPreflight
 ): Promise<boolean> {
   try {
-    const policy = evaluateGitPushPolicy(preflight.root, config.gitPushPolicy, preflight.remote, preflight.branch);
+    const policy = evaluateGitRetirementPolicy(preflight.root, config.gitPushPolicy, preflight.remote, preflight.branch);
     if (!policy.allowed || policy.endpoint !== preflight.endpoint) return false;
-    const resolved = await resolveGitPushMutationEndpointUrl(config, workspace, preflight.remote, preflight.endpoint);
+    const resolved = await resolveGitRetirementEndpointUrl(config, workspace, preflight.remote, preflight.endpoint);
     if (
       resolved.identity !== preflight.endpoint
       || resolved.endpoint !== preflight.mutation_endpoint
@@ -835,7 +932,7 @@ async function preservationStillValid(
   if (observed.status !== "head" || observed.head !== route.expected_head) return false;
   if (route.type !== "integrated") return true;
   try {
-    await assertCandidateAncestry(config, workspace, preflight.preservation.accepted_candidate, route.expected_head);
+    await assertIntegratedTopology(config, workspace, preflight.preservation.accepted_candidate, route.expected_head, route.integration_mode);
     return true;
   } catch {
     return false;
@@ -846,10 +943,15 @@ async function withRetirementConfigLocks<T>(
   preflight: GitRetireRemoteBranchPreflight,
   action: (locks: readonly GitPushConfigLock[]) => Promise<T>
 ): Promise<T> {
+  let actionCompleted = false;
   try {
-    return await withGitPushConfigLocks(preflight.config_sources, action);
+    return await withGitPushConfigLocks(preflight.config_sources, async (locks) => {
+      const value = await action(locks);
+      actionCompleted = true;
+      return value;
+    });
   } catch (error) {
-    if (error instanceof GitPushConfigLockError) return failRetirement(preflight, "mutation-failed");
+    if (error instanceof GitPushConfigLockError) return failRetirement(preflight, actionCompleted ? "mutation-uncertain" : "mutation-failed");
     throw error;
   }
 }

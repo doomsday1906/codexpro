@@ -100,7 +100,17 @@ function config(endpoint, prefixes = ["mission/"]) {
     writeMode: "workspace",
     gitPushPolicy: {
       enabled: true,
-      rules: [{ remote: "origin", endpoint, branches: [], branch_prefixes: prefixes }]
+      rules: [{
+        remote: "origin",
+        endpoint,
+        branches: [],
+        branch_prefixes: prefixes,
+        retirement: {
+          branches: [],
+          branch_prefixes: prefixes,
+          canonical_branches: ["main"]
+        }
+      }]
     }
   };
 }
@@ -108,6 +118,60 @@ function config(endpoint, prefixes = ["mission/"]) {
 function remoteHead(remoteRoot, branch) {
   const value = tryGit(remoteRoot, ["rev-parse", `refs/heads/${branch}`]);
   return value.status === 0 ? value.stdout.trim() : null;
+}
+
+class StdioClient {
+  constructor(root, policy) {
+    this.child = spawn(process.execPath, ["dist/stdio.js", "--tool-mode", "full", "--write", "workspace", "--bash", "off"], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        CODEXPRO_ROOT: root,
+        CODEXPRO_ALLOWED_ROOTS: root,
+        CODEXPRO_TOOL_MODE: "full",
+        CODEXPRO_WRITE_MODE: "workspace",
+        CODEXPRO_BASH_MODE: "off",
+        CODEXPRO_CODEX_SESSIONS: "off",
+        CODEXPRO_ALLOW_NO_HTTP_TOKEN: "1",
+        CODEXPRO_GIT_PUSH_POLICY: JSON.stringify(policy)
+      },
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    this.buffer = "";
+    this.pending = new Map();
+    this.nextId = 1;
+    this.child.stdout.on("data", (chunk) => {
+      this.buffer += String(chunk);
+      while (true) {
+        const end = this.buffer.indexOf("\n");
+        if (end < 0) break;
+        const line = this.buffer.slice(0, end);
+        this.buffer = this.buffer.slice(end + 1);
+        if (!line.trim()) continue;
+        const message = JSON.parse(line);
+        const pending = this.pending.get(message.id);
+        if (!pending) continue;
+        this.pending.delete(message.id);
+        clearTimeout(pending.timer);
+        if (message.error) pending.reject(new Error(message.error.message));
+        else pending.resolve(message.result);
+      }
+    });
+  }
+  request(method, params = {}) {
+    const id = this.nextId++;
+    this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${method}`)), 15_000);
+      this.pending.set(id, { resolve, reject, timer });
+    });
+  }
+  notify(method, params = {}) { this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`); }
+  async close() {
+    if (this.child.exitCode !== null) return;
+    this.child.kill("SIGTERM");
+    await new Promise((resolve) => this.child.once("exit", resolve));
+  }
 }
 
 function snapshot(root, remoteRoot) {
@@ -126,6 +190,7 @@ function snapshot(root, remoteRoot) {
 
 function receipt(candidate, route, authority = "TASK-002 accepted receipt") {
   return {
+    schema_version: 1,
     accepted_candidate: candidate,
     acceptance_authority: authority,
     evidence_sha256: "a".repeat(64),
@@ -212,6 +277,34 @@ try {
   console.log(`RAW_OBSERVATION: compiled retirement removed only refs/heads/mission/retire; proof/accepted remained ${candidate}, local HEAD/index/worktree/ref snapshots stayed unchanged, and result reports push_attempts=1.`);
   console.log("SANITY_VERDICT: MATCH — real bare-remote absence and preservation postconditions match the accepted published-retirement outcome.");
 
+  // Exercise the same contract through the compiled ordinary public MCP route.
+  git(targetRoot, ["push", "--quiet", `file://${remoteRoot}`, `${candidate}:refs/heads/mission/public`]);
+  const publicClient = new StdioClient(targetRoot, policy.gitPushPolicy);
+  try {
+    await publicClient.request("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "git-retire-public-smoke", version: "1.0.0" }
+    });
+    publicClient.notify("notifications/initialized");
+    const publicCall = await publicClient.request("tools/call", {
+      name: "git_retire_remote_branch",
+      arguments: {
+        ...request,
+        branch: "mission/public"
+      }
+    });
+    assert.equal(publicCall.isError, undefined, `compiled public retirement failed: ${JSON.stringify(publicCall)}`);
+    assert.equal(publicCall.structuredContent.status, "retired");
+    assert.equal(publicCall.structuredContent.push_attempts, 1);
+    assert.equal(remoteHead(remoteRoot, "mission/public"), null);
+    assert.equal(remoteHead(remoteRoot, "proof/accepted"), candidate);
+    console.log("RAW_OBSERVATION: compiled stdio MCP tools/call retired mission/public; direct bare-remote observation shows exact absence while proof/accepted remains at the accepted candidate.");
+    console.log("SANITY_VERDICT: MATCH — public target route produced the required retired result and real remote postconditions.");
+  } finally {
+    await publicClient.close();
+  }
+
   // Integrated route: candidate is an ancestor of a canonical protected head.
   initRepo(integratedRoot, "mission/integrated", "Integrated");
   git(integratedRoot, ["remote", "add", "origin", endpoint]);
@@ -236,7 +329,7 @@ try {
       remote: "origin",
       branch: "main",
       expected_head: canonicalHead,
-      integration_mode: "COMMIT_PRESERVING_MERGE"
+      integration_mode: "FAST_FORWARD"
     })
   };
   // The candidate object is locally present through the explicit accepted

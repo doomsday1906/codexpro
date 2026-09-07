@@ -965,6 +965,37 @@ export async function resolveGitPushMutationEndpointUrl(
   return effectivePushEndpoint(config, workspace, remote, authorizedIdentity, options);
 }
 
+/** Resolve one equal, credential-safe fetch/push identity for retirement. */
+export async function resolveGitRetirementEndpointUrl(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  remote: string,
+  authorizedIdentity: string,
+  options: { readonly globalArgs?: readonly string[] } = {}
+): Promise<{ readonly endpoint: string; readonly identity: string; readonly configured_endpoint: string }> {
+  const push = await effectivePushEndpoint(config, workspace, remote, authorizedIdentity, options);
+  const pushParsed = inspectGitPushEndpoint(push.endpoint);
+  if (!pushParsed.ok || pushParsed.style === "scp") return fail("disallowed-local-endpoint");
+  const fetchResult = await runGitChecked(config, workspace, [
+    ...(options.globalArgs ?? []),
+    "remote",
+    "get-url",
+    "--all",
+    remote
+  ]);
+  const fetchBytes = fetchResult.copyStdoutBytes();
+  if (fetchBytes.length > MAX_REMOTE_OBSERVATION_BYTES) return fail("ambiguous-multiple-effective-push-endpoints");
+  const fetchText = decodeUtf8(fetchResult);
+  if (!fetchText.endsWith("\n")) return fail("effective-endpoint-unavailable");
+  const fetchLines = fetchText.slice(0, -1).split("\n");
+  if (fetchLines.length !== 1 || !fetchLines[0]) return fail(fetchLines.length === 0 ? "zero-effective-push-endpoints" : "ambiguous-multiple-effective-push-endpoints");
+  const parsedFetch = inspectGitPushEndpoint(fetchLines[0]);
+  if (!parsedFetch.ok) return fail(policyFailureReason(parsedFetch.reason), parsedFetch.reason);
+  if (parsedFetch.style === "scp") return fail("disallowed-local-endpoint");
+  if (parsedFetch.identity !== push.identity) return fail("effective-endpoint-not-allowlisted");
+  return push;
+}
+
 /**
  * Validate one explicit workspace and exact local/remote/policy push precondition.
  * Every Git invocation uses the sealed trusted-config runner and only fixed
