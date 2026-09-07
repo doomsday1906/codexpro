@@ -301,7 +301,7 @@ function assertDescriptor(tool) {
   assert.deepEqual(new Set(schema.required ?? []), new Set(fields), "git_push schema does not require every field");
   for (const field of fields) assert.equal(schema.properties?.[field]?.type, "string", `${field} is not a string`);
   assert.equal(schema.properties?.expected_local_head?.pattern, "^(?:[0-9a-f]{40}|[0-9a-f]{64})$");
-  assert.equal(schema.properties?.expected_remote_head?.pattern, "^(?:[0-9a-f]{40}|[0-9a-f]{64})$");
+  assert.equal(schema.properties?.expected_remote_head?.pattern, "^(?:absent|[0-9a-f]{40}|[0-9a-f]{64})$");
 }
 
 const fixture = await mkdtemp(path.join(os.tmpdir(), "codexpro-task003-tester-"));

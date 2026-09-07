@@ -223,7 +223,7 @@ function assertDescriptor(tool) {
   assert.equal(schema.properties?.workspace_id?.minLength, 1);
   assert.equal(schema.properties?.workspace_id?.maxLength, 128);
   assert.equal(schema.properties?.expected_local_head?.pattern, "^(?:[0-9a-f]{40}|[0-9a-f]{64})$");
-  assert.equal(schema.properties?.expected_remote_head?.pattern, "^(?:[0-9a-f]{40}|[0-9a-f]{64})$");
+  assert.equal(schema.properties?.expected_remote_head?.pattern, "^(?:absent|[0-9a-f]{40}|[0-9a-f]{64})$");
 }
 
 async function freeHttpServer({ defaultRoot, allowedRoots, policy, toolMode, writeMode }, callback) {

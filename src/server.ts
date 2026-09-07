@@ -520,15 +520,16 @@ const GIT_PUSH_ARGUMENTS_SCHEMA = z.object({
   branch: z.string()
     .min(1)
     .max(256)
-    .describe("Exact existing branch name to update."),
+    .describe("Exact branch name to publish or update."),
   expected_local_head: z.string()
     .max(64)
     .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu, "expected_local_head must be a full commit SHA.")
     .describe("Exact full current local commit SHA."),
   expected_remote_head: z.string()
     .max(64)
-    .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu, "expected_remote_head must be a full commit SHA.")
-    .describe("Exact full remote branch commit SHA used for the mutation precondition.")
+    .regex(/^(?:absent|[0-9a-f]{40}|[0-9a-f]{64})$/iu, "expected_remote_head must be literal 'absent' or a full commit SHA.")
+    .refine((value) => value === "absent" || /^[0-9a-f]+$/iu.test(value), "expected_remote_head must use lowercase literal 'absent' or hexadecimal SHA characters.")
+    .describe("Exact full remote branch commit SHA, or literal 'absent' for first publication.")
 }).strict();
 
 const GIT_PUSH_FIELD_NAMES = new Set([
@@ -4047,7 +4048,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     "git_push",
     {
       title: "Git Push",
-      description: "Perform one bounded fast-forward remote push for an existing allowlisted branch after exact local/remote preflight and mutation-time compare-and-swap validation. Available only in full tool mode with CODEXPRO_WRITE_MODE=workspace and an enabled exact Git push policy. The endpoint, lease, refspec, and push options are internally controlled; Git authentication and synchronous pre-push hooks remain Git-owned.",
+      description: "Perform one bounded non-force fast-forward remote push for an explicitly allowlisted exact branch or literal branch-prefix family after exact local/remote preflight and mutation-time compare-and-swap validation. Use expected_remote_head='absent' only for a first publication whose remote branch was independently observed absent; otherwise provide the exact full remote head SHA. Publication never grants acceptance or mutates canonical integration. Available only in full tool mode with CODEXPRO_WRITE_MODE=workspace and an enabled Git push policy. The endpoint, lease, refspec, and push options are internally controlled; Git authentication and synchronous pre-push hooks remain Git-owned.",
       inputSchema: GIT_PUSH_PUBLIC_SCHEMA,
       runtimeInputSchema: GIT_PUSH_ARGUMENTS_SCHEMA,
       annotations: GIT_PUSH_ANNOTATIONS,

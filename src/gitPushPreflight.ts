@@ -13,8 +13,11 @@ export interface GitPushRequest {
   readonly remote: string;
   readonly branch: string;
   readonly expected_local_head: string;
-  readonly expected_remote_head: string;
+  readonly expected_remote_head: GitPushExpectedRemoteHead;
 }
+
+/** Caller assertion for the remote branch: an exact full SHA or known absence. */
+export type GitPushExpectedRemoteHead = string | "absent";
 
 /** Configuration needed by the preflight; no public tool registration is implied. */
 export type GitPushPreflightConfig = Pick<
@@ -141,7 +144,7 @@ export interface GitPushPreflight {
   readonly source_ref: string;
   readonly destination_ref: string;
   readonly expected_local_head: string;
-  readonly expected_remote_head: string;
+  readonly expected_remote_head: GitPushExpectedRemoteHead;
 }
 
 export type GitPushRemoteObservation =
@@ -232,6 +235,11 @@ function validateHead(value: unknown): string {
   return value.toLowerCase();
 }
 
+function validateExpectedRemoteHead(value: unknown): GitPushExpectedRemoteHead {
+  if (value === "absent") return value;
+  return validateHead(value);
+}
+
 /** Strict internal request validator; the public wrapper owns its own schema surface. */
 export function validateGitPushRequest(raw: unknown): GitPushRequest {
   if (!isRecord(raw)) return fail("invalid-input");
@@ -255,7 +263,7 @@ export function validateGitPushRequest(raw: unknown): GitPushRequest {
     remote: validateRemote(raw.remote),
     branch: validateBranch(raw.branch),
     expected_local_head: validateHead(raw.expected_local_head),
-    expected_remote_head: validateHead(raw.expected_remote_head)
+    expected_remote_head: validateExpectedRemoteHead(raw.expected_remote_head)
   };
 }
 
@@ -802,14 +810,18 @@ async function assertRemoteHead(
   remote: string,
   destinationRef: string,
   objectFormat: "sha1" | "sha256",
-  expectedRemoteHead: string
+  expectedRemoteHead: GitPushExpectedRemoteHead
 ): Promise<void> {
   const observed = await observeGitPushRemoteHead(config, workspace, remote, destinationRef, objectFormat);
-  if (observed.status === "absent") return fail("remote-absent");
+  if (observed.status === "absent") {
+    if (expectedRemoteHead === "absent") return;
+    return fail("remote-absent");
+  }
   if (observed.status === "ambiguous") return fail("remote-ambiguous");
   if (observed.status === "malformed") return fail("remote-malformed");
   if (observed.status === "execution") return fail("execution");
   if (observed.status !== "head") return fail("execution");
+  if (expectedRemoteHead === "absent") return fail("remote-head-mismatch");
   if (observed.head !== expectedRemoteHead) return fail("remote-head-mismatch");
 }
 
@@ -873,7 +885,10 @@ export async function preflightGitPush(
     repository.configPath,
     repository.worktreeConfigPath
   );
-  if (request.expected_local_head.length !== (repository.objectFormat === "sha1" ? 40 : 64) || request.expected_remote_head.length !== (repository.objectFormat === "sha1" ? 40 : 64)) {
+  if (
+    request.expected_local_head.length !== (repository.objectFormat === "sha1" ? 40 : 64) ||
+    (request.expected_remote_head !== "absent" && request.expected_remote_head.length !== (repository.objectFormat === "sha1" ? 40 : 64))
+  ) {
     return fail("invalid-head");
   }
 
@@ -895,10 +910,17 @@ export async function preflightGitPush(
   if (!policy.endpoint) return fail("invalid-policy", "missing-effective-endpoint");
   await effectivePushEndpoint(config, workspace, request.remote, policy.endpoint);
 
-  await assertRemoteObject(config, workspace, request.expected_remote_head);
-  const ancestry = await runGitExitAware(config, workspace, ["merge-base", "--is-ancestor", request.expected_remote_head, request.expected_local_head]);
-  if (ancestry.exitCode === 1 && ancestry.signal === null && !ancestry.timedOut) return fail("non-fast-forward");
-  if (ancestry.exitCode !== 0 || ancestry.signal !== null || ancestry.timedOut) return fail("execution");
+  // First publication requires an independent absence observation before any
+  // mutation-time revalidation. Existing-head publication retains its exact
+  // object and ancestry checks unchanged.
+  if (request.expected_remote_head === "absent") {
+    await assertRemoteHead(config, workspace, request.remote, branchRef, repository.objectFormat, request.expected_remote_head);
+  } else {
+    await assertRemoteObject(config, workspace, request.expected_remote_head);
+    const ancestry = await runGitExitAware(config, workspace, ["merge-base", "--is-ancestor", request.expected_remote_head, request.expected_local_head]);
+    if (ancestry.exitCode === 1 && ancestry.signal === null && !ancestry.timedOut) return fail("non-fast-forward");
+    if (ancestry.exitCode !== 0 || ancestry.signal !== null || ancestry.timedOut) return fail("execution");
+  }
 
   await assertDefaultReceivePack(config, workspace, request.remote);
   await assertRemoteHead(config, workspace, request.remote, branchRef, repository.objectFormat, request.expected_remote_head);

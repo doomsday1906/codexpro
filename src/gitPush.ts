@@ -10,6 +10,7 @@ import {
   revalidateGitPushPreflight,
   resolveGitPushMutationEndpoint,
   type GitPushPreflight,
+  type GitPushExpectedRemoteHead,
   type GitPushRemoteObservation
 } from "./gitPushPreflight.js";
 
@@ -32,7 +33,7 @@ export class GitPushError extends CodexProError {
       readonly remote: string;
       readonly branch: string;
       readonly source_head: string;
-      readonly expected_remote_head: string;
+      readonly expected_remote_head: GitPushExpectedRemoteHead;
       readonly remote_head?: string;
     }
   ) {
@@ -60,7 +61,7 @@ export interface GitPushResult {
   readonly branch: string;
   readonly destination_ref: string;
   readonly source_head: string;
-  readonly expected_remote_head: string;
+  readonly expected_remote_head: GitPushExpectedRemoteHead;
   readonly remote_head: string;
   readonly push_attempts: 1;
 }
@@ -99,7 +100,11 @@ export function buildGitPushArgs(preflight: GitPushPreflight): readonly string[]
       expected_remote_head: preflight.expected_remote_head
     });
   }
-  const lease = `--force-with-lease=${destination}:${preflight.expected_remote_head}`;
+  // Git's empty expected value is the native absence-CAS spelling. The public
+  // contract uses the explicit, non-ambiguous sentinel "absent" instead of
+  // exposing an empty field that could be confused with omission.
+  const leaseExpected = preflight.expected_remote_head === "absent" ? "" : preflight.expected_remote_head;
+  const lease = `--force-with-lease=${destination}:${leaseExpected}`;
   const refspec = `${preflight.expected_local_head}:${destination}`;
   return Object.freeze([
     ...GIT_PUSH_FIXED_OPTIONS,
@@ -401,7 +406,7 @@ export async function gitPush(
     if (execution.failed || execution.result?.exitCode !== 0 || execution.result?.signal !== null || execution.result?.timedOut || execution.result?.stdoutOverflow || execution.result?.stderrOverflow) {
       if (!postRouteValid) return failPush(preflight, "mutation-failed");
       if (observed.status === "head") {
-        if (observed.head === preflight.expected_remote_head) {
+        if (preflight.expected_remote_head !== "absent" && observed.head === preflight.expected_remote_head) {
           return failPush(preflight, "mutation-failed", observed.head);
         }
         if (observed.head === preflight.expected_local_head) {
@@ -410,7 +415,10 @@ export async function gitPush(
         return failPush(preflight, "cas-stale", observed.head);
       }
       if (observed.status === "absent") {
-        return failPush(preflight, "cas-stale");
+        // A still-absent branch after a failed first-publication attempt is
+        // not evidence of a concurrent writer; classify it as an ordinary
+        // mutation failure. Existing-branch disappearance remains stale CAS.
+        return failPush(preflight, preflight.expected_remote_head === "absent" ? "mutation-failed" : "cas-stale");
       }
       return failPush(preflight, "mutation-failed");
     }

@@ -7,6 +7,7 @@ export interface GitPushPolicyRule {
   remote: string;
   endpoint: string;
   branches: string[];
+  branch_prefixes?: string[];
 }
 
 export interface GitPushPolicy {

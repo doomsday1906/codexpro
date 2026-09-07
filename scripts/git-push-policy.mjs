@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 
 const MAX_POLICY_RULES = 128;
 const MAX_BRANCHES_PER_RULE = 128;
+const MAX_BRANCH_PREFIXES_PER_RULE = 128;
 const MAX_POLICY_VALUE_BYTES = 256 * 1024;
 const MAX_ENDPOINT_BYTES = 4_096;
 const MAX_REMOTE_BYTES = 256;
@@ -10,6 +11,11 @@ const DEFAULT_GIT_SCHEMES = new Set(["http", "https", "ssh", "git", "git+ssh"]);
 const CONTROL_OR_WHITESPACE = /[\u0000-\u001f\u007f\s]/u;
 const HELPER_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*::/u;
 const GLOB_TOKEN = /[*?\[\]]/u;
+// These characters are rejected for namespace prefixes even when Git would
+// accept them in a ref name. They are commonly used to spell regexes or
+// refspec modifiers and have no place in a literal policy prefix.
+const PREFIX_PATTERN_TOKEN = /[+$^()|{}]/u;
+const PROTECTED_BRANCH_PREFIXES = new Set(["main/", "master/", "develop/", "trunk/", "head/", "refs/"]);
 
 export function defaultGitPushPolicy() {
   return { enabled: false, rules: [] };
@@ -64,6 +70,30 @@ function branchName(value) {
     invalidPolicy("branch must be one exact branch name; globs and invalid ref forms are not allowed.");
   }
   return branch;
+}
+
+function branchPrefixName(value) {
+  const prefix = boundedString(value, "branch_prefix", MAX_BRANCH_BYTES);
+  if (
+    !prefix.endsWith("/") ||
+    prefix.length === 1 ||
+    prefix.startsWith("/") ||
+    prefix.endsWith("//") ||
+    prefix.startsWith("+") ||
+    GLOB_TOKEN.test(prefix) ||
+    PREFIX_PATTERN_TOKEN.test(prefix)
+  ) {
+    invalidPolicy("branch_prefix must be a literal namespace prefix ending in '/'; globs, regexes, refspecs, and protected prefixes are not allowed.");
+  }
+  const base = prefix.slice(0, -1);
+  // Reuse exact ref-name validation for every component before the required
+  // namespace separator. This also rejects traversal, controls, and option
+  // looking prefixes without inventing a second Git grammar.
+  branchName(base);
+  if ([...PROTECTED_BRANCH_PREFIXES].some((protectedPrefix) => prefix.toLowerCase().startsWith(protectedPrefix))) {
+    invalidPolicy("branch_prefix may not authorize a canonical or protected branch namespace.");
+  }
+  return prefix;
 }
 
 function endpointFailure(raw, reason) {
@@ -152,18 +182,20 @@ function normalizePolicyObject(value) {
 
   const rules = [];
   const seen = new Set();
+  const seenPrefixesByRemote = new Map();
+  const seenBranchesByRemote = new Map();
   for (const rawRule of rawRules) {
     if (!isRecord(rawRule)) invalidPolicy("each rule must be an object.");
     const remote = remoteName(rawRule.remote);
     const endpoint = canonicalEndpoint(rawRule.endpoint);
-    if (!Array.isArray(rawRule.branches) || rawRule.branches.length === 0) {
-      invalidPolicy("each rule must contain one or more exact branches.");
+    if (rawRule.branches !== undefined && !Array.isArray(rawRule.branches)) {
+      invalidPolicy("branches must be an array when provided.");
     }
-    if (rawRule.branches.length > MAX_BRANCHES_PER_RULE) {
+    if (Array.isArray(rawRule.branches) && rawRule.branches.length > MAX_BRANCHES_PER_RULE) {
       invalidPolicy(`each rule may contain at most ${MAX_BRANCHES_PER_RULE} branches.`);
     }
     const branches = [];
-    for (const rawBranch of rawRule.branches) {
+    for (const rawBranch of rawRule.branches ?? []) {
       const branch = branchName(rawBranch);
       if (branches.includes(branch)) invalidPolicy("duplicate exact branch in one rule.");
       const key = `${remote}\u0000${branch}`;
@@ -171,10 +203,61 @@ function normalizePolicyObject(value) {
       seen.add(key);
       branches.push(branch);
     }
-    rules.push({ remote, endpoint, branches });
+    if (rawRule.branch_prefixes !== undefined && !Array.isArray(rawRule.branch_prefixes)) {
+      invalidPolicy("branch_prefixes must be an array when provided.");
+    }
+    if (Array.isArray(rawRule.branch_prefixes) && rawRule.branch_prefixes.length === 0) {
+      invalidPolicy("branch_prefixes must contain at least one literal prefix when provided.");
+    }
+    if (Array.isArray(rawRule.branch_prefixes) && rawRule.branch_prefixes.length > MAX_BRANCH_PREFIXES_PER_RULE) {
+      invalidPolicy(`each rule may contain at most ${MAX_BRANCH_PREFIXES_PER_RULE} branch_prefixes.`);
+    }
+    const branchPrefixes = [];
+    for (const rawPrefix of rawRule.branch_prefixes ?? []) {
+      const prefix = branchPrefixName(rawPrefix);
+      if (branchPrefixes.includes(prefix)) invalidPolicy("duplicate branch_prefix in one rule.");
+      branchPrefixes.push(prefix);
+    }
+    if (branches.length === 0 && branchPrefixes.length === 0) {
+      invalidPolicy("each rule must contain one or more exact branches or literal branch_prefixes.");
+    }
+
+    const remoteBranches = seenBranchesByRemote.get(remote) ?? [];
+    const remotePrefixes = seenPrefixesByRemote.get(remote) ?? [];
+    for (const branch of branches) {
+      if (remotePrefixes.some((prefix) => branch.startsWith(prefix))) {
+        invalidPolicy("exact branch overlaps a branch_prefix for the same remote and is ambiguous.");
+      }
+    }
+    for (const prefix of branchPrefixes) {
+      if (branches.some((branch) => branch.startsWith(prefix))) {
+        invalidPolicy("exact branch overlaps a branch_prefix in the same rule and is ambiguous.");
+      }
+      if (remoteBranches.some((branch) => branch.startsWith(prefix))) {
+        invalidPolicy("branch_prefix overlaps an exact branch for the same remote and is ambiguous.");
+      }
+      if (remotePrefixes.some((other) => prefix.startsWith(other) || other.startsWith(prefix))) {
+        invalidPolicy("branch_prefixes overlap for the same remote and are ambiguous.");
+      }
+    }
+    for (let index = 0; index < branchPrefixes.length; index += 1) {
+      for (let otherIndex = index + 1; otherIndex < branchPrefixes.length; otherIndex += 1) {
+        const prefix = branchPrefixes[index];
+        const other = branchPrefixes[otherIndex];
+        if (prefix.startsWith(other) || other.startsWith(prefix)) {
+          invalidPolicy("branch_prefixes overlap for the same remote and are ambiguous.");
+        }
+      }
+    }
+    seenBranchesByRemote.set(remote, [...remoteBranches, ...branches]);
+    seenPrefixesByRemote.set(remote, [...remotePrefixes, ...branchPrefixes]);
+
+    const normalizedRule = { remote, endpoint, branches };
+    if (rawRule.branch_prefixes !== undefined) normalizedRule.branch_prefixes = branchPrefixes;
+    rules.push(normalizedRule);
   }
 
-  if (enabled && rules.length === 0) invalidPolicy("an enabled policy requires at least one exact rule.");
+  if (enabled && rules.length === 0) invalidPolicy("an enabled policy requires at least one branch rule.");
   return { enabled, rules };
 }
 
@@ -229,17 +312,28 @@ function sanitizedBranches(value) {
   );
 }
 
+function sanitizedBranchPrefixes(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, MAX_BRANCH_PREFIXES_PER_RULE).map((prefix) =>
+    typeof prefix === "string" && prefix && !CONTROL_OR_WHITESPACE.test(prefix) ? prefix.slice(0, MAX_BRANCH_BYTES) : "<invalid>"
+  );
+}
+
 export function sanitizeGitPushPolicy(value) {
   if (!isRecord(value)) return defaultGitPushPolicy();
   const enabled = value.enabled === true;
   const rawRules = Array.isArray(value.rules) ? value.rules.slice(0, MAX_POLICY_RULES) : [];
   return {
     enabled,
-    rules: rawRules.map((rule) => ({
-      remote: sanitizedRemote(rule?.remote),
-      endpoint: sanitizedEndpoint(rule?.endpoint),
-      branches: sanitizedBranches(rule?.branches)
-    }))
+    rules: rawRules.map((rule) => {
+      const safeRule = {
+        remote: sanitizedRemote(rule?.remote),
+        endpoint: sanitizedEndpoint(rule?.endpoint),
+        branches: sanitizedBranches(rule?.branches)
+      };
+      if (Array.isArray(rule?.branch_prefixes)) safeRule.branch_prefixes = sanitizedBranchPrefixes(rule.branch_prefixes);
+      return safeRule;
+    })
   };
 }
 
@@ -354,7 +448,12 @@ export function evaluateGitPushPolicy(repoRoot, policy, remote, branch, options 
   } catch {
     return { allowed: false, reason: "invalid-remote-or-branch" };
   }
-  const matches = normalized.rules.filter((rule) => rule.remote === safeRemote && rule.branches.includes(safeBranch));
+  const matches = normalized.rules.filter((rule) =>
+    rule.remote === safeRemote && (
+      rule.branches.includes(safeBranch) ||
+      (rule.branch_prefixes ?? []).some((prefix) => safeBranch.startsWith(prefix))
+    )
+  );
   if (matches.length !== 1) return { allowed: false, reason: matches.length === 0 ? "remote-or-branch-not-allowlisted" : "ambiguous-policy-rule" };
   const effective = resolveEffectivePushEndpoint(repoRoot, safeRemote, options);
   if (!effective.ok) return { allowed: false, reason: effective.reason, endpoint: effective.endpoint };
