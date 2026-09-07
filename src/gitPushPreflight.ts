@@ -975,7 +975,21 @@ export async function resolveGitRetirementEndpointUrl(
 ): Promise<{ readonly endpoint: string; readonly identity: string; readonly configured_endpoint: string }> {
   const push = await effectivePushEndpoint(config, workspace, remote, authorizedIdentity, options);
   const pushParsed = inspectGitPushEndpoint(push.endpoint);
-  if (!pushParsed.ok || pushParsed.style === "scp") return fail("disallowed-local-endpoint");
+  const strictEndpoint = (raw: string, parsed: ReturnType<typeof inspectGitPushEndpoint>): boolean => {
+    if (!parsed.ok || !["http", "https", "git", "ssh"].includes(parsed.style ?? "") || raw.includes("%")) return false;
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(raw)) {
+      try {
+        const url = new URL(raw);
+        if (url.username || url.password) return false;
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (!strictEndpoint(push.endpoint, pushParsed) || !strictEndpoint(push.configured_endpoint, inspectGitPushEndpoint(push.configured_endpoint))) {
+    return fail("disallowed-local-endpoint");
+  }
   const fetchResult = await runGitChecked(config, workspace, [
     ...(options.globalArgs ?? []),
     "remote",
@@ -990,8 +1004,7 @@ export async function resolveGitRetirementEndpointUrl(
   const fetchLines = fetchText.slice(0, -1).split("\n");
   if (fetchLines.length !== 1 || !fetchLines[0]) return fail(fetchLines.length === 0 ? "zero-effective-push-endpoints" : "ambiguous-multiple-effective-push-endpoints");
   const parsedFetch = inspectGitPushEndpoint(fetchLines[0]);
-  if (!parsedFetch.ok) return fail(policyFailureReason(parsedFetch.reason), parsedFetch.reason);
-  if (parsedFetch.style === "scp") return fail("disallowed-local-endpoint");
+  if (!strictEndpoint(fetchLines[0], parsedFetch)) return fail("disallowed-local-endpoint");
   if (parsedFetch.identity !== push.identity) return fail("effective-endpoint-not-allowlisted");
   return push;
 }

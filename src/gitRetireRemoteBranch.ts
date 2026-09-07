@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { CodexProConfig } from "./config.js";
@@ -29,6 +29,8 @@ const MAX_REMOTE_BYTES = 256;
 const MAX_BRANCH_BYTES = 256;
 const MAX_HEAD_BYTES = 64;
 const MAX_AUTHORITY_BYTES = 4_096;
+const MAX_LOCAL_SNAPSHOT_BYTES = 64 * 1024 * 1024;
+const MAX_LOCAL_SNAPSHOT_FILES = 16_384;
 
 const PROTECTED_EXACT_BRANCHES = new Set(["main", "master", "develop", "trunk", "head"]);
 const PROTECTED_BRANCH_PREFIXES = Object.freeze(["main/", "master/", "develop/", "trunk/", "head/", "refs/"]);
@@ -353,10 +355,10 @@ function validateObjectId(value: unknown): string {
 }
 
 function validateEvidenceDigest(value: unknown): string {
-  if (typeof value !== "string" || value.trim() !== value || !FULL_SHA256_PATTERN.test(value)) {
+  if (typeof value !== "string" || value.trim() !== value || !FULL_SHA256_PATTERN.test(value) || value !== value.toLowerCase()) {
     return failPreflight("invalid-receipt");
   }
-  return value.toLowerCase();
+  return value;
 }
 
 function validateAuthority(value: unknown): string {
@@ -779,6 +781,124 @@ function samePreservation(left: GitRetirePreservation, right: GitRetirePreservat
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+interface GitRetireFileSnapshot {
+  readonly path: string;
+  readonly kind: "absent" | "file" | "symlink" | "other";
+  readonly size: number;
+  readonly digest: string;
+}
+
+interface GitRetireLocalSnapshot {
+  readonly head: string;
+  readonly refs: string;
+  readonly status: string;
+  readonly staged: string;
+  readonly unstaged: string;
+  readonly untracked: readonly GitRetireFileSnapshot[];
+  readonly index: GitRetireFileSnapshot;
+  readonly config: readonly GitRetireFileSnapshot[];
+}
+
+async function snapshotGitOutput(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  args: readonly string[]
+): Promise<Buffer> {
+  const result = await runGitExitAware(config, workspace, args);
+  if (result.exitCode !== 0 || result.signal !== null || result.timedOut || result.stdoutOverflow || result.stderrOverflow) {
+    return failPreflight("execution");
+  }
+  const output = result.copyStdoutBytes();
+  if (output.length > MAX_LOCAL_SNAPSHOT_BYTES) return failPreflight("execution");
+  return output;
+}
+
+function snapshotText(output: Buffer): string {
+  return output.toString("utf8");
+}
+
+function snapshotPath(root: string, value: string): string {
+  if (!value || value.includes("\u0000")) return failPreflight("execution");
+  const resolved = path.resolve(root, value);
+  const relative = path.relative(root, resolved);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return failPreflight("execution");
+  return resolved;
+}
+
+async function fileSnapshot(root: string, filePath: string, confined = true): Promise<GitRetireFileSnapshot> {
+  const safePath = confined
+    ? snapshotPath(root, filePath)
+    : path.resolve(filePath);
+  if (!path.isAbsolute(safePath) || safePath.includes("\u0000")) return failPreflight("execution");
+  try {
+    const stat = await fsp.lstat(safePath);
+    if (stat.isFile()) {
+      if (stat.size > MAX_LOCAL_SNAPSHOT_BYTES) return failPreflight("execution");
+      const bytes = await fsp.readFile(safePath);
+      return { path: safePath, kind: "file", size: bytes.length, digest: createHash("sha256").update(bytes).digest("hex") };
+    }
+    if (stat.isSymbolicLink()) {
+      const target = await fsp.readlink(safePath, "utf8");
+      return { path: safePath, kind: "symlink", size: Buffer.byteLength(target, "utf8"), digest: createHash("sha256").update(target).digest("hex") };
+    }
+    return { path: safePath, kind: "other", size: stat.size, digest: `${stat.mode}:${stat.size}` };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path: safePath, kind: "absent", size: 0, digest: "" };
+    return failPreflight("execution");
+  }
+}
+
+async function captureLocalSnapshot(
+  config: GitPushPreflightConfig,
+  workspace: Workspace,
+  preflight: GitRetireRemoteBranchPreflight
+): Promise<GitRetireLocalSnapshot> {
+  const untrackedRaw = await snapshotGitOutput(config, workspace, ["ls-files", "--others", "--exclude-standard", "-z"]);
+  if (untrackedRaw.length > 0 && untrackedRaw.at(-1) !== 0) return failPreflight("execution");
+  const untrackedNames = untrackedRaw.length === 0 ? [] : untrackedRaw.toString("utf8").slice(0, -1).split("\u0000");
+  if (untrackedNames.length > MAX_LOCAL_SNAPSHOT_FILES) return failPreflight("execution");
+  const untracked: GitRetireFileSnapshot[] = [];
+  for (const name of untrackedNames) untracked.push(await fileSnapshot(preflight.root, name));
+
+  const indexPath = snapshotText(await snapshotGitOutput(config, workspace, ["rev-parse", "--path-format=absolute", "--git-path", "index"])).trim();
+  if (!path.isAbsolute(indexPath)) return failPreflight("execution");
+  const configFiles: GitRetireFileSnapshot[] = [];
+  let totalConfigBytes = 0;
+  for (const source of preflight.config_sources) {
+    const file = await fileSnapshot(preflight.root, source, false);
+    totalConfigBytes += file.size;
+    if (totalConfigBytes > MAX_LOCAL_SNAPSHOT_BYTES) return failPreflight("execution");
+    configFiles.push(file);
+  }
+  return Object.freeze({
+    head: snapshotText(await snapshotGitOutput(config, workspace, ["rev-parse", "HEAD"])),
+    refs: snapshotText(await snapshotGitOutput(config, workspace, ["for-each-ref", "--format=%(refname)%00%(objectname)%00"])),
+    status: snapshotText(await snapshotGitOutput(config, workspace, ["status", "--porcelain=v1", "--untracked-files=all"])),
+    staged: snapshotText(await snapshotGitOutput(config, workspace, ["diff", "--cached", "--binary", "--no-ext-diff"])),
+    unstaged: snapshotText(await snapshotGitOutput(config, workspace, ["diff", "--binary", "--no-ext-diff"])),
+    untracked: Object.freeze(untracked),
+    index: await fileSnapshot(preflight.root, indexPath, false),
+    config: Object.freeze(configFiles)
+  });
+}
+
+function sameFileSnapshot(left: GitRetireFileSnapshot, right: GitRetireFileSnapshot): boolean {
+  return left.path === right.path && left.kind === right.kind && left.size === right.size && left.digest === right.digest;
+}
+
+function sameLocalSnapshot(left: GitRetireLocalSnapshot, right: GitRetireLocalSnapshot): boolean {
+  return left.head === right.head
+    && left.refs === right.refs
+    && left.status === right.status
+    && left.staged === right.staged
+    && left.unstaged === right.unstaged
+    && sameFileSnapshot(left.index, right.index)
+    && left.untracked.length === right.untracked.length
+    && left.untracked.every((file, index) => sameFileSnapshot(file, right.untracked[index]))
+    && left.config.length === right.config.length
+    && left.config.every((file, index) => sameFileSnapshot(file, right.config[index]));
+}
+
 async function revalidateRetirement(
   config: GitRetireRemoteBranchConfig,
   workspace: Workspace,
@@ -825,7 +945,8 @@ export const GIT_RETIRE_REMOTE_BRANCH_FIXED_OPTIONS = Object.freeze([
   "--no-tags",
   "--no-mirror",
   "--no-prune",
-  "--no-set-upstream"
+  "--no-set-upstream",
+  "--no-verify"
 ] as const);
 
 /** Construct only the internal exact-head deletion CAS. */
@@ -975,9 +1096,27 @@ export async function gitRetireRemoteBranch(
       return failRetirement(initial, "mutation-failed");
     }
 
+    let localBefore: GitRetireLocalSnapshot;
+    try {
+      localBefore = await captureLocalSnapshot(config, workspace, preflight);
+    } catch {
+      return failRetirement(preflight, "mutation-failed");
+    }
+
     const execution = await executeRetirement(config, workspace, preflight);
+    let localAfter: GitRetireLocalSnapshot | undefined;
+    try {
+      localAfter = await captureLocalSnapshot(config, workspace, preflight);
+    } catch {
+      return failRetirement(preflight, "mutation-uncertain");
+    }
+    const localStateUnchanged = sameLocalSnapshot(localBefore, localAfter);
     const postRouteValid = await postRouteMatchesPolicy(config, workspace, preflight);
     const observed = postRouteValid ? await observeTarget(config, workspace, preflight) : { status: "execution" as const };
+
+    if (!localStateUnchanged) {
+      return failRetirement(preflight, execution.failed ? "mutation-uncertain" : "postcondition");
+    }
 
     if (
       execution.failed

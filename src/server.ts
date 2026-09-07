@@ -627,7 +627,7 @@ const GIT_RETIRE_REMOTE_BRANCH_PRESERVATION_SCHEMA = z.object({
     .max(4_096)
     .refine((value) => value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value), "acceptance_authority must be bounded text without surrounding whitespace or controls."),
   evidence_sha256: z.string()
-    .regex(/^[0-9a-f]{64}$/iu, "evidence_sha256 must be a full SHA-256 digest."),
+    .regex(/^[0-9a-f]{64}$/u, "evidence_sha256 must be a lowercase full SHA-256 digest."),
   route: z.discriminatedUnion("type", [
     GIT_RETIRE_REMOTE_BRANCH_ROUTE_PUBLISHED_SCHEMA,
     GIT_RETIRE_REMOTE_BRANCH_ROUTE_INTEGRATED_SCHEMA

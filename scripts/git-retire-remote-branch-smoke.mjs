@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { spawn, spawnSync } from "node:child_process";
 import net from "node:net";
 import os from "node:os";
@@ -227,13 +227,9 @@ try {
   git(publishedRoot, ["fetch", "--quiet", "origin", "mission/retire"]);
   git(publishedRoot, ["push", "--quiet", "origin", `${candidate}:refs/heads/proof/accepted`]);
 
-  // Exercise the same named-remote single-rewrite route used by production:
-  // passing the already-expanded endpoint directly would be redirected to an
-  // unrelated endpoint by the second rewrite and must not be accepted.
-  const substitutedEndpoint = `git://127.0.0.1:${port}/substituted.git`;
-  git(targetRoot, ["config", "remote.origin.pushurl", "RETIRE_ALIAS:"]);
-  git(targetRoot, ["config", `url.${endpoint}.insteadOf`, "RETIRE_ALIAS:"]);
-  git(targetRoot, ["config", `url.${substitutedEndpoint}.pushInsteadOf`, endpoint]);
+  const hookPath = path.join(targetRoot, ".git", "hooks", "pre-push");
+  await writeFile(hookPath, "#!/bin/sh\nprintf 'hook ran\\n' > hook-fired.txt\nprintf 'hook mutation\\n' > candidate.txt\ngit add candidate.txt\ngit config --local codexpro.hook-mutated yes\ngit update-ref refs/heads/hook-mutated HEAD\n", { mode: 0o755 });
+  await chmod(hookPath, 0o755);
 
   const targetWorkspace = workspace(path.resolve(targetRoot));
   const policy = config(endpoint);
@@ -274,8 +270,58 @@ try {
     "retirement changed local target state"
   );
   assert.equal(targetAfter.remoteRefs.includes("refs/remotes/origin/mission/retire"), false);
+  await assert.rejects(readFile(path.join(targetRoot, "hook-fired.txt")));
+  await rm(hookPath);
   console.log(`RAW_OBSERVATION: compiled retirement removed only refs/heads/mission/retire; proof/accepted remained ${candidate}, local HEAD/index/worktree/ref snapshots stayed unchanged, and result reports push_attempts=1.`);
   console.log("SANITY_VERDICT: MATCH — real bare-remote absence and preservation postconditions match the accepted published-retirement outcome.");
+
+  // A configured alias that resolves to the allowlisted identity is still
+  // hostile input for retirement: the raw configured route must be safe too.
+  const hostileHead = await commit(targetRoot, "hostile.txt", "hostile\n", "hostile endpoint target");
+  git(targetRoot, ["push", "--quiet", "origin", `${hostileHead}:refs/heads/mission/hostile-config`]);
+  git(targetRoot, ["config", "remote.origin.pushurl", "RETIRE_ALIAS:"]);
+  git(targetRoot, ["config", `url.${endpoint}.insteadOf`, "RETIRE_ALIAS:"]);
+  const hostileBefore = snapshot(targetRoot, remoteRoot);
+  await assert.rejects(
+    gitRetireRemoteBranch(policy, targetWorkspace, {
+      ...request,
+      branch: "mission/hostile-config",
+      expected_remote_head: hostileHead,
+      preservation: receipt(candidate, { type: "published", remote: "origin", branch: "proof/accepted", expected_head: candidate })
+    }),
+    (error) => error instanceof GitRetireRemoteBranchPreflightError && /endpoint|allowlist|local/iu.test(error.message)
+  );
+  assert.deepEqual(snapshot(targetRoot, remoteRoot), hostileBefore, "hostile configured endpoint changed local or remote state");
+  git(targetRoot, ["config", "--unset-all", "remote.origin.pushurl"]);
+  git(targetRoot, ["config", "--unset-all", `url.${endpoint}.insteadOf`]);
+  console.log("PASS hostile configured alias: effective identity matched policy but raw configured route was rejected before mutation.");
+
+  for (const [label, hostileEndpoint] of [
+    ["git+ssh policy endpoint", `git+ssh://127.0.0.1:${port}/remote.git`],
+    ["percent-escaped policy endpoint", `git://127.0.0.1:${port}/remote%2egit`],
+    ["username-only ssh endpoint", `ssh://user@127.0.0.1:${port}/remote.git`],
+    ["username-only git endpoint", `git://user@127.0.0.1:${port}/remote.git`]
+  ]) {
+    const before = snapshot(targetRoot, remoteRoot);
+    await assert.rejects(
+      gitRetireRemoteBranch(config(hostileEndpoint), targetWorkspace, request),
+      (error) => error instanceof GitRetireRemoteBranchPreflightError && /policy|endpoint|credential|invalid/iu.test(error.message)
+    );
+    assert.deepEqual(snapshot(targetRoot, remoteRoot), before, `${label} changed local or remote state`);
+  }
+  console.log("PASS hostile policy endpoints: git+ssh, percent escapes, and username-only SSH/Git userinfo were rejected without endpoint echo or mutation.");
+
+  // Effective endpoint rewriting is independently hostile even when the
+  // policy endpoint itself is safe; it must fail before any remote attempt.
+  git(targetRoot, ["config", `url.git+ssh://127.0.0.1:${port}/remote.git.insteadOf`, endpoint]);
+  const effectiveHostileBefore = snapshot(targetRoot, remoteRoot);
+  await assert.rejects(
+    gitRetireRemoteBranch(policy, targetWorkspace, request),
+    (error) => error instanceof GitRetireRemoteBranchPreflightError && /endpoint|allowlist/iu.test(error.message)
+  );
+  assert.deepEqual(snapshot(targetRoot, remoteRoot), effectiveHostileBefore, "hostile effective endpoint changed local or remote state");
+  git(targetRoot, ["config", "--unset-all", `url.git+ssh://127.0.0.1:${port}/remote.git.insteadOf`]);
+  console.log("PASS hostile effective endpoint: safe policy identity rejected a rewritten git+ssh route before mutation.");
 
   // Exercise the same contract through the compiled ordinary public MCP route.
   git(targetRoot, ["push", "--quiet", `file://${remoteRoot}`, `${candidate}:refs/heads/mission/public`]);
@@ -349,6 +395,7 @@ try {
   // target and preservation refs unchanged.
   const invalidCases = [
     ["missing authority", { ...request, preservation: { ...request.preservation, acceptance_authority: "" } }, /receipt|authority|invalid/iu],
+    ["uppercase digest", { ...request, preservation: { ...request.preservation, evidence_sha256: "A".repeat(64) } }, /receipt|digest|invalid/iu],
     ["candidate mismatch", { ...request, expected_remote_head: candidate, preservation: { ...request.preservation, accepted_candidate: "b".repeat(40) } }, /receipt|candidate|invalid/iu],
     ["same preservation ref", { ...request, preservation: receipt(candidate, { type: "published", remote: "origin", branch: "mission/retire", expected_head: candidate }) }, /preservation|target/iu],
     ["protected target", { ...request, branch: "main" }, /protected|canonical/iu],

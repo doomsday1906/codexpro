@@ -8,6 +8,7 @@ const MAX_ENDPOINT_BYTES = 4_096;
 const MAX_REMOTE_BYTES = 256;
 const MAX_BRANCH_BYTES = 256;
 const DEFAULT_GIT_SCHEMES = new Set(["http", "https", "ssh", "git", "git+ssh"]);
+const RETIREMENT_GIT_SCHEMES = new Set(["http", "https", "ssh", "git"]);
 const CONTROL_OR_WHITESPACE = /[\u0000-\u001f\u007f\s]/u;
 const HELPER_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*::/u;
 const GLOB_TOKEN = /[*?\[\]]/u;
@@ -239,6 +240,28 @@ function canonicalEndpoint(value) {
   return parsed.identity;
 }
 
+function retirementEndpoint(value) {
+  if (typeof value !== "string" || value.includes("%")) return endpointFailure(value, "invalid-endpoint");
+  const parsed = parseEndpoint(value);
+  if (!parsed.ok || !RETIREMENT_GIT_SCHEMES.has(parsed.style)) return endpointFailure(value, "invalid-endpoint");
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(value)) {
+    let url;
+    try {
+      url = new URL(value);
+    } catch {
+      return endpointFailure(value, "invalid-endpoint");
+    }
+    if (url.username || url.password) return endpointFailure(value, "credential-bearing-endpoint");
+  }
+  return parsed;
+}
+
+function canonicalRetirementEndpoint(value) {
+  const parsed = retirementEndpoint(value);
+  if (!parsed.ok) invalidPolicy(`retirement endpoint is ${parsed.reason}.`);
+  return parsed.identity;
+}
+
 function normalizePolicyObject(value) {
   if (!isRecord(value)) invalidPolicy("policy must be an object.");
   for (const key of Object.keys(value)) if (!POLICY_KEYS.has(key)) invalidPolicy("policy contains an unknown field.");
@@ -325,7 +348,10 @@ function normalizePolicyObject(value) {
 
     const normalizedRule = { remote, endpoint, branches };
     if (rawRule.branch_prefixes !== undefined) normalizedRule.branch_prefixes = branchPrefixes;
-    if (rawRule.retirement !== undefined) normalizedRule.retirement = normalizeRetirement(rawRule.retirement);
+    if (rawRule.retirement !== undefined) {
+      canonicalRetirementEndpoint(rawRule.endpoint);
+      normalizedRule.retirement = normalizeRetirement(rawRule.retirement);
+    }
     rules.push(normalizedRule);
   }
 
@@ -577,6 +603,8 @@ export function evaluateGitRetirementPolicy(repoRoot, policy, remote, branch, op
   if (matches.length !== 1) return { allowed: false, reason: matches.length === 0 ? "remote-or-branch-not-allowlisted" : "ambiguous-policy-rule" };
   const effective = resolveEffectivePushEndpoint(repoRoot, safeRemote, options);
   if (!effective.ok) return { allowed: false, reason: effective.reason, endpoint: effective.endpoint };
+  const effectiveRetirement = retirementEndpoint(effective.endpoint);
+  if (!effectiveRetirement.ok) return { allowed: false, reason: effectiveRetirement.reason };
   if (effective.identity !== matches[0].endpoint) {
     return { allowed: false, reason: "effective-endpoint-not-allowlisted", endpoint: effective.identity };
   }
