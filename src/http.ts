@@ -1589,10 +1589,18 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     res.status(401).send("Unauthorized");
   });
 
+  // HTTP MCP session lifecycle (TASK-001 in-flight-safe repair).
+  //
+  // A retained record owns zero or more open transport.handleRequest() lifetimes
+  // (POST, GET SSE listener, DELETE). A record with inFlightRequests > 0 is BUSY
+  // and MUST NOT be TTL-expired or capacity-evicted: closing its transport would
+  // destroy a live response channel after server-side work completes. Only
+  // genuinely idle records (inFlightRequests == 0) are reclaimable.
   type TransportRecord = {
     transport: StreamableHTTPServerTransport;
     createdAt: number;
     lastSeenAt: number;
+    inFlightRequests: number;
     lifecycle: "active" | "closed" | "expired" | "capacity_evicted";
   };
 
@@ -1602,6 +1610,14 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
   let totalClosed = 0;
   let totalExpired = 0;
   let totalCapacityEvicted = 0;
+  // Synchronous pending-initialization reservations: increment synchronously during
+  // admission (before any awaited transport/server work) so concurrent initialize
+  // requests cannot consume the same free slot. Released exactly once when the
+  // session materializes, fails, or aborts.
+  let pendingInitializations = 0;
+  let retainedHighWatermark = 0;
+  let totalCapacityRejected = 0;
+  let totalInflightEvictionPrevented = 0;
 
   function requestSessionId(req: Request): string | undefined {
     const value = req.headers["mcp-session-id"];
@@ -1635,26 +1651,118 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     void record.transport.close?.();
   }
 
+  function isIdleRecord(record: TransportRecord): boolean {
+    return record.lifecycle === "active" && record.inFlightRequests <= 0;
+  }
+
+  // Idle-only TTL + hygiene prune. Busy records are never expired; a busy record
+  // past TTL increments the protection counter once per prune pass as evidence
+  // that an expiry was refused. Never evicts for capacity (admission owns that).
   function pruneTransports(): void {
     const now = Date.now();
     for (const [sessionId, record] of transports) {
+      if (record.lifecycle !== "active") continue;
+      if (record.inFlightRequests > 0) {
+        if (now - record.lastSeenAt > config.httpSessionTtlMs) {
+          totalInflightEvictionPrevented += 1;
+        }
+        continue;
+      }
       if (now - record.lastSeenAt > config.httpSessionTtlMs) {
         transports.delete(sessionId);
         closeTransport(record, "expired");
       }
     }
-    while (transports.size > config.maxHttpSessions) {
-      const oldest = [...transports.entries()].sort((a, b) => a[1].lastSeenAt - b[1].lastSeenAt)[0];
-      if (!oldest) break;
-      transports.delete(oldest[0]);
-      closeTransport(oldest[1], "capacity_evicted");
+  }
+
+  function oldestIdleVictim(): { sessionId: string; record: TransportRecord } | undefined {
+    let victim: { sessionId: string; record: TransportRecord } | undefined;
+    for (const [sessionId, record] of transports) {
+      if (!isIdleRecord(record)) continue;
+      if (!victim || record.lastSeenAt < victim.record.lastSeenAt) {
+        victim = { sessionId, record };
+      }
     }
+    return victim;
+  }
+
+  // Synchronous admission gate for a no-session initialize request. Must run
+  // before any awaited transport/server work so concurrent initializers cannot
+  // consume the same free slot. Returns true with exactly one reservation held
+  // (pendingInitializations incremented), or false when every slot is
+  // busy/reserved and the new initialization must be cleanly rejected.
+  function reserveInitializationSlot(): boolean {
+    pruneTransports();
+    if (transports.size + pendingInitializations < config.maxHttpSessions) {
+      pendingInitializations += 1;
+      return true;
+    }
+    const victim = oldestIdleVictim();
+    if (!victim) {
+      // All-busy: fail the NEW work, never an in-flight incumbent.
+      totalCapacityRejected += 1;
+      totalInflightEvictionPrevented += 1;
+      return false;
+    }
+    // Every busy session older (by activity time) than the chosen idle victim
+    // was spared by age order; count each refusal exactly once per admission.
+    for (const record of transports.values()) {
+      if (record.lifecycle === "active" && record.inFlightRequests > 0 && record.lastSeenAt < victim.record.lastSeenAt) {
+        totalInflightEvictionPrevented += 1;
+      }
+    }
+    transports.delete(victim.sessionId);
+    closeTransport(victim.record, "capacity_evicted");
+    pendingInitializations += 1;
+    return true;
+  }
+
+  function sendCapacityRejection(res: Response, body: unknown): void {
+    const id = body !== null && typeof body === "object" && "id" in body
+      ? (body as { id?: unknown }).id ?? null
+      : null;
+    res.status(503).json({
+      jsonrpc: "2.0",
+      error: { code: -32002, message: "HTTP session capacity exhausted; retry later" },
+      id
+    });
+  }
+
+  // Begin request-lifetime protection for one open handleRequest() on a retained
+  // record. Refreshes activity at acquisition; the returned releaser refreshes
+  // activity at completion, never drives the counter negative, and is idempotent
+  // so res-close and finally paths cannot double-release. Operates on the record
+  // object only: if onclose detaches the record mid-request, release still
+  // updates the detached object without reinserting it or double-counting.
+  function trackRequestStart(record: TransportRecord): () => void {
+    record.inFlightRequests += 1;
+    record.lastSeenAt = Date.now();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      record.inFlightRequests = Math.max(0, record.inFlightRequests - 1);
+      record.lastSeenAt = Date.now();
+    };
   }
 
   function httpDiagnosticSnapshot(currentRecord: TransportRecord | undefined): HttpDiagnosticSnapshot {
     const currentSession = currentRecord?.lifecycle === "active"
-      ? Object.freeze({ createdAt: currentRecord.createdAt, lastSeenAt: currentRecord.lastSeenAt })
+      ? Object.freeze({
+          createdAt: currentRecord.createdAt,
+          lastSeenAt: currentRecord.lastSeenAt,
+          inFlightRequests: currentRecord.inFlightRequests
+        })
       : null;
+    let idle = 0;
+    let inFlightSessions = 0;
+    let inFlightRequests = 0;
+    for (const record of transports.values()) {
+      if (record.lifecycle !== "active") continue;
+      inFlightRequests += Math.max(0, record.inFlightRequests);
+      if (record.inFlightRequests > 0) inFlightSessions += 1;
+      else idle += 1;
+    }
     return Object.freeze({
       active: transports.size,
       max: config.maxHttpSessions,
@@ -1663,6 +1771,13 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       totalClosed,
       totalExpired,
       totalCapacityEvicted,
+      idle,
+      inFlightSessions,
+      inFlightRequests,
+      pendingInitializations,
+      highWatermark: retainedHighWatermark,
+      totalCapacityRejected,
+      totalInflightEvictionPrevented,
       currentSession
     });
   }
@@ -1675,13 +1790,12 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     }
   }
 
-  function getTransport(sessionId: string | undefined): StreamableHTTPServerTransport | undefined {
+  // Lookup without touching activity truth; request guards own lastSeenAt.
+  // Prunes idle-expired records first so TTL reclamation stays lazy and safe.
+  function getTransportRecord(sessionId: string | undefined): TransportRecord | undefined {
     if (!sessionId || !sessionIdPattern.test(sessionId)) return undefined;
     pruneTransports();
-    const record = transports.get(sessionId);
-    if (!record) return undefined;
-    record.lastSeenAt = Date.now();
-    return record.transport;
+    return transports.get(sessionId);
   }
 
   const pruneTimer = setInterval(pruneTransports, Math.min(config.httpSessionTtlMs, 60_000));
@@ -1748,26 +1862,82 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     try {
       const sessionId = requestSessionId(req);
       let transport: StreamableHTTPServerTransport;
+      // The retained record for an existing-session request, guarded over the
+      // complete handleRequest() lifetime. Undefined on the init path until
+      // onsessioninitialized materializes the record mid-request.
+      let requestRecord: TransportRecord | undefined;
+      let releaseRequest: (() => void) | undefined;
 
-      const existingTransport = getTransport(sessionId);
-      if (existingTransport) {
-        transport = existingTransport;
+      const existingRecord = getTransportRecord(sessionId);
+      if (existingRecord) {
+        transport = existingRecord.transport;
+        requestRecord = existingRecord;
       } else if (!sessionId && isInitializeRequest(req.body)) {
+        if (!reserveInitializationSlot()) {
+          sendCapacityRejection(res, req.body);
+          return;
+        }
+        let reservationHeld = true;
+        const releaseReservation = (): void => {
+          if (!reservationHeld) return;
+          reservationHeld = false;
+          pendingInitializations = Math.max(0, pendingInitializations - 1);
+        };
         let currentRecord: TransportRecord | undefined;
+        let releaseInitRequest: (() => void) | undefined;
+        let initAborted = false;
+        let initCompleted = false;
+        // Client went away before any response was produced and before the
+        // record materialized: free the reservation exactly once. res "close"
+        // is the reliable signal (fires after finish on success with
+        // writableEnded true, or on premature disconnect with it false);
+        // req "close" must NOT be used here because the request stream also
+        // closes on normal body completion while the response is still pending.
+        res.on("close", () => {
+          if (!res.writableEnded && !initCompleted && !currentRecord) {
+            initAborted = true;
+            releaseReservation();
+          }
+        });
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId: string) => {
-            pruneTransports();
+            if (initAborted) {
+              // Client already gone: close instead of retaining a zombie slot.
+              try {
+                void transport.close?.();
+              } catch {
+                // Best-effort cleanup of an abandoned transport.
+              }
+              return;
+            }
             const now = Date.now();
             currentRecord = {
               transport,
               createdAt: now,
               lastSeenAt: now,
+              // This initialize request itself stays in flight until its
+              // response completes (LAW-007).
+              inFlightRequests: 1,
               lifecycle: "active"
             };
             transports.set(newSessionId, currentRecord);
+            if (transports.size > retainedHighWatermark) retainedHighWatermark = transports.size;
             totalInitialized += 1;
-            pruneTransports();
+            // The reservation converts into the retained slot.
+            releaseReservation();
+            let initReleased = false;
+            releaseInitRequest = () => {
+              if (initReleased) return;
+              initReleased = true;
+              if (currentRecord) {
+                currentRecord.inFlightRequests = Math.max(0, currentRecord.inFlightRequests - 1);
+                currentRecord.lastSeenAt = Date.now();
+              }
+            };
+            // If the client disconnects and handleRequest never settles, the
+            // slot still releases; idempotent with the finally path below.
+            res.on("close", releaseInitRequest);
           }
         } as any);
 
@@ -1789,12 +1959,28 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
         });
         options.onDiagnosticContext?.(diagnosticContext);
         await server.connect(transport);
+        try {
+          await transport.handleRequest(req, res, req.body);
+        } finally {
+          initCompleted = true;
+          if (releaseInitRequest) releaseInitRequest();
+          else releaseReservation();
+        }
+        return;
       } else {
         sendSessionError(res, sessionId);
         return;
       }
 
-      await transport.handleRequest(req, res, req.body);
+      releaseRequest = trackRequestStart(requestRecord);
+      // If the client disconnects and handleRequest never settles, the slot
+      // still releases; idempotent with the finally path below.
+      res.on("close", releaseRequest);
+      try {
+        await transport.handleRequest(req, res, req.body);
+      } finally {
+        releaseRequest();
+      }
     } catch (error) {
       console.error(error instanceof Error ? error.stack ?? error.message : String(error));
       if (!res.headersSent) {
@@ -1809,12 +1995,20 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
 
   const handleSessionRequest = async (req: express.Request, res: express.Response) => {
     const sessionId = requestSessionId(req);
-    const transport = getTransport(sessionId);
-    if (!transport) {
+    const record = getTransportRecord(sessionId);
+    if (!record) {
       sendSessionError(res, sessionId);
       return;
     }
-    await transport.handleRequest(req, res);
+    const releaseRequest = trackRequestStart(record);
+    // If the client disconnects and handleRequest never settles, the slot
+    // still releases; idempotent with the finally path below.
+    res.on("close", releaseRequest);
+    try {
+      await record.transport.handleRequest(req, res);
+    } finally {
+      releaseRequest();
+    }
   };
 
   app.get("/mcp", handleSessionRequest);

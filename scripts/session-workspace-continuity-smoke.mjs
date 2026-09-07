@@ -242,6 +242,16 @@ async function closeClient(session) {
   try { await session.client.close(); } catch { /* close is best-effort after DELETE */ }
 }
 
+// Detach the SSE listener without DELETE: the server-side session record is
+// retained but becomes genuinely idle, hence eligible for TTL/capacity
+// reclamation. Under the in-flight-safe lifecycle contract an attached client
+// (open GET SSE stream) counts as in-flight and is never reclaimed, so idle
+// fixtures must detach first. The record itself is untouched (no close counted).
+async function detachClient(session) {
+  if (!session) return;
+  try { await session.client.close(); } catch { /* close is best-effort */ }
+}
+
 function requestFor(session, method, name) {
   return [...session.captures].reverse().find((capture) => {
     if (capture.method !== "POST" || !capture.requestBody) return false;
@@ -631,12 +641,33 @@ try {
   const lifecycleTtlInitial = structured(lifecycleTtlInitialCall);
   const ttlLastSeenAt = Date.parse(lifecycleTtlInitial?.http_sessions?.current_session?.last_seen_at ?? "");
   await delay(250);
+  // In-flight-safe lifecycle: an attached client holds an open GET SSE stream
+  // (in-flight), so the TTL fixture must detach A first; the retained record
+  // becomes genuinely idle and therefore TTL-eligible. No close is counted.
+  await detachClient(lifecycleTtlA);
   const lifecycleTtlB = await connectHttp(lifecycleServer.url, "life-ttl-b");
   rememberRoutingSessionId(lifecycleTtlB);
   lifecycleSessions.push(lifecycleTtlB);
-  const lifecycleAfterTtlCall = await diagnosticCall(lifecycleTtlB);
+  // Abort propagation is async; poll until the idle record is reclaimed
+  // (active back to 1 with one expiry counted) instead of sleeping.
+  let lifecycleAfterTtlCall;
+  let lifecycleAfterTtl;
+  {
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      lifecycleAfterTtlCall = await diagnosticCall(lifecycleTtlB);
+      lifecycleAfterTtl = structured(lifecycleAfterTtlCall);
+      if (lifecycleAfterTtl?.http_sessions?.active === 1 && (lifecycleAfterTtl?.http_sessions?.total_expired ?? 0) >= 1) break;
+      if (Date.now() > deadline) break;
+      await delay(100);
+    }
+  }
   emitContinuityHttpArtifact("lifecycle-ttl-after", lifecycleAfterTtlCall);
-  const lifecycleAfterTtl = structured(lifecycleAfterTtlCall);
+  // Release the replacement's listener before shutting the listener: an
+  // attached client holds an open GET SSE stream, and listener.close() waits
+  // for open streams. (Under the in-flight-safe lifecycle the attached record
+  // is never TTL-reclaimed while attached, so this detach is now required.)
+  await detachClient(lifecycleTtlB);
   await closeInProcessHttp(lifecycleServer);
   lifecycleServer = undefined;
 
@@ -647,6 +678,45 @@ try {
   const capacityOldDiagCall = await diagnosticCall(capacityOld);
   emitContinuityHttpArtifact("lifecycle-capacity-before", capacityOldDiagCall);
   const capacityOldDiag = structured(capacityOldDiagCall);
+  // In-flight-safe lifecycle: an attached client is in-flight (open GET SSE
+  // stream) and can never be capacity-evicted, so the capacity fixture must
+  // detach the old session first. The detached SDK client can no longer send,
+  // so readiness is polled with raw loopback POSTs on the retained record:
+  // current_session.in_flight_requests == 1 (only the polling POST itself)
+  // proves the GET listener is gone and the record is genuinely idle.
+  await detachClient(capacityOld);
+  {
+    const oldSessionId = capacityOld.captures.find((capture) => capture.method === "POST")?.responseSessionId;
+    assert.ok(oldSessionId, "capacity fixture did not capture the old routing session id");
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      const response = await fetch(capacityServer.url, {
+        method: "POST",
+        headers: {
+          accept: "application/json, text/event-stream",
+          "content-type": "application/json",
+          authorization: `Bearer ${AUTH_TOKEN}`,
+          "mcp-session-id": oldSessionId
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 9001, method: "tools/call", params: { name: "session_workspace_diagnostics", arguments: {} } })
+      });
+      const text = await response.text();
+      let inFlight = "unknown";
+      for (const line of text.split(/\r?\n/)) {
+        if (!line.startsWith("data:")) continue;
+        try {
+          const message = JSON.parse(line.slice(5).trim());
+          const sessions = message?.result?.structuredContent?.http_sessions;
+          if (sessions?.current_session) inFlight = sessions.current_session.in_flight_requests;
+        } catch { /* ignore non-JSON SSE lines */ }
+      }
+      if (inFlight === 1) break;
+      if (Date.now() > deadline) {
+        throw new Error(`capacity fixture old session never went idle (last in_flight=${inFlight})`);
+      }
+      await delay(100);
+    }
+  }
   const capacityNew = await connectHttp(capacityServer.url, "capacity-new");
   rememberRoutingSessionId(capacityNew);
   capacitySessions.push(capacityNew);

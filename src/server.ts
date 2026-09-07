@@ -2755,12 +2755,21 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
             total_closed: httpSnapshot.totalClosed,
             total_expired: httpSnapshot.totalExpired,
             total_capacity_evicted: httpSnapshot.totalCapacityEvicted,
+            idle: httpSnapshot.idle,
+            in_flight_sessions: httpSnapshot.inFlightSessions,
+            in_flight_requests: httpSnapshot.inFlightRequests,
+            pending_initializations: httpSnapshot.pendingInitializations,
+            high_watermark: httpSnapshot.highWatermark,
+            total_capacity_rejected: httpSnapshot.totalCapacityRejected,
+            total_inflight_eviction_prevented: httpSnapshot.totalInflightEvictionPrevented,
             current_session: httpSnapshot.currentSession
               ? {
                   created_at: publicDiagnosticTimestamp(httpSnapshot.currentSession.createdAt),
                   created_age_ms: ageMilliseconds(httpSnapshot.currentSession.createdAt, now),
                   last_seen_at: publicDiagnosticTimestamp(httpSnapshot.currentSession.lastSeenAt),
-                  last_seen_age_ms: ageMilliseconds(httpSnapshot.currentSession.lastSeenAt, now)
+                  last_seen_age_ms: ageMilliseconds(httpSnapshot.currentSession.lastSeenAt, now),
+                  in_flight: httpSnapshot.currentSession.inFlightRequests > 0,
+                  in_flight_requests: httpSnapshot.currentSession.inFlightRequests
                 }
               : null
           }

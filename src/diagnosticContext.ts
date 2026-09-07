@@ -5,6 +5,7 @@ export type DiagnosticTransportKind = "http" | "stdio" | "in-memory";
 export interface HttpDiagnosticCurrentSession {
   readonly createdAt: number;
   readonly lastSeenAt: number;
+  readonly inFlightRequests: number;
 }
 
 export interface HttpDiagnosticSnapshot {
@@ -15,6 +16,13 @@ export interface HttpDiagnosticSnapshot {
   readonly totalClosed: number;
   readonly totalExpired: number;
   readonly totalCapacityEvicted: number;
+  readonly idle: number;
+  readonly inFlightSessions: number;
+  readonly inFlightRequests: number;
+  readonly pendingInitializations: number;
+  readonly highWatermark: number;
+  readonly totalCapacityRejected: number;
+  readonly totalInflightEvictionPrevented: number;
   readonly currentSession: HttpDiagnosticCurrentSession | null;
 }
 
