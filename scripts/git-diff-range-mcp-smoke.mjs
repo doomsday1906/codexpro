@@ -704,8 +704,12 @@ function assertPublicRange(result, expected, label) {
   assert.equal(result.patch_limit, expected.patchLimit, `${label}: patch limit drifted`);
   assert.equal(result.patch_truncated, expected.patchTruncated ?? false, `${label}: patch truncation drifted`);
   assert.equal(result.patch_files_included, expected.patchFilesIncluded ?? 0, `${label}: patch included count drifted`);
-  assert.equal(result.patch_files_omitted, Object.values(expected.omissionCounts).reduce((sum, count) => sum + count, 0), `${label}: patch omission total drifted`);
-  assert.deepEqual(result.patch_omission_counts, expected.omissionCounts, `${label}: patch omission counts drifted`);
+  const expectedOmissionCounts = { ...expected.omissionCounts, malformed: expected.omissionCounts.malformed ?? 0, continuation: expected.omissionCounts.continuation ?? 0 };
+  assert.equal(result.patch_files_omitted, Object.values(expectedOmissionCounts).reduce((sum, count) => sum + count, 0), `${label}: patch omission total drifted`);
+  assert.deepEqual(result.patch_omission_counts, expectedOmissionCounts, `${label}: patch omission counts drifted`);
+  assert.equal(result.patch_files.length, expected.returned.length, `${label}: per-file patch records drifted`);
+  assert.deepEqual(result.patch_files.map((file) => file.index), expected.returned.map((_, index) => index), `${label}: per-file patch order drifted`);
+  assert.equal(result.patch_next_index, (expected.patchTruncated ?? false) ? result.patch_files.find((file) => file.omission_reason === "budget" || file.omission_reason === "too_large")?.index ?? null : null, `${label}: continuation index drifted`);
   publicChangedFileKeys(result, label);
 }
 
@@ -1353,7 +1357,7 @@ async function main() {
     assert.equal(schema.type, "object", "git_diff_range schema is not an object");
     assert.equal(schema.additionalProperties, false, "git_diff_range schema allows unknown properties");
     assert.deepEqual([...schema.required].sort(), ["base_ref", "head_ref", "workspace_id"], "git_diff_range required fields drifted");
-    assert.deepEqual(Object.keys(schema.properties).sort(), ["base_ref", "context_lines", "head_ref", "include_patch", "max_files", "max_patch_bytes", "path", "workspace_id"], "git_diff_range property set drifted");
+    assert.deepEqual(Object.keys(schema.properties).sort(), ["base_ref", "context_lines", "head_ref", "include_patch", "max_files", "max_patch_bytes", "patch_start_index", "path", "workspace_id"], "git_diff_range property set drifted");
     const property = (name) => resolveSchema(schema, schema.properties[name]);
     assert.equal(property("workspace_id").type, "string");
     assert.equal(property("base_ref").type, "string");
@@ -1373,6 +1377,10 @@ async function main() {
     assert.equal(property("context_lines").minimum, 0);
     assert.equal(property("context_lines").maximum, 20);
     assert.equal(property("context_lines").default, 3);
+    assert.equal(property("patch_start_index").type, "integer");
+    assert.equal(property("patch_start_index").minimum, 0);
+    assert.equal(property("patch_start_index").maximum, 200);
+    assert.equal(property("patch_start_index").default, 0);
     assert.equal(rangeTool.annotations?.readOnlyHint, true);
     assert.equal(rangeTool.annotations?.destructiveHint, false);
     assert.equal(rangeTool.annotations?.openWorldHint, false);
@@ -1410,7 +1418,7 @@ async function main() {
     console.log(`RAW_OBSERVATION: B post-lookup list selected=${postLookupList.selected_workspace_id} default-B=${bCurrentResult.structuredContent.workspace_id}; target id=${postLookupTarget.id} root=${postLookupTarget.root} is present only as a non-selected local workspace.`);
     console.log("PASS same-process post-lookup selection: explicit target reconstruction returned target truth while B list_workspaces retained default-B as selected and exposed the target only as a non-selected local entry.");
     const businessKeys = [
-      "base_commit_sha", "base_ref_input", "blocked_files_omitted", "changed_file_count", "changed_files", "changed_files_truncated", "comparison_mode", "eligible_changed_file_count", "head_commit_sha", "head_ref_input", "object_format", "patch", "patch_bytes", "patch_files_included", "patch_files_omitted", "patch_included", "patch_limit", "patch_omission_counts", "patch_requested", "patch_truncated", "returned_file_count", "root", "schema_version", "warnings", "workspace_id"
+      "base_commit_sha", "base_ref_input", "blocked_files_omitted", "changed_file_count", "changed_files", "changed_files_truncated", "comparison_mode", "eligible_changed_file_count", "head_commit_sha", "head_ref_input", "object_format", "patch", "patch_bytes", "patch_files", "patch_files_included", "patch_files_omitted", "patch_included", "patch_limit", "patch_next_index", "patch_omission_counts", "patch_requested", "patch_truncated", "returned_file_count", "root", "schema_version", "warnings", "workspace_id"
     ];
     assert.deepEqual(Object.keys(structured).sort(), ["codexpro_title", "codexpro_tool", ...businessKeys].sort(), "git_diff_range structured contract key set drifted");
     assert.equal(structured.codexpro_tool, "git_diff_range");
@@ -1437,7 +1445,9 @@ async function main() {
     assert.equal(structured.patch_limit, 60_000);
     assert.equal(structured.patch_files_included, 1);
     assert.equal(structured.patch_files_omitted, 0);
-    assert.deepEqual(structured.patch_omission_counts, { binary: 0, blocked: 0, budget: 0, disabled: 0, file_limit: 0, too_large: 0 });
+    assert.deepEqual(structured.patch_omission_counts, { binary: 0, blocked: 0, budget: 0, disabled: 0, file_limit: 0, too_large: 0, malformed: 0, continuation: 0 });
+    assert.deepEqual(structured.patch_files, [{ index: 0, status: "M", old_path: "target-range.txt", new_path: "target-range.txt", patch: expectedRedactedPatch, omission_reason: null }]);
+    assert.equal(structured.patch_next_index, null);
     assert.deepEqual(structured.warnings, []);
     assert.equal(Object.hasOwn(structured, "path"), false);
     assert.equal(explicitResult._meta?.ui, undefined);
@@ -1446,8 +1456,8 @@ async function main() {
     // Patch identity is checked by exact object path, not by naive substring
     // counting of repeated diff fragments.
     const patchLocations = valuesAtPaths(explicitResult, (value, pathParts) => value === expectedRedactedPatch).map(({ path: pathParts }) => pathParts.join("."));
-    assert.deepEqual(patchLocations, ["structuredContent.patch"], "patch appeared at an unexpected envelope location or more than once");
-    assert.equal((explicitCall.raw.match(/"patch":/gu) ?? []).length, 1, "complete response contained more than one exact patch field");
+    assert.deepEqual(patchLocations, ["structuredContent.patch", "structuredContent.patch_files.0.patch"], "patch appeared at an unexpected envelope location or more than once");
+    assert.equal((explicitCall.raw.match(/"patch":/gu) ?? []).length, 2, "complete response contained an unexpected patch field count");
     assert.equal(serialized(explicitResult.content).includes(expectedRedactedPatch), false, "human content duplicated the full patch");
     assert.equal(serialized(explicitResult._meta).includes(expectedRedactedPatch), false, "_meta duplicated the full patch");
     assert.equal(serialized(explicitResult.content).includes(ADD_SECRET), false, "human content leaked addition secret");
@@ -1810,6 +1820,24 @@ async function main() {
       omissionCounts: { binary: 0, blocked: 0, budget: 1, disabled: 0, file_limit: 0, too_large: 0 }
     }, "public multi-fragment prefix");
     assertNoResponseLiterals(budgetMultiCall, [matrixSecrets[0]], "public multi-fragment prefix");
+    const budgetResumeCall = await callTool(secondClient, "git_diff_range", {
+      workspace_id: budgetWorkspace.id,
+      base_ref: budget.baseSha,
+      head_ref: budget.headSha,
+      patch_start_index: 1,
+      max_patch_bytes: Buffer.byteLength(budgetBPatch, "utf8")
+    });
+    const budgetResumeResult = successResult(budgetResumeCall, "public resumed patch page");
+    assertPublicRange(budgetResumeResult.structuredContent, {
+      workspaceId: budgetWorkspace.id, root: budgetWorkspace.root, baseRef: budget.baseSha, baseSha: budget.baseSha, headRef: budget.headSha, headSha: budget.headSha,
+      raw: budgetRaw.records, eligible: budgetRaw.records, returned: budgetRaw.records, blocked: 0, patch: budgetBPatch, patchRequested: true,
+      patchLimit: Buffer.byteLength(budgetBPatch, "utf8"), patchTruncated: false, patchFilesIncluded: 1,
+      omissionCounts: { binary: 0, blocked: 0, budget: 0, continuation: 1, disabled: 0, file_limit: 0, malformed: 0, too_large: 0 }
+    }, "public resumed patch page");
+    assert.equal(budgetResumeResult.structuredContent.patch_files[0].omission_reason, "continuation");
+    assert.equal(budgetResumeResult.structuredContent.patch_files[1].patch, budgetBPatch);
+    assertNoResponseLiterals(budgetResumeCall, [matrixSecrets[0]], "public resumed patch page");
+    console.log("PASS public patch continuation: patch_start_index returned a deterministic continuation record and complete resumed suffix.");
     const budgetDisabledCall = await callTool(secondClient, "git_diff_range", {
       workspace_id: budgetWorkspace.id,
       base_ref: budget.baseSha,

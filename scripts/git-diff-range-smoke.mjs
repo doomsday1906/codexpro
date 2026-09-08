@@ -905,6 +905,7 @@ const STRUCTURED_RESULT_KEYS = [
   "object_format",
   "patch",
   "patch_bytes",
+  "patch_files",
   "patch_files_included",
   "patch_files_omitted",
   "patch_included",
@@ -912,6 +913,7 @@ const STRUCTURED_RESULT_KEYS = [
   "patch_omission_counts",
   "patch_requested",
   "patch_truncated",
+  "patch_next_index",
   "root",
   "schema_version",
   "warnings",
@@ -920,7 +922,7 @@ const STRUCTURED_RESULT_KEYS = [
   "returned_file_count"
 ];
 const STRUCTURED_CHANGED_FILE_KEYS = ["additions", "binary", "deletions", "new_path", "old_path", "similarity", "status"];
-const STRUCTURED_OMISSION_KEYS = ["binary", "blocked", "budget", "disabled", "file_limit", "too_large"];
+const STRUCTURED_OMISSION_KEYS = ["binary", "blocked", "budget", "disabled", "file_limit", "too_large", "malformed", "continuation"];
 
 function publicChangedFile(record) {
   return {
@@ -973,9 +975,13 @@ function assertStructuredContract(result, expected, label) {
   assert.equal(result.patch_bytes, Buffer.byteLength(expected.patch, "utf8"), `${label}: public patch byte count drifted`);
   assert.equal(result.patch_limit, expected.patchLimit, `${label}: patch limit drifted`);
   assert.equal(result.patch_files_included, expected.patchFilesIncluded, `${label}: patch included count drifted`);
-  assert.equal(result.patch_files_omitted, Object.values(expected.omissionCounts).reduce((sum, count) => sum + count, 0), `${label}: patch omitted count drifted`);
+  const expectedOmissionCounts = { ...expected.omissionCounts, malformed: expected.omissionCounts.malformed ?? 0, continuation: expected.omissionCounts.continuation ?? 0 };
+  assert.equal(result.patch_files_omitted, Object.values(expectedOmissionCounts).reduce((sum, count) => sum + count, 0), `${label}: patch omitted count drifted`);
   assert.deepEqual(Object.keys(result.patch_omission_counts).sort(), [...STRUCTURED_OMISSION_KEYS].sort(), `${label}: omission key set drifted`);
-  assert.deepEqual(result.patch_omission_counts, expected.omissionCounts, `${label}: omission classifications drifted`);
+  assert.deepEqual(result.patch_omission_counts, expectedOmissionCounts, `${label}: omission classifications drifted`);
+  assert.equal(result.patch_next_index, expected.patchTruncated ? result.patch_files.find((file) => file.omission_reason === "budget" || file.omission_reason === "too_large")?.index ?? null : null, `${label}: continuation index drifted`);
+  assert.equal(result.patch_files.length, expected.returnedRecords.length, `${label}: per-file patch record count drifted`);
+  assert.deepEqual(result.patch_files.map((file) => file.index), expected.returnedRecords.map((_, index) => index), `${label}: per-file patch order drifted`);
   assert.deepEqual(result.warnings, expected.warnings, `${label}: warning set drifted`);
   assert.equal(Object.hasOwn(result, "eligibleChangedFiles"), false, `${label}: internal eligibleChangedFiles leaked`);
   assert.equal(Object.hasOwn(result, "identity"), false, `${label}: internal identity leaked`);
@@ -1795,7 +1801,9 @@ assert.deepEqual(patchResult.patchOmissionCounts, {
   budget: 0,
   tooLarge: 0,
   fileLimit: 0,
-  disabled: 0
+  disabled: 0,
+  malformed: 0,
+  continuation: 0
 });
 assert.equal(patchResult.patchFilesIncluded + patchResult.patchFilesOmitted, patchResult.changedFileCount);
 assertNoForbiddenPatchLiterals(patchResult, "complete redacted patch result");
@@ -1955,17 +1963,22 @@ for (const [label, reason, options] of invalidPatchCases) {
 }
 console.log("PASS invalid include_patch/max_patch_bytes/context_lines/internal ceiling fail before any Git command");
 
-const mismatchError = await withArmedGit("patch-header", "patch-header-mismatch", async () => expectTargetFailure(
-  () => collectGitDiffRangePatch(patchContext.config, patchContext.guard, patchContext.workspace, {
+const mismatchResult = await withArmedGit("patch-header", "patch-header-mismatch", async () => collectGitDiffRangePatch(
+  patchContext.config,
+  patchContext.guard,
+  patchContext.workspace,
+  {
     baseRef: patchFixture.baseSha,
     headRef: patchFixture.headSha,
     path: "added.py"
-  }),
-  "patch-fragment-mismatch",
-  "patch fragment header mismatch"
+  }
 ));
-assertNoForbiddenPatchLiterals(mismatchError, "patch fragment header mismatch");
-console.log("PASS malformed requested-fragment header falsifier fails closed without raw diagnostics");
+assert.equal(mismatchResult.patch, "", "patch fragment header mismatch emitted a partial patch");
+assert.equal(mismatchResult.patchFiles.length, 1);
+assert.equal(mismatchResult.patchFiles[0].omission_reason, "malformed");
+assert.equal(mismatchResult.patchOmissionCounts.malformed, 1);
+assertNoForbiddenPatchLiterals(mismatchResult, "patch fragment header mismatch");
+console.log("PASS malformed requested-fragment header falsifier omits only the malformed file without raw diagnostics");
 
 const oddRecord = patchRaw.records.find((record) => {
   const value = record.oldPath ?? record.newPath ?? "";

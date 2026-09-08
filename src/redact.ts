@@ -82,6 +82,27 @@ export function redactUnifiedDiff(
   return policyRedactUnifiedDiff(text, { languageForPath });
 }
 
+/** Redact a unified diff while preserving hunk line cardinality. */
+export function redactUnifiedDiffPreservingLines(
+  text: string,
+  languageForPath?: (path: string | undefined) => SourceLanguage | undefined
+): string {
+  const blocks = extractDiffFileBlocks(text);
+  return blocks.map((block) => {
+    const oldLanguage = block.oldPresent && block.pathDiscoveryValid
+      ? languageForPath?.(block.oldPath)
+      : undefined;
+    const newLanguage = block.newPresent && block.pathDiscoveryValid
+      ? languageForPath?.(block.newPath)
+      : undefined;
+    return policyRedactSensitiveTextPreservingLines(block.source, {
+      context: "source",
+      oldLanguage,
+      newLanguage
+    });
+  }).join("");
+}
+
 export function redactDiagnosticText(text: string): string {
   return policyRedactDiagnosticText(text);
 }

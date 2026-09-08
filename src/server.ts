@@ -192,7 +192,8 @@ const GIT_DIFF_RANGE_ARGUMENTS_SCHEMA = z.object({
   include_patch: z.boolean().default(true),
   max_files: z.number().int().min(1).max(200).default(100),
   max_patch_bytes: z.number().int().min(0).max(100_000).default(60_000),
-  context_lines: z.number().int().min(0).max(20).default(3)
+  context_lines: z.number().int().min(0).max(20).default(3),
+  patch_start_index: z.number().int().min(0).max(200).default(0)
 }).strict();
 
 const GIT_DIFF_RANGE_FIELD_NAMES = new Set([
@@ -203,7 +204,8 @@ const GIT_DIFF_RANGE_FIELD_NAMES = new Set([
   "include_patch",
   "max_files",
   "max_patch_bytes",
-  "context_lines"
+  "context_lines",
+  "patch_start_index"
 ]);
 
 function boundedGitDiffRangeValidationError(issues: readonly z.ZodIssue[]): z.ZodError {
@@ -306,7 +308,8 @@ const GIT_DIFF_RANGE_TRANSPORT_SCHEMA = z.object({
   include_patch: z.unknown().optional(),
   max_files: z.unknown().optional(),
   max_patch_bytes: z.unknown().optional(),
-  context_lines: z.unknown().optional()
+  context_lines: z.unknown().optional(),
+  patch_start_index: z.unknown().optional()
 }).passthrough();
 const GIT_DIFF_RANGE_PUBLIC_SCHEMA = z.object(GIT_DIFF_RANGE_ARGUMENTS_SCHEMA.shape).strict();
 GIT_DIFF_RANGE_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_DIFF_RANGE_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_DIFF_RANGE_PUBLIC_SCHEMA.safeParse;
@@ -4547,7 +4550,8 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         includePatch: args.include_patch,
         maxFiles: args.max_files,
         maxPatchBytes: args.max_patch_bytes,
-        contextLines: args.context_lines
+        contextLines: args.context_lines,
+        patchStartIndex: args.patch_start_index
       });
       const patchBody = publicSourceBody(result.patch);
       const warningText = result.warnings.length > 0

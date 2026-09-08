@@ -4,7 +4,11 @@ import { createGitReadOnlyContext, GitExecutionError, runGitReadOnly, type GitRe
 import { CodexProError, type PathGuard, type Workspace } from "./guard.js";
 import { validateHistoricalPath } from "./historicalPath.js";
 import { GitRefResolutionError, resolveGitRef, type GitObjectFormat, type GitReviewRef } from "./gitReviewRef.js";
-import { extractDiffFileBlocks, redactUnifiedDiff, sourceLanguageForPath } from "./redact.js";
+import {
+  extractDiffFileBlocks,
+  redactUnifiedDiffPreservingLines,
+  sourceLanguageForPath
+} from "./redact.js";
 
 /** Configuration consumed by the machine-safe historical metadata operation. */
 export type GitDiffRangeConfig = Pick<CodexProConfig, "maxGitTimeoutMs" | "maxOutputBytes"> &
@@ -144,6 +148,8 @@ export interface GitDiffRangePatchOptions extends GitDiffRangeMetadataOptions {
   readonly patchFragmentMaxBytes?: unknown;
   /** Internal spelling retained for focused callers that use the config name. */
   readonly maxPatchFragmentBytes?: unknown;
+  /** Zero-based changed-file index at which patch page generation begins. */
+  readonly patchStartIndex?: unknown;
 }
 
 export interface GitDiffRangePatchOnlyOptions {
@@ -152,6 +158,8 @@ export interface GitDiffRangePatchOnlyOptions {
   readonly contextLines?: unknown;
   readonly patchFragmentMaxBytes?: unknown;
   readonly maxPatchFragmentBytes?: unknown;
+  /** Zero-based changed-file index at which patch page generation begins. */
+  readonly patchStartIndex?: unknown;
 }
 
 export interface GitDiffRangePatchOmissionCounts {
@@ -167,6 +175,30 @@ export interface GitDiffRangePatchOmissionCounts {
   readonly fileLimit: number;
   /** Returned text records omitted because patch generation was disabled. */
   readonly disabled: number;
+  /** Returned text records whose complete fragment failed structural validation. */
+  readonly malformed: number;
+  /** Records before patch_start_index already returned by an earlier page. */
+  readonly continuation: number;
+}
+
+export type GitDiffRangePatchOmissionReason =
+  | "binary"
+  | "too_large"
+  | "malformed"
+  | "blocked"
+  | "budget"
+  | "disabled"
+  | "file_limit"
+  | "continuation";
+
+/** One complete metadata record and its independently bounded patch outcome. */
+export interface GitDiffRangePatchFile {
+  readonly index: number;
+  readonly status: GitDiffRangeStatus;
+  readonly old_path: string | null;
+  readonly new_path: string | null;
+  readonly patch: string | null;
+  readonly omission_reason: GitDiffRangePatchOmissionReason | null;
 }
 
 export interface GitDiffRangePatchResult extends GitDiffRangeMetadataResult {
@@ -182,6 +214,10 @@ export interface GitDiffRangePatchResult extends GitDiffRangeMetadataResult {
   /** Sum of patchOmissionCounts; every raw metadata record is classified once. */
   readonly patchFilesOmitted: number;
   readonly patchOmissionCounts: GitDiffRangePatchOmissionCounts;
+  /** Per-file complete-unit outcomes, in changed-file metadata order. */
+  readonly patchFiles: readonly GitDiffRangePatchFile[];
+  /** Index of the first record not represented by this page, or null. */
+  readonly patchNextIndex: number | null;
 }
 
 interface RawPath {
@@ -259,6 +295,7 @@ interface ValidatedPatchOptions {
   readonly maxPatchBytes: number;
   readonly contextLines: number;
   readonly patchFragmentMaxBytes: number;
+  readonly patchStartIndex: number;
 }
 
 function patchFragmentCaptureLimit(config: GitDiffRangeConfig, requested: unknown): number {
@@ -303,7 +340,9 @@ function validatePatchOptions(
 
   const requestedFragmentLimit = options?.patchFragmentMaxBytes ?? options?.maxPatchFragmentBytes;
   const patchFragmentMaxBytes = patchFragmentCaptureLimit(config, requestedFragmentLimit);
-  return { includePatch, maxPatchBytes, contextLines, patchFragmentMaxBytes };
+  const patchStartIndex = options?.patchStartIndex === undefined ? 0 : options.patchStartIndex;
+  if (!nonNegativeSafeInteger(patchStartIndex) || patchStartIndex > MAX_FILES) throw operationError("invalid-limit");
+  return { includePatch, maxPatchBytes, contextLines, patchFragmentMaxBytes, patchStartIndex };
 }
 
 function splitNulRecords(bytes: Buffer, kind: "name-status" | "numstat"): Buffer[] {
@@ -872,7 +911,22 @@ function selectPatchFragment(
 function redactCompletePatchFragment(fragment: SelectedPatchFragment, recordIndex: number): string {
   let redacted: string;
   try {
-    redacted = redactUnifiedDiff(fragment.source, sourceLanguageForPath);
+    redacted = redactUnifiedDiffPreservingLines(fragment.source, sourceLanguageForPath);
+    const sourceLines = fragment.source.split("\n");
+    const redactedLines = redacted.split("\n");
+    if (sourceLines.length !== redactedLines.length) {
+      throw new Error("redaction changed historical fragment line cardinality");
+    }
+    // The private-key policy intentionally preserves physical lines, but a
+    // key embedded in a quoted diff payload can consume the leading `+`/`-`
+    // marker while replacing its contents. Restore only markers established
+    // by the raw Git fragment; never infer a marker from redacted text.
+    redacted = redactedLines.map((line, index) => {
+      const marker = sourceLines[index]?.[0];
+      return (marker === "+" || marker === "-" || marker === " ") && !/^[ +\-]/u.test(line)
+        ? `${marker}${line}`
+        : line;
+    }).join("\n");
   } catch {
     throw operationError("patch-fragment-malformed", {
       record: recordIndex,
@@ -1038,6 +1092,12 @@ function patchOmissionWarning(
   if (patchTruncated && counts.tooLarge > 0) {
     warnings.push("Patch evidence stopped at a fragment beyond the bounded acquisition limit.");
   }
+  if (counts.malformed > 0) {
+    warnings.push("Malformed patch records were omitted while complete neighboring fragments were retained.");
+  }
+  if (counts.continuation > 0) {
+    warnings.push("Patch evidence resumes after the requested continuation index.");
+  }
   return warnings;
 }
 
@@ -1047,7 +1107,9 @@ function patchCountSum(counts: GitDiffRangePatchOmissionCounts): number {
     + counts.budget
     + counts.tooLarge
     + counts.fileLimit
-    + counts.disabled;
+    + counts.disabled
+    + counts.malformed
+    + counts.continuation;
 }
 
 /**
@@ -1069,12 +1131,15 @@ export async function collectGitDiffRangePatchForMetadata(
     budget: 0,
     tooLarge: 0,
     fileLimit: Math.max(0, metadata.eligibleChangedFileCount - metadata.changedFiles.length),
-    disabled: 0
+    disabled: 0,
+    malformed: 0,
+    continuation: 0
   };
   let patch = "";
   let patchFilesIncluded = 0;
   let patchTruncated = false;
   let stopped: "budget" | "tooLarge" | undefined;
+  const patchFiles: GitDiffRangePatchFile[] = [];
 
   const changedFiles = metadata.changedFiles;
   const needsPatchContext = validated.includePatch
@@ -1093,18 +1158,32 @@ export async function collectGitDiffRangePatchForMetadata(
   try {
     for (let index = 0; index < changedFiles.length; index += 1) {
       const record = changedFiles[index];
+      const publicRecord = {
+        index,
+        status: record.status,
+        old_path: record.oldPath,
+        new_path: record.newPath
+      };
+      if (index < validated.patchStartIndex) {
+        counts.continuation += 1;
+        patchFiles.push({ ...publicRecord, patch: null, omission_reason: "continuation" });
+        continue;
+      }
       if (record.binary) {
         counts.binary += 1;
+        patchFiles.push({ ...publicRecord, patch: null, omission_reason: "binary" });
         continue;
       }
 
       if (!validated.includePatch) {
         counts.disabled += 1;
+        patchFiles.push({ ...publicRecord, patch: null, omission_reason: "disabled" });
         continue;
       }
 
       if (stopped !== undefined) {
         counts[stopped] += 1;
+        patchFiles.push({ ...publicRecord, patch: null, omission_reason: stopped === "budget" ? "budget" : "too_large" });
         continue;
       }
 
@@ -1113,17 +1192,32 @@ export async function collectGitDiffRangePatchForMetadata(
         counts.budget += 1;
         patchTruncated = true;
         stopped = "budget";
+        patchFiles.push({ ...publicRecord, patch: null, omission_reason: "budget" });
         continue;
       }
 
       if (context === undefined) throw operationError("execution");
-      const producer = await runPatchProducer(
-        config,
-        context,
-        patchDiffArgs(metadata.identity, record, validated.contextLines, context.orderFile),
-        validated.patchFragmentMaxBytes,
-        index
-      );
+      let producer: PatchProducerResult;
+      try {
+        producer = await runPatchProducer(
+          config,
+          context,
+          patchDiffArgs(metadata.identity, record, validated.contextLines, context.orderFile),
+          validated.patchFragmentMaxBytes,
+          index
+        );
+      } catch (error) {
+        if (error instanceof GitDiffRangeError && [
+          "patch-fragment-mismatch",
+          "patch-fragment-malformed",
+          "patch-encoding"
+        ].includes(error.reason)) {
+          counts.malformed += 1;
+          patchFiles.push({ ...publicRecord, patch: null, omission_reason: "malformed" });
+          continue;
+        }
+        throw error;
+      }
       if (producer.tooLarge) {
         // Prefix semantics: once one complete fragment cannot be acquired, no
         // later fragment is probed. Every remaining text record is classified
@@ -1131,21 +1225,38 @@ export async function collectGitDiffRangePatchForMetadata(
         counts.tooLarge += 1;
         patchTruncated = true;
         stopped = "tooLarge";
+        patchFiles.push({ ...publicRecord, patch: null, omission_reason: "too_large" });
         continue;
       }
 
-      const fragment = selectPatchFragment(producer.text ?? "", record, index);
-      const redacted = redactCompletePatchFragment(fragment, index);
+      let redacted: string;
+      try {
+        const fragment = selectPatchFragment(producer.text ?? "", record, index);
+        redacted = redactCompletePatchFragment(fragment, index);
+      } catch (error) {
+        if (error instanceof GitDiffRangeError && [
+          "patch-fragment-mismatch",
+          "patch-fragment-malformed",
+          "patch-encoding"
+        ].includes(error.reason)) {
+          counts.malformed += 1;
+          patchFiles.push({ ...publicRecord, patch: null, omission_reason: "malformed" });
+          continue;
+        }
+        throw error;
+      }
       const redactedBytes = Buffer.byteLength(redacted, "utf8");
       if (redactedBytes > remaining) {
         counts.budget += 1;
         patchTruncated = true;
         stopped = "budget";
+        patchFiles.push({ ...publicRecord, patch: null, omission_reason: "budget" });
         continue;
       }
 
       patch += redacted;
       patchFilesIncluded += 1;
+      patchFiles.push({ ...publicRecord, patch: redacted, omission_reason: null });
     }
   } catch (error) {
     patchFailure = error;
@@ -1194,6 +1305,10 @@ export async function collectGitDiffRangePatchForMetadata(
     patchFilesIncluded,
     patchFilesOmitted,
     patchOmissionCounts,
+    patchFiles,
+    patchNextIndex: patchTruncated
+      ? patchFiles.find((file) => file.omission_reason === "budget" || file.omission_reason === "too_large")?.index ?? null
+      : null,
     warnings: [...new Set(warnings)]
   };
 }
@@ -1294,7 +1409,11 @@ export interface GitDiffRangeResult {
     readonly too_large: number;
     readonly file_limit: number;
     readonly disabled: number;
+    readonly malformed: number;
+    readonly continuation: number;
   };
+  readonly patch_files: readonly GitDiffRangePatchFile[];
+  readonly patch_next_index: number | null;
   readonly warnings: readonly string[];
 }
 
@@ -1355,8 +1474,12 @@ export async function gitDiffRange(
       budget: result.patchOmissionCounts.budget,
       too_large: result.patchOmissionCounts.tooLarge,
       file_limit: result.patchOmissionCounts.fileLimit,
-      disabled: result.patchOmissionCounts.disabled
+      disabled: result.patchOmissionCounts.disabled,
+      malformed: result.patchOmissionCounts.malformed,
+      continuation: result.patchOmissionCounts.continuation
     },
+    patch_files: result.patchFiles,
+    patch_next_index: result.patchNextIndex,
     warnings: [...new Set(warnings)]
   };
 }
