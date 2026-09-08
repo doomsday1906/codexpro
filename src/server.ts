@@ -1002,10 +1002,10 @@ function readManyResponse(
   itemCount: number
 ): any {
   const sourceFields: PublicSourceField[] = [];
-  for (const item of results) {
+  for (const [resultIndex, item] of results.entries()) {
     if (!item.ok) continue;
     const body = publicSourceBody(item.result.text);
-    sourceFields.push({ path: ["results", item.index, "result", "text"], body });
+    sourceFields.push({ path: ["results", resultIndex, "result", "text"], body });
   }
   const continuationCursor = readManyCursorFor(workspace, requestHash, nextIndex, itemCount);
   return textResult(readManyText(workspace, results, maxTotalBytes, continuationCursor === null ? null : nextIndex), {
