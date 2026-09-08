@@ -245,6 +245,8 @@ function retirementEndpoint(value) {
   const parsed = parseEndpoint(value);
   if (!parsed.ok || !RETIREMENT_GIT_SCHEMES.has(parsed.style)) return endpointFailure(value, "invalid-endpoint");
   if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(value)) {
+    const authority = value.match(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)/u)?.[1] ?? "";
+    if (authority.includes("@")) return endpointFailure(value, "credential-bearing-endpoint");
     let url;
     try {
       url = new URL(value);

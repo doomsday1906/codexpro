@@ -300,7 +300,10 @@ try {
     ["git+ssh policy endpoint", `git+ssh://127.0.0.1:${port}/remote.git`],
     ["percent-escaped policy endpoint", `git://127.0.0.1:${port}/remote%2egit`],
     ["username-only ssh endpoint", `ssh://user@127.0.0.1:${port}/remote.git`],
-    ["username-only git endpoint", `git://user@127.0.0.1:${port}/remote.git`]
+    ["username-only git endpoint", `git://user@127.0.0.1:${port}/remote.git`],
+    ["empty ssh userinfo", `ssh://@127.0.0.1:${port}/remote.git`],
+    ["empty https userinfo", `https://@127.0.0.1:${port}/remote.git`],
+    ["empty https password userinfo", `https://:@127.0.0.1:${port}/remote.git`]
   ]) {
     const before = snapshot(targetRoot, remoteRoot);
     await assert.rejects(
@@ -310,6 +313,27 @@ try {
     assert.deepEqual(snapshot(targetRoot, remoteRoot), before, `${label} changed local or remote state`);
   }
   console.log("PASS hostile policy endpoints: git+ssh, percent escapes, and username-only SSH/Git userinfo were rejected without endpoint echo or mutation.");
+
+  for (const hostileEndpoint of [
+    `ssh://@127.0.0.1:${port}/remote.git`,
+    `https://@127.0.0.1:${port}/remote.git`,
+    `https://:@127.0.0.1:${port}/remote.git`
+  ]) {
+    git(targetRoot, ["config", "remote.origin.pushurl", hostileEndpoint]);
+    const before = snapshot(targetRoot, remoteRoot);
+    await assert.rejects(
+      gitRetireRemoteBranch(config(endpoint), targetWorkspace, {
+        ...request,
+        branch: "mission/hostile-config",
+        expected_remote_head: hostileHead,
+        preservation: receipt(candidate, { type: "published", remote: "origin", branch: "proof/accepted", expected_head: candidate })
+      }),
+      (error) => error instanceof GitRetireRemoteBranchPreflightError && /endpoint|credential|local|allowlist/iu.test(error.message)
+    );
+    assert.deepEqual(snapshot(targetRoot, remoteRoot), before, "empty-userinfo configured endpoint changed local or remote state");
+    git(targetRoot, ["config", "--unset-all", "remote.origin.pushurl"]);
+  }
+  console.log("PASS empty configured userinfo: ssh://@host, https://@host, and https://:@host routes were rejected before mutation.");
 
   // Effective endpoint rewriting is independently hostile even when the
   // policy endpoint itself is safe; it must fail before any remote attempt.
@@ -322,6 +346,22 @@ try {
   assert.deepEqual(snapshot(targetRoot, remoteRoot), effectiveHostileBefore, "hostile effective endpoint changed local or remote state");
   git(targetRoot, ["config", "--unset-all", `url.git+ssh://127.0.0.1:${port}/remote.git.insteadOf`]);
   console.log("PASS hostile effective endpoint: safe policy identity rejected a rewritten git+ssh route before mutation.");
+
+  for (const hostileEndpoint of [
+    `ssh://@127.0.0.1:${port}/remote.git`,
+    `https://@127.0.0.1:${port}/remote.git`,
+    `https://:@127.0.0.1:${port}/remote.git`
+  ]) {
+    git(targetRoot, ["config", `url.${hostileEndpoint}.insteadOf`, endpoint]);
+    const before = snapshot(targetRoot, remoteRoot);
+    await assert.rejects(
+      gitRetireRemoteBranch(config(endpoint), targetWorkspace, request),
+      (error) => error instanceof GitRetireRemoteBranchPreflightError && /endpoint|credential|local|allowlist/iu.test(error.message)
+    );
+    assert.deepEqual(snapshot(targetRoot, remoteRoot), before, "empty-userinfo effective endpoint changed local or remote state");
+    git(targetRoot, ["config", "--unset-all", `url.${hostileEndpoint}.insteadOf`]);
+  }
+  console.log("PASS empty effective userinfo: rewritten ssh/https authority delimiters were rejected before mutation.");
 
   // Exercise the same contract through the compiled ordinary public MCP route.
   git(targetRoot, ["push", "--quiet", `file://${remoteRoot}`, `${candidate}:refs/heads/mission/public`]);

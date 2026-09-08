@@ -978,6 +978,8 @@ export async function resolveGitRetirementEndpointUrl(
   const strictEndpoint = (raw: string, parsed: ReturnType<typeof inspectGitPushEndpoint>): boolean => {
     if (!parsed.ok || !["http", "https", "git", "ssh"].includes(parsed.style ?? "") || raw.includes("%")) return false;
     if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(raw)) {
+      const authority = raw.match(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)/u)?.[1] ?? "";
+      if (authority.includes("@")) return false;
       try {
         const url = new URL(raw);
         if (url.username || url.password) return false;
