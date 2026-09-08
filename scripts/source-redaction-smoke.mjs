@@ -3428,7 +3428,7 @@ try {
   assert.equal(fourKilobyteBatch.structuredContent.max_total_bytes, 4_000, 'read_many explicit budget was not reported');
   assert.ok(Buffer.byteLength(JSON.stringify(fourKilobyteBatch), 'utf8') <= 4_000, 'read_many explicit 4000-byte budget was exceeded');
 
-  const aggregateOverflowBatch = assertToolError(await client.request('tools/call', {
+  const aggregateOverflowBatch = assertToolSuccess(await client.request('tools/call', {
     name: 'read_many',
     arguments: {
       workspace_id: workspaceId,
@@ -3436,7 +3436,11 @@ try {
       items: Array.from({ length: 32 }, () => ({ path: 'ranged-byte-limit.ts' }))
     }
   }), 'read_many aggregate byte limit');
-  assert.match(resultText(aggregateOverflowBatch), /aggregate response exceeds|max_total_bytes/i, 'read_many aggregate byte limit changed its bounded error');
+  const aggregateOverflowResults = aggregateOverflowBatch.structuredContent.results ?? [];
+  assert.ok(aggregateOverflowResults.length > 0 && aggregateOverflowResults.length < 32, 'read_many aggregate byte limit did not return a useful bounded prefix');
+  assert.ok(aggregateOverflowResults.every((item, index) => item.index === index && item.ok === false && /aggregate response budget/i.test(item.error)), 'read_many aggregate byte limit returned incomplete or unmarked item results');
+  assert.equal(aggregateOverflowBatch.structuredContent.next_index, aggregateOverflowResults.length, 'read_many aggregate byte limit lost deterministic next_index');
+  assert.equal(typeof aggregateOverflowBatch.structuredContent.cursor, 'string', 'read_many aggregate byte limit lost continuation cursor');
   expectNoRawLiterals(aggregateOverflowBatch, ['x'.repeat(128)], 'read_many aggregate byte-limit error');
 
   const thirtyTwoItemBatch = assertToolSuccess(await client.request('tools/call', {

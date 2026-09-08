@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Added the bounded read-only `read_many` MCP tool for ordered text-file batches with existing read/path protections, isolated item errors, and a hard aggregate response budget.
+- Added the bounded read-only `read_many` MCP tool for ordered text-file batches with existing read/path protections, isolated item errors, a hard aggregate response budget, and complete-prefix continuation via request-bound cursor/`next_index`.
 
 ## 0.30.0 (2026-08-08)
 

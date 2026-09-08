@@ -267,7 +267,7 @@ const readManyItemSchema = resolveJsonSchema(readManyInputSchema, readManySchema
 if (
   readManySchema?.type !== 'object' ||
   readManySchema?.additionalProperties !== false ||
-  JSON.stringify(Object.keys(readManySchema.properties ?? {}).sort()) !== JSON.stringify(['items', 'max_total_bytes', 'workspace_id']) ||
+  JSON.stringify(Object.keys(readManySchema.properties ?? {}).sort()) !== JSON.stringify(['cursor', 'items', 'max_total_bytes', 'next_index', 'workspace_id']) ||
   JSON.stringify(readManySchema.required ?? []) !== JSON.stringify(['items'])
 ) {
   throw new Error(`read_many tools/list top-level schema was not the accepted strict object: ${JSON.stringify(readManySchema)}`);
@@ -281,7 +281,15 @@ if (
   readManySchema.properties.max_total_bytes?.type !== 'integer' ||
   readManySchema.properties.max_total_bytes?.minimum !== 4000 ||
   readManySchema.properties.max_total_bytes?.maximum !== 100000 ||
-  readManySchema.required.includes('max_total_bytes')
+  readManySchema.required.includes('max_total_bytes') ||
+  readManySchema.properties.next_index?.type !== 'integer' ||
+  readManySchema.properties.next_index?.minimum !== 0 ||
+  readManySchema.properties.next_index?.maximum !== 32 ||
+  readManySchema.required.includes('next_index') ||
+  readManySchema.properties.cursor?.type !== 'string' ||
+  readManySchema.properties.cursor?.minLength !== 1 ||
+  readManySchema.properties.cursor?.maxLength !== 512 ||
+  readManySchema.required.includes('cursor')
 ) {
   throw new Error(`read_many tools/list top-level fields were not truthful: ${JSON.stringify(readManySchema)}`);
 }
@@ -676,8 +684,50 @@ const explicitAggregateOverflow = await client.request('tools/call', {
   arguments: { workspace_id: ws, max_total_bytes: 4_000, items: [{ path: 'read-many-large.txt' }] }
 });
 const explicitAggregateOverflowBytes = serializedToolResultBytes(explicitAggregateOverflow);
-if (!explicitAggregateOverflow.isError || !/aggregate response exceeds/i.test(toolResultText(explicitAggregateOverflow)) || explicitAggregateOverflowBytes > 4_000) {
-  throw new Error(`read_many aggregate overflow did not preserve its bounded explicit error: ${JSON.stringify({ bytes: explicitAggregateOverflowBytes, result: explicitAggregateOverflow })}`);
+const explicitAggregateOverflowItem = explicitAggregateOverflow.structuredContent?.results?.[0];
+if (explicitAggregateOverflow.isError || explicitAggregateOverflowBytes > 4_000 || explicitAggregateOverflowItem?.ok !== false || !/exceeds.*aggregate response budget/i.test(explicitAggregateOverflowItem?.error ?? '') || explicitAggregateOverflow.structuredContent?.next_index !== null) {
+  throw new Error(`read_many single-item overflow did not preserve an explicit complete item error: ${JSON.stringify({ bytes: explicitAggregateOverflowBytes, result: explicitAggregateOverflow })}`);
+}
+
+const prefixPage = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: {
+    workspace_id: ws,
+    max_total_bytes: 4_000,
+    items: [{ path: 'demo.txt' }, { path: 'read-many-large.txt' }, { path: 'other.txt' }]
+  }
+});
+const prefixResults = prefixPage.structuredContent?.results ?? [];
+if (prefixPage.isError || prefixResults.length !== 1 || prefixResults[0]?.index !== 0 || prefixResults[0]?.ok !== true || prefixPage.structuredContent?.next_index !== 1 || typeof prefixPage.structuredContent?.cursor !== 'string') {
+  throw new Error(`read_many did not return a complete prefix and continuation: ${JSON.stringify(prefixPage.structuredContent)}`);
+}
+if (serializedToolResultBytes(prefixPage) > 4_000) {
+  throw new Error(`read_many prefix page exceeded its requested budget: ${serializedToolResultBytes(prefixPage)}`);
+}
+const continuationPage = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: {
+    workspace_id: ws,
+    max_total_bytes: 100_000,
+    items: [{ path: 'demo.txt' }, { path: 'read-many-large.txt' }, { path: 'other.txt' }],
+    cursor: prefixPage.structuredContent.cursor
+  }
+});
+const continuationResults = continuationPage.structuredContent?.results ?? [];
+if (continuationPage.isError || continuationResults.map((item) => item.index).join(',') !== '1,2' || continuationPage.structuredContent?.next_index !== null || continuationPage.structuredContent?.cursor !== null) {
+  throw new Error(`read_many cursor continuation repeated, skipped, or failed to complete items: ${JSON.stringify(continuationPage.structuredContent)}`);
+}
+const tamperedCursor = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: {
+    workspace_id: ws,
+    max_total_bytes: 100_000,
+    items: [{ path: 'demo.txt' }, { path: 'other.txt' }, { path: 'read-many-large.txt' }],
+    cursor: prefixPage.structuredContent.cursor
+  }
+});
+if (!tamperedCursor.isError || !/cursor does not match/i.test(toolResultText(tamperedCursor))) {
+  throw new Error(`read_many accepted a cursor against a different file request: ${JSON.stringify(tamperedCursor)}`);
 }
 
 const max100KSuccess = await client.request('tools/call', {
@@ -704,6 +754,8 @@ const readManyValidationProof = {
   smallFourKSuccessBytes,
   nearFourKSuccessBytes,
   explicitAggregateOverflowBytes,
+  prefixPageBytes: serializedToolResultBytes(prefixPage),
+  continuationPageBytes: serializedToolResultBytes(continuationPage),
   max100KSuccessBytes,
   max100KPlusOneBytes,
   configuredMaxOutputBytesReadManyResultBytes
@@ -1151,7 +1203,13 @@ await expectToolError('read_many', { workspace_id: ws, items: [] }, /Invalid arg
 await expectToolError('read_many', { workspace_id: ws, items: Array.from({ length: 33 }, () => ({ path: readManyPaths[0] })) }, /Invalid arguments for read_many/);
 await expectToolError('read_many', { workspace_id: ws, items: [{ path: readManyPaths[0], workspace_id: ws }] }, /Invalid arguments for read_many/);
 await expectToolError('read_many', { workspace_id: ws, items: [{ path: readManyPaths[0] }], unexpected: true }, /Invalid arguments for read_many/);
-await expectToolError('read_many', { workspace_id: ws, items: [{ path: 'read-many-large.txt' }], max_total_bytes: 4_000 }, /aggregate response exceeds/);
+const singleTooLarge = await client.request('tools/call', {
+  name: 'read_many',
+  arguments: { workspace_id: ws, items: [{ path: 'read-many-large.txt' }], max_total_bytes: 4_000 }
+});
+if (singleTooLarge.isError || singleTooLarge.structuredContent?.results?.[0]?.ok !== false || !/read-style start_line\/end_line|max_bytes/i.test(singleTooLarge.structuredContent?.results?.[0]?.error ?? '')) {
+  throw new Error(`read_many single too-large item lost explicit continuation guidance: ${JSON.stringify(singleTooLarge.structuredContent)}`);
+}
 await expectToolError('read_many', { workspace_id: ws, items: [{ path: readManyPaths[0] }], max_total_bytes: 100_001 }, /Invalid arguments for read_many/);
 await expectToolError('read_many', { workspace_id: 'ws_000000000000000000000000', items: [{ path: readManyPaths[0] }] }, /Unknown workspace_id/);
 for (const linkPath of danglingSymlinks) {

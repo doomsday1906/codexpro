@@ -57,6 +57,7 @@ const READ_MANY_MAX_TOTAL_BYTES = 100_000;
 const READ_MANY_RESPONSE_FRAMING_RESERVE_BYTES = 1_024;
 const READ_MANY_MAX_PATH_CHARS = 2_000;
 const READ_MANY_MAX_ERROR_CHARS = 512;
+const READ_MANY_CURSOR_MAX_CHARS = 512;
 
 const REVIEW_REF_MAX_BYTES = 512;
 const REVIEW_PATH_MAX_BYTES = 4_096;
@@ -754,7 +755,9 @@ const READ_MANY_ARGUMENTS_SCHEMA = z.object({
     .min(1)
     .max(READ_MANY_MAX_ITEMS)
     .describe(`Non-empty ordered batch of at most ${READ_MANY_MAX_ITEMS} text-file reads.`),
-  max_total_bytes: z.number().int().min(READ_MANY_MIN_TOTAL_BYTES).max(READ_MANY_MAX_TOTAL_BYTES).optional().describe(`Hard serialized response budget in bytes. Default: ${READ_MANY_DEFAULT_MAX_TOTAL_BYTES}; minimum: ${READ_MANY_MIN_TOTAL_BYTES}; maximum: ${READ_MANY_MAX_TOTAL_BYTES}.`)
+  max_total_bytes: z.number().int().min(READ_MANY_MIN_TOTAL_BYTES).max(READ_MANY_MAX_TOTAL_BYTES).optional().describe(`Hard serialized response budget in bytes. Default: ${READ_MANY_DEFAULT_MAX_TOTAL_BYTES}; minimum: ${READ_MANY_MIN_TOTAL_BYTES}; maximum: ${READ_MANY_MAX_TOTAL_BYTES}.`),
+  next_index: z.number().int().min(0).max(READ_MANY_MAX_ITEMS).optional().describe("Deterministic index of the next item to read. Prefer the opaque cursor returned by a previous page."),
+  cursor: z.string().min(1).max(READ_MANY_CURSOR_MAX_CHARS).optional().describe("Opaque continuation cursor returned by a previous read_many page; bound to the same workspace and complete item request.")
 }).strict();
 
 // The MCP SDK validates tool arguments before invoking the handler. Keep this
@@ -764,7 +767,9 @@ const READ_MANY_ARGUMENTS_SCHEMA = z.object({
 const READ_MANY_TRANSPORT_SCHEMA = z.object({
   workspace_id: z.unknown().optional().describe("Workspace id for the entire batch from open_workspace."),
   items: z.unknown().optional().describe(`Ordered batch of at most ${READ_MANY_MAX_ITEMS} text-file reads.`),
-  max_total_bytes: z.unknown().optional().describe(`Serialized response budget in bytes. Default: ${READ_MANY_DEFAULT_MAX_TOTAL_BYTES}; minimum: ${READ_MANY_MIN_TOTAL_BYTES}; maximum: ${READ_MANY_MAX_TOTAL_BYTES}.`)
+  max_total_bytes: z.unknown().optional().describe(`Serialized response budget in bytes. Default: ${READ_MANY_DEFAULT_MAX_TOTAL_BYTES}; minimum: ${READ_MANY_MIN_TOTAL_BYTES}; maximum: ${READ_MANY_MAX_TOTAL_BYTES}.`),
+  next_index: z.unknown().optional().describe("Deterministic index of the next item to read."),
+  cursor: z.unknown().optional().describe("Opaque continuation cursor returned by a previous read_many page.")
 }).passthrough();
 
 // The SDK uses one schema for both tools/list JSON conversion and tools/call
@@ -781,6 +786,13 @@ type ReadManyArguments = z.infer<typeof READ_MANY_ARGUMENTS_SCHEMA>;
 type ReadManyResult =
   | { index: number; path: string; ok: true; result: ReadFileResult }
   | { index: number; path: string; ok: false; error: string };
+
+type ReadManyCursor = {
+  version: 1;
+  workspace_id: string;
+  request_hash: string;
+  next_index: number;
+};
 
 // Public source bodies are redacted against the complete file before they are
 // placed in a response. Keep that body as an explicit typed exception to the
@@ -886,13 +898,61 @@ function parseReadManyArguments(args: unknown): ReadManyArguments {
   throw boundedReadManyValidationError(parsed.error.issues);
 }
 
-function readManyText(workspace: Workspace, results: ReadManyResult[], maxTotalBytes: number): readonly PublicTextSegment[] {
+function readManyRequestHash(workspace: Workspace, items: readonly ReadManyItem[]): string {
+  const identity = {
+    workspace_id: workspace.id,
+    workspace_root: workspace.root,
+    items: items.map((item) => ({
+      path: item.path,
+      ...(item.start_line === undefined ? {} : { start_line: item.start_line }),
+      ...(item.end_line === undefined ? {} : { end_line: item.end_line }),
+      ...(item.max_bytes === undefined ? {} : { max_bytes: item.max_bytes })
+    }))
+  };
+  return createHash("sha256").update(JSON.stringify(identity), "utf8").digest("hex");
+}
+
+function encodeReadManyCursor(cursor: ReadManyCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeReadManyCursor(value: string, workspace: Workspace, requestHash: string, itemCount: number): number {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+  } catch {
+    throw new CodexProError("Invalid read_many cursor. Start a new batch or use the cursor returned by read_many.");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new CodexProError("Invalid read_many cursor. Start a new batch or use the cursor returned by read_many.");
+  }
+  const cursor = parsed as Partial<ReadManyCursor>;
+  if (
+    cursor.version !== 1 ||
+    cursor.workspace_id !== workspace.id ||
+    cursor.request_hash !== requestHash ||
+    !Number.isInteger(cursor.next_index) ||
+    (cursor.next_index as number) < 0 ||
+    (cursor.next_index as number) > itemCount
+  ) {
+    throw new CodexProError("read_many cursor does not match this workspace and complete item request.");
+  }
+  return cursor.next_index as number;
+}
+
+function readManyCursorFor(workspace: Workspace, requestHash: string, nextIndex: number, itemCount: number): string | null {
+  if (nextIndex >= itemCount) return null;
+  return encodeReadManyCursor({ version: 1, workspace_id: workspace.id, request_hash: requestHash, next_index: nextIndex });
+}
+
+function readManyText(workspace: Workspace, results: ReadManyResult[], maxTotalBytes: number, nextIndex: number | null): readonly PublicTextSegment[] {
   const parts: Array<string | PublicSourceBody> = [
     "# Read Many",
     "",
     `Workspace: ${workspace.root}`,
     `Items returned: ${results.length}`,
     `Aggregate response budget: ${maxTotalBytes} bytes`,
+    `Next item index: ${nextIndex === null ? "complete" : nextIndex}`,
     ""
   ];
   for (const item of results) {
@@ -933,20 +993,30 @@ function readManyText(workspace: Workspace, results: ReadManyResult[], maxTotalB
   return segments;
 }
 
-function readManyResponse(workspace: Workspace, results: ReadManyResult[], maxTotalBytes: number): any {
+function readManyResponse(
+  workspace: Workspace,
+  results: ReadManyResult[],
+  maxTotalBytes: number,
+  requestHash: string,
+  nextIndex: number,
+  itemCount: number
+): any {
   const sourceFields: PublicSourceField[] = [];
   for (const item of results) {
     if (!item.ok) continue;
     const body = publicSourceBody(item.result.text);
     sourceFields.push({ path: ["results", item.index, "result", "text"], body });
   }
-  return textResult(readManyText(workspace, results, maxTotalBytes), {
+  const continuationCursor = readManyCursorFor(workspace, requestHash, nextIndex, itemCount);
+  return textResult(readManyText(workspace, results, maxTotalBytes, continuationCursor === null ? null : nextIndex), {
     workspace_id: workspace.id,
     root: workspace.root,
     max_items: READ_MANY_MAX_ITEMS,
     max_total_bytes: maxTotalBytes,
     item_count: results.length,
-    results
+    results,
+    next_index: continuationCursor === null ? null : nextIndex,
+    cursor: continuationCursor
   }, {}, { sourceFields });
 }
 
@@ -3664,7 +3734,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     "read_many",
     {
       title: "Read Many",
-      description: `Read 1-${READ_MANY_MAX_ITEMS} bounded text files in input order by composing read. Each item may set start_line, end_line, and max_bytes using read's semantics. Item failures are isolated with {index,path,error}; the request has a ${READ_MANY_DEFAULT_MAX_TOTAL_BYTES}-byte default and ${READ_MANY_MAX_TOTAL_BYTES}-byte maximum serialized response budget including a ${READ_MANY_RESPONSE_FRAMING_RESERVE_BYTES}-byte framing reserve (lowered by maxOutputBytes when configured).`,
+      description: `Read 1-${READ_MANY_MAX_ITEMS} bounded text files in input order by composing read. Each item may set start_line, end_line, and max_bytes using read's semantics. Item failures are isolated with {index,path,error}; aggregate pressure returns a complete prefix and an opaque cursor/next_index for the remaining items. A cursor is bound to the same workspace and complete item request. The request has a ${READ_MANY_DEFAULT_MAX_TOTAL_BYTES}-byte default and ${READ_MANY_MAX_TOTAL_BYTES}-byte maximum serialized response budget including a ${READ_MANY_RESPONSE_FRAMING_RESERVE_BYTES}-byte framing reserve (lowered by maxOutputBytes when configured).`,
       inputSchema: READ_MANY_PUBLIC_SCHEMA,
       runtimeInputSchema: READ_MANY_TRANSPORT_SCHEMA,
       annotations: READ_ONLY_ANNOTATIONS,
@@ -3683,8 +3753,21 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         throw new CodexProError(`max_total_bytes (${requestedMaxTotalBytes}) exceeds the configured read_many response limit (${configuredMaxTotalBytes} bytes).`);
       }
 
+      const requestHash = readManyRequestHash(workspace, validatedArgs.items);
+      const cursorIndex = validatedArgs.cursor === undefined
+        ? undefined
+        : decodeReadManyCursor(validatedArgs.cursor, workspace, requestHash, validatedArgs.items.length);
+      if (cursorIndex !== undefined && validatedArgs.next_index !== undefined && cursorIndex !== validatedArgs.next_index) {
+        throw new CodexProError("next_index does not match the read_many cursor.");
+      }
+      const startIndex = cursorIndex ?? validatedArgs.next_index ?? 0;
+      if (startIndex > validatedArgs.items.length) {
+        throw new CodexProError("next_index is outside the supplied read_many item list.");
+      }
       const results: ReadManyResult[] = [];
-      for (const [index, item] of validatedArgs.items.entries()) {
+      let nextIndex = startIndex;
+      for (let index = startIndex; index < validatedArgs.items.length; index += 1) {
+        const item = validatedArgs.items[index];
         let result: ReadManyResult;
         try {
           const readResult = await readPublicTextFile(config, guard, workspace, item.path, {
@@ -3698,14 +3781,39 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         }
 
         const candidateResults = [...results, result];
-        const candidate = readManyResponse(workspace, candidateResults, requestedMaxTotalBytes);
+        const candidate = readManyResponse(workspace, candidateResults, requestedMaxTotalBytes, requestHash, index + 1, validatedArgs.items.length);
         if (serializedReadManyResponseBytes(candidate) + READ_MANY_RESPONSE_FRAMING_RESERVE_BYTES > requestedMaxTotalBytes) {
-          throw new CodexProError(`read_many aggregate response exceeds max_total_bytes (${requestedMaxTotalBytes} bytes); no items were omitted.`);
+          if (results.length > 0) {
+            // Preserve the complete prefix and leave this item at the cursor.
+            // No later item is attempted, so continuation cannot skip or
+            // repeat a returned result.
+            nextIndex = index;
+            break;
+          }
+
+          // Even one complete item cannot fit this aggregate budget. Return a
+          // bounded item-local error rather than truncating its source body;
+          // callers can retry that item with read's start_line/end_line or
+          // max_bytes controls, or continue with a larger aggregate budget.
+          const tooLarge: ReadManyResult = {
+            index,
+            path: item.path,
+            ok: false,
+            error: `Item exceeds the read_many aggregate response budget (${requestedMaxTotalBytes} bytes). Retry this item with read-style start_line/end_line or max_bytes bounds.`
+          };
+          const errorCandidate = readManyResponse(workspace, [tooLarge], requestedMaxTotalBytes, requestHash, index + 1, validatedArgs.items.length);
+          if (serializedReadManyResponseBytes(errorCandidate) + READ_MANY_RESPONSE_FRAMING_RESERVE_BYTES > requestedMaxTotalBytes) {
+            throw new CodexProError(`read_many aggregate response budget (${requestedMaxTotalBytes} bytes) is too small to return a complete item or bounded error.`);
+          }
+          results.push(tooLarge);
+          nextIndex = index + 1;
+          continue;
         }
         results.push(result);
+        nextIndex = index + 1;
       }
 
-      return readManyResponse(workspace, results, requestedMaxTotalBytes);
+      return readManyResponse(workspace, results, requestedMaxTotalBytes, requestHash, nextIndex, validatedArgs.items.length);
     }
   );
 
