@@ -28,7 +28,7 @@ import { PTY_RUN_ARGUMENTS_SCHEMA } from "./ptyValidator.js";
 import { gitDiff, gitDiffStatus, gitLog, gitStatus } from "./gitOps.js";
 import { gitDiffRange } from "./gitDiffRange.js";
 import { gitLogStructured, gitMergeBase, gitResolveRef, gitShowCommit } from "./gitHistoryOps.js";
-import { readAtRef } from "./gitHistoricalBlob.js";
+import { HistoricalBlobError, readAtRef } from "./gitHistoricalBlob.js";
 import { GIT_COMMIT_MAX_MESSAGE_BYTES, GIT_COMMIT_MAX_PATH_BYTES, GIT_COMMIT_MAX_PATHS, gitCommit } from "./gitCommit.js";
 import { gitPush } from "./gitPush.js";
 import { gitRetireRemoteBranch } from "./gitRetireRemoteBranch.js";
@@ -1087,6 +1087,14 @@ async function fitSingleReadEnvelope<T>(
       current = await reread(maxBytes);
     } catch (error) {
       if (error instanceof Error && error.name === "SelectedLineTooLargeError") break;
+      // R2-4: read_at_ref maps the identical floor condition (a selected line
+      // that fits the raw budget but cannot serialize into the output
+      // envelope) to HistoricalBlobError reason range-too-large. A reread
+      // only happens because the envelope did not fit, so this is the same
+      // specific output-envelope classification as read — never a claim that
+      // the raw range exceeded max_bytes. The initial call still surfaces
+      // range-too-large directly when the user's raw window is over budget.
+      if (error instanceof HistoricalBlobError && error.reason === "range-too-large") break;
       throw error;
     }
   }
