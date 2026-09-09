@@ -672,6 +672,27 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
   }
   const explicitFile = await isExplicitFileTarget(guard, workspace, options.root ?? ".");
   const fileSizeCeiling = explicitFile ? SOURCE_SCAN_LIMIT_BYTES : textScanByteLimit(config);
+  // Finding R-F4rg: rg does not apply --max-filesize to explicitly-passed
+  // files, so an over-ceiling (or giant-line) explicit target must be
+  // admitted here — before spawning rg — or the JSON parser meets a record it
+  // was never budgeted for. The disclosure wording matches the post-search
+  // probe branch below.
+  if (explicitFile) {
+    try {
+      const preStat = await fsp.stat(target.absPath);
+      if (preStat.isFile() && preStat.size > fileSizeCeiling) {
+        return {
+          text: `No matches.\nCoverage incomplete: the explicit target exceeds the ${fileSizeCeiling}-byte search admission and was not searched.`,
+          matches: [],
+          truncated: true,
+          used: "ripgrep"
+        };
+      }
+    } catch {
+      // A target that cannot be statted stays on the normal path; rg and the
+      // coverage probe below report what they can.
+    }
+  }
   const args = ["--json", "--line-number", "--with-filename", "--no-heading", "--color=never", "--max-columns", "500", "--max-count", "50", "--max-filesize", String(fileSizeCeiling)];
   if (!options.regex) args.push("--fixed-strings");
   if (options.includeHidden) args.push("--hidden");
@@ -699,6 +720,15 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
     let parserFailure: CodexProError | undefined;
     let terminationRequested = false;
     let settled = false;
+    // R-F4rg skip-and-disclose state: one giant JSON record must not abort the
+    // whole search. The current file (from begin records) is flagged once and
+    // parsing continues; settlement discloses the gap. Bounded: counters plus
+    // one transient path string, never a retained list.
+    let recordFile = "";
+    let recordFileSkipped = false;
+    let broadSkippedFiles = 0;
+    let explicitSkipped = false;
+    let skippingOversizedRecord = false;
 
     const requestTermination = (): void => {
       if (terminationRequested || settled) return;
@@ -758,7 +788,20 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
         failParser("ripgrep returned malformed JSON.");
         return;
       }
-      if (!value || typeof value !== "object" || (value as { type?: unknown }).type !== "match") return;
+      if (!value || typeof value !== "object") return;
+      const recordType = (value as { type?: unknown }).type;
+      // Track the file rg is currently emitting so a skipped giant record can
+      // be attributed without retaining paths. Begin/end/summary records carry
+      // no match evidence themselves.
+      if (recordType === "begin") {
+        const data = (value as { data?: unknown }).data;
+        const pathValue = data && typeof data === "object" ? (data as { path?: unknown }).path : undefined;
+        const pathText = pathValue && typeof pathValue === "object" ? (pathValue as { text?: unknown }).text : undefined;
+        recordFile = typeof pathText === "string" ? pathText : "";
+        recordFileSkipped = false;
+        return;
+      }
+      if (recordType !== "match") return;
 
       const data = (value as { data?: unknown }).data;
       if (!data || typeof data !== "object") return;
@@ -798,9 +841,30 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
         const segmentEnd = newline < 0 ? text.length : newline;
         const segment = text.slice(offset, segmentEnd);
         const segmentBytes = Buffer.byteLength(segment, "utf8");
+        if (skippingOversizedRecord) {
+          // Still inside the dropped giant record: discard through its end.
+          if (newline < 0) return;
+          skippingOversizedRecord = false;
+          offset = newline + 1;
+          continue;
+        }
         if (partialLineBytes + segmentBytes > RIPGREP_PARTIAL_RECORD_MAX_BYTES) {
-          failParser("ripgrep returned an oversized incomplete JSON record.");
-          return;
+          // Skip-and-disclose instead of aborting the whole search: drop this
+          // record, flag its file exactly once, and keep parsing. The genuine
+          // malformed-JSON path above still fails closed via failParser.
+          if (!recordFileSkipped) {
+            recordFileSkipped = true;
+            if (explicitFile) explicitSkipped = true;
+            else broadSkippedFiles += 1;
+          }
+          partialLine = "";
+          partialLineBytes = 0;
+          if (newline < 0) {
+            skippingOversizedRecord = true;
+            return;
+          }
+          offset = newline + 1;
+          continue;
         }
         partialLine += segment;
         partialLineBytes += segmentBytes;
@@ -816,7 +880,16 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
     const flushDecoder = (): void => {
       if (parserFailure || outputLimited || settled) return;
       consumeDecodedText(stdoutDecoder.end());
-      if (parserFailure || outputLimited || settled || !partialLine.trim()) return;
+      if (parserFailure || outputLimited || settled) return;
+      if (skippingOversizedRecord) {
+        // The producer ended mid-record. Unlike a complete-but-wide record
+        // (bounded as one dropped record with disclosure), an unterminated
+        // tail cannot be bounded — the producer did not finish the record —
+        // so this stays a fail-closed MCP error with no payload echo.
+        failParser("ripgrep returned an unterminated oversized record.");
+        return;
+      }
+      if (!partialLine.trim()) return;
       processRecord(partialLine, partialLineBytes);
       partialLine = "";
       partialLineBytes = 0;
@@ -877,6 +950,58 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
           });
         }
         if (settled) return;
+        // R-F4rg explicit recovery: the rg record was too wide for the parser,
+        // but the target is within the scan policy. Recover line evidence
+        // through the bounded streaming matcher plus shared hydration (giant
+        // lines surface as unavailable/line-too-large, never exposed). Literal
+        // only — regex has no bounded matcher and keeps disclosure. When the
+        // fallback scan is clean, coverage is complete through it and the
+        // partial-search trailer is dropped; any fallback error keeps it.
+        let recoveredClean = false;
+        if (explicitFile && explicitSkipped && !options.regex) {
+          try {
+            const queryBytes = Buffer.from(options.query, "utf8");
+            if (queryBytes.length > 0 && queryBytes.length <= NODE_SEARCH_MAX_QUERY_BYTES) {
+              const remaining = Math.max(0, options.maxResults - admittedMatches.length);
+              const rec = await scanNodeFallbackFile(target.absPath, queryBytes, fileSizeCeiling, remaining);
+              const recReason = nodeFallbackFileReason(rec);
+              if (rec.keptLines.length > 0) {
+                const have = new Set(admittedMatches.map((m) => m.line));
+                const fresh = rec.keptLines.filter((lineNo) => !have.has(lineNo));
+                let recHydrated: Map<number, HydratedSearchLine> | undefined;
+                if (recReason === null || (recReason !== "scan-limit" && recReason !== "race" && recReason !== "io-error")) {
+                  try {
+                    recHydrated = await hydrateSearchLines(config, guard, workspace, target.relPath, fresh);
+                  } catch {
+                    recHydrated = undefined;
+                  }
+                }
+                for (const lineNo of fresh) {
+                  const h = recHydrated?.get(lineNo) ??
+                    (recReason !== null
+                      ? { line: lineNo, text: UNAVAILABLE_SEARCH_CONTEXT, text_status: "unavailable" as const, reason: recReason }
+                      : undefined) ??
+                    { line: lineNo, text: UNAVAILABLE_SEARCH_CONTEXT, text_status: "unavailable" as const, reason: "io-error" as const };
+                  admittedMatches.push({ path: target.relPath, line: lineNo });
+                  matches.push({
+                    path: target.relPath,
+                    line: lineNo,
+                    text: h.text,
+                    text_status: h.text_status,
+                    ...(h.reason === undefined ? {} : { reason: h.reason })
+                  });
+                }
+                matches.sort((a, b) => a.line - b.line);
+                visibleMatches += rec.keptLines.length + rec.extraCount;
+                if (recReason === null) recoveredClean = true;
+              } else if (recReason === null) {
+                recoveredClean = true;
+              }
+            }
+          } catch {
+            // Recovery is best-effort; disclosure below still holds.
+          }
+        }
         // F4-A: disclose broad-admission size exclusions. The --max-filesize
         // policy silently skips files; without this probe a match living only
         // in an omitted file reads as complete no-match coverage.
@@ -898,7 +1023,8 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
         } catch {
           coverageUnknown = true;
         }
-        const truncated = visibleMatches > matches.length || outputLimited || sizeSkips > 0 || coverageUnknown;
+        const truncated = visibleMatches > matches.length || outputLimited || sizeSkips > 0 || coverageUnknown ||
+          (explicitFile ? explicitSkipped && !recoveredClean : broadSkippedFiles > 0);
         let text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
         if (sizeSkips > 0) {
           text += explicitFile
@@ -906,6 +1032,15 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
             : `\nCoverage incomplete: ${sizeSkips} file${sizeSkips === 1 ? "" : "s"} ${sizeSkips === 1 ? "exceeds" : "exceed"} the ${fileSizeCeiling}-byte search admission and ${sizeSkips === 1 ? "was" : "were"} not searched.`;
         } else if (coverageUnknown) {
           text += "\nCoverage incomplete: size-admission coverage could not be verified.";
+        }
+        // R-F4rg: giant JSON records were skipped mid-stream (parser bound).
+        // Their files' evidence may be partial; other files' results stand.
+        // A clean explicit recovery completes coverage through the fallback,
+        // so only unrecovered gaps keep the trailer.
+        if (explicitFile && explicitSkipped && !recoveredClean) {
+          text += `\nCoverage incomplete: the explicit target emitted a match record beyond the ${RIPGREP_PARTIAL_RECORD_MAX_BYTES}-byte parser bound and was only partially searched.`;
+        } else if (!explicitFile && broadSkippedFiles > 0) {
+          text += `\nCoverage incomplete: ${broadSkippedFiles} file${broadSkippedFiles === 1 ? "" : "s"} emitted match records beyond the ${RIPGREP_PARTIAL_RECORD_MAX_BYTES}-byte parser bound and ${broadSkippedFiles === 1 ? "was" : "were"} only partially searched.`;
         }
         settled = true;
         resolve({ text, matches, truncated, used: "ripgrep" });

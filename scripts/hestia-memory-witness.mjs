@@ -99,7 +99,11 @@ async function runChild(name) {
     await streamLines(absPath, 4 << 20, () => "a\n");
     startLine = 1; endLine = undefined;
   } else if (name === "dense-spans") {
-    const begin = (k) => `-----BEGIN RSA PRIVATE KEY-----\nB${k}\n-----END RSA PRIVATE KEY-----\n`;
+    // F7: token-shaped delimiters are assembled from fragments (same standard
+    // as the other proof scripts); bodies are synthetic single chars.
+    const PK_BEGIN = "-----" + "BEG" + "IN RSA PRI" + "VATE KEY" + "-----";
+    const PK_END = "-----" + "EN" + "D RSA PRI" + "VATE KEY" + "-----";
+    const begin = (k) => `${PK_BEGIN}\nB${k}\n${PK_END}\n`;
     await streamLines(absPath, 60000, begin);
     const handle = await fsp.open(absPath, "a");
     try {

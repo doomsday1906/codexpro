@@ -1252,6 +1252,7 @@ export function projectLargeWindow(
   if (scan.spansOverflowed) {
     const forcedAll = window.map((_, index) => index);
     const lines = window.map(() => forceRedactLine());
+    applySourceFinalEmptyLine(lines, window, scan.totalLines);
     return {
       lines,
       redacted: lines.map((line, index) => line !== window[index].text),
@@ -1318,8 +1319,30 @@ export function projectLargeWindow(
       forceLine(0);
     }
   }
+  // R1-Finding-1: the source-final zero-width line is always bare in the
+  // accepted oracle (no span can cover it — the `end <= lineStart` skip — and
+  // no credential pattern or nuke trigger touches empty text), while Stage 2
+  // re-detection on the flanked slice would mark it whenever an unterminated
+  // block reaches EOF. Restore the exact oracle verdict (fail-closed residue
+  // removed: an empty line carries no content to expose either way).
+  applySourceFinalEmptyLine(windowLines, window, scan.totalLines);
   const redacted = windowLines.map((line, index) => line !== rawLines[index]);
   return { lines: windowLines, redacted, nukeApplied: nuke.applied, forcedLines };
+}
+
+/**
+ * Clear a source-final zero-width line to the oracle-exact bare verdict (see
+ * the Stage 2 note at the end of projectLargeWindow). Interior empty lines
+ * and giant entries are untouched: only the source's own final empty line
+ * carries the oracle exemption.
+ */
+function applySourceFinalEmptyLine(lines: string[], window: ScannedLine[], totalLines: number): void {
+  if (lines.length === 0 || window.length !== lines.length) return;
+  const last = window.length - 1;
+  const entry = window[last];
+  if (!entry.giant && entry.text === "" && entry.lineNo === totalLines) {
+    lines[last] = "";
+  }
 }
 
 /**
