@@ -50,12 +50,34 @@ export interface SearchOptions {
   deterministicOrder?: boolean;
 }
 
+export interface SearchCoverageFacts {
+  truncated: boolean;
+  sizeSkips: number;
+  coverageUnknown: boolean;
+  parserSkips: number;
+  incompleteFiles: number;
+  recoveredClean: boolean;
+}
+
+function completeSearchCoverage(): SearchCoverageFacts {
+  return { truncated: false, sizeSkips: 0, coverageUnknown: false, parserSkips: 0, incompleteFiles: 0, recoveredClean: false };
+}
+
 export interface SearchResult {
   text: string;
   matches: SearchMatch[];
   truncated: boolean;
   used: "ripgrep" | "node";
+  /** Bounded reason/count coverage facts (numbers/booleans only, never source). */
+  coverage: SearchCoverageFacts;
+  /** The exact public coverage-explanation block appended to text ("" when complete). */
+  coverageText: string;
   analysis?: StructuredSearchResult;
+}
+
+/** Append the bounded coverage explanation to an already-projected match text. */
+export function withSearchCoverageText(base: string, result: Pick<SearchResult, "coverageText">): string {
+  return result.coverageText ? `${base}\n${result.coverageText}` : base;
 }
 
 function commandExists(command: string): Promise<boolean> {
@@ -673,7 +695,7 @@ function enforceStructuredSearchScope(structured: StructuredSearchResult, scope:
 async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: Workspace, options: SearchOptions): Promise<SearchResult> {
   const target = guard.resolve(workspace, options.root ?? ".");
   if (options.includeHidden === false && isHiddenRelativePath(target.relPath)) {
-    return { text: "No matches.", matches: [], truncated: false, used: "ripgrep" };
+    return { text: "No matches.", matches: [], truncated: false, used: "ripgrep", coverage: completeSearchCoverage(), coverageText: "" };
   }
   const explicitFile = await isExplicitFileTarget(guard, workspace, options.root ?? ".");
   const fileSizeCeiling = explicitFile ? SOURCE_SCAN_LIMIT_BYTES : textScanByteLimit(config);
@@ -686,11 +708,14 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
     try {
       const preStat = await fsp.stat(target.absPath);
       if (preStat.isFile() && preStat.size > fileSizeCeiling) {
+        const coverageText = `Coverage incomplete: the explicit target exceeds the ${fileSizeCeiling}-byte search admission and was not searched.`;
         return {
-          text: `No matches.\nCoverage incomplete: the explicit target exceeds the ${fileSizeCeiling}-byte search admission and was not searched.`,
+          text: `No matches.\n${coverageText}`,
           matches: [],
           truncated: true,
-          used: "ripgrep"
+          used: "ripgrep",
+          coverage: { truncated: true, sizeSkips: 1, coverageUnknown: false, parserSkips: 0, incompleteFiles: 0, recoveredClean: false },
+          coverageText
         };
       }
     } catch {
@@ -1040,25 +1065,46 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
         }
         const truncated = visibleMatches > matches.length || outputLimited || sizeSkips > 0 || coverageUnknown ||
           (explicitFile ? explicitSkipped && !recoveredClean : broadSkippedFiles > 0);
-        let text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
+        // R2-3: the public coverage explanation is BOTH structural facts
+        // (numbers/booleans in `coverage`) AND the exact trailer block in
+        // `coverageText`, so the server's match-text restoration pass can
+        // retain the explanation instead of replacing it with "No matches."
+        const trailers: string[] = [];
         if (sizeSkips > 0) {
-          text += explicitFile
-            ? `\nCoverage incomplete: the explicit target exceeds the ${fileSizeCeiling}-byte search admission and was not searched.`
-            : `\nCoverage incomplete: ${sizeSkips} file${sizeSkips === 1 ? "" : "s"} ${sizeSkips === 1 ? "exceeds" : "exceed"} the ${fileSizeCeiling}-byte search admission and ${sizeSkips === 1 ? "was" : "were"} not searched.`;
+          trailers.push(explicitFile
+            ? `Coverage incomplete: the explicit target exceeds the ${fileSizeCeiling}-byte search admission and was not searched.`
+            : `Coverage incomplete: ${sizeSkips} file${sizeSkips === 1 ? "" : "s"} ${sizeSkips === 1 ? "exceeds" : "exceed"} the ${fileSizeCeiling}-byte search admission and ${sizeSkips === 1 ? "was" : "were"} not searched.`);
         } else if (coverageUnknown) {
-          text += "\nCoverage incomplete: size-admission coverage could not be verified.";
+          trailers.push("Coverage incomplete: size-admission coverage could not be verified.");
         }
         // R-F4rg: giant JSON records were skipped mid-stream (parser bound).
         // Their files' evidence may be partial; other files' results stand.
         // A clean explicit recovery completes coverage through the fallback,
         // so only unrecovered gaps keep the trailer.
         if (explicitFile && explicitSkipped && !recoveredClean) {
-          text += `\nCoverage incomplete: the explicit target emitted a match record beyond the ${RIPGREP_PARTIAL_RECORD_MAX_BYTES}-byte parser bound and was only partially searched.`;
+          trailers.push(`Coverage incomplete: the explicit target emitted a match record beyond the ${RIPGREP_PARTIAL_RECORD_MAX_BYTES}-byte parser bound and was only partially searched.`);
         } else if (!explicitFile && broadSkippedFiles > 0) {
-          text += `\nCoverage incomplete: ${broadSkippedFiles} file${broadSkippedFiles === 1 ? "" : "s"} emitted match records beyond the ${RIPGREP_PARTIAL_RECORD_MAX_BYTES}-byte parser bound and ${broadSkippedFiles === 1 ? "was" : "were"} only partially searched.`;
+          trailers.push(`Coverage incomplete: ${broadSkippedFiles} file${broadSkippedFiles === 1 ? "" : "s"} emitted match records beyond the ${RIPGREP_PARTIAL_RECORD_MAX_BYTES}-byte parser bound and ${broadSkippedFiles === 1 ? "was" : "were"} only partially searched.`);
         }
+        const coverageText = trailers.join("\n");
+        let text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
+        if (coverageText) text += `\n${coverageText}`;
         settled = true;
-        resolve({ text, matches, truncated, used: "ripgrep" });
+        resolve({
+          text,
+          matches,
+          truncated,
+          used: "ripgrep",
+          coverage: {
+            truncated,
+            sizeSkips,
+            coverageUnknown,
+            parserSkips: explicitFile ? (explicitSkipped ? 1 : 0) : broadSkippedFiles,
+            incompleteFiles: 0,
+            recoveredClean
+          },
+          coverageText
+        });
       } catch (error) {
         if (settled) return;
         settled = true;
@@ -1168,23 +1214,38 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
     };
   });
   const truncated = visibleMatches > matches.length || hasIncomplete;
+  // R2-3: same structural coverage contract as the ripgrep route. The
+  // explicit zero-match sentence keeps its existing public shape; the
+  // explanation half also rides in coverageText so the server's match-text
+  // restoration pass cannot drop it.
   let text: string;
+  let coverageText = "";
   if (matches.length === 0) {
     if (explicitFile && incompleteExplicit.length > 0) {
       const details = incompleteExplicit.map((e) => `${e.path}: could not be fully covered (${e.reason}).`).join(" ");
-      text = `No matches. ${details} Coverage is incomplete.`;
+      coverageText = `${details} Coverage is incomplete.`;
+      text = `No matches.\n${coverageText}`;
     } else if (!explicitFile && hasIncomplete) {
-      text = `No matches.\nCoverage incomplete: ${incompleteCount} file${incompleteCount === 1 ? "" : "s"} could not be fully covered (size/encoding/binary/race limits).`;
+      coverageText = `Coverage incomplete: ${incompleteCount} file${incompleteCount === 1 ? "" : "s"} could not be fully covered (size/encoding/binary/race limits).`;
+      text = `No matches.\n${coverageText}`;
     } else {
       text = "No matches.";
     }
   } else {
     text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
     if (!explicitFile && hasIncomplete) {
-      text += `\nCoverage incomplete: ${incompleteCount} file${incompleteCount === 1 ? "" : "s"} could not be fully covered (size/encoding/binary/race limits).`;
+      coverageText = `Coverage incomplete: ${incompleteCount} file${incompleteCount === 1 ? "" : "s"} could not be fully covered (size/encoding/binary/race limits).`;
+      text += `\n${coverageText}`;
     }
   }
-  return { text, matches, truncated, used: "node" };
+  return {
+    text,
+    matches,
+    truncated,
+    used: "node",
+    coverage: { truncated, sizeSkips: 0, coverageUnknown: false, parserSkips: 0, incompleteFiles: incompleteCount, recoveredClean: false },
+    coverageText
+  };
 }
 
 export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, workspace: Workspace, rawOptions: Partial<SearchOptions>): Promise<SearchResult> {
@@ -1289,7 +1350,10 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
             : status === "unavailable" ? { reason: "io-error" as const } : {})
         };
       });
-      lexical.text = lexical.matches.map((match) => `${match.path}:${match.line}: ${match.text}`).join("\n") || "No matches.";
+      lexical.text = withSearchCoverageText(
+        lexical.matches.map((match) => `${match.path}:${match.line}: ${match.text}`).join("\n") || "No matches.",
+        lexical
+      );
     }
     lexical.analysis = structured;
   } catch (error) {
