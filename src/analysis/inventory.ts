@@ -25,7 +25,13 @@ export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuar
   // F4-C: oversized exclusions are bounded skip facts, not silent ordinary
   // skips. Sized here from the pre-admission stat (already in hand) so no
   // error-message sniffing is needed.
+  // R2-1: the exclusion SET is cache identity, not just the count. The
+  // fingerprint below folds each excluded file's path/size/mtime in, so
+  // adding, removing, or growing a file across the admission boundary always
+  // changes the cache key and a fresh bounded coverage result can never be
+  // replaced by an older complete one.
   let oversizedSkippedFiles = 0;
+  const oversizedSkipped: string[] = [];
   const traversalResult = await listFilesDetailed(guard, workspace, {
     root: ".",
     includeHidden: true,
@@ -38,6 +44,7 @@ export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuar
         if (!stat.isFile()) return undefined;
         if (stat.size > admissionBytes) {
           oversizedSkippedFiles += 1;
+          oversizedSkipped.push(`${resolved.relPath}:${stat.size}:${stat.mtimeMs}`);
           return undefined;
         }
         await guard.assertTextFile(resolved.absPath, admissionBytes);
@@ -61,8 +68,10 @@ export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuar
   const files: InventoryFile[] = (traversalResult.preparedFiles ?? []).map(({ prepared }) => prepared);
 
   files.sort((a, b) => Number(isHiddenRelativePath(a.path)) - Number(isHiddenRelativePath(b.path)) || compareCodeUnit(a.path, b.path));
+  oversizedSkipped.sort(compareCodeUnit);
   const fingerprint = createHash("sha256")
-    .update(files.map((file) => `${file.path}:${file.bytes}:${file.modifiedMs}`).join("\n"))
+    .update(files.map((file) => `${file.path}:${file.bytes}:${file.modifiedMs}`).join("\n") +
+      "\n\x00oversized-skipped:\n" + oversizedSkipped.join("\n"))
     .digest("hex");
   const warnings = truncated
     ? traversalResult.traversal?.capacityExhausted
