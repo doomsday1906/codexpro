@@ -252,7 +252,9 @@ try {
   assert.equal(mcpRange.structuredContent.budgetTruncated, false);
   assert.ok(typeof mcpRange.structuredContent.returnedBytes === 'number');
   const envelopeBytes = Buffer.byteLength(JSON.stringify(mcpRange), 'utf8');
-  assert.ok(envelopeBytes <= config.maxOutputBytes + 65536, `envelope ${envelopeBytes} exceeds output bound`);
+  // F5: the complete serialized response plus transport reserve fits the
+  // output policy (the old +65536 slack is gone; see hestia-envelope-proof).
+  assert.ok(envelopeBytes + 2048 <= config.maxOutputBytes, `envelope ${envelopeBytes} exceeds output policy ${config.maxOutputBytes}`);
   console.log(`ok mcp stdio range envelope=${envelopeBytes}`);
 
   const mcpUnbounded = assertToolSuccess(await stdioClient.request('tools/call', {

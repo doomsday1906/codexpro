@@ -58,6 +58,14 @@ const READ_MANY_RESPONSE_FRAMING_RESERVE_BYTES = 1_024;
 const READ_MANY_MAX_PATH_CHARS = 2_000;
 const READ_MANY_MAX_ERROR_CHARS = 512;
 const READ_MANY_CURSOR_MAX_CHARS = 512;
+// F5: single-read (read/read_at_ref) final-envelope policy. max_bytes remains
+// the selected/paged raw numbered-window budget; the complete serialized MCP
+// response (content text + structuredContent duplication + metadata + JSON
+// framing + redaction expansion + continuation) is independently bounded by
+// maxOutputBytes minus this transport reserve. Pages shrink by whole complete
+// lines with continuation; they are never split mid-line or mid-code-point.
+const READ_SINGLE_RESPONSE_RESERVE_BYTES = 2_048;
+const READ_SINGLE_ENVELOPE_FIT_ATTEMPTS = 12;
 
 const REVIEW_REF_MAX_BYTES = 512;
 const REVIEW_PATH_MAX_BYTES = 4_096;
@@ -1036,6 +1044,55 @@ function serializedReadManyResponseBytes(response: any): number {
     }
   };
   return Buffer.byteLength(JSON.stringify(tagged), "utf8");
+}
+
+/**
+ * F5 single-read final-envelope fit. `build` renders one complete MCP
+ * response from a read result; `reread` repeats the same window with a
+ * smaller raw numbered-window budget (framing pages by whole complete lines,
+ * so continuation stays deterministic and non-overlapping). The first fit
+ * within budget wins; when even the floor budget cannot render, a specific
+ * bounded envelope error names the numbers instead of truncating a line.
+ * `returnedBytes` keeps meaning UTF-8 bytes of the public source body —
+ * envelope fitting only shrinks which complete lines are on the page.
+ */
+async function fitSingleReadEnvelope<T>(
+  initial: T,
+  initialMaxBytes: number,
+  reread: (maxBytes: number) => Promise<T>,
+  build: (result: T) => any,
+  bodyBytes: (result: T) => number,
+  budget: number
+): Promise<any> {
+  let current = initial;
+  let maxBytes = Math.max(1000, Math.floor(initialMaxBytes));
+  let smallestMeasured = Number.POSITIVE_INFINITY;
+  for (let attempt = 0; attempt < READ_SINGLE_ENVELOPE_FIT_ATTEMPTS; attempt += 1) {
+    const response = build(current);
+    const measured = Buffer.byteLength(JSON.stringify(response ?? {}), "utf8");
+    if (measured < smallestMeasured) smallestMeasured = measured;
+    if (measured + READ_SINGLE_RESPONSE_RESERVE_BYTES <= budget) return response;
+    if (maxBytes <= 1000) break;
+    // Proportional shrink on the body share: the serialized response is
+    // roughly (duplicated body + fixed metadata), so scale the raw window
+    // budget by the affordable body fraction instead of subtracting
+    // serialized bytes from a raw budget (which would overshoot to the floor).
+    const body = Math.max(1, bodyBytes(current));
+    const fixed = Math.max(0, measured - 2 * body);
+    const affordableBody = Math.max(1, budget - READ_SINGLE_RESPONSE_RESERVE_BYTES - fixed);
+    const scaled = Math.floor(maxBytes * affordableBody / (measured - fixed));
+    const nextMax = Math.min(maxBytes - 1, Math.max(1000, scaled));
+    maxBytes = nextMax;
+    try {
+      current = await reread(maxBytes);
+    } catch (error) {
+      if (error instanceof Error && error.name === "SelectedLineTooLargeError") break;
+      throw error;
+    }
+  }
+  throw new CodexProError(
+    `Read response does not fit the configured output envelope: smallest page measured ${smallestMeasured} serialized bytes for a ${budget}-byte output budget (reserve ${READ_SINGLE_RESPONSE_RESERVE_BYTES} bytes). Narrow the window with start_line/end_line or raise maxOutputBytes.`
+  );
 }
 
 function errorText(error: unknown): string {
@@ -3711,26 +3768,40 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
-      const result = await readPublicTextFile(config, guard, workspace, args.path, {
+      const readArgs = {
         startLine: args.start_line,
         endLine: args.end_line,
         maxBytes: args.max_bytes
-      });
-      const body = publicSourceBody(result.text);
-      const continuation = result.nextStartLine === undefined
-        ? ""
-        : `\nNext start line: ${result.nextStartLine}${result.budgetTruncated ? " (response budget shortened the window)" : ""}`;
-      const text = [
-        {
-          kind: "normal" as const,
-          text: `# Read File\n\nPath: ${result.path}\nLines: ${result.startLine}-${result.endLine} of ${result.totalLines}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}${continuation}\n\n\`\`\`text\n`
-        },
-        body,
-        { kind: "normal" as const, text: "\n\`\`\`" }
-      ] as const;
-      return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result }, {}, {
-        sourceFields: [{ path: ["text"], body }]
-      });
+      };
+      const initial = await readPublicTextFile(config, guard, workspace, args.path, readArgs);
+      const initialMaxBytes = Math.min(args.max_bytes ?? config.maxReadBytes, config.maxReadBytes);
+      const buildReadResponse = (result: typeof initial) => {
+        const body = publicSourceBody(result.text);
+        const continuation = result.nextStartLine === undefined
+          ? ""
+          : `\nNext start line: ${result.nextStartLine}${result.budgetTruncated ? " (response budget shortened the window)" : ""}`;
+        const text = [
+          {
+            kind: "normal" as const,
+            text: `# Read File\n\nPath: ${result.path}\nLines: ${result.startLine}-${result.endLine} of ${result.totalLines}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}${continuation}\n\n\`\`\`text\n`
+          },
+          body,
+          { kind: "normal" as const, text: "\n\`\`\`" }
+        ] as const;
+        return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result }, {}, {
+          sourceFields: [{ path: ["text"], body }]
+        });
+      };
+      // F5: max_bytes stays the raw numbered-window budget; the final
+      // serialized response independently fits the output envelope.
+      return fitSingleReadEnvelope(
+        initial,
+        initialMaxBytes,
+        (maxBytes) => readPublicTextFile(config, guard, workspace, args.path, { ...readArgs, maxBytes }),
+        buildReadResponse,
+        (result) => Buffer.byteLength(result.text, "utf8"),
+        config.maxOutputBytes
+      );
     }
   );
 
@@ -4549,65 +4620,78 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
-      const result = await readAtRef(config, guard, workspace, {
+      const refArgs = {
         ref: args.ref,
         path: args.path,
         startLine: args.start_line,
         endLine: args.end_line,
         maxBytes: args.max_bytes
-      });
-      const body = publicSourceBody(result.text);
-      const continuation = result.nextStartLine === undefined
-        ? []
-        : [`Next start line: ${result.nextStartLine}${result.budgetTruncated ? " (response budget shortened the window)" : ""}`];
-      const text = [
-        {
-          kind: "normal" as const,
-          text: [
-            "# Read Historical File",
-            "",
-            `Workspace: ${workspace.root}`,
-            `Ref: ${result.ref.input} (${result.commitSha})`,
-            `Path: ${result.path}`,
-            `Git mode: ${result.gitMode}`,
-            `Entry kind: ${result.entryKind}`,
-            `Lines: ${result.startLine}-${result.endLine} of ${result.totalLines}`,
-            `Bytes: ${result.bytes}`,
-            `Blob SHA: ${result.blobSha}`,
-            `SHA-256: ${result.sha256}`,
-            `Truncated: ${result.truncated}`,
-            ...continuation,
-            "",
-            "```text"
-          ].join("\n")
-        },
-        body,
-        { kind: "normal" as const, text: "\n```" }
-      ] as const;
-      return textResult(text, {
-        schema_version: 1,
-        workspace_id: workspace.id,
-        root: workspace.root,
-        ref: publicGitReviewRef(result.ref),
-        object_format: result.ref.objectFormat,
-        commit_sha: result.commitSha,
-        path: result.path,
-        git_mode: result.gitMode,
-        entry_kind: result.entryKind,
-        blob_sha: result.blobSha,
-        text: result.text,
-        start_line: result.startLine,
-        end_line: result.endLine,
-        total_lines: result.totalLines,
-        bytes: result.bytes,
-        sha256: result.sha256,
-        truncated: result.truncated,
-        returned_bytes: result.returnedBytes,
-        budget_truncated: result.budgetTruncated,
-        ...(result.nextStartLine === undefined ? {} : { next_start_line: result.nextStartLine })
-      }, {}, {
-        sourceFields: [{ path: ["text"], body }]
-      });
+      };
+      const initial = await readAtRef(config, guard, workspace, refArgs);
+      const initialMaxBytes = Math.min(args.max_bytes ?? config.maxReadBytes, config.maxReadBytes);
+      const buildRefResponse = (result: typeof initial) => {
+        const body = publicSourceBody(result.text);
+        const continuation = result.nextStartLine === undefined
+          ? []
+          : [`Next start line: ${result.nextStartLine}${result.budgetTruncated ? " (response budget shortened the window)" : ""}`];
+        const text = [
+          {
+            kind: "normal" as const,
+            text: [
+              "# Read Historical File",
+              "",
+              `Workspace: ${workspace.root}`,
+              `Ref: ${result.ref.input} (${result.commitSha})`,
+              `Path: ${result.path}`,
+              `Git mode: ${result.gitMode}`,
+              `Entry kind: ${result.entryKind}`,
+              `Lines: ${result.startLine}-${result.endLine} of ${result.totalLines}`,
+              `Bytes: ${result.bytes}`,
+              `Blob SHA: ${result.blobSha}`,
+              `SHA-256: ${result.sha256}`,
+              `Truncated: ${result.truncated}`,
+              ...continuation,
+              "",
+              "```text"
+            ].join("\n")
+          },
+          body,
+          { kind: "normal" as const, text: "\n```" }
+        ] as const;
+        return textResult(text, {
+          schema_version: 1,
+          workspace_id: workspace.id,
+          root: workspace.root,
+          ref: publicGitReviewRef(result.ref),
+          object_format: result.ref.objectFormat,
+          commit_sha: result.commitSha,
+          path: result.path,
+          git_mode: result.gitMode,
+          entry_kind: result.entryKind,
+          blob_sha: result.blobSha,
+          text: result.text,
+          start_line: result.startLine,
+          end_line: result.endLine,
+          total_lines: result.totalLines,
+          bytes: result.bytes,
+          sha256: result.sha256,
+          truncated: result.truncated,
+          returned_bytes: result.returnedBytes,
+          budget_truncated: result.budgetTruncated,
+          ...(result.nextStartLine === undefined ? {} : { next_start_line: result.nextStartLine })
+        }, {}, {
+          sourceFields: [{ path: ["text"], body }]
+        });
+      };
+      // F5: same independent output-envelope fit as read.
+      return fitSingleReadEnvelope(
+        initial,
+        initialMaxBytes,
+        (maxBytes) => readAtRef(config, guard, workspace, { ...refArgs, maxBytes }),
+        buildRefResponse,
+        (result) => Buffer.byteLength(result.text, "utf8"),
+        config.maxOutputBytes
+      );
     }
   );
 
