@@ -27,12 +27,13 @@ try {
   await fsp.writeFile(path.join(tmp, "huge.txt"), `x\n`.repeat(400000));
   await fsp.appendFile(path.join(tmp, "huge.txt"), `only R2ZeroNeedleGamma inside excluded file\n`);
 
-  const launch = (env) => {
+  const launch = (root, extraEnv = {}) => {
+    const env = { ...process.env, CODEXPRO_ROOT: root, CODEXPRO_ALLOWED_ROOTS: root, ...extraEnv };
     const pending = new Map();
     let nextId = 1;
     let buffer = "";
     const child = spawn(process.execPath, [
-      "dist/stdio.js", "--root", tmp, "--allow-root", tmp,
+      "dist/stdio.js", "--root", root, "--allow-root", root,
       "--bash", "off", "--write", "off", "--tool-mode", "full"
     ], { cwd: projectRoot, env });
     child.stdout.on("data", (chunk) => {
@@ -71,12 +72,12 @@ try {
   const contentText = (result) => result.content.filter((p) => p.type === "text").map((p) => p.text).join("\n");
 
   for (const mode of ["ripgrep", "node"]) {
-    const env = { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp };
+    const extraEnv = {};
     if (mode === "node") {
-      env.PATH = emptyPathDir;
-      assert.equal(rgGone(env), true, "fallback not forced: rg still resolves");
+      extraEnv.PATH = emptyPathDir;
+      assert.equal(rgGone({ ...process.env, ...extraEnv }), true, "fallback not forced: rg still resolves");
     }
-    const { child, search } = launch(env);
+    const { child, search } = launch(tmp, extraEnv);
     try {
       // Matches present: projected text preserved + explanation retained.
       const hit = await search({ query: NEEDLE });
@@ -108,6 +109,30 @@ try {
     } finally {
       child.kill("SIGKILL");
     }
+  }
+  // Output-budget cut (R2 review R3-T1): truncated=true must come with an
+  // explanation and a structural fact, never a bare complete-looking list.
+  const cutTmp = await fsp.mkdtemp(path.join(os.tmpdir(), "codexpro-r2-pubcov-cut-"));
+  let cutChild;
+  try {
+    for (let i = 0; i < 60; i += 1) {
+      await fsp.writeFile(path.join(cutTmp, `cut${String(i).padStart(2, "0")}.txt`), `cut filler line ${i} ${NEEDLE} padding abcdefghij\n`);
+    }
+    const cut = launch(cutTmp, { CODEXPRO_MAX_OUTPUT_BYTES: "4000" });
+    cutChild = cut.child;
+    try {
+      const cutResult = await cut.search({ query: NEEDLE, max_results: 200 });
+      const sc = cutResult.structuredContent;
+      const text = contentText(cutResult);
+      assert.equal(sc.truncated, true, "evidence-budget cut must truncate");
+      assert.equal(sc.coverage.outputLimited, true, "REGRESSION: output-budget cut missing structural fact");
+      assert.match(text, /Coverage incomplete: the search evidence exceeded the 4000-byte evidence budget/, "REGRESSION: output-budget cut missing public explanation");
+      assert.ok(sc.matches.length > 0, "cut fixture must retain the admitted matches");
+    } finally {
+      cutChild.kill("SIGKILL");
+    }
+  } finally {
+    await fsp.rm(cutTmp, { recursive: true, force: true });
   }
   console.log("HESTIA_R2_PUBLIC_COVERAGE_PROOF: PASS");
 } finally {

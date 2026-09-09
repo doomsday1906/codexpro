@@ -57,10 +57,11 @@ export interface SearchCoverageFacts {
   parserSkips: number;
   incompleteFiles: number;
   recoveredClean: boolean;
+  outputLimited: boolean;
 }
 
 function completeSearchCoverage(): SearchCoverageFacts {
-  return { truncated: false, sizeSkips: 0, coverageUnknown: false, parserSkips: 0, incompleteFiles: 0, recoveredClean: false };
+  return { truncated: false, sizeSkips: 0, coverageUnknown: false, parserSkips: 0, incompleteFiles: 0, recoveredClean: false, outputLimited: false };
 }
 
 export interface SearchResult {
@@ -714,7 +715,7 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
           matches: [],
           truncated: true,
           used: "ripgrep",
-          coverage: { truncated: true, sizeSkips: 1, coverageUnknown: false, parserSkips: 0, incompleteFiles: 0, recoveredClean: false },
+          coverage: { truncated: true, sizeSkips: 1, coverageUnknown: false, parserSkips: 0, incompleteFiles: 0, recoveredClean: false, outputLimited: false },
           coverageText
         };
       }
@@ -1086,6 +1087,12 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
         } else if (!explicitFile && broadSkippedFiles > 0) {
           trailers.push(`Coverage incomplete: ${broadSkippedFiles} file${broadSkippedFiles === 1 ? "" : "s"} emitted match records beyond the ${RIPGREP_PARTIAL_RECORD_MAX_BYTES}-byte parser bound and ${broadSkippedFiles === 1 ? "was" : "were"} only partially searched.`);
         }
+        // R2 review R3-T1: the evidence-bytes budget cut is also a coverage
+        // gap. It already forced truncated=true with no explanation; disclose
+        // it with the same bounded reason/budget facts.
+        if (outputLimited) {
+          trailers.push(`Coverage incomplete: the search evidence exceeded the ${maxOutputBytes}-byte evidence budget and was cut short.`);
+        }
         const coverageText = trailers.join("\n");
         let text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
         if (coverageText) text += `\n${coverageText}`;
@@ -1101,7 +1108,8 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
             coverageUnknown,
             parserSkips: explicitFile ? (explicitSkipped ? 1 : 0) : broadSkippedFiles,
             incompleteFiles: 0,
-            recoveredClean
+            recoveredClean,
+            outputLimited
           },
           coverageText
         });
@@ -1243,7 +1251,7 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
     matches,
     truncated,
     used: "node",
-    coverage: { truncated, sizeSkips: 0, coverageUnknown: false, parserSkips: 0, incompleteFiles: incompleteCount, recoveredClean: false },
+    coverage: { truncated, sizeSkips: 0, coverageUnknown: false, parserSkips: 0, incompleteFiles: incompleteCount, recoveredClean: false, outputLimited: false },
     coverageText
   };
 }
