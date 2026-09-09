@@ -162,6 +162,31 @@ async function main() {
       console.log('ok abort');
     }
 
+    // AP-006b: an explicit huge requested range cannot pin source-sized memory.
+    // Capture stops at the byte cap (counting continues); framing pages with continuation.
+    {
+      const p = path.join(tmpRoot, 'cap-victim.bin');
+      const handle = await fsp.open(p, 'w');
+      for (let i = 0; i < 100000; i += 1) {
+        await handle.write(`cap line ${String(i).padStart(7, '0')} ${'v'.repeat(50)}\n`);
+      }
+      await handle.close();
+      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 1, endLine: 100000, selectMaxBytes: 65536 });
+      assert.equal(scan.selectionCapped, true);
+      assert.ok(scan.capturedThroughLine < 100000);
+      assert.equal(scan.totalLines, 100001);
+      assert.ok(scan.maxRetainedBytes <= 2 * 1024 * 1024, `retention ${scan.maxRetainedBytes}`);
+      const framed = frameRawWindow(scan.selected, scan.selected, {
+        startLine: 1, endLine: 100000, totalLines: scan.totalLines, bytes: scan.bytes,
+        sha256: scan.sha256, maxBytes: 180000, capped: scan.selectionCapped,
+        capturedThroughLine: scan.capturedThroughLine,
+      });
+      assert.equal(framed.budgetTruncated, true);
+      assert.equal(framed.nextStartLine, framed.endLine + 1);
+      assert.ok(framed.nextStartLine <= scan.capturedThroughLine + 1);
+      console.log(`ok capture-cap lines=${scan.totalLines} capturedThrough=${scan.capturedThroughLine} retained=${scan.maxRetainedBytes}`);
+    }
+
     // AP-006: no source-size gate derived from output/read budgets.
     {
       // tiny scan policy proves the failure reason is scan policy, not response budget

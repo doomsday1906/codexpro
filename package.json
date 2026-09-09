@@ -95,6 +95,7 @@
     "verification:r6-falsifier": "node scripts/verification-r6-falsifier.mjs",
     "source-redaction:smoke": "npm run build && node scripts/source-redaction-smoke.mjs",
     "source-scanner:smoke": "npm run build && node scripts/source-scanner-smoke.mjs",
+    "source-projection:smoke": "npm run build && node scripts/source-projection-smoke.mjs",
     "apply-patch:smoke": "npm run build && node scripts/apply-patch-matrix-smoke.mjs",
     "diagnostic-output:smoke": "npm run build && node scripts/diagnostic-output-smoke.mjs",
     "diagnostic-context:smoke": "npm run build && node scripts/diagnostic-context-smoke.mjs",

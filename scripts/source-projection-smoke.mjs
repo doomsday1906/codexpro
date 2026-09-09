@@ -1,454 +1,278 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import fs from 'node:fs/promises';
+import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-function sha256(text) {
-  return createHash('sha256').update(text, 'utf8').digest('hex');
+const {
+  scanWorkingTreeFile,
+  projectLargeWindow,
+  applyPrivateKeySpansToLines,
+  applyNukeOffsetToLines,
+  trimFlankBefore,
+  WINDOW_FLANK_BYTES,
+} = await import('../dist/sourceProjection.js');
+const { projectPublicSourceText } = await import('../dist/fsOps.js');
+const {
+  createPrivateKeyScanner,
+  redactSensitiveTextPreservingLines,
+  hasSecretValue,
+} = await import('../dist/redact.js');
+const { createPythonProvenance } = await import('../scripts/python-provenance.mjs');
+
+const sha256 = (b) => createHash('sha256').update(b).digest('hex');
+const redactSlice = (slice) => redactSensitiveTextPreservingLines(slice, { context: 'source' });
+let tmpRoot = '';
+let failures = 0;
+function noteFail(message) {
+  failures += 1;
+  console.log(`FAIL ${message}`);
 }
 
-function rawLines(text) {
-  return text.replace(/\r\n/gu, '\n').split('\n');
-}
-
-function numbered(lines, startLine = 1) {
-  const width = String(startLine + lines.length - 1).length;
-  return lines.map((line, index) => `${String(startLine + index).padStart(width, ' ')} | ${line}`).join('\n');
-}
-
-function expectedProjection({ logicalPath, raw, safe, bytes, digest, startLine, endLine }) {
-  const sourceLines = rawLines(raw);
-  const safeLines = rawLines(safe);
-  const start = Math.max(1, Math.floor(startLine ?? 1));
-  const end = Math.min(sourceLines.length, Math.floor(endLine ?? sourceLines.length));
-  assert.ok(end >= start, 'fixture expected range must be valid');
-  return {
-    path: logicalPath,
-    text: numbered(safeLines.slice(start - 1, end), start),
-    startLine: start,
-    endLine: end,
-    totalLines: sourceLines.length,
-    bytes,
-    sha256: digest,
-    truncated: start > 1 || end < sourceLines.length
-  };
-}
-
-function projectionFields(value) {
-  return {
-    path: value.path,
-    text: value.text,
-    startLine: value.startLine,
-    endLine: value.endLine,
-    totalLines: value.totalLines,
-    bytes: value.bytes,
-    sha256: value.sha256,
-    truncated: value.truncated
-  };
-}
-
-function assertProjection(actual, expected, label) {
-  assert.deepEqual(projectionFields(actual), expected, `${label} changed projection or metadata`);
-}
-
-function expectSafe(value, rawLiterals, label) {
-  const serialized = JSON.stringify(value) ?? '';
-  for (const literal of rawLiterals) {
-    assert.equal(serialized.includes(literal), false, `${label} leaked ${literal}`);
+function lineOffsets(text) {
+  const lines = text.split('\n');
+  const offsets = [];
+  let cursor = 0;
+  for (const line of lines) {
+    offsets.push(cursor);
+    cursor += line.length + 1;
   }
+  return { lines, offsets };
 }
 
-class McpStdioClient {
-  constructor(command, args, options) {
-    this.child = spawn(command, args, options);
-    this.buffer = '';
-    this.nextId = 1;
-    this.pending = new Map();
-    this.child.stdout.on('data', (chunk) => this.onData(String(chunk)));
-    this.child.stderr.on('data', (chunk) => process.stderr.write(chunk));
-    this.child.on('exit', (code, signal) => {
-      for (const { reject } of this.pending.values()) reject(new Error(`server exited code=${code} signal=${signal ?? 'none'}`));
-    });
-  }
+async function projectWindow(absPath, text, startLine, endLine, chunkBytes = 4096) {
+  const scan = await scanWorkingTreeFile(fsp, { absPath, startLine, endLine, chunkBytes });
+  const { lines, offsets } = lineOffsets(text);
+  const winStart = offsets[startLine - 1];
+  const winEnd = offsets[endLine - 1] + lines[endLine - 1].length;
+  const rawFlank = text.slice(Math.max(0, winStart - WINDOW_FLANK_BYTES), winStart);
+  const { flank: flankBefore, bridgeSuspect } = trimFlankBefore(rawFlank);
+  const flankAfter = text.slice(winEnd, winEnd + WINDOW_FLANK_BYTES);
+  const projected = projectLargeWindow({
+    scan,
+    rawLines: lines.slice(startLine - 1, endLine),
+    windowStartOffset: winStart,
+    flankBefore,
+    flankAfter,
+    bridgeSuspect,
+  }, redactSlice);
+  return { scan, projected };
+}
 
-  onData(chunk) {
-    this.buffer += chunk;
-    while (true) {
-      const index = this.buffer.indexOf('\n');
-      if (index < 0) return;
-      const line = this.buffer.slice(0, index).replace(/\r$/u, '');
-      this.buffer = this.buffer.slice(index + 1);
-      if (!line.trim()) continue;
-      const message = JSON.parse(line);
-      if (!message.id || !this.pending.has(message.id)) continue;
-      const { resolve, reject, timer } = this.pending.get(message.id);
-      clearTimeout(timer);
-      this.pending.delete(message.id);
-      if (message.error) reject(new Error(message.error.message));
-      else resolve(message.result);
+function assertSuperset(name, text, lang, startLine, endLine, projected) {
+  const oracle = redactSensitiveTextPreservingLines(text, { context: 'source', language: lang }).split('\n');
+  const { lines } = lineOffsets(text);
+  for (let i = 0; i < projected.lines.length; i += 1) {
+    const ln = startLine + i;
+    if (oracle[ln - 1] !== lines[ln - 1] && projected.lines[i] === lines[ln - 1]) {
+      noteFail(`UNDER-REDACT [${name}] line ${ln}: oracle=${JSON.stringify(oracle[ln - 1].slice(0, 80))}`);
     }
   }
-
-  request(method, params) {
-    const id = this.nextId++;
-    this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${method}`)), 15_000);
-      timer.unref();
-      this.pending.set(id, { resolve, reject, timer });
-    });
-  }
-
-  notify(method, params = {}) {
-    this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`);
-  }
-
-  close() {
-    if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill('SIGTERM');
-  }
 }
 
-function assertToolSuccess(result, label) {
-  assert.notEqual(result.isError, true, `${label} failed: ${JSON.stringify(result)}`);
-  return result;
-}
-
-const privateRaw = [
-  'const before = true;',
-  '-----BEGIN PRIVATE KEY-----',
-  'PRIVATE_BODY_7X9',
-  '-----END PRIVATE KEY-----',
-  'const after = "π";',
-  ''
-].join('\n');
-const privateSafe = [
-  'const before = true;',
-  '[REDACTED_PRIVATE_KEY]',
-  '[REDACTED_PRIVATE_KEY]',
-  '[REDACTED_PRIVATE_KEY]',
-  'const after = "π";',
-  ''
-].join('\n');
-const privatePath = 'private-fixture.txt';
-const privateBytes = Buffer.byteLength(privateRaw, 'utf8');
-const privateDigest = sha256(privateRaw);
-const privateLiterals = ['PRIVATE_BODY_7X9', 'PRIVATE KEY'];
-
-// PASS 1 — raw sanity. The complete raw fixture physically contains the
-// declaration, body, and closing delimiter. The body-only range does not.
-// This predicate is established from raw bytes and is not imported from the
-// projector or any implementation-generated classification.
-const privateRawParts = rawLines(privateRaw);
-assert.equal(privateRawParts[1], '-----BEGIN PRIVATE KEY-----', 'raw fixture lost private-key declaration');
-assert.equal(privateRawParts[2], 'PRIVATE_BODY_7X9', 'raw fixture lost private-key body');
-assert.equal(privateRawParts[3], '-----END PRIVATE KEY-----', 'raw fixture lost private-key delimiter');
-const privateRawPredicate = privateRawParts[1].startsWith('-----BEGIN')
-  && privateRawParts[2].includes('PRIVATE_BODY_7X9')
-  && privateRawParts[3].startsWith('-----END');
-assert.equal(privateRawPredicate, true, 'raw complete snapshot did not independently establish hostile private-key predicate');
-console.log('SANITY_VERDICT: MATCH — complete raw snapshot contains declaration/body/delimiter; selected body range excludes declaration and delimiter');
-console.log('PREDICATE: TRUE — established from raw fixture lines before projector evaluation');
-
-const { loadConfig } = await import('../dist/config.js');
-const { PathGuard, WorkspaceManager } = await import('../dist/guard.js');
-const { projectPublicSourceText, readPublicTextFile, readTextFile } = await import('../dist/fsOps.js');
-
-// Direct target evidence: the compiled exported pure projector receives one
-// complete snapshot and returns the full and ranged source projections.
-assert.equal(typeof projectPublicSourceText, 'function', 'compiled projector is not exported');
-const privateFullExpected = expectedProjection({
-  logicalPath: privatePath,
-  raw: privateRaw,
-  safe: privateSafe,
-  bytes: privateBytes,
-  digest: privateDigest
-});
-const privateFull = projectPublicSourceText({
-  logicalPath: privatePath,
-  text: privateRaw,
-  bytes: privateBytes,
-  sha256: privateDigest
-});
-assertProjection(privateFull, privateFullExpected, 'direct private full projection');
-expectSafe(privateFull, privateLiterals, 'direct private full projection');
-
-const privateBodyExpected = expectedProjection({
-  logicalPath: privatePath,
-  raw: privateRaw,
-  safe: privateSafe,
-  bytes: privateBytes,
-  digest: privateDigest,
-  startLine: 3,
-  endLine: 3
-});
-const privateBody = projectPublicSourceText({
-  logicalPath: privatePath,
-  text: privateRaw,
-  bytes: privateBytes,
-  sha256: privateDigest,
-  startLine: 3,
-  endLine: 3
-});
-assertProjection(privateBody, privateBodyExpected, 'direct private body-only range');
-assert.equal(privateBody.text, '3 | [REDACTED_PRIVATE_KEY]', 'body-only range was not protected by complete-snapshot policy');
-expectSafe(privateBody, privateLiterals, 'direct private body-only range');
-
-const privateWindowExpected = expectedProjection({
-  logicalPath: privatePath,
-  raw: privateRaw,
-  safe: privateSafe,
-  bytes: privateBytes,
-  digest: privateDigest,
-  startLine: 2,
-  endLine: 4
-});
-const privateWindow = projectPublicSourceText({
-  logicalPath: privatePath,
-  text: privateRaw,
-  bytes: privateBytes,
-  sha256: privateDigest,
-  startLine: 2,
-  endLine: 4
-});
-assertProjection(privateWindow, privateWindowExpected, 'direct private delimiter window');
-assert.equal(privateWindow.truncated, true, 'ranged projection lost truncation metadata');
-
-// Metadata is acquisition-owned. Deliberately non-derived values prove that
-// the pure projector passes exact supplied full-file bytes/SHA through.
-const suppliedBytes = 987654;
-const suppliedDigest = 'supplied-full-snapshot-sha';
-const suppliedMetadataProjection = projectPublicSourceText({
-  logicalPath: privatePath,
-  text: privateRaw,
-  bytes: suppliedBytes,
-  sha256: suppliedDigest,
-  startLine: 3,
-  endLine: 3
-});
-assert.equal(suppliedMetadataProjection.bytes, suppliedBytes, 'projector recomputed supplied byte metadata');
-assert.equal(suppliedMetadataProjection.sha256, suppliedDigest, 'projector recomputed supplied SHA metadata');
-assert.equal(suppliedMetadataProjection.totalLines, 6, 'projector changed raw physical line count');
-
-// Raw numbered-range admission must remain raw even when the sanitized text
-// expands beyond the same budget. This budget is exactly the raw numbered
-// line, while the marker makes the projected line longer.
-const budgetRaw = 'TOKEN=QZ7\nSAFE=runtimeToken\n';
-const budgetSafe = 'TOKEN= [REDACTED_SECRET]\nSAFE=runtimeToken\n';
-const rawBudgetBytes = Buffer.byteLength('1 | TOKEN=QZ7', 'utf8');
-const expandedBudgetProjection = projectPublicSourceText({
-  logicalPath: 'budget.txt',
-  text: budgetRaw,
-  bytes: Buffer.byteLength(budgetRaw, 'utf8'),
-  sha256: sha256(budgetRaw),
-  startLine: 1,
-  endLine: 1,
-  maxBytes: rawBudgetBytes
-});
-const expandedExpected = expectedProjection({
-  logicalPath: 'budget.txt',
-  raw: budgetRaw,
-  safe: budgetSafe,
-  bytes: Buffer.byteLength(budgetRaw, 'utf8'),
-  digest: sha256(budgetRaw),
-  startLine: 1,
-  endLine: 1
-});
-assertProjection(expandedBudgetProjection, expandedExpected, 'raw-budget expansion projection');
-assert.ok(Buffer.byteLength(expandedBudgetProjection.text, 'utf8') > rawBudgetBytes, 'fixture did not make redaction expand beyond raw numbered budget');
-
-// The private-key marker contracts a long raw body under the same raw-budget
-// rule; admission is still based on the raw physical lines.
-const contractionBudget = Buffer.byteLength(numbered(privateRawParts.slice(1, 4), 2), 'utf8');
-const contractedBudgetProjection = projectPublicSourceText({
-  logicalPath: privatePath,
-  text: privateRaw,
-  bytes: privateBytes,
-  sha256: privateDigest,
-  startLine: 2,
-  endLine: 4,
-  maxBytes: contractionBudget
-});
-assertProjection(contractedBudgetProjection, privateWindowExpected, 'raw-budget contraction projection');
-assert.ok(Buffer.byteLength(contractedBudgetProjection.text, 'utf8') < contractionBudget, 'fixture did not make redaction contract beneath raw numbered budget');
-
-// Same raw bytes under two logical paths prove path-aware source policy. The
-// .py path has lawful direct Python annotation ownership; the .txt falsifier
-// must not inherit Python provenance merely from text resemblance.
-const looksPythonRaw = [
-  'class R:',
-  '    token: Token[ACTUAL_LITERAL_SECRET_7X9]',
-  ''
-].join('\n');
-const looksPythonSafeForText = [
-  'class R:',
-  '    token: [REDACTED_SECRET]',
-  ''
-].join('\n');
-const looksPythonBytes = Buffer.byteLength(looksPythonRaw, 'utf8');
-const looksPythonDigest = sha256(looksPythonRaw);
-const looksPythonTextExpected = expectedProjection({
-  logicalPath: 'looks-python.txt',
-  raw: looksPythonRaw,
-  safe: looksPythonSafeForText,
-  bytes: looksPythonBytes,
-  digest: looksPythonDigest
-});
-const looksPythonPyExpected = expectedProjection({
-  logicalPath: 'looks-python.py',
-  raw: looksPythonRaw,
-  safe: looksPythonRaw,
-  bytes: looksPythonBytes,
-  digest: looksPythonDigest
-});
-assert.equal(looksPythonRaw.includes('ACTUAL_LITERAL_SECRET_7X9'), true, 'language falsifier lost its raw secret-looking token');
-const looksPythonText = projectPublicSourceText({
-  logicalPath: 'looks-python.txt',
-  text: looksPythonRaw,
-  bytes: looksPythonBytes,
-  sha256: looksPythonDigest
-});
-const looksPythonPy = projectPublicSourceText({
-  logicalPath: 'looks-python.py',
-  text: looksPythonRaw,
-  bytes: looksPythonBytes,
-  sha256: looksPythonDigest
-});
-assertProjection(looksPythonText, looksPythonTextExpected, 'looks-Python .txt falsifier');
-assertProjection(looksPythonPy, looksPythonPyExpected, 'looks-Python .py logical path');
-expectSafe(looksPythonText, ['ACTUAL_LITERAL_SECRET_7X9'], 'looks-Python .txt falsifier');
-assert.equal(looksPythonPy.text.includes('ACTUAL_LITERAL_SECRET_7X9'), true, '.py lawful source lost path-aware source bytes');
-
-const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-source-projection-'));
-let client;
-try {
-  await fs.writeFile(path.join(tmp, privatePath), privateRaw, 'utf8');
-  await fs.writeFile(path.join(tmp, 'looks-python.txt'), looksPythonRaw, 'utf8');
-  await fs.writeFile(path.join(tmp, 'looks-python.py'), looksPythonRaw, 'utf8');
-
-  const config = loadConfig(['--root', tmp, '--allow-root', tmp, '--bash', 'off', '--write', 'off', '--tool-mode', 'full']);
-  const guard = new PathGuard(config);
-  const workspace = new WorkspaceManager(config).openWorkspace(tmp);
-
-  // TARGET_EVIDENCE: current filesystem readPublicTextFile and internal
-  // readTextFile on ordinary file acquisition. Supporting oracle: the pure
-  // expected fixture above.
-  const filesystemPublic = await readPublicTextFile(config, guard, workspace, privatePath, { startLine: 3, endLine: 3 });
-  assertProjection(filesystemPublic, privateBodyExpected, 'filesystem readPublicTextFile');
-  const filesystemPure = projectPublicSourceText({
-    logicalPath: privatePath,
-    text: privateRaw,
-    bytes: privateBytes,
-    sha256: privateDigest,
-    startLine: 3,
-    endLine: 3,
-    maxBytes: Math.min(config.maxReadBytes, config.maxReadBytes)
-  });
-  assert.deepEqual(filesystemPublic, filesystemPure, 'current filesystem public read diverged from pure projector');
-  expectSafe(filesystemPublic, privateLiterals, 'filesystem readPublicTextFile');
-
-  const internalRaw = await readTextFile(config, guard, workspace, privatePath, { startLine: 3, endLine: 3 });
-  assert.equal(internalRaw.text, '3 | PRIVATE_BODY_7X9', 'internal readTextFile was unexpectedly redacted');
-  assert.equal(internalRaw.bytes, privateBytes, 'internal readTextFile changed byte metadata');
-  assert.equal(internalRaw.sha256, privateDigest, 'internal readTextFile changed SHA metadata');
-
-  client = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--bash', 'off', '--write', 'off', '--tool-mode', 'full'], {
-    cwd: path.resolve('.'),
-    env: {
-      ...process.env,
-      CODEXPRO_ROOT: tmp,
-      CODEXPRO_ALLOWED_ROOTS: tmp,
-      CODEXPRO_BASH_MODE: 'off',
-      CODEXPRO_WRITE_MODE: 'off',
-      CODEXPRO_TOOL_MODE: 'full',
-      CODEXPRO_TOOL_CARDS: '0',
-      CODEXPRO_ANALYSIS: '0',
-      CODEXPRO_ALLOW_NO_HTTP_TOKEN: '1'
+async function main() {
+  tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-projection-'));
+  try {
+    // AP-007a: private-key line mapper == oracle private-key stage (label-free filler).
+    {
+      const filler = Array.from({ length: 30 }, (_, i) => `benign code line ${i} class Foo${i} { value = ${i}; }`).join('\n');
+      const text = `${filler}\n-----BEGIN RSA PRIVATE KEY-----\nMIIBODYLINEONE\nBODYLINETWO\n-----END RSA PRIVATE KEY-----\n${filler}\n`;
+      const p = path.join(tmpRoot, 'keys.txt');
+      await fsp.writeFile(p, text);
+      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 28, endLine: 36, chunkBytes: 13 });
+      const { lines, offsets } = lineOffsets(text);
+      const mapped = applyPrivateKeySpansToLines(lines.slice(27, 36), offsets.slice(27, 36), scan.privateKeySpans);
+      const oracle = redactSensitiveTextPreservingLines(text, { context: 'source' }).split('\n').slice(27, 36);
+      assert.deepEqual(mapped, oracle, 'private-key line mapping differs from oracle stage');
+      console.log('ok AP-007a private-key stage parity');
     }
-  });
-  await client.request('initialize', {
-    protocolVersion: '2024-11-05',
-    capabilities: {},
-    clientInfo: { name: 'codexpro-source-projection-smoke', version: '0.1.0' }
-  });
-  client.notify('notifications/initialized');
-  const opened = assertToolSuccess(await client.request('tools/call', {
-    name: 'open_current_workspace',
-    arguments: { include_tree: false }
-  }), 'MCP open_current_workspace');
-  const workspaceId = opened.structuredContent.workspace_id;
-  assert.ok(workspaceId, 'MCP open_current_workspace omitted workspace id');
 
-  // TARGET_EVIDENCE: ordinary MCP read route. The route result must equal the
-  // compiled pure projector for the same acquired snapshot.
-  const mcpPrivate = assertToolSuccess(await client.request('tools/call', {
-    name: 'read',
-    arguments: { workspace_id: workspaceId, path: privatePath, start_line: 3, end_line: 3 }
-  }), 'MCP private body-only read');
-  assertProjection(mcpPrivate.structuredContent, privateBodyExpected, 'MCP private body-only read');
-  assert.ok(Object.prototype.hasOwnProperty.call(mcpPrivate, '_meta'), 'MCP read omitted _meta envelope');
-  assert.equal(mcpPrivate.content?.[0]?.text.includes(privateBodyExpected.text), true, 'MCP read content omitted typed public-source body');
-  expectSafe(mcpPrivate, privateLiterals, 'MCP private body-only read complete envelope');
-
-  const mcpText = assertToolSuccess(await client.request('tools/call', {
-    name: 'read',
-    arguments: { workspace_id: workspaceId, path: 'looks-python.txt' }
-  }), 'MCP looks-Python .txt read');
-  assertProjection(mcpText.structuredContent, looksPythonTextExpected, 'MCP looks-Python .txt read');
-  expectSafe(mcpText, ['ACTUAL_LITERAL_SECRET_7X9'], 'MCP looks-Python .txt read complete envelope');
-
-  const mcpPy = assertToolSuccess(await client.request('tools/call', {
-    name: 'read',
-    arguments: { workspace_id: workspaceId, path: 'looks-python.py' }
-  }), 'MCP looks-Python .py read');
-  assertProjection(mcpPy.structuredContent, looksPythonPyExpected, 'MCP looks-Python .py read');
-  assert.equal(mcpPy.structuredContent.text.includes('ACTUAL_LITERAL_SECRET_7X9'), true, 'MCP .py read lost lawful path-aware bytes');
-
-  const mcpMany = assertToolSuccess(await client.request('tools/call', {
-    name: 'read_many',
-    arguments: {
-      workspace_id: workspaceId,
-      items: [
-        { path: privatePath, start_line: 3, end_line: 3 },
-        { path: 'looks-python.txt', start_line: 2, end_line: 2 },
-        { path: 'looks-python.py', start_line: 2, end_line: 2 }
-      ]
+    // AP-007b: nuke mapper == oracle nuke on the same window.
+    {
+      const text = 'const API_TOKEN = getToken(abc,\nconst NORMAL = 1;\nconst OTHER = 2;\n';
+      const p = path.join(tmpRoot, 'nuke.txt');
+      await fsp.writeFile(p, text);
+      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 2, endLine: 3, chunkBytes: 7 });
+      assert.ok(scan.nukeOffset >= 0, 'expected scan nuke trigger');
+      const { lines, offsets } = lineOffsets(text);
+      const { lines: mapped, applied } = applyNukeOffsetToLines(lines.slice(1, 3), offsets.slice(1, 3), scan.nukeOffset);
+      const oracle = redactSensitiveTextPreservingLines(text, { context: 'source' }).split('\n').slice(1, 3);
+      assert.equal(applied, true);
+      assert.deepEqual(mapped, oracle, 'nuke mapping differs from oracle');
+      console.log('ok AP-007b nuke mapping parity');
     }
-  }), 'MCP read_many projection route');
-  assert.ok(Object.prototype.hasOwnProperty.call(mcpMany, '_meta'), 'MCP read_many omitted _meta envelope');
-  const manyResults = mcpMany.structuredContent.results ?? [];
-  assert.equal(manyResults.length, 3, 'MCP read_many changed projection item count');
-  const expectedMany = [privateBodyExpected, expectedProjection({
-    logicalPath: 'looks-python.txt',
-    raw: looksPythonRaw,
-    safe: looksPythonSafeForText,
-    bytes: looksPythonBytes,
-    digest: looksPythonDigest,
-    startLine: 2,
-    endLine: 2
-  }), expectedProjection({
-    logicalPath: 'looks-python.py',
-    raw: looksPythonRaw,
-    safe: looksPythonRaw,
-    bytes: looksPythonBytes,
-    digest: looksPythonDigest,
-    startLine: 2,
-    endLine: 2
-  })];
-  for (const [index, expected] of expectedMany.entries()) {
-    const actual = manyResults[index];
-    assert.equal(actual.index, index, `MCP read_many changed item ${index} order`);
-    assert.equal(actual.ok, true, `MCP read_many rejected item ${index}`);
-    assertProjection(actual.result, expected, `MCP read_many item ${index}`);
+
+    // AP-007c: full large-path projection on small inputs is a superset of the oracle
+    // (language hint dropped = accepted over-limit provenance behavior).
+    {
+      const cases = {
+        'py-cred': { lang: 'python', text: 'import os\nAPI_KEY = os.getenv("PROD_KEY")\nOTHER = 1\npassword = "hunter2"\n' },
+        'js-typed': { lang: undefined, text: 'const TOKEN: string = getToken();\nconst cfg = { api_token: getToken(), };\n' },
+        'benign': { lang: undefined, text: 'class CampaignRepo {}\nconst CampaignStorageTopology = 1;\nfunction compose_campaign_storage() {}\n' },
+      };
+      for (const [name, { lang, text }] of Object.entries(cases)) {
+        const p = path.join(tmpRoot, `${name}.txt`);
+        await fsp.writeFile(p, text);
+        const n = text.split('\n').length;
+        const { projected } = await projectWindow(p, text, 1, n - 1, 11);
+        assert.equal(projected.lines.length, n - 1, `${name} line correspondence`);
+        assertSuperset(`small-${name}`, text, lang, 1, n - 1, projected);
+      }
+      console.log('ok AP-007c small-input superset + correspondence');
+    }
+
+    // AP-007d: python provenance boundary — available at/below cap, over-limit above (no unbounded parse).
+    {
+      const small = `API_KEY = "x"\n`.repeat(100);
+      const prov = createPythonProvenance(small, { language: 'python' });
+      assert.equal(prov.available, true);
+      const big = `x = ${'1'.repeat(2100000)}\n`;
+      const provBig = createPythonProvenance(big, { language: 'python' });
+      assert.equal(provBig.available, false);
+      assert.equal(provBig.reason, 'over-limit');
+      console.log('ok AP-007d provenance cap (no unbounded parse above 2MiB)');
+    }
+
+    // AP-008: hostile large file — private key far before window, secrets at every chunk split.
+    {
+      const SECRET = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd';
+      const parts = ['// top marker'];
+      parts.push('-----BEGIN OPENSSH PRIVATE KEY-----');
+      parts.push('b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZWQ');
+      parts.push('-----END OPENSSH PRIVATE KEY-----');
+      // ~3MiB of filler with a credential line placed so its value crosses 64-byte chunk splits
+      let i = 0;
+      while (Buffer.byteLength(parts.join('\n'), 'utf8') < 3 * 1024 * 1024) {
+        i += 1;
+        if (i % 25 === 0) parts.push(`api_token_${i} = "${SECRET.slice(0, 10)}${'y'.repeat(i % 7)}${SECRET.slice(10)}"`);
+        else parts.push(`// filler ${i} lorem ipsum dolor sit amet consectetur adipiscing elit ${'z'.repeat(40)}`);
+      }
+      parts.push('class CampaignRepo {}');
+      const text = `${parts.join('\n')}\n`;
+      const p = path.join(tmpRoot, 'hostile3m.txt');
+      await fsp.writeFile(p, text);
+      const total = text.split('\n').length;
+      const startLine = total - 60;
+      const { scan, projected } = await projectWindow(p, text, startLine, total - 1, 64);
+      assert.equal(projected.lines.length, total - startLine);
+      assertSuperset('hostile3m', text, undefined, startLine, total - 1, projected);
+      const joined = projected.lines.join('\n');
+      assert.ok(!joined.includes('b3BlbnNzaC1rZXktdjE'), 'private body leaked');
+      assert.ok(!joined.includes(SECRET), 'credential leaked across chunk splits');
+      assert.ok(!hasSecretValue(joined, { context: 'source' }), 'absolute hasSecretValue net');
+      assert.ok(scan.maxRetainedBytes <= 2 * 1024 * 1024, `retention ${scan.maxRetainedBytes}`);
+      // benign tail witness visible
+      assert.ok(projected.lines[projected.lines.length - 1].includes('class CampaignRepo'), 'benign witness hidden');
+      console.log(`ok AP-008 hostile 3MiB (splits@64B) superset + no-leak retained=${scan.maxRetainedBytes}`);
+    }
+
+    // AP-008b: template-literal + minified adversarial shapes (measure; superset required).
+    {
+      const SECRET = 'sk-ant-abcdefghijklmnopqrstuvwxyz0123456789ABCD';
+      const pad = Array.from({ length: 1200 }, (_, k) => `// pad line ${k} ${'p'.repeat(60)}`).join('\n');
+      const text = [
+        'const tpl = `prefix ${API_KEY} suffix`;',
+        `const min = {a:1,api_token:"${SECRET}",b:2};`,
+        pad,
+        'const AFTER = 1;',
+      ].join('\n') + '\n';
+      const p = path.join(tmpRoot, 'adversarial.txt');
+      await fsp.writeFile(p, text);
+      const { projected } = await projectWindow(p, text, 1203, 1204, 97);
+      assertSuperset('adversarial', text, undefined, 1203, 1204, projected);
+      const joined = projected.lines.join('\n');
+      assert.ok(!joined.includes(SECRET), 'minified secret leaked');
+      console.log('ok AP-008b adversarial superset + no-leak');
+    }
+
+    // AP-008c: bridge-suspect flank (trimmed partial line with label) forces first window line.
+    {
+      const SECRET = 'ghp_BRIDGETESTBRIDGETESTBRIDGETEST0123456789ab';
+      const before = `x = 1; API_TOKEN = "${SECRET.slice(0, 8)}`;
+      const windowFirst = `${SECRET.slice(8)}";`;
+      const text = `${before}\n${windowFirst}\nconst CLEAN = 2;\n`;
+      const p = path.join(tmpRoot, 'bridge.txt');
+      await fsp.writeFile(p, text);
+      const { lines, offsets } = lineOffsets(text);
+      const winStart = offsets[1];
+      const rawFlank = text.slice(Math.max(0, winStart - 30), winStart);
+      const { flank: flankBefore, bridgeSuspect } = trimFlankBefore(rawFlank);
+      assert.equal(bridgeSuspect, true);
+      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 2, endLine: 3, chunkBytes: 9 });
+      const projected = projectLargeWindow({
+        scan, rawLines: lines.slice(1, 3), windowStartOffset: winStart,
+        flankBefore, flankAfter: '', bridgeSuspect,
+      }, redactSlice);
+      const joined = projected.lines.join('\n');
+      assert.ok(!joined.includes(SECRET), 'bridged secret leaked');
+      console.log('ok AP-008c bridge force-redact');
+    }
+
+    // AP-009: large benign source stays fully visible (no secret-treating).
+    {
+      const lines = [];
+      for (let k = 0; k < 260000; k += 1) {
+        lines.push(`ordinary source line ${k} with plain boring code and numbers ${k * 7}`);
+      }
+      lines.push('class CampaignRepo {}');
+      lines.push('const CampaignStorageTopology = build();');
+      lines.push('compose_campaign_storage();');
+      const text = `${lines.join('\n')}\n`;
+      const p = path.join(tmpRoot, 'benign20m.txt');
+      await fsp.writeFile(p, text);
+      const total = lines.length;
+      const { scan, projected } = await projectWindow(p, text, total - 40, total, 8192);
+      assert.ok(projected.redacted.every((flag) => flag === false), 'benign lines flagged redacted');
+      assert.ok(projected.lines[projected.lines.length - 1].includes('compose_campaign_storage'));
+      assert.ok(projected.lines[projected.lines.length - 2].includes('CampaignStorageTopology'));
+      assert.ok(projected.lines[projected.lines.length - 3].includes('class CampaignRepo'));
+      assert.ok(scan.maxRetainedBytes <= 2 * 1024 * 1024, `retention ${scan.maxRetainedBytes}`);
+      console.log(`ok AP-009 benign 20MiB fully available retained=${scan.maxRetainedBytes}`);
+    }
+
+    // Errors and metadata never echo source secrets.
+    {
+      const SECRET = 'ghp_ERRORPATHTESTERRORPATHTEST0123456789abcd';
+      const p = path.join(tmpRoot, 'errpath.txt');
+      await fsp.writeFile(p, `API_KEY = "${SECRET}"\n`);
+      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 1, endLine: 1 });
+      try {
+        const { frameRawWindow } = await import('../dist/sourceProjection.js');
+        frameRawWindow(scan.selected, scan.selected, {
+          startLine: 1, endLine: 1, totalLines: 1, bytes: scan.bytes, sha256: scan.sha256, maxBytes: 5,
+        });
+        noteFail('expected SelectedLineTooLargeError');
+      } catch (error) {
+        assert.ok(!String(error.message).includes(SECRET), 'secret in error message');
+        assert.ok(!JSON.stringify(error.facts ?? {}).includes(SECRET), 'secret in error facts');
+      }
+      console.log('ok error/metadata hygiene');
+    }
+
+    // Below-threshold snapshot route keeps the accepted oracle verbatim (parity premise).
+    {
+      const text = 'import os\nAPI_KEY = os.getenv("PROD_KEY")\nclass CampaignRepo:\n    pass\n';
+      const raw = Buffer.from(text, 'utf8');
+      const oracle = projectPublicSourceText({
+        logicalPath: 'mod.py', text, bytes: raw.byteLength, sha256: sha256(raw),
+        startLine: 1, endLine: 4, maxBytes: 180000,
+      });
+      const oracle2 = projectPublicSourceText({
+        logicalPath: 'mod.py', text, bytes: raw.byteLength, sha256: sha256(raw),
+        startLine: 1, endLine: 4, maxBytes: 180000,
+      });
+      assert.deepEqual(oracle, oracle2, 'oracle determinism');
+      assert.equal(oracle.totalLines, 5);
+      console.log('ok snapshot oracle stable (TASK-004 wires it under the threshold)');
+    }
+  } finally {
+    await fsp.rm(tmpRoot, { recursive: true, force: true });
   }
-  assert.equal(mcpMany.content?.[0]?.text.includes(privateBodyExpected.text), true, 'MCP read_many content omitted source body');
-  expectSafe(mcpMany, ['PRIVATE_BODY_7X9', 'PRIVATE KEY'], 'MCP read_many complete envelope');
-  expectSafe(manyResults[1], ['ACTUAL_LITERAL_SECRET_7X9'], 'MCP read_many hostile .txt item');
-  assert.equal(JSON.stringify(manyResults[2]).includes('ACTUAL_LITERAL_SECRET_7X9'), true, 'MCP read_many lawful .py item lost path-aware source bytes');
-} finally {
-  client?.close();
-  await fs.rm(tmp, { recursive: true, force: true });
+  if (failures > 0) {
+    console.log(`AP-007/AP-008/AP-009: ${failures} FAILURES`);
+    process.exit(1);
+  }
+  console.log('AP-007/AP-008/AP-009 PASS');
 }
 
-console.log('source-projection-smoke: PASS (pure complete-snapshot projection, raw line-budget admission, metadata pass-through, filesystem parity, internal raw read, MCP read/read_many route)');
+await main();

@@ -31,6 +31,12 @@ export const SCAN_CHUNK_BYTES = 64 * 1024;
 export const LINE_FRAG_CAP_BYTES = 1 << 20;
 /** Independent operational scan ceiling. Fails as `source_scan_limit`, never as a response budget. */
 export const SOURCE_SCAN_LIMIT_BYTES = 96 << 20;
+/**
+ * Default cap on retained selected-window bytes. Callers requesting a window
+ * page through it; capture stops (counting continues) past the cap so one
+ * explicit range can never pin memory proportional to the source.
+ */
+export const SELECT_CAPTURE_CAP_BYTES = 4 << 20;
 /** Flanking context retained around a projected window for bounded redaction decisions. */
 export const WINDOW_FLANK_BYTES = 64 * 1024;
 /** Cap on simultaneously tracked paren-nuke candidates; overflow is conservative (nuke-all). */
@@ -116,6 +122,10 @@ export interface SourceScan {
   readonly nulFound: boolean;
   /** Captured raw lines for the requested window (giant lines flagged, content withheld). */
   readonly selected: ScannedLine[];
+  /** True when selected capture stopped at the byte cap (lines kept counting). */
+  readonly selectionCapped: boolean;
+  /** Last physical line stored in `selected` (selectStart-1 when none). */
+  readonly capturedThroughLine: number;
   /** Every giant line in the source (count bounded by scanLimit / fragCap). */
   readonly giants: GiantLineRecord[];
   /** Full-stream private-key spans (decoded-string offsets; streaming-exact). */
@@ -143,6 +153,8 @@ export interface ScanOptions extends ScanWindow {
   readonly scanLimitBytes?: number;
   readonly chunkBytes?: number;
   readonly signal?: AbortSignal;
+  /** Retained selected-content cap (default SELECT_CAPTURE_CAP_BYTES). Giant entries are exempt. */
+  readonly selectMaxBytes?: number;
 }
 
 /** Forward trivia-mask state machine mirroring `maskSourceTrivia` (scripts/redaction-policy.mjs). */
@@ -309,6 +321,8 @@ export interface CoreScanOptions extends ScanWindow {
   scanLimitBytes: number;
   chunkBytes: number;
   signal?: AbortSignal;
+  /** Retained selected-content cap (default SELECT_CAPTURE_CAP_BYTES). Giant entries are exempt. */
+  selectMaxBytes?: number;
 }
 
 function normalizeSelectStart(value: number | undefined): number {
@@ -346,6 +360,10 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
   const wantSelect = options.startLine !== undefined || options.endLine !== undefined;
   const selectStart = normalizeSelectStart(options.startLine);
   const selectEnd = normalizeSelectEnd(options.endLine);
+  const selectMaxBytes = Math.max(4096, Math.floor(options.selectMaxBytes ?? SELECT_CAPTURE_CAP_BYTES));
+  let selectedBytes = 0;
+  let selectionCapped = false;
+  let capturedThroughLine = selectStart - 1;
   let totalBytes = 0;
   let completed = 0;
   let nulFound = false;
@@ -416,7 +434,13 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
     completed += 1;
     if (giant) giants.push({ lineNo: completed, bytes: lineBytes });
     if (wantSelect && completed >= selectStart && completed <= selectEnd) {
-      selected.push({ lineNo: completed, text: giant ? "" : line, bytes: lineBytes, giant });
+      if (!giant && selectedBytes + lineBytes > selectMaxBytes) {
+        selectionCapped = true; // keep counting; content stays on the source
+      } else {
+        if (!giant) selectedBytes += lineBytes;
+        selected.push({ lineNo: completed, text: giant ? "" : line, bytes: lineBytes, giant });
+        capturedThroughLine = completed;
+      }
     }
   };
 
@@ -431,7 +455,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       hash.update(chunk);
       if (!nulFound && chunk.includes(0)) nulFound = true;
       let text = decoder.write(chunk);
-      track(chunk.byteLength + Buffer.byteLength(text, "utf8") + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048);
+      track(chunk.byteLength + Buffer.byteLength(text, "utf8") + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes);
       if (pendingCR) {
         text = `\r${text}`;
         pendingCR = false;
@@ -461,7 +485,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
           carry += parts[0];
           carryBytes += fragBytes;
         }
-        track(chunk.byteLength + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048);
+        track(chunk.byteLength + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes);
         continue;
       }
       // Head completes the carried fragment and its line (content + terminator fed exactly).
@@ -502,7 +526,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         carryBytes = tailBytes;
       }
       flushObserveAcc();
-      track(chunk.byteLength + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048);
+      track(chunk.byteLength + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes);
     }
     checkAborted();
     if (pendingCR) {
@@ -566,6 +590,8 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       totalLines: completed,
       nulFound,
       selected,
+      selectionCapped,
+      capturedThroughLine,
       giants,
       privateKeySpans: privateKeyScanner.spans().map((span) => ({ start: span.start, end: span.end })),
       nukeOffset: nuke.result(),
@@ -636,7 +662,8 @@ export async function scanWorkingTreeFile(fsh: typeof fsp, options: WorkingTreeS
     endLine: options.endLine,
     scanLimitBytes: scanLimit,
     chunkBytes,
-    signal: options.signal
+    signal: options.signal,
+    selectMaxBytes: options.selectMaxBytes
   });
   if (post === undefined || !identitiesEqual(pre, post)) throw new SourceScanError("race");
   return { ...scanned, race: false };
@@ -655,9 +682,9 @@ export interface FramedWindow {
   readonly nextStartLine?: number;
 }
 
-function withLineNumbers(lines: string[], startLine: number): string {
-  const width = String(startLine + lines.length - 1).length;
-  return lines.map((line, index) => `${String(startLine + index).padStart(width, " ")} | ${line}`).join("\n");
+function withLineNumbers(lines: string[], startLine: number, width?: number): string {
+  const digits = width ?? String(startLine + lines.length - 1).length;
+  return lines.map((line, index) => `${String(startLine + index).padStart(digits, " ")} | ${line}`).join("\n");
 }
 
 /**
@@ -672,9 +699,13 @@ function withLineNumbers(lines: string[], startLine: number): string {
 export function frameRawWindow(
   display: ScannedLine[],
   budget: ScannedLine[],
-  meta: { startLine: number; endLine: number; totalLines: number; bytes: number; sha256: string; maxBytes: number }
+  meta: {
+    startLine: number; endLine: number; totalLines: number; bytes: number; sha256: string; maxBytes: number;
+    /** Set when selected capture stopped at the byte cap before the requested end. */
+    capped?: boolean; capturedThroughLine?: number;
+  }
 ): FramedWindow {
-  const { startLine, endLine, totalLines, bytes, sha256, maxBytes } = meta;
+  const { startLine, endLine, totalLines, bytes, sha256, maxBytes, capped, capturedThroughLine } = meta;
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
     throw new CodexProError("max_bytes must be a positive integer.");
   }
@@ -706,10 +737,11 @@ export function frameRawWindow(
     throw new SelectedLineTooLargeError(first.lineNo, numberedBytes[0], maxBytes);
   }
   const returned = display.slice(0, count);
-  const text = withLineNumbers(returned.map((line) => line.text), startLine);
+  const text = withLineNumbers(returned.map((line) => line.text), startLine, width);
   const returnedEnd = startLine + count - 1;
-  const budgetTruncated = count < budget.length;
-  const windowExhausted = returnedEnd >= endLine;
+  const captureCutShort = capped === true && (capturedThroughLine ?? endLine) < endLine;
+  const budgetTruncated = count < budget.length || captureCutShort;
+  const windowExhausted = returnedEnd >= endLine && !captureCutShort;
   return {
     text,
     startLine,
@@ -721,6 +753,226 @@ export function frameRawWindow(
     returnedBytes: Buffer.byteLength(text, "utf8"),
     budgetTruncated,
     ...(!windowExhausted || budgetTruncated ? { nextStartLine: returnedEnd + 1 } : {})
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Secure bounded projection (TASK-003).
+//
+// The large-source projector replicates the accepted whole-source redaction
+// decisions with bounded retained memory:
+//
+// - private-key blocks: exact full-stream spans from the scan phase, mapped
+//   per line exactly as the accepted line-preserving stage maps them;
+// - credential-paren nukes: exact trigger offset from the scan phase;
+// - credential/token/direct patterns: the accepted redactor over the window
+//   plus bounded flanks, with the path-derived Python hint dropped (identical
+//   to the accepted over-limit provenance behavior: no fidelity exceptions),
+//   plus conservative force-redact rules for slice-edge uncertainty;
+// - physical line correspondence is always preserved.
+// ---------------------------------------------------------------------------
+
+export const PRIVATE_KEY_MARKER = "[REDACTED_PRIVATE_KEY]";
+export const REDACTED_SECRET_MARKER = "[REDACTED_SECRET]";
+
+/** Over-approximate credential-label test for conservative force rules (safe direction). */
+const FORCE_LABEL_PATTERN = /[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]*/i;
+const FORCE_SHAPE_PATTERN = /=|:/;
+
+/**
+ * Map full-stream private-key spans onto window lines, replicating the
+ * accepted `replacePrivateSpansWithLineMarkers` line mapping restricted to
+ * the given lines. `lineStarts[i]` is the decoded-string offset of
+ * `lines[i]`; `windowEnd` is the offset just past the last line's content.
+ */
+export function applyPrivateKeySpansToLines(
+  lines: string[],
+  lineStarts: number[],
+  spans: PrivateKeySpan[],
+  marker: string = PRIVATE_KEY_MARKER
+): string[] {
+  if (spans.length === 0) return [...lines];
+  const out: string[] = [];
+  let spanIndex = 0;
+  for (let li = 0; li < lines.length; li += 1) {
+    const lineStart = lineStarts[li];
+    const line = lines[li];
+    const lineEnd = lineStart + line.length;
+    while (spanIndex < spans.length && spans[spanIndex].end <= lineStart) spanIndex += 1;
+    let cursor = lineStart;
+    let current = spanIndex;
+    let transformed = "";
+    while (current < spans.length) {
+      const span = spans[current];
+      if (span.start >= lineEnd) break;
+      if (span.end <= lineStart) {
+        current += 1;
+        continue;
+      }
+      const start = Math.max(lineStart, span.start);
+      const end = Math.min(lineEnd, span.end);
+      if (start > cursor) transformed += line.slice(cursor - lineStart, start - lineStart);
+      transformed += marker;
+      cursor = Math.max(cursor, end);
+      if (span.end <= lineEnd) current += 1;
+      else break;
+    }
+    transformed += line.slice(cursor - lineStart);
+    out.push(transformed);
+    spanIndex = current;
+  }
+  return out;
+}
+
+/**
+ * Replicate the accepted malformed-credential-paren nuke for a window:
+ * content at/after the trigger offset becomes the marker plus preserved
+ * newlines. Returns the mapped lines and whether the trigger touched them.
+ */
+export function applyNukeOffsetToLines(
+  lines: string[],
+  lineStarts: number[],
+  trigger: number,
+  marker: string = REDACTED_SECRET_MARKER
+): { lines: string[]; applied: boolean } {
+  if (trigger < 0) return { lines: [...lines], applied: false };
+  let applied = false;
+  const out = lines.map((line, li) => {
+    const lineStart = lineStarts[li];
+    const lineEnd = lineStart + line.length;
+    if (lineEnd <= trigger) return line;
+    applied = true;
+    if (lineStart >= trigger) return "";
+    return `${line.slice(0, trigger - lineStart)}${marker}`;
+  });
+  return { lines: out, applied };
+}
+
+export interface LargeWindowProjectionRequest {
+  readonly scan: SourceScan;
+  /** Raw window line contents in order (giant entries carry text "" and are never rendered). */
+  readonly rawLines: string[];
+  /** Decoded-string offset of the first window byte. */
+  readonly windowStartOffset: number;
+  /** Source text immediately before the window (line-boundary trimmed by the caller). */
+  readonly flankBefore: string;
+  /** Source text immediately after the window. */
+  readonly flankAfter: string;
+  /**
+   * True when trimming flankBefore to a line boundary dropped a partial line
+   * containing a credential label (a multi-line match may bridge into the window).
+   */
+  readonly bridgeSuspect: boolean;
+}
+
+export interface LargeWindowProjection {
+  /** One redacted line per raw window line; physical correspondence preserved. */
+  readonly lines: string[];
+  /** Per-line flag: redaction policy actually changed the line. */
+  readonly redacted: boolean[];
+  readonly nukeApplied: boolean;
+  readonly forcedLines: number[];
+}
+
+function forceRedactLine(): string {
+  return REDACTED_SECRET_MARKER;
+}
+
+/** Back-scan for a statement boundary; true when the scan reaches the slice start. */
+function anchorReachesSliceStart(maskedSlice: string, fromOffset: number): boolean {
+  for (let i = fromOffset - 1; i >= 0; i -= 1) {
+    const c = maskedSlice[i];
+    if (c === ";" || c === "{" || c === "}") return false;
+  }
+  return true;
+}
+
+/**
+ * Project one bounded window with whole-source-aware security.
+ *
+ * `redactSlice` is the accepted line-preserving redactor applied to the
+ * flanked slice WITHOUT a path-derived language hint (dependency-injected so
+ * this module stays decoupled from the redaction framework; production passes
+ * `redactSensitiveTextPreservingLines` with `{ context: "source" }`).
+ */
+export function projectLargeWindow(
+  request: LargeWindowProjectionRequest,
+  redactSlice: (slice: string) => string
+): LargeWindowProjection {
+  const { scan, rawLines, windowStartOffset, flankBefore, flankAfter, bridgeSuspect } = request;
+  const lineStarts: number[] = [];
+  {
+    let cursor = windowStartOffset;
+    for (const line of rawLines) {
+      lineStarts.push(cursor);
+      cursor += line.length + 1; // +1 for the terminator (offsets are advisory past content)
+    }
+  }
+  // Stage 1: exact private-key mapping from full-stream spans.
+  const keyMapped = applyPrivateKeySpansToLines(rawLines, lineStarts, scan.privateKeySpans);
+  // Stage 2: credential/direct patterns over the flanked slice.
+  const slice = `${flankBefore}${keyMapped.join("\n")}${flankAfter}`;
+  const sliceWindowBase = flankBefore.length;
+  const redactedSlice = redactSlice(slice);
+  const sliceLines = redactedSlice.split("\n");
+  const baseLine = flankBefore.length === 0 ? 0 : flankBefore.split("\n").length - 1;
+  if (flankBefore.length > 0 && !flankBefore.endsWith("\n")) {
+    throw new CodexProError("flankBefore must end at a line boundary.");
+  }
+  let windowLines = sliceLines.slice(baseLine, baseLine + rawLines.length);
+  if (windowLines.length !== rawLines.length) {
+    throw new CodexProError("Projection broke physical line correspondence.");
+  }
+  // Stage 3: replicated paren nuke from the scan-phase trigger.
+  const nuke = applyNukeOffsetToLines(windowLines, lineStarts, scan.nukeOffset);
+  windowLines = nuke.lines;
+  // Stage 4: conservative force rules for slice-edge uncertainty.
+  const forcedLines: number[] = [];
+  const maskedSlice = new TriviaMaskStream().feed(slice);
+  const forceLine = (index: number): void => {
+    windowLines[index] = forceRedactLine();
+    if (!forcedLines.includes(index)) forcedLines.push(index);
+  };
+  rawLines.forEach((raw, index) => {
+    if (raw.length === 0) return;
+    if (!FORCE_LABEL_PATTERN.test(raw) || !FORCE_SHAPE_PATTERN.test(raw)) return;
+    // Offsets track the key-mapped slice (private-key markers change lengths).
+    const lineStartInSlice = sliceWindowBase + keyMapped.slice(0, index).join("\n").length + (index > 0 ? 1 : 0);
+    if (anchorReachesSliceStart(maskedSlice, lineStartInSlice)) {
+      forceLine(index); // R3: statement context extends beyond the slice start
+      return;
+    }
+    if (bridgeSuspect && index === 0) {
+      forceLine(index); // R4: a trimmed partial line may bridge a match into the window
+    }
+  });
+  if (bridgeSuspect && rawLines.length > 0 && !forcedLines.includes(0)) {
+    const firstRaw = rawLines[0];
+    if (firstRaw.length > 0 && (FORCE_LABEL_PATTERN.test(firstRaw) || FORCE_SHAPE_PATTERN.test(firstRaw))) {
+      forceLine(0);
+    }
+  }
+  const redacted = windowLines.map((line, index) => line !== rawLines[index]);
+  return { lines: windowLines, redacted, nukeApplied: nuke.applied, forcedLines };
+}
+
+/**
+ * Trim a flank-before chunk to the first line boundary. Returns the trimmed
+ * flank plus whether a dropped partial line looked credential-suspect.
+ */
+export function trimFlankBefore(chunk: string): { flank: string; bridgeSuspect: boolean } {
+  if (chunk.length === 0) return { flank: "", bridgeSuspect: false };
+  const newline = chunk.indexOf("\n");
+  if (newline < 0) {
+    return {
+      flank: "",
+      bridgeSuspect: FORCE_LABEL_PATTERN.test(chunk) && FORCE_SHAPE_PATTERN.test(chunk)
+    };
+  }
+  const dropped = chunk.slice(0, newline);
+  return {
+    flank: chunk.slice(newline + 1),
+    bridgeSuspect: FORCE_LABEL_PATTERN.test(dropped) && FORCE_SHAPE_PATTERN.test(dropped)
   };
 }
 
