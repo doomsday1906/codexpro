@@ -10,8 +10,12 @@ import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const projectRoot = "/home/andrew/AgentWorkspace/worktrees/codexpro/repoconnect-large-file-surgical-readability/primary";
+// R5-1: package-relative root — no machine-specific absolute path. The
+// script targets the dist/ belonging to the package or checkout containing
+// this script, whether run in place or from a staged/unpacked npm package.
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const NEEDLE = "R3EnvelopeNeedle";
 const SMALL_BUDGET = 4000;
 

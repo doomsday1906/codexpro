@@ -7,16 +7,19 @@
 // error (classification intact); executable-start failure; minimum-success-
 // cannot-fit error (giant query + intent); default policy; multibyte
 // diagnostic (no split code point); tiny constant fallback fits the lawful
-// minimum (direct unit call at an unlawful budget); wrapper reachability.
+// minimum (direct unit call at an unlawful budget); MCP supertool reachability.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { TextDecoder } from "node:util";
 
-const projectRoot = "/home/andrew/AgentWorkspace/worktrees/codexpro/repoconnect-large-file-surgical-readability/primary";
+// R5-1: package-relative root — no machine-specific absolute path. The
+// script targets the dist/ belonging to the package or checkout containing
+// this script, whether run in place or from a staged/unpacked npm package.
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SMALL_BUDGET = 4000;
 const fatalUtf8 = new TextDecoder("utf-8", { fatal: true });
 
@@ -76,6 +79,11 @@ try {
     });
     return {
       child,
+      callTool: async (name, args) => {
+        const { msg, raw } = await request("tools/call", { name, arguments: args });
+        assert.equal(msg.error, undefined, `${name} protocol error: ${JSON.stringify(msg.error)}`);
+        return { result: msg.result, raw };
+      },
       callSearch: async (args) => {
         const { msg, raw } = await request("tools/call", { name: "search", arguments: args });
         assert.equal(msg.error, undefined, `search protocol error: ${JSON.stringify(msg.error)}`);
@@ -83,6 +91,7 @@ try {
       }
     };
   };
+  const contentText = (result) => result.content.filter((p) => p.type === "text").map((p) => p.text).join("\n");
   const assertBoundedError = (result, raw, label, budget) => {
     assert.equal(result.isError, true, `${label}: must be an error result`);
     const size = Buffer.byteLength(JSON.stringify(result), "utf8");
@@ -220,12 +229,62 @@ try {
     assert.ok(Buffer.byteLength(JSON.stringify(fb), "utf8") <= SMALL_BUDGET, "fallback: fits the lawful minimum");
   }
 
-  // 8. Wrapper reachability: scripts/codexpro.mjs carries no tool-call path
-  // to search, so the compiled stdio route above (the same server binary the
-  // wrapper launches) is the reachable surface. Tripwire if that changes.
+  // 8. MCP codexpro SUPERTOOL reachability (R5-2 correction: the supertool
+  // named codexpro IS a real wrapper and CAN invoke search; the earlier
+  // revision wrongly examined only the CLI launcher script). The CLI
+  // launcher (scripts/codexpro.mjs) separately carries no tool-call path —
+  // it is a process launcher, not a substitute for this test.
   {
     const wrapper = await fsp.readFile(path.join(projectRoot, "scripts", "codexpro.mjs"), "utf8");
-    assert.ok(!wrapper.includes("tools/call"), "wrapper: no MCP tool-call path exists");
+    assert.ok(!wrapper.includes("tools/call"), "launcher: no MCP tool-call path exists in the CLI launcher");
+  }
+
+  // 9. Wrapped success through the supertool (action: search).
+  {
+    for (let i = 0; i < 60; i += 1) {
+      await fsp.writeFile(path.join(tmp, `wrap${String(i).padStart(2, "0")}.txt`), `wrapped filler line ${i} R5SuperNeedle padding abcdefghij\n`);
+    }
+    const { child, callTool } = launch({ CODEXPRO_MAX_OUTPUT_BYTES: String(SMALL_BUDGET) });
+    try {
+      const { result, raw } = await callTool("codexpro", { action: "search", args: { query: "R5SuperNeedle", max_results: 200 } });
+      const sc = result.structuredContent;
+      assert.equal(result.isError, undefined, "wrapped success must not be an error");
+      assert.equal(sc.codexpro_super_action, "search", "wrapped metadata must identify the super action");
+      assert.equal(sc.wrapped_tool, "search", "wrapped metadata must identify the wrapped tool");
+      const size = Buffer.byteLength(JSON.stringify(result), "utf8");
+      assert.ok(size <= SMALL_BUDGET, `wrapped success serialized ${size} exceeds policy ${SMALL_BUDGET}`);
+      assert.ok(Buffer.byteLength(raw, "utf8") <= SMALL_BUDGET, "wrapped success frame must fit the policy");
+      assert.ok(sc.matches.length > 0 && sc.matches.length < 60, "wrapped cut must retain a whole-record prefix");
+      assert.equal(sc.truncated, true, "wrapped cut must be truncated");
+      assert.equal(sc.coverage.outputLimited, true, "wrapped cut must set the structural fact");
+      assert.match(contentText(result), /cut to whole records\./, "wrapped cut must explain publicly");
+      for (const m of sc.matches) {
+        assert.equal(typeof m.path, "string", "wrapped matches must be whole records");
+        assert.equal(typeof m.line, "number", "wrapped matches must be whole records");
+        assert.equal(typeof m.text, "string", "wrapped matches must be whole records");
+      }
+      fatalUtf8.decode(Buffer.from(JSON.stringify(result), "utf8"));
+      console.log(`wrapped success serialized=${size}`);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  }
+
+  // 10. Wrapped error through the supertool (action: search, failing producer).
+  {
+    const { child, callTool } = launch({ CODEXPRO_MAX_OUTPUT_BYTES: String(SMALL_BUDGET), PATH: `${binDir}:${process.env.PATH}` });
+    try {
+      const { result, raw } = await callTool("codexpro", { action: "search", args: { query: "hello" } });
+      const sc = result.structuredContent;
+      assert.equal(result.isError, true, "wrapped error must be an error result");
+      assert.equal(sc.codexpro_super_action, "search", "wrapped error metadata must identify the super action");
+      assert.equal(sc.wrapped_tool, "search", "wrapped error metadata must identify the wrapped tool");
+      const text = assertBoundedError(result, raw, "wrapped-error", SMALL_BUDGET);
+      assert.match(text, /truncated/, "wrapped error must carry the bounded indication");
+      console.log(`wrapped error serialized=${Buffer.byteLength(JSON.stringify(result))}`);
+    } finally {
+      child.kill("SIGKILL");
+    }
   }
 
   console.log("HESTIA_R4_SEARCH_ERROR_ENVELOPE_PROOF: PASS");
