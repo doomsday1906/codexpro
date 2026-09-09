@@ -24,6 +24,7 @@ import {
   type SearchUnavailableReason
 } from "./analysis/types.js";
 import { resolveSearchScope } from "./analysis/scope.js";
+import { classifyFileRole, classifyLanguage } from "./analysis/classify.js";
 
 export type { SearchTextStatus, SearchUnavailableReason };
 export { UNAVAILABLE_SEARCH_CONTEXT };
@@ -70,6 +71,54 @@ function commandExists(command: string): Promise<boolean> {
 function truncateLine(line: string, max = 400): string {
   if (line.length <= max) return line;
   return `${line.slice(0, max)}…`;
+}
+
+/**
+ * F4-A: count files the broad admission ceiling excludes from ripgrep.
+ * `rg --files` honors the same ignore/hidden/glob scope as the search; the
+ * difference between the unceiled and ceiled listings is exactly the set the
+ * `--max-filesize` policy skipped. Only the COUNT is retained (never paths),
+ * and both listings stream through a line counter (never a retained array).
+ * Returns -1 when the probe itself cannot run (coverage unverifiable).
+ */
+async function probeRipgrepSizeSkips(
+  targetAbsPath: string,
+  extraArgs: string[],
+  ceilingBytes: number
+): Promise<number> {
+  const countFiles = (withCeiling: boolean): Promise<number> => new Promise((resolve, reject) => {
+    const args = ["--files", "--color=never"];
+    if (withCeiling) args.push("--max-filesize", String(ceilingBytes));
+    args.push(...extraArgs, "--", targetAbsPath);
+    const child = spawn("rg", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let lines = 0;
+    let tail = "";
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      const combined = tail + text;
+      const parts = combined.split("\n");
+      tail = parts.pop() ?? "";
+      lines += parts.length;
+    });
+    child.stderr.on("data", () => undefined);
+    child.on("error", reject);
+    child.on("close", (code) => {
+      // rg --files exits 0 even when nothing matches; any other close means
+      // the listing cannot be trusted, so the probe reports unverifiable.
+      if (code !== 0) {
+        reject(new Error(`rg --files exited ${code}`));
+        return;
+      }
+      if (tail.length > 0) lines += 1;
+      resolve(lines);
+    });
+  });
+  try {
+    const [all, sized] = await Promise.all([countFiles(false), countFiles(true)]);
+    return Math.max(0, all - sized);
+  } catch {
+    return -1;
+  }
 }
 
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
@@ -503,8 +552,97 @@ async function isExplicitFileTarget(guard: PathGuard, workspace: Workspace, root
   }
 }
 
-function mergeLexicalProvenance(structured: StructuredSearchResult, lexical: SearchResult): void {
-  const byPathLine = new Map<string, StructuredSearchMatch>();
+/**
+ * F4-D explicit large-file structured evidence. Runs the bounded streaming
+ * literal scan for candidate lines, then hydrates them through the shared
+ * bounded pipeline — the same evidence the read routes return. Records mirror
+ * the structured scan loop's non-definition shape (group by file role,
+ * role-tier score, exact-text-match reasons) so downstream passes treat them
+ * as already-redacted source lines. Bounded: at most maxResults lines, one
+ * scan, no whole-file retention. Regex stays delegated (warning only).
+ */
+async function appendExplicitLargeFileEvidence(
+  config: CodexProConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  options: SearchOptions,
+  query: string,
+  structured: StructuredSearchResult
+): Promise<void> {
+  let resolved;
+  try {
+    if (!(await isExplicitFileTarget(guard, workspace, options.root ?? "."))) return;
+    resolved = guard.resolve(workspace, options.root as string);
+  } catch {
+    return;
+  }
+  let size = 0;
+  try {
+    const stat = await fsp.stat(resolved.absPath);
+    if (!stat.isFile()) return;
+    size = stat.size;
+  } catch {
+    return;
+  }
+  const admission = textScanByteLimit(config);
+  if (size <= admission) return; // The inventory covers this target; nothing to add.
+  const overScanPolicy = size > SOURCE_SCAN_LIMIT_BYTES;
+  const warning = overScanPolicy
+    ? `The explicit target exceeds the ${SOURCE_SCAN_LIMIT_BYTES}-byte scan policy; source-line evidence is unavailable and structured coverage is incomplete.`
+    : `The explicit target exceeds the ${admission}-byte analysis admission; source-line evidence comes from the bounded hydration route, not full analysis.`;
+  structured.warnings.push(warning);
+  structured.coverage.warnings.push(warning);
+  structured.coverage.truncated = true;
+  if (overScanPolicy || options.regex) return;
+  const queryBytes = Buffer.from(query, "utf8");
+  if (queryBytes.length === 0 || queryBytes.length > NODE_SEARCH_MAX_QUERY_BYTES) return;
+  let scan: NodeFallbackFileScan;
+  try {
+    scan = await scanNodeFallbackFile(resolved.absPath, queryBytes, SOURCE_SCAN_LIMIT_BYTES, Math.max(1, options.maxResults));
+  } catch {
+    return;
+  }
+  if (scan.keptLines.length === 0) return;
+  const relPath = resolved.relPath;
+  const seen = new Set(structured.matches.map((m) => `${m.path}:${m.line}`));
+  const role = classifyFileRole(relPath, classifyLanguage(relPath));
+  const group = role === "test" ? "tests" : role === "config" ? "configuration" : role === "docs" ? "documentation" : "references";
+  const score = role === "source" ? 150 : role === "test" ? 130 : role === "config" ? 110 : role === "docs" ? 100 : 90;
+  const directReason = nodeFallbackFileReason(scan);
+  let hydrated: Map<number, HydratedSearchLine> | undefined;
+  if (directReason === null || (directReason !== "scan-limit" && directReason !== "race" && directReason !== "io-error")) {
+    try {
+      hydrated = await hydrateSearchLines(config, guard, workspace, relPath, scan.keptLines);
+    } catch {
+      hydrated = undefined;
+    }
+  }
+  for (const lineNo of scan.keptLines) {
+    if (seen.has(`${relPath}:${lineNo}`)) continue;
+    seen.add(`${relPath}:${lineNo}`);
+    const line = hydrated?.get(lineNo) ??
+      (directReason !== null
+        ? { line: lineNo, text: UNAVAILABLE_SEARCH_CONTEXT, text_status: "unavailable" as const, reason: directReason }
+        : undefined) ??
+      { line: lineNo, text: UNAVAILABLE_SEARCH_CONTEXT, text_status: "unavailable" as const, reason: "io-error" as const };
+    const record: StructuredSearchMatch = {
+      path: relPath,
+      line: lineNo,
+      text: line.text.trim().slice(0, 400),
+      text_status: line.text_status,
+      ...(line.reason === undefined ? {} : { reason: line.reason }),
+      group,
+      score,
+      reasons: ["exact text match", "bounded hydration route"],
+      confidence: "exact",
+      source: "built-in analysis"
+    };
+    structured.matches.push(record);
+    structured.groups[group].push(record);
+  }
+}
+
+function mergeLexicalProvenance(structured: StructuredSearchResult, lexical: SearchResult): void {  const byPathLine = new Map<string, StructuredSearchMatch>();
   for (const match of structured.matches) {
     byPathLine.set(`${match.path}\u0000${match.line}`, match);
     for (const line of match.additionalLines ?? []) {
@@ -739,9 +877,38 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
           });
         }
         if (settled) return;
-        const text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
+        // F4-A: disclose broad-admission size exclusions. The --max-filesize
+        // policy silently skips files; without this probe a match living only
+        // in an omitted file reads as complete no-match coverage.
+        let sizeSkips = 0;
+        let coverageUnknown = false;
+        try {
+          if (explicitFile) {
+            const stat = await fsp.stat(target.absPath);
+            if (stat.isFile() && stat.size > fileSizeCeiling) sizeSkips = 1;
+          } else {
+            const scopeArgs: string[] = [];
+            if (options.includeHidden) scopeArgs.push("--hidden");
+            for (const glob of config.blockedGlobs) scopeArgs.push("-g", `!${glob}`);
+            if (options.glob) scopeArgs.push("-g", options.glob);
+            const probed = await probeRipgrepSizeSkips(target.absPath, scopeArgs, fileSizeCeiling);
+            if (probed < 0) coverageUnknown = true;
+            else sizeSkips = probed;
+          }
+        } catch {
+          coverageUnknown = true;
+        }
+        const truncated = visibleMatches > matches.length || outputLimited || sizeSkips > 0 || coverageUnknown;
+        let text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
+        if (sizeSkips > 0) {
+          text += explicitFile
+            ? `\nCoverage incomplete: the explicit target exceeds the ${fileSizeCeiling}-byte search admission and was not searched.`
+            : `\nCoverage incomplete: ${sizeSkips} file${sizeSkips === 1 ? "" : "s"} ${sizeSkips === 1 ? "exceeds" : "exceed"} the ${fileSizeCeiling}-byte search admission and ${sizeSkips === 1 ? "was" : "were"} not searched.`;
+        } else if (coverageUnknown) {
+          text += "\nCoverage incomplete: size-admission coverage could not be verified.";
+        }
         settled = true;
-        resolve({ text, matches, truncated: visibleMatches > matches.length || outputLimited, used: "ripgrep" });
+        resolve({ text, matches, truncated, used: "ripgrep" });
       } catch (error) {
         if (settled) return;
         settled = true;
@@ -776,7 +943,13 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
   const scanInfoByPath = new Map<string, NodeFallbackFileScan>();
   let visibleMatches = 0;
   let hasIncomplete = false;
+  let incompleteCount = 0;
   const incompleteExplicit: Array<{ path: string; reason: SearchUnavailableReason }> = [];
+  const markIncomplete = (rel: string, explicitReason?: SearchUnavailableReason): void => {
+    hasIncomplete = true;
+    incompleteCount += 1;
+    if (explicitFile && explicitReason !== undefined) incompleteExplicit.push({ path: rel, reason: explicitReason });
+  };
   for (const rel of files) {
     // Explicit targets scan every admitted file fully (correctness over speed).
     // Broad scans stop between files once truncation is proven; each scanned
@@ -786,8 +959,7 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
     try {
       resolved = guard.resolve(workspace, rel);
     } catch {
-      hasIncomplete = true;
-      if (explicitFile) incompleteExplicit.push({ path: rel, reason: "io-error" });
+      markIncomplete(rel, "io-error");
       continue;
     }
     let scan: NodeFallbackFileScan;
@@ -795,8 +967,7 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
       const retainBudget = Math.max(0, options.maxResults - pending.length);
       scan = await scanNodeFallbackFile(resolved.absPath, queryBytes, scanBytes, retainBudget);
     } catch {
-      hasIncomplete = true;
-      if (explicitFile) incompleteExplicit.push({ path: rel, reason: "io-error" });
+      markIncomplete(rel, "io-error");
       continue;
     }
     const totalInFile = scan.keptLines.length + scan.extraCount;
@@ -807,12 +978,9 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
     if (scan.keptLines.length > 0) scanInfoByPath.set(rel, scan);
     const reason = nodeFallbackFileReason(scan);
     if (totalInFile === 0) {
-      if (reason !== null) {
-        hasIncomplete = true;
-        if (explicitFile) incompleteExplicit.push({ path: rel, reason });
-      }
+      if (reason !== null) markIncomplete(rel, reason);
     } else if (scan.scanLimited || scan.race || scan.ioError) {
-      hasIncomplete = true;
+      markIncomplete(rel);
     }
   }
   // Hydrate through the shared pipeline (one scan per file), so match evidence
@@ -855,11 +1023,16 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
     if (explicitFile && incompleteExplicit.length > 0) {
       const details = incompleteExplicit.map((e) => `${e.path}: could not be fully covered (${e.reason}).`).join(" ");
       text = `No matches. ${details} Coverage is incomplete.`;
+    } else if (!explicitFile && hasIncomplete) {
+      text = `No matches.\nCoverage incomplete: ${incompleteCount} file${incompleteCount === 1 ? "" : "s"} could not be fully covered (size/encoding/binary/race limits).`;
     } else {
       text = "No matches.";
     }
   } else {
     text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
+    if (!explicitFile && hasIncomplete) {
+      text += `\nCoverage incomplete: ${incompleteCount} file${incompleteCount === 1 ? "" : "s"} could not be fully covered (size/encoding/binary/race limits).`;
+    }
   }
   return { text, matches, truncated, used: "node" };
 }
@@ -896,7 +1069,7 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
       intent: rawOptions.intent && rawOptions.intent !== "auto" ? rawOptions.intent : "text",
       groups: { definitions: [], references: [], tests: [], configuration: [], documentation: [], other: [] },
       matches: [],
-      coverage: { inventoryFiles: 0, analyzedFiles: 0, scannedBytes: 0, symbolCount: 0, relationshipCount: 0, truncated: true, warnings: ["Repository analysis is disabled by configuration."] },
+      coverage: { inventoryFiles: 0, analyzedFiles: 0, scannedBytes: 0, symbolCount: 0, relationshipCount: 0, truncated: true, oversizedSkippedFiles: 0, warnings: ["Repository analysis is disabled by configuration."] },
       warnings: ["Repository analysis is disabled by configuration."],
       cache: { hit: false, key: "disabled" }
     };
@@ -918,6 +1091,11 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
     // through a path not covered by its own admission loop.
     enforceStructuredSearchScope(structured, resolveSearchScope(guard, workspace, options));
     mergeLexicalProvenance(structured, lexical);
+    // F4-D: an explicit target above the analysis admission is absent from the
+    // inventory, so inventory-derived matches cannot cover it. Source-line
+    // evidence then comes from the bounded hydration route (never a silent
+    // inventory fallback), with truncated coverage and a bounded warning.
+    await appendExplicitLargeFileEvidence(config, guard, workspace, options, query, structured);
     // Binary/NUL files may be found by lexical ripgrep while analysis has no
     // decodable inventory or structured matches. Use both redacted producers
     // before echoing the query, including the regex structured route.
@@ -971,7 +1149,7 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
       intent: rawOptions.intent && rawOptions.intent !== "auto" ? rawOptions.intent : "text",
       groups: { definitions: [], references: [], tests: [], configuration: [], documentation: [], other: [] },
       matches: [],
-      coverage: { inventoryFiles: 0, analyzedFiles: 0, scannedBytes: 0, symbolCount: 0, relationshipCount: 0, truncated: true, warnings: [] },
+      coverage: { inventoryFiles: 0, analyzedFiles: 0, scannedBytes: 0, symbolCount: 0, relationshipCount: 0, truncated: true, oversizedSkippedFiles: 0, warnings: [] },
       warnings: [`Repository analysis unavailable: ${redactDiagnosticText(error instanceof Error ? error.message : String(error))}`],
       cache: { hit: false, key: "unavailable" }
     };

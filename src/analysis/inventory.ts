@@ -21,6 +21,11 @@ function isOrdinaryInventorySkip(error: unknown): boolean {
 
 export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuard, workspace: Workspace): Promise<InventoryResult> {
   const maxFiles = config.analysisLimits.maxInventoryFiles;
+  const admissionBytes = textScanByteLimit(config);
+  // F4-C: oversized exclusions are bounded skip facts, not silent ordinary
+  // skips. Sized here from the pre-admission stat (already in hand) so no
+  // error-message sniffing is needed.
+  let oversizedSkippedFiles = 0;
   const traversalResult = await listFilesDetailed(guard, workspace, {
     root: ".",
     includeHidden: true,
@@ -31,7 +36,11 @@ export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuar
         const resolved = guard.resolve(workspace, relPath);
         const stat = await fsp.stat(resolved.absPath);
         if (!stat.isFile()) return undefined;
-        await guard.assertTextFile(resolved.absPath, textScanByteLimit(config));
+        if (stat.size > admissionBytes) {
+          oversizedSkippedFiles += 1;
+          return undefined;
+        }
+        await guard.assertTextFile(resolved.absPath, admissionBytes);
         const language = classifyLanguage(resolved.relPath);
         return {
           path: resolved.relPath,
@@ -60,6 +69,11 @@ export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuar
       ? [`Inventory truncated at ${maxFiles} files.`]
       : ["Inventory coverage is unresolved before reaching its configured file limit."]
     : [];
+  if (oversizedSkippedFiles > 0) {
+    warnings.push(
+      `${oversizedSkippedFiles} file${oversizedSkippedFiles === 1 ? "" : "s"} exceed${oversizedSkippedFiles === 1 ? "s" : ""} the ${admissionBytes}-byte analysis admission and ${oversizedSkippedFiles === 1 ? "was" : "were"} not analyzed.`
+    );
+  }
   return {
     files,
     fingerprint,
@@ -69,8 +83,9 @@ export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuar
       scannedBytes: 0,
       symbolCount: 0,
       relationshipCount: 0,
-      truncated,
-      warnings
+      truncated: truncated || oversizedSkippedFiles > 0,
+      warnings,
+      oversizedSkippedFiles
     }
   };
 }

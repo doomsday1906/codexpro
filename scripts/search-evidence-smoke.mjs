@@ -768,7 +768,11 @@ function assertInventoryProjection(result, fixture, {
   hiddenPaths,
   truncated,
   unreadable,
-  label
+  label,
+  // Expected oversized-skip count for THIS phase. Defaults to the fixture's
+  // static oversized set; transition phases that rewrite the transition file
+  // to eligible content must pass the reduced count explicitly.
+  oversized
 }) {
   const expected = expectedInventoryPaths(visiblePaths, hiddenPaths);
   const actualPaths = result.structuredContent.files.map((file) => file.path);
@@ -786,9 +790,20 @@ function assertInventoryProjection(result, fixture, {
   assert.equal(coverage.inventoryFiles, expected.length, `${label} eligible inventory count diverged`);
   assert.equal(coverage.analyzedFiles, expected.length, `${label} eligible analyzed count diverged`);
   assert(coverage.scannedBytes > 0, `${label} analysis scanned no eligible source bytes`);
-  assert.equal(coverage.truncated, truncated, `${label} eligibility-aware truncation truth diverged`);
+  // F4-C: oversized exclusions are disclosed as truncated coverage with a
+  // bounded admission warning — they no longer read as complete. `truncated`
+  // still means capacity truncation; oversized truth is OR-ed from the
+  // fixture (or the explicit per-phase override).
+  const oversizedCount = oversized ?? ((fixture.visibleOversizedPaths?.length ?? 0) +
+    (fixture.hiddenOversizedPaths?.length ?? 0) +
+    (fixture.transitionIneligiblePath ? 1 : 0));
+  assert.equal(coverage.truncated, truncated || oversizedCount > 0, `${label} eligibility-aware truncation truth diverged`);
   if (truncated) {
     assert(coverage.warnings.some((warning) => warning.includes(`Inventory truncated at ${ELIGIBLE_CAPACITY_INVENTORY_LIMIT} files.`)), `${label} omitted bounded inventory warning`);
+  }
+  if (oversizedCount > 0) {
+    assert.equal(coverage.oversizedSkippedFiles, oversizedCount, `${label} oversized skip count diverged`);
+    assert(coverage.warnings.some((warning) => /exceeds? the \d+-byte analysis admission/.test(warning)), `${label} omitted bounded admission warning`);
   }
   return {
     paths: actualPaths,
@@ -799,6 +814,7 @@ function assertInventoryProjection(result, fixture, {
       symbolCount: coverage.symbolCount,
       relationshipCount: coverage.relationshipCount,
       truncated: coverage.truncated,
+      oversizedSkippedFiles: coverage.oversizedSkippedFiles,
       warnings: coverage.warnings
     }
   };
@@ -1008,6 +1024,9 @@ async function runEligibilityCacheTransitions({ fixture, client, workspaceId, se
     visiblePaths: [...expectedVisible, transitionPath],
     hiddenPaths: promotedHidden,
     truncated: true,
+    // The transition file currently holds small eligible content, so only the
+    // static hidden oversized set still skips.
+    oversized: fixture.hiddenOversizedPaths.length,
     label: 'ineligible-to-eligible transition'
   });
 

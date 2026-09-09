@@ -54,6 +54,12 @@ export interface AnalysisCoverage {
   relationshipCount: number;
   truncated: boolean;
   warnings: string[];
+  /**
+   * F4-C: files excluded from analysis admission specifically for exceeding
+   * the text scan byte limit (not unreadable, not binary — oversized). They
+   * are bounded counts, never path enumerations.
+   */
+  oversizedSkippedFiles: number;
 }
 
 export interface InventoryResult {

@@ -179,6 +179,7 @@ function fallbackMeasurePayloadBytes(
         symbolCount: 100,
         relationshipCount: 100,
         truncated: true,
+        oversizedSkippedFiles: 0,
         warnings: [BUDGET_TRUNCATION_WARNING]
       },
       warnings: [BUDGET_TRUNCATION_WARNING],
