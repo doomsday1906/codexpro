@@ -8,6 +8,29 @@ export interface HttpDiagnosticCurrentSession {
   readonly inFlightRequests: number;
 }
 
+export interface HttpLifecycleEvent {
+  readonly seq: number;
+  readonly t: number;
+  readonly event:
+    | "initialize_admitted"
+    | "initialize_rejected"
+    | "request_finish"
+    | "session_not_found"
+    | "capacity_evict"
+    | "ttl_expire"
+    | "transport_close";
+  readonly method: string;
+  readonly status: number | null;
+  readonly durationMs: number | null;
+  /** Salted/truncated non-reversible session fingerprint for correlation only. Never a routing id. */
+  readonly fp: string | null;
+  readonly active: number;
+  readonly pending: number;
+  readonly reason: string | null;
+  readonly completed: number | null;
+  readonly idleMs: number | null;
+}
+
 export interface HttpDiagnosticSnapshot {
   readonly active: number;
   readonly max: number;
@@ -24,6 +47,8 @@ export interface HttpDiagnosticSnapshot {
   readonly totalCapacityRejected: number;
   readonly totalInflightEvictionPrevented: number;
   readonly currentSession: HttpDiagnosticCurrentSession | null;
+  /** Process-local lifecycle ring tail (oldest-first, bounded by the HTTP layer). Additive. */
+  readonly recentLifecycleEvents: ReadonlyArray<HttpLifecycleEvent>;
 }
 
 export interface CodexProDiagnosticContext {

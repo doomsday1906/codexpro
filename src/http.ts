@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,7 +20,7 @@ import {
   type WorkspaceProfile
 } from "./profileStore.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
-import { createDiagnosticContext, type CodexProDiagnosticContext, type HttpDiagnosticSnapshot } from "./diagnosticContext.js";
+import { createDiagnosticContext, type CodexProDiagnosticContext, type HttpDiagnosticSnapshot, type HttpLifecycleEvent } from "./diagnosticContext.js";
 import type { WorkspaceDiagnosticReader } from "./guard.js";
 import { createCodexProServer } from "./server.js";
 import { defaultGitPushPolicy, normalizeGitPushPolicy, sanitizeGitPushPolicy, summarizeGitPushPolicy, type GitPushPolicy } from "./gitPushPolicy.js";
@@ -1602,6 +1602,11 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     lastSeenAt: number;
     inFlightRequests: number;
     lifecycle: "active" | "closed" | "expired" | "capacity_evicted";
+    // Completed handleRequest() count on this record (transport-level only:
+    // every method counts the same; no tool/payload content affects it).
+    // Continuity signal for victim scoring: abandoned connects sit at the
+    // lowest counts, one-shot sessions next, recurrently reused sessions higher.
+    completedRequests: number;
   };
 
   const transports = new Map<string, TransportRecord>();
@@ -1619,14 +1624,67 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
   let totalCapacityRejected = 0;
   let totalInflightEvictionPrevented = 0;
 
+  // Bounded process-local lifecycle event ring (observability only: never
+  // changes admission/eviction behavior). Lets future production triage answer
+  // whether a failed request reached RepoConnect, with what status/reason, and
+  // whether its session was reclaimed. LAW-009: fingerprints are salted +
+  // truncated hashes for correlation only; no routing session ids, no auth
+  // material, no query/tool/payload content is ever recorded.
+  const LIFECYCLE_RING_CAP = 128;
+  const LIFECYCLE_RING_EXPOSED = 32;
+  const lifecycleSalt = randomBytes(16).toString("hex");
+  const lifecycleEvents: HttpLifecycleEvent[] = [];
+  let lifecycleSeq = 0;
+
+  function fingerprintSession(sessionId: string): string {
+    return createHash("sha256").update(`${lifecycleSalt}:${sessionId}`).digest("hex").slice(0, 12);
+  }
+
+  function ringEvent(input: {
+    event: HttpLifecycleEvent["event"];
+    method: string;
+    status?: number | null;
+    durationMs?: number | null;
+    fp?: string | null;
+    reason?: string | null;
+    completed?: number | null;
+    idleMs?: number | null;
+  }): void {
+    lifecycleSeq += 1;
+    lifecycleEvents.push(Object.freeze({
+      seq: lifecycleSeq,
+      t: Date.now(),
+      event: input.event,
+      method: input.method,
+      status: input.status ?? null,
+      durationMs: input.durationMs ?? null,
+      fp: input.fp ?? null,
+      active: transports.size,
+      pending: pendingInitializations,
+      reason: input.reason ?? null,
+      completed: input.completed ?? null,
+      idleMs: input.idleMs ?? null
+    }));
+    if (lifecycleEvents.length > LIFECYCLE_RING_CAP) {
+      lifecycleEvents.splice(0, lifecycleEvents.length - LIFECYCLE_RING_CAP);
+    }
+  }
+
   function requestSessionId(req: Request): string | undefined {
     const value = req.headers["mcp-session-id"];
     return Array.isArray(value) ? value[0] : value;
   }
 
-  function sendSessionError(res: Response, sessionId: string | undefined): void {
+  function sendSessionError(res: Response, sessionId: string | undefined, method: string): void {
     const missing = !sessionId;
     const malformed = Boolean(sessionId && !sessionIdPattern.test(sessionId));
+    ringEvent({
+      event: "session_not_found",
+      method,
+      status: missing || malformed ? 400 : 404,
+      fp: sessionId && !missing ? fingerprintSession(sessionId) : null,
+      reason: missing ? "missing_session_id" : malformed ? "malformed_session_id" : "unknown_session"
+    });
     res.status(missing || malformed ? 400 : 404).json({
       jsonrpc: "2.0",
       error: missing
@@ -1638,12 +1696,13 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     });
   }
 
-  function markTransportClosed(record: TransportRecord, reason: "closed" | "expired" | "capacity_evicted"): void {
-    if (record.lifecycle !== "active") return;
+  function markTransportClosed(record: TransportRecord, reason: "closed" | "expired" | "capacity_evicted"): boolean {
+    if (record.lifecycle !== "active") return false;
     record.lifecycle = reason;
     totalClosed += 1;
     if (reason === "expired") totalExpired += 1;
     if (reason === "capacity_evicted") totalCapacityEvicted += 1;
+    return true;
   }
 
   function closeTransport(record: TransportRecord, reason: "expired" | "capacity_evicted"): void {
@@ -1669,21 +1728,79 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
         continue;
       }
       if (now - record.lastSeenAt > config.httpSessionTtlMs) {
+        const idleMs = now - record.lastSeenAt;
+        const completed = record.completedRequests;
         transports.delete(sessionId);
         closeTransport(record, "expired");
+        ringEvent({
+          event: "ttl_expire",
+          method: "prune",
+          fp: fingerprintSession(sessionId),
+          reason: "idle_ttl",
+          completed,
+          idleMs
+        });
       }
     }
   }
 
-  function oldestIdleVictim(): { sessionId: string; record: TransportRecord } | undefined {
+  // Continuity-aware victim selection (LAW-006: idle is not abandonment).
+  //
+  // A zero-in-flight record may still be expected by its client moments later,
+  // and pure oldest-idle-first strands legitimate reusable sessions while
+  // provably one-shot sessions exist to reclaim instead (CLASS-A). Idle
+  // candidates are therefore ordered in two bands:
+  //
+  //   1. Settled sessions (completedRequests >= 2: the initialize handshake
+  //      finished and the session delivered value), ordered by
+  //      (completedRequests ASC, lastSeenAt ASC): abandoned connects that
+  //      settled but were never used meaningfully and one-shot sessions
+  //      reclaim first; recurrently reused sessions survive while any
+  //      less-used settled idle exists; among equals the oldest (least
+  //      recently seen) remains the best abandonment guess.
+  //   2. Unsettled-but-young sessions (completedRequests <= 1 and idle for
+  //      less than HANDSHAKE_GRACE_MS) are mid-handshake newborns, not proven
+  //      garbage: a session is idle with count 1 in the millisecond gap
+  //      between its initialize response and its next request. Evicting them
+  //      first would systematically murder fresh clients under burst churn
+  //      (LAW-007). They are protected while any settled idle exists.
+  //
+  // Unsettled sessions older than the grace are abandoned connects: pure
+  // garbage that never delivered value, reclaimed before anything settled.
+  // When every idle session is mid-handshake young (pure burst), the oldest
+  // such session is reclaimed as a fallback so admission still always
+  // succeeds while any idle exists — fresh clients are never starved and 503
+  // stays reserved for true all-busy pressure. Busy records are never
+  // candidates (LAW-002). Counting is transport-level only (every method
+  // counts the same); tool/payload content never affects survival (LAW-008).
+  const HANDSHAKE_GRACE_MS = 10_000;
+  function continuityAwareVictim(now: number): { sessionId: string; record: TransportRecord; handshakeFallback: boolean } | undefined {
     let victim: { sessionId: string; record: TransportRecord } | undefined;
+    let fallback: { sessionId: string; record: TransportRecord } | undefined;
+    const consider = (
+      slot: { sessionId: string; record: TransportRecord } | undefined,
+      sessionId: string,
+      record: TransportRecord
+    ): { sessionId: string; record: TransportRecord } | undefined => {
+      if (!slot
+        || record.completedRequests < slot.record.completedRequests
+        || (record.completedRequests === slot.record.completedRequests && record.lastSeenAt < slot.record.lastSeenAt)) {
+        return { sessionId, record };
+      }
+      return slot;
+    };
     for (const [sessionId, record] of transports) {
       if (!isIdleRecord(record)) continue;
-      if (!victim || record.lastSeenAt < victim.record.lastSeenAt) {
-        victim = { sessionId, record };
+      const midHandshake = record.completedRequests <= 1 && now - record.lastSeenAt < HANDSHAKE_GRACE_MS;
+      if (midHandshake) {
+        fallback = consider(fallback, sessionId, record);
+      } else {
+        victim = consider(victim, sessionId, record);
       }
     }
-    return victim;
+    if (victim) return { ...victim, handshakeFallback: false };
+    if (fallback) return { ...fallback, handshakeFallback: true };
+    return undefined;
   }
 
   // Synchronous admission gate for a no-session initialize request. Must run
@@ -1695,13 +1812,15 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     pruneTransports();
     if (transports.size + pendingInitializations < config.maxHttpSessions) {
       pendingInitializations += 1;
+      ringEvent({ event: "initialize_admitted", method: "POST", reason: "free_slot" });
       return true;
     }
-    const victim = oldestIdleVictim();
+    const victim = continuityAwareVictim(Date.now());
     if (!victim) {
       // All-busy: fail the NEW work, never an in-flight incumbent.
       totalCapacityRejected += 1;
       totalInflightEvictionPrevented += 1;
+      ringEvent({ event: "initialize_rejected", method: "POST", status: 503, reason: "all_busy" });
       return false;
     }
     // Every busy session older (by activity time) than the chosen idle victim
@@ -1713,7 +1832,16 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     }
     transports.delete(victim.sessionId);
     closeTransport(victim.record, "capacity_evicted");
+    ringEvent({
+      event: "capacity_evict",
+      method: "POST",
+      fp: fingerprintSession(victim.sessionId),
+      reason: victim.handshakeFallback ? "burst_newborn_fallback" : "idle_reclamation",
+      completed: victim.record.completedRequests,
+      idleMs: Date.now() - victim.record.lastSeenAt
+    });
     pendingInitializations += 1;
+    ringEvent({ event: "initialize_admitted", method: "POST", reason: "idle_reclaimed" });
     return true;
   }
 
@@ -1743,6 +1871,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       released = true;
       record.inFlightRequests = Math.max(0, record.inFlightRequests - 1);
       record.lastSeenAt = Date.now();
+      record.completedRequests += 1;
     };
   }
 
@@ -1778,7 +1907,8 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       highWatermark: retainedHighWatermark,
       totalCapacityRejected,
       totalInflightEvictionPrevented,
-      currentSession
+      currentSession,
+      recentLifecycleEvents: Object.freeze(lifecycleEvents.slice(-LIFECYCLE_RING_EXPOSED))
     });
   }
 
@@ -1887,6 +2017,8 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
         let releaseInitRequest: (() => void) | undefined;
         let initAborted = false;
         let initCompleted = false;
+        let initSessionId: string | undefined;
+        const initRequestStart = Date.now();
         // Client went away before any response was produced and before the
         // record materialized: free the reservation exactly once. res "close"
         // is the reliable signal (fires after finish on success with
@@ -1912,6 +2044,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
               return;
             }
             const now = Date.now();
+            initSessionId = newSessionId;
             currentRecord = {
               transport,
               createdAt: now,
@@ -1919,7 +2052,8 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
               // This initialize request itself stays in flight until its
               // response completes (LAW-007).
               inFlightRequests: 1,
-              lifecycle: "active"
+              lifecycle: "active",
+              completedRequests: 0
             };
             transports.set(newSessionId, currentRecord);
             if (transports.size > retainedHighWatermark) retainedHighWatermark = transports.size;
@@ -1933,6 +2067,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
               if (currentRecord) {
                 currentRecord.inFlightRequests = Math.max(0, currentRecord.inFlightRequests - 1);
                 currentRecord.lastSeenAt = Date.now();
+                currentRecord.completedRequests += 1;
               }
             };
             // If the client disconnects and handleRequest never settles, the
@@ -1943,8 +2078,11 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
 
         (transport as any).onclose = () => {
           if (!currentRecord) return;
+          const closedFp = initSessionId ? fingerprintSession(initSessionId) : null;
           removeTransportRecord(currentRecord);
-          markTransportClosed(currentRecord, "closed");
+          if (markTransportClosed(currentRecord, "closed")) {
+            ringEvent({ event: "transport_close", method: "transport", fp: closedFp, reason: "client_close" });
+          }
         };
 
         const diagnosticContext = createDiagnosticContext({
@@ -1965,14 +2103,22 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
           initCompleted = true;
           if (releaseInitRequest) releaseInitRequest();
           else releaseReservation();
+          ringEvent({
+            event: "request_finish",
+            method: "POST",
+            status: res.statusCode,
+            durationMs: Date.now() - initRequestStart,
+            fp: initSessionId ? fingerprintSession(initSessionId) : null
+          });
         }
         return;
       } else {
-        sendSessionError(res, sessionId);
+        sendSessionError(res, sessionId, "POST");
         return;
       }
 
       releaseRequest = trackRequestStart(requestRecord);
+      const postRequestStart = Date.now();
       // If the client disconnects and handleRequest never settles, the slot
       // still releases; idempotent with the finally path below.
       res.on("close", releaseRequest);
@@ -1980,6 +2126,13 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
         await transport.handleRequest(req, res, req.body);
       } finally {
         releaseRequest();
+        ringEvent({
+          event: "request_finish",
+          method: "POST",
+          status: res.statusCode,
+          durationMs: Date.now() - postRequestStart,
+          fp: sessionId ? fingerprintSession(sessionId) : null
+        });
       }
     } catch (error) {
       console.error(error instanceof Error ? error.stack ?? error.message : String(error));
@@ -1997,10 +2150,11 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     const sessionId = requestSessionId(req);
     const record = getTransportRecord(sessionId);
     if (!record) {
-      sendSessionError(res, sessionId);
+      sendSessionError(res, sessionId, req.method);
       return;
     }
     const releaseRequest = trackRequestStart(record);
+    const sessionRequestStart = Date.now();
     // If the client disconnects and handleRequest never settles, the slot
     // still releases; idempotent with the finally path below.
     res.on("close", releaseRequest);
@@ -2008,6 +2162,13 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       await record.transport.handleRequest(req, res);
     } finally {
       releaseRequest();
+      ringEvent({
+        event: "request_finish",
+        method: req.method,
+        status: res.statusCode,
+        durationMs: Date.now() - sessionRequestStart,
+        fp: sessionId ? fingerprintSession(sessionId) : null
+      });
     }
   };
 

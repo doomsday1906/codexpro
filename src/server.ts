@@ -3181,6 +3181,21 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
             high_watermark: httpSnapshot.highWatermark,
             total_capacity_rejected: httpSnapshot.totalCapacityRejected,
             total_inflight_eviction_prevented: httpSnapshot.totalInflightEvictionPrevented,
+            recent_lifecycle_events: httpSnapshot.recentLifecycleEvents.map((entry) => ({
+              seq: entry.seq,
+              t: publicDiagnosticTimestamp(entry.t),
+              age_ms: ageMilliseconds(entry.t, now),
+              event: entry.event,
+              method: entry.method,
+              status: entry.status,
+              duration_ms: entry.durationMs,
+              fp: entry.fp,
+              active: entry.active,
+              pending: entry.pending,
+              reason: entry.reason,
+              completed: entry.completed,
+              idle_ms: entry.idleMs
+            })),
             current_session: httpSnapshot.currentSession
               ? {
                   created_at: publicDiagnosticTimestamp(httpSnapshot.currentSession.createdAt),
