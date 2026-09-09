@@ -197,6 +197,18 @@ async function main() {
       console.log(`ok scan flanks before=${scan.flankBefore.length} after=${scan.flankAfter.length}`);
     }
 
+    // Reviewer R4 companion: a boundary-aligned pre-window (everything retained
+    // from file start) never fabricates bridge suspicion by trimming its first
+    // complete line.
+    {
+      const p = path.join(tmpRoot, 'nobridge.txt');
+      await fsp.writeFile(p, 'const API_KEY = "boundary"\nsecond line here\nthird line here\n');
+      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 2, endLine: 3, chunkBytes: 7 });
+      assert.equal(scan.bridgeSuspect, false, 'fabricated bridge suspicion on retained pre-window');
+      assert.ok(scan.flankBefore.includes('const API_KEY'), 'retained first line dropped from flank');
+      console.log('ok no-fabricated-bridge on boundary-aligned pre-window');
+    }
+
     // Uncertain mask state (window opens inside a block comment): labeled lines forced.
     {
       const text = '/* open comment\nTOKEN = config.prod_value_here\nstill comment\n*/\nconst AFTER = 1;\n';
@@ -277,6 +289,63 @@ async function main() {
         assert.equal(out, whole, `mask segmentation diverged at seg=${seg}`);
       }
       console.log('ok reviewer residual mask segmentation equivalence (closers/escapes/fences)');
+    }
+
+    // Reviewer R4 regression: nuke candidates straddling detector feed cuts are
+    // found exactly once via discovery overlap (no reliance on cut alignment).
+    {
+      const { NukeDetectorStream, TriviaMaskStream } = await import('../dist/sourceProjection.js');
+      const evil = 'const API_KEY = wrap(getToken(q7z\n';
+      const filler = Array.from({ length: 120 }, (_, i) => `const pad${i} = ${i}; // filler ${'y'.repeat(40)}\n`).join('');
+      const text = `${evil}${filler}const after = 1;\n`;
+      const oracleHere = redactSensitiveTextPreservingLines(text, { context: 'source' });
+      assert.ok(oracleHere.includes('[REDACTED_SECRET]'), 'oracle fixture must nuke');
+      for (const seg of [7, 64, 1024, 65536]) {
+        const m = new TriviaMaskStream();
+        const det = new NukeDetectorStream();
+        let fed = 0;
+        let pending = '';
+        const feedM = (chunk) => {
+          const combined = pending + chunk;
+          if (combined.length > 1024) {
+            const cut = combined.length - 1024;
+            det.feed(combined.slice(0, cut), fed);
+            fed += cut;
+            pending = combined.slice(cut);
+          } else {
+            pending = combined;
+          }
+        };
+        for (let i = 0; i < text.length; i += seg) feedM(m.feed(text.slice(i, i + seg)));
+        feedM(m.flush());
+        if (pending) det.feed(pending, fed);
+        assert.ok(det.result() >= 0, `straddled candidate missed at seg=${seg}`);
+        assert.equal(det.result(), text.indexOf('('), `wrong trigger at seg=${seg}`);
+      }
+      console.log('ok reviewer-R4 straddled candidate triggers at every segmentation');
+    }
+
+    // Reviewer R5 regression: CRLF span mapping is terminator-exact (no +1/line drift).
+    {
+      const keyBlock = '-----BEGIN RSA PRIVATE KEY-----\r\nCRLFMAPBODYONE7X9\r\nCRLFMAPBODYTWO7X9\r\n-----END RSA PRIVATE KEY-----\r\n';
+      const crlfFiller = Array.from({ length: 200 }, (_, i) => `filler line ${i} data data data\r\n`).join('');
+      const text = `${keyBlock}${crlfFiller}postlude line here\r\n`;
+      const p = path.join(tmpRoot, 'crlf-map.txt');
+      await fsp.writeFile(p, text);
+      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 150, endLine: 155, chunkBytes: 64 });
+      assert.ok(scan.privateKeySpans.length > 0, 'key spans missing');
+      const { lines, offsets } = lineOffsets(text);
+      const window = scan.selected.filter((entry) => entry.lineNo >= 150 && entry.lineNo <= 155);
+      // entries carry exact offsets: verify against oracle string offsets
+      const oracle = redactSensitiveTextPreservingLines(text, { context: 'source' }).split('\n');
+      for (const entry of window) {
+        const expectedStart = offsets[entry.lineNo - 1];
+        assert.equal(entry.startOffset, expectedStart, `CRLF offset drift at line ${entry.lineNo}`);
+      }
+      const projected = projectLargeWindow({ scan, window }, redactSlice);
+      const oracleWindow = oracle.map((line) => (line.endsWith('\r') ? line.slice(0, -1) : line)).slice(149, 155);
+      assert.deepEqual(projected.lines, oracleWindow, 'CRLF projection diverged from oracle');
+      console.log('ok reviewer-R5 CRLF span mapping exact');
     }
 
     // AP-009: large benign source stays fully visible (no secret-treating).

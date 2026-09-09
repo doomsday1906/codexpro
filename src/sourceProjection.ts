@@ -351,49 +351,77 @@ interface NukeCandidate {
   opening: number;
   balance: number;
   min: number;
+  bornFeed: number;
 }
+
+/** Discovery lookbehind: retained masked tail re-scanned with each segment. Must exceed any credential-match length. */
+const NUKE_DISCOVERY_OVERLAP = 1024;
 
 /**
  * Streaming replica of `unmatchedCredentialParenthesisStart`: masked-text
  * candidate detection with per-candidate (balance, min) tracking in absolute
  * offset order. Matched candidates are pruned; at most NUKE_CANDIDATE_CAP are
  * tracked and overflow resolves conservative (trigger at 0).
+ *
+ * Candidate discovery runs over retained history plus the new segment, so
+ * matches straddling feed cuts are still found exactly once (deduped by
+ * absolute opening); paren accounting applies strictly once per position.
  */
 export class NukeDetectorStream {
   private readonly candidates: NukeCandidate[] = [];
   private overflow = false;
   private readonly cap: number;
+  private history = "";
+  private historyBase = 0;
+  private feedId = 0;
   constructor(cap = NUKE_CANDIDATE_CAP) {
     this.cap = cap;
   }
   /** Feed one masked segment with its absolute base offset. Segments must be fed once, in order. */
   feed(maskedSegment: string, baseOffset: number): void {
-    const openings: Array<{ at: number; off: number }> = [];
+    const myId = this.feedId++;
+    // 1. Discovery over history + new segment (absolute coordinates).
+    const windowText = this.history + maskedSegment;
+    const windowBase = this.historyBase;
+    const seen = new Set<number>(this.candidates.map((candidate) => candidate.opening));
     NUKE_CANDIDATE_PATTERN.lastIndex = 0;
     let match: RegExpExecArray | null;
-    while ((match = NUKE_CANDIDATE_PATTERN.exec(maskedSegment)) !== null) {
-      const localOpen = maskedSegment.indexOf("(", match.index);
-      if (localOpen >= 0) openings.push({ at: localOpen, off: baseOffset + localOpen });
-    }
-    openings.sort((a, b) => a.off - b.off);
-    let next = 0;
-    for (let i = 0; i < maskedSegment.length; i += 1) {
-      while (next < openings.length && openings[next].at === i) {
-        if (this.candidates.length < this.cap) {
-          // The opening paren itself counts first, mirroring the oracle loop.
-          this.candidates.push({ opening: openings[next].off, balance: 1, min: 1 });
-        } else {
-          this.overflow = true;
+    while ((match = NUKE_CANDIDATE_PATTERN.exec(windowText)) !== null) {
+      const localOpen = windowText.indexOf("(", match.index);
+      if (localOpen < 0) continue;
+      const opening = windowBase + localOpen;
+      if (seen.has(opening)) continue;
+      seen.add(opening);
+      // Suffix balance/min from the opening through the window end, mirroring
+      // the oracle's depth-scan prefix. A suffix returning to zero is a matched
+      // paren pair, not a trigger.
+      let balance = 0;
+      let min = Number.POSITIVE_INFINITY;
+      let matched = false;
+      for (let k = localOpen; k < windowText.length; k += 1) {
+        const c = windowText[k];
+        if (c !== "(" && c !== ")") continue;
+        balance += c === "(" ? 1 : -1;
+        if (balance < min) min = balance;
+        if (balance === 0) {
+          matched = true;
+          break;
         }
-        next += 1;
       }
+      if (matched) continue;
+      if (this.candidates.length < this.cap) {
+        this.candidates.push({ opening, balance, min, bornFeed: myId });
+      } else {
+        this.overflow = true;
+      }
+    }
+    // 2. Accounting: new-segment parens only, for earlier-born candidates.
+    for (let i = 0; i < maskedSegment.length; i += 1) {
       const c = maskedSegment[i];
       if (c !== "(" && c !== ")") continue;
       const cursor = baseOffset + i;
       for (const candidate of this.candidates) {
-        // Every paren strictly after a candidate's own opening counts toward
-        // it — including other candidates' openings, exactly like the oracle's
-        // depth scan. Only the candidate's own opening is already counted.
+        if (candidate.bornFeed === myId) continue;
         if (candidate.opening >= cursor) continue;
         candidate.balance += c === "(" ? 1 : -1;
         if (candidate.balance < candidate.min) candidate.min = candidate.balance;
@@ -402,13 +430,14 @@ export class NukeDetectorStream {
         if (this.candidates[j].balance === 0) this.candidates.splice(j, 1);
       }
     }
-    while (next < openings.length) {
-      if (this.candidates.length < this.cap) {
-        this.candidates.push({ opening: openings[next].off, balance: 1, min: 1 });
-      } else {
-        this.overflow = true;
-      }
-      next += 1;
+    // 3. Retain the discovery tail.
+    const combined = this.history + maskedSegment;
+    if (combined.length > NUKE_DISCOVERY_OVERLAP) {
+      const cut = combined.length - NUKE_DISCOVERY_OVERLAP;
+      this.history = combined.slice(cut);
+      this.historyBase += cut;
+    } else {
+      this.history = combined;
     }
   }
   /** -1 when no trigger; otherwise the first unmatched offset (0 on overflow). */
@@ -554,6 +583,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
 
   // Flank context (fixed bounds; context only, never returned).
   let preTail = "";
+  let preTailCut = false;
   let preGiant = false;
   let flankBefore = "";
   let flankBridgeSuspect = false;
@@ -579,11 +609,25 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         preGiant = true;
       } else {
         preTail += record;
-        if (preTail.length > FLANK_RING_CHARS) preTail = preTail.slice(-WINDOW_FLANK_BYTES);
+        if (preTail.length > FLANK_RING_CHARS) {
+          preTail = preTail.slice(-WINDOW_FLANK_BYTES);
+          preTailCut = true;
+        }
       }
     }
     if (wantSelect && completed === selectStart) {
-      const trimmed = trimFlankBefore(preTail.slice(-WINDOW_FLANK_BYTES));
+      // The retained pre-window text starts at file offset 0 (complete lines)
+      // unless the ring cut it or it exceeds the flank bound; only a genuinely
+      // mid-line start is trimmed, so bridge suspicion is never fabricated.
+      let flankSource = preTail;
+      let startsAtBoundary = !preTailCut;
+      if (flankSource.length > WINDOW_FLANK_BYTES) {
+        flankSource = flankSource.slice(-WINDOW_FLANK_BYTES);
+        startsAtBoundary = false;
+      }
+      const trimmed = startsAtBoundary
+        ? { flank: flankSource, bridgeSuspect: false }
+        : trimFlankBefore(flankSource);
       flankBefore = trimmed.flank;
       flankBridgeSuspect = trimmed.bridgeSuspect || preGiant;
       preTail = "";
@@ -1104,19 +1148,13 @@ export function projectLargeWindow(
   if (scan.maskAtWindowStart === null || scan.maskAtWindowStart.offset !== window[0].startOffset) {
     throw new CodexProError("Projection window offsets disagree with the scan snapshot.");
   }
-  const windowStartOffset = window[0].startOffset;
   const rawLines = window.map((entry) => entry.text);
   const flankBefore = scan.flankBefore;
   const flankAfter = scan.flankAfter;
   const bridgeSuspect = scan.bridgeSuspect;
-  const lineStarts: number[] = [];
-  {
-    let cursor = windowStartOffset;
-    for (const line of rawLines) {
-      lineStarts.push(cursor);
-      cursor += line.length + 1; // +1 for the terminator (offsets are advisory past content)
-    }
-  }
+  // Exact per-line string offsets from the scan (terminator-aware: CRLF counts
+  // two). Never recomputed with +1/line arithmetic here.
+  const lineStarts: number[] = window.map((entry) => entry.startOffset);
   // Stage 1: exact private-key mapping from full-stream spans.
   const keyMapped = applyPrivateKeySpansToLines(rawLines, lineStarts, scan.privateKeySpans);
   // Stage 2: credential/direct patterns over the flanked slice. The window is
