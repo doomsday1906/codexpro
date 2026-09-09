@@ -110,10 +110,41 @@ export interface WorkspaceAnalysis {
   cache: { hit: boolean; key: string };
 }
 
+/** Source-line evidence status: benign text present, actually redacted, or not producible. */
+export type SearchTextStatus = "available" | "redacted" | "unavailable";
+
+/** Bounded machine-readable reason for `unavailable` source context. */
+export type SearchUnavailableReason =
+  | "binary"
+  | "invalid-encoding"
+  | "race"
+  | "scan-limit"
+  | "io-error"
+  | "line-too-large"
+  | "capture-capped";
+
+/**
+ * Stable marker for source context that could not be produced for a bounded
+ * operational reason. Never the secret marker: `unavailable` is not `redacted`.
+ */
+export const UNAVAILABLE_SEARCH_CONTEXT = "[SOURCE_CONTEXT_UNAVAILABLE]";
+
+/** Actual secret redaction occurred in this text (either marker form). */
+export function searchTextLooksRedacted(text: string): boolean {
+  return text.includes("[REDACTED_SECRET]") || text.includes("[REDACTED_PRIVATE_KEY]");
+}
+
+/** Status for derived (non-source-line) evidence text: redacted only when markers prove it. */
+export function statusForDerivedSearchText(text: string): SearchTextStatus {
+  return searchTextLooksRedacted(text) ? "redacted" : "available";
+}
+
 export interface StructuredSearchMatch {
   path: string;
   line: number;
   text: string;
+  text_status: SearchTextStatus;
+  reason?: SearchUnavailableReason;
   group: AnalysisResultGroup;
   score: number;
   reasons: string[];

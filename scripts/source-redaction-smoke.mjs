@@ -3632,8 +3632,13 @@ try {
   }), 'binary private-key search');
   assert.deepEqual(
     binaryPrivateSearch.structuredContent.matches?.map((match) => ({ line: match.line, text: match.text })),
-    [{ line: 2, text: '[REDACTED_SECRET]' }],
-    'binary private-key search did not fail closed when full-file context was unavailable'
+    [{ line: 2, text: '[SOURCE_CONTEXT_UNAVAILABLE]' }],
+    'binary private-key search did not report unavailable context distinctly from redaction'
+  );
+  assert.deepEqual(
+    binaryPrivateSearch.structuredContent.matches?.map((match) => ({ line: match.line, text_status: match.text_status, reason: match.reason })),
+    [{ line: 2, text_status: 'unavailable', reason: 'binary' }],
+    'binary private-key search omitted honest unavailable status'
   );
   assert.equal(resultText(binaryPrivateSearch).includes(binaryPrivateBody), false, 'binary private-key search leaked through its content envelope');
   assert.equal(structuredStringFields(binaryPrivateSearch.structuredContent).some((text) => text.includes(binaryPrivateBody)), false, 'binary private-key search leaked through nested structured strings');
@@ -3652,8 +3657,13 @@ try {
     }), `mixed-case private-key ${label} structured search`);
     assert.deepEqual(
       mixedPrivateStructured.structuredContent.matches?.map((match) => ({ line: match.line, text: match.text })),
-      [{ line: 2, text: '[REDACTED_SECRET]' }],
-      `mixed-case private-key ${label} search changed its fail-closed lexical match`
+      [{ line: 2, text: '[SOURCE_CONTEXT_UNAVAILABLE]' }],
+      `mixed-case private-key ${label} search changed its unavailable lexical match`
+    );
+    assert.deepEqual(
+      mixedPrivateStructured.structuredContent.matches?.map((match) => ({ line: match.line, text_status: match.text_status, reason: match.reason })),
+      [{ line: 2, text_status: 'unavailable', reason: 'binary' }],
+      `mixed-case private-key ${label} search omitted honest unavailable status`
     );
     assert.equal(mixedPrivateStructured.structuredContent.matches?.[0]?.path, 'mixed-private.ts', `mixed-case private-key ${label} search hid its source path`);
     assert.equal(mixedPrivateStructured.structuredContent.analysis?.query, '[REDACTED_SECRET]', `mixed-case private-key ${label} search echoed its raw query`);
@@ -3667,8 +3677,13 @@ try {
   }), 'invalid UTF-8 private-key structured search');
   assert.deepEqual(
     invalidPrivateStructured.structuredContent.analysis?.matches?.map((match) => ({ line: match.line, text: match.text })),
-    [{ line: 2, text: '[REDACTED_SECRET]' }],
-    'invalid UTF-8 private-key analysis did not fail closed'
+    [{ line: 2, text: '[SOURCE_CONTEXT_UNAVAILABLE]' }],
+    'invalid UTF-8 private-key analysis did not report unavailable context'
+  );
+  assert.deepEqual(
+    invalidPrivateStructured.structuredContent.analysis?.matches?.map((match) => ({ line: match.line, text_status: match.text_status, reason: match.reason })),
+    [{ line: 2, text_status: 'unavailable', reason: 'invalid-encoding' }],
+    'invalid UTF-8 private-key analysis omitted honest unavailable status'
   );
   assert.equal(resultText(invalidPrivateStructured).includes(invalidPrivateBody), false, 'invalid UTF-8 private-key search leaked through its content envelope');
   assert.equal(structuredStringFields(invalidPrivateStructured.structuredContent).some((text) => text.includes(invalidPrivateBody)), false, 'invalid UTF-8 private-key analysis leaked through nested structured strings');

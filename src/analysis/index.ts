@@ -11,9 +11,15 @@ import { buildRelationshipsWithCoverage, IMPACT_TRAVERSAL_TRUNCATION_WARNING, tr
 import { inventoryWorkspace } from "./inventory.js";
 import { BUDGET_TRUNCATION_WARNING, classifyDefinitionMatch, classifySearchIntent, emptySearchGroups, groupForFile, MANDATORY_BUDGET_OVERFLOW_WARNING, scheduleStructuredMatches, sortStructuredMatches } from "./rank.js";
 import { resolveSearchScope, searchScopeCacheKey } from "./scope.js";
-import type { AnalysisSearchIntent, StructuredSearchMatch, StructuredSearchResult, WorkspaceAnalysis } from "./types.js";
-
-const REDACTED_SEARCH_CONTEXT = "[REDACTED_SECRET]";
+import type {
+  AnalysisSearchIntent,
+  SearchTextStatus,
+  SearchUnavailableReason,
+  StructuredSearchMatch,
+  StructuredSearchResult,
+  WorkspaceAnalysis
+} from "./types.js";
+import { statusForDerivedSearchText, UNAVAILABLE_SEARCH_CONTEXT } from "./types.js";
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const MAX_ADDITIONAL_OCCURRENCE_LINES = 16;
 const CONFIDENCE_RANK: Record<StructuredSearchMatch["confidence"], number> = { exact: 0, inferred: 1, strong: 2 };
@@ -157,12 +163,16 @@ class StructuredEvidenceAccumulator {
   }
 }
 
-function decodeSearchBuffer(buffer: Buffer): { text: string; contextAvailable: boolean } {
-  if (buffer.includes(0)) return { text: buffer.toString("utf8"), contextAvailable: false };
+function decodeSearchBuffer(buffer: Buffer): {
+  text: string;
+  contextAvailable: boolean;
+  reason?: SearchUnavailableReason;
+} {
+  if (buffer.includes(0)) return { text: buffer.toString("utf8"), contextAvailable: false, reason: "binary" };
   try {
     return { text: UTF8_DECODER.decode(buffer), contextAvailable: true };
   } catch {
-    return { text: buffer.toString("utf8"), contextAvailable: false };
+    return { text: buffer.toString("utf8"), contextAvailable: false, reason: "invalid-encoding" };
   }
 }
 
@@ -302,6 +312,7 @@ export async function searchWorkspaceStructured(
   let impactTraversalTruncated = false;
   let skippedFiles = 0;
   const firstTestLineText = new Map<string, string>();
+  const firstTestLineStatus = new Map<string, { text_status: SearchTextStatus; reason?: SearchUnavailableReason }>();
 
   const scopedFiles = analysis.files.filter((file) => includePath(file.path));
 
@@ -320,6 +331,7 @@ export async function searchWorkspaceStructured(
     }
     let text: string;
     let contextAvailable = true;
+    let unavailableReason: SearchUnavailableReason = "io-error";
     let sourceBytes = 0;
     try {
       const resolved = guard.resolve(workspace, file.path);
@@ -328,6 +340,7 @@ export async function searchWorkspaceStructured(
       const decoded = decodeSearchBuffer(buffer);
       text = decoded.text;
       contextAvailable = decoded.contextAvailable;
+      if (decoded.reason !== undefined) unavailableReason = decoded.reason;
     } catch {
       skippedFiles += 1;
       continue;
@@ -342,6 +355,17 @@ export async function searchWorkspaceStructured(
     const definitions = definitionsByPath.get(file.path) ?? new Map();
     const lines = text.split(/\r?\n/);
     let redactedLines: string[] | null | undefined = contextAvailable ? undefined : null;
+    // Per-line evidence status for this file: unavailable carries the bounded
+    // reason; redacted means policy actually changed the raw line.
+    const lineStatus = (index: number): { text_status: SearchTextStatus; reason?: SearchUnavailableReason } => {
+      if (!contextAvailable) return { text_status: "unavailable", reason: unavailableReason };
+      const raw = lines[index] ?? "";
+      const redacted = redactedLines?.[index];
+      if (redacted === undefined) return { text_status: "unavailable", reason: unavailableReason };
+      return redacted !== raw ? { text_status: "redacted" } : { text_status: "available" };
+    };
+    const lineText = (index: number): string =>
+      (contextAvailable ? (redactedLines?.[index] ?? UNAVAILABLE_SEARCH_CONTEXT) : UNAVAILABLE_SEARCH_CONTEXT).trim().slice(0, 400);
     if (file.role === "test") {
       if (contextAvailable) {
         redactedLines = redactSensitiveTextPreservingLines(text, {
@@ -349,7 +373,8 @@ export async function searchWorkspaceStructured(
           language: sourceLanguageForPath(file.path)
         }).split(/\r?\n/);
       }
-      firstTestLineText.set(file.path, (redactedLines?.[0] ?? REDACTED_SEARCH_CONTEXT).trim().slice(0, 400));
+      firstTestLineText.set(file.path, lineText(0));
+      firstTestLineStatus.set(file.path, lineStatus(0));
     }
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index];
@@ -393,7 +418,8 @@ export async function searchWorkspaceStructured(
       const admitted = accumulator.add({
         path: file.path,
         line: index + 1,
-        text: (redactedLines?.[index] ?? REDACTED_SEARCH_CONTEXT).trim().slice(0, 400),
+        text: lineText(index),
+        ...lineStatus(index),
         group,
         score,
         reasons,
@@ -438,10 +464,12 @@ export async function searchWorkspaceStructured(
         : (res.depth === 1 ? 170 : 162);
       const line = res.line;
       if (typeof line !== "number" || !Number.isInteger(line) || line < 1) continue;
+      const impactText = res.text ?? `${res.kind} ${res.target ?? res.via ?? [...definitionPaths][0] ?? query}`;
       const admitted = accumulator.add({
         path: res.path,
         line,
-        text: res.text ?? `${res.kind} ${res.target ?? res.via ?? [...definitionPaths][0] ?? query}`,
+        text: impactText,
+        text_status: statusForDerivedSearchText(impactText),
         group,
         score,
         reasons: res.reasons,
@@ -464,14 +492,27 @@ export async function searchWorkspaceStructured(
         const matchesQuery = queryStem.length > 3 && fileLower.replace(/[^a-z0-9]/g, "").includes(queryStem);
         if (matchesDef || matchesQuery) {
           const physicalEntries = accumulator.entriesFor(file.path, "tests");
+          const fallbackStatus: { text_status: SearchTextStatus; reason?: SearchUnavailableReason } =
+            firstTestLineStatus.get(file.path) ?? { text_status: "unavailable", reason: "io-error" };
           const fallbackEntries = physicalEntries.length > 0
-            ? physicalEntries
-            : [{ line: 1, text: firstTestLineText.get(file.path) ?? REDACTED_SEARCH_CONTEXT }];
+            ? physicalEntries.map((entry) => ({
+              line: entry.line,
+              text: entry.text,
+              text_status: entry.text_status ?? statusForDerivedSearchText(entry.text),
+              reason: entry.reason
+            }))
+            : [{
+              line: 1,
+              text: firstTestLineText.get(file.path) ?? UNAVAILABLE_SEARCH_CONTEXT,
+              ...fallbackStatus
+            }];
           for (const physical of fallbackEntries) {
             accumulator.add({
               path: file.path,
               line: physical.line,
               text: physical.text,
+              text_status: physical.text_status,
+              ...(physical.reason === undefined ? {} : { reason: physical.reason }),
               group: "tests",
               score: 150,
               reasons: ["dependent test", "related test", "test filename matches definition"],
@@ -497,10 +538,12 @@ export async function searchWorkspaceStructured(
       if (typeof line !== "number" || !Number.isInteger(line) || line < 1) continue;
       const reason = relationship.kind === "tests" ? "dependent test" : "dependent module";
       const score = relationship.kind === "tests" ? 140 : 165;
+      const relationshipText = relationship.text ?? `${relationship.kind} ${relationship.to}`;
       const admitted = accumulator.add({
         path: relationship.from,
         line,
-        text: relationship.text ?? `${relationship.kind} ${relationship.to}`,
+        text: relationshipText,
+        text_status: statusForDerivedSearchText(relationshipText),
         group,
         score,
         reasons: [reason, `${relationship.kind} relationship`],

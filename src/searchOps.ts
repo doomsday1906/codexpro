@@ -1,6 +1,7 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import { TextDecoder } from "node:util";
 import type { CodexProConfig } from "./config.js";
@@ -8,8 +9,32 @@ import type { Workspace } from "./guard.js";
 import { CodexProError, PathGuard } from "./guard.js";
 import { isHiddenRelativePath, listFiles, textScanByteLimit } from "./fsOps.js";
 import { redactDiagnosticText, redactSearchQuery, redactSensitiveTextPreservingLines, sourceLanguageForPath, truncateUtf8 } from "./redact.js";
+import {
+  FIXED_SNAPSHOT_BYTES,
+  SOURCE_SCAN_LIMIT_BYTES,
+  projectLargeWindow,
+  scanWorkingTreeFile,
+  type SourceScan
+} from "./sourceProjection.js";
 import { searchWorkspaceStructured, type AnalysisSearchIntent, type StructuredSearchMatch, type StructuredSearchResult } from "./analysis/index.js";
+import {
+  UNAVAILABLE_SEARCH_CONTEXT,
+  statusForDerivedSearchText,
+  type SearchTextStatus,
+  type SearchUnavailableReason
+} from "./analysis/types.js";
 import { resolveSearchScope } from "./analysis/scope.js";
+
+export type { SearchTextStatus, SearchUnavailableReason };
+export { UNAVAILABLE_SEARCH_CONTEXT };
+
+export interface SearchMatch {
+  path: string;
+  line: number;
+  text: string;
+  text_status: SearchTextStatus;
+  reason?: SearchUnavailableReason;
+}
 
 export interface SearchOptions {
   query: string;
@@ -26,7 +51,7 @@ export interface SearchOptions {
 
 export interface SearchResult {
   text: string;
-  matches: Array<{ path: string; line: number; text: string }>;
+  matches: SearchMatch[];
   truncated: boolean;
   used: "ripgrep" | "node";
   analysis?: StructuredSearchResult;
@@ -47,8 +72,6 @@ function truncateLine(line: string, max = 400): string {
   return `${line.slice(0, max)}…`;
 }
 
-type RedactedSearchLines = string[] | null;
-const REDACTED_SEARCH_CONTEXT = "[REDACTED_SECRET]";
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const RIPGREP_PARTIAL_RECORD_MAX_BYTES = 64 * 1024;
 
@@ -59,15 +82,6 @@ function decodeSearchText(buffer: Buffer): string | null {
   } catch {
     return null;
   }
-}
-
-function redactSearchBuffer(buffer: Buffer, relativePath?: string): RedactedSearchLines {
-  const source = decodeSearchText(buffer);
-  if (source === null) return null;
-  return redactSensitiveTextPreservingLines(source, {
-    context: "source",
-    language: sourceLanguageForPath(relativePath ?? "")
-  }).split(/\r?\n/);
 }
 
 async function readSearchBufferBounded(absPath: string, limit: number): Promise<Buffer | null> {
@@ -92,26 +106,237 @@ async function readSearchBufferBounded(absPath: string, limit: number): Promise<
   }
 }
 
-async function loadRedactedSearchLines(
+export interface HydratedSearchLine {
+  readonly line: number;
+  readonly text: string;
+  readonly text_status: SearchTextStatus;
+  readonly reason?: SearchUnavailableReason;
+}
+
+function unavailableLine(line: number, reason: SearchUnavailableReason): HydratedSearchLine {
+  return { line, text: UNAVAILABLE_SEARCH_CONTEXT, text_status: "unavailable", reason };
+}
+
+/**
+ * Hydrate requested source lines through the shared bounded-source pipeline
+ * with exactly one scan per file per call. Small sources use the accepted
+ * complete-snapshot oracle (with path-derived language); large sources use
+ * the secure bounded projector — the same evidence the read routes return.
+ * Failures are `unavailable` with a bounded reason; only actual policy
+ * suppression is `redacted`. `[REDACTED_SECRET]` is never an unavailability
+ * placeholder here.
+ */
+export async function hydrateSearchLines(
   config: CodexProConfig,
   guard: PathGuard,
   workspace: Workspace,
-  relativePath: string
-): Promise<RedactedSearchLines> {
+  relativePath: string,
+  lineNumbers: number[]
+): Promise<Map<number, HydratedSearchLine>> {
+  const unique = [...new Set(lineNumbers.filter((line) => Number.isSafeInteger(line) && line >= 1))].sort((a, b) => a - b);
+  const result = new Map<number, HydratedSearchLine>();
+  if (unique.length === 0) return result;
+  const failAll = (reason: SearchUnavailableReason): Map<number, HydratedSearchLine> => {
+    for (const line of unique) result.set(line, unavailableLine(line, reason));
+    return result;
+  };
+  let resolved;
   try {
-    const resolved = guard.resolve(workspace, relativePath);
-    const buffer = await readSearchBufferBounded(resolved.absPath, textScanByteLimit(config));
-    return buffer ? redactSearchBuffer(buffer, relativePath) : null;
+    resolved = guard.resolve(workspace, relativePath);
   } catch {
-    return null;
+    return failAll("io-error");
   }
+  // Cluster far-apart lines so each bounded scan covers a tight span: one scan
+  // in the common clustered case, sequential bounded scans otherwise. Memory
+  // stays capped per scan; a cluster wider than the capture cap still reports
+  // its tail truthfully instead of failing the whole hydration.
+  const clusters: number[][] = [];
+  for (const line of unique) {
+    const current = clusters[clusters.length - 1];
+    if (current !== undefined && line - current[current.length - 1] <= CLUSTER_LINE_GAP) {
+      current.push(line);
+    } else {
+      clusters.push([line]);
+    }
+  }
+  const merged = new Map<number, HydratedSearchLine>();
+  for (const cluster of clusters) {
+    const partial = await hydrateSearchCluster(resolved.absPath, relativePath, cluster);
+    for (const [line, hydrated] of partial) merged.set(line, hydrated);
+  }
+  return merged;
 }
 
-function selectRedactedSearchLine(lines: RedactedSearchLines, lineNumber: number): string {
-  const contextualLine = lines?.[lineNumber - 1];
-  return contextualLine === undefined
-    ? REDACTED_SEARCH_CONTEXT
-    : truncateLine(contextualLine);
+/** Lines farther apart than this start a new hydration scan cluster. */
+const CLUSTER_LINE_GAP = 10000;
+
+async function hydrateSearchCluster(
+  absPath: string,
+  relativePath: string,
+  unique: number[]
+): Promise<Map<number, HydratedSearchLine>> {
+  const result = new Map<number, HydratedSearchLine>();
+  const failAll = (reason: SearchUnavailableReason): Map<number, HydratedSearchLine> => {
+    for (const line of unique) result.set(line, unavailableLine(line, reason));
+    return result;
+  };
+  const minLine = unique[0];
+  const maxLine = unique[unique.length - 1];
+  let scan;
+  try {
+    scan = await scanWorkingTreeFile(fsp, { absPath, startLine: minLine, endLine: maxLine });
+  } catch (error) {
+    if (error && typeof error === "object" && "reason" in error) {
+      const reason = (error as { reason?: unknown }).reason;
+      if (reason === "race") return failAll("race");
+      if (reason === "source_scan_limit") return failAll("scan-limit");
+    }
+    return failAll("io-error");
+  }
+  if (scan.nulFound) return failAll("binary");
+  if (!scan.utf8Valid) return failAll("invalid-encoding");
+  if (scan.bytes <= FIXED_SNAPSHOT_BYTES) {
+    return hydrateSnapshotLines(absPath, scan, relativePath, unique);
+  }
+  return hydrateLargeLines(scan, unique);
+}
+
+async function hydrateSnapshotLines(
+  absPath: string,
+  scan: SourceScan,
+  relPath: string,
+  unique: number[]
+): Promise<Map<number, HydratedSearchLine>> {
+  const result = new Map<number, HydratedSearchLine>();
+  const missing = (reason: SearchUnavailableReason): void => {
+    for (const line of unique) {
+      if (!result.has(line)) result.set(line, unavailableLine(line, reason));
+    }
+  };
+  // Bounded re-read with content-addressed coherence against the scan.
+  let buffer: Buffer;
+  try {
+    const handle = await fsp.open(absPath, "r");
+    try {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      const slab = Buffer.allocUnsafe(64 * 1024);
+      for (;;) {
+        const { bytesRead } = await handle.read(slab, 0, slab.length, null);
+        if (bytesRead === 0) break;
+        total += bytesRead;
+        if (total > scan.bytes + 65536) {
+          missing("race");
+          return result;
+        }
+        chunks.push(Buffer.from(slab.subarray(0, bytesRead)));
+      }
+      buffer = Buffer.concat(chunks);
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  } catch {
+    missing("io-error");
+    return result;
+  }
+  if (buffer.byteLength !== scan.bytes || createHash("sha256").update(buffer).digest("hex") !== scan.sha256) {
+    missing("race");
+    return result;
+  }
+  const text = buffer.toString("utf8");
+  const redacted = redactSensitiveTextPreservingLines(text, {
+    context: "source",
+    language: sourceLanguageForPath(relPath)
+  });
+  const rawLines = text.replace(/\r\n/g, "\n").split("\n");
+  const redactedLines = redacted.replace(/\r\n/g, "\n").split("\n");
+  if (redactedLines.length !== rawLines.length) {
+    missing("io-error");
+    return result;
+  }
+  for (const line of unique) {
+    const raw = rawLines[line - 1];
+    if (raw === undefined) {
+      result.set(line, unavailableLine(line, "io-error"));
+      continue;
+    }
+    const red = redactedLines[line - 1] ?? "";
+    result.set(line, {
+      line,
+      text: truncateLine(red),
+      text_status: red !== raw ? "redacted" : "available"
+    });
+  }
+  return result;
+}
+
+function hydrateLargeLines(
+  scan: SourceScan,
+  unique: number[]
+): Map<number, HydratedSearchLine> {
+  const result = new Map<number, HydratedSearchLine>();
+  if (scan.maskAtWindowStart === null) {
+    for (const line of unique) result.set(line, unavailableLine(line, "io-error"));
+    return result;
+  }
+  // Project the full contiguous captured range in one call (same decisions as
+  // the read routes), then pick the requested lines out of the projection.
+  let projected: readonly string[];
+  try {
+    projected = projectLargeWindow(
+      { scan, window: scan.selected, windowStartOffset: scan.maskAtWindowStart.offset },
+      (slice) => redactSensitiveTextPreservingLines(slice, { context: "source" })
+    ).lines;
+  } catch {
+    for (const line of unique) result.set(line, unavailableLine(line, "io-error"));
+    return result;
+  }
+  if (projected.length !== scan.selected.length) {
+    for (const line of unique) result.set(line, unavailableLine(line, "io-error"));
+    return result;
+  }
+  // Empty selection means the window started past EOF: every line is past the end.
+  const baseLineNo = scan.selected.length > 0 ? scan.selected[0].lineNo : unique[0];
+  for (const line of unique) {
+    if (line > scan.totalLines) {
+      result.set(line, unavailableLine(line, "io-error"));
+      continue;
+    }
+    const index = line - baseLineNo;
+    const entry = index >= 0 && index < scan.selected.length && scan.selected[index].lineNo === line
+      ? scan.selected[index]
+      : undefined;
+    if (entry === undefined) {
+      result.set(line, unavailableLine(line, "capture-capped"));
+      continue;
+    }
+    if (entry.giant) {
+      result.set(line, unavailableLine(line, "line-too-large"));
+      continue;
+    }
+    const raw = entry.text;
+    const red = projected[index] ?? "";
+    result.set(line, {
+      line,
+      text: truncateLine(red),
+      text_status: red !== raw ? "redacted" : "available"
+    });
+  }
+  return result;
+}
+
+/**
+ * A caller explicitly targeting a file (root resolves to a regular file)
+ * searches it under the independent scan policy instead of the broad
+ * admission ceiling, so large in-scope files stay searchable.
+ */
+async function isExplicitFileTarget(guard: PathGuard, workspace: Workspace, root: string): Promise<boolean> {
+  try {
+    const target = guard.resolve(workspace, root);
+    return (await fsp.stat(target.absPath)).isFile();
+  } catch {
+    return false;
+  }
 }
 
 function mergeLexicalProvenance(structured: StructuredSearchResult, lexical: SearchResult): void {
@@ -143,7 +368,9 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
   if (options.includeHidden === false && isHiddenRelativePath(target.relPath)) {
     return { text: "No matches.", matches: [], truncated: false, used: "ripgrep" };
   }
-  const args = ["--json", "--line-number", "--with-filename", "--no-heading", "--color=never", "--max-columns", "500", "--max-count", "50", "--max-filesize", String(textScanByteLimit(config))];
+  const explicitFile = await isExplicitFileTarget(guard, workspace, options.root ?? ".");
+  const fileSizeCeiling = explicitFile ? SOURCE_SCAN_LIMIT_BYTES : textScanByteLimit(config);
+  const args = ["--json", "--line-number", "--with-filename", "--no-heading", "--color=never", "--max-columns", "500", "--max-count", "50", "--max-filesize", String(fileSizeCeiling)];
   if (!options.regex) args.push("--fixed-strings");
   if (options.includeHidden) args.push("--hidden");
   for (const glob of config.blockedGlobs) args.push("-g", `!${glob}`);
@@ -152,7 +379,6 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
   // Pass the query via -e so patterns beginning with "-" (e.g. "->", "--flag")
   // are treated as the search term instead of ripgrep options.
   args.push("-e", options.query, "--", target.absPath);
-  const redactedLinesByPath = new Map<string, RedactedSearchLines>();
 
   return new Promise((resolve, reject) => {
     const child = spawn("rg", args, { cwd: workspace.root, env: { ...process.env, NO_COLOR: "1" } });
@@ -322,16 +548,30 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
           return;
         }
 
-        const matches: Array<{ path: string; line: number; text: string }> = [];
+        // One shared-pipeline hydration per file: requested lines are grouped so
+        // a large file is scanned once per operation, not once per match.
+        const linesByPath = new Map<string, number[]>();
+        for (const admitted of admittedMatches) {
+          const wanted = linesByPath.get(admitted.path);
+          if (wanted) wanted.push(admitted.line);
+          else linesByPath.set(admitted.path, [admitted.line]);
+        }
+        const hydratedByPath = new Map<string, Map<number, HydratedSearchLine>>();
+        for (const [matchPath, wanted] of linesByPath) {
+          if (settled) return;
+          hydratedByPath.set(matchPath, await hydrateSearchLines(config, guard, workspace, matchPath, wanted));
+        }
+        const matches: SearchMatch[] = [];
         for (const admitted of admittedMatches) {
           if (settled) return;
-          if (!redactedLinesByPath.has(admitted.path)) {
-            redactedLinesByPath.set(admitted.path, await loadRedactedSearchLines(config, guard, workspace, admitted.path));
-          }
+          const line = hydratedByPath.get(admitted.path)?.get(admitted.line) ??
+            { line: admitted.line, text: UNAVAILABLE_SEARCH_CONTEXT, text_status: "unavailable" as const, reason: "io-error" as const };
           matches.push({
             path: admitted.path,
             line: admitted.line,
-            text: selectRedactedSearchLine(redactedLinesByPath.get(admitted.path) ?? null, admitted.line)
+            text: line.text,
+            text_status: line.text_status,
+            ...(line.reason === undefined ? {} : { reason: line.reason })
           });
         }
         if (settled) return;
@@ -353,15 +593,18 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
       "Regex search requires ripgrep. Install rg or retry with regex=false; the Node fallback only supports literal search."
     );
   }
+  const explicitFile = await isExplicitFileTarget(guard, workspace, options.root ?? ".");
   const files = await listFiles(guard, workspace, {
     root: options.root,
     glob: options.glob,
     includeHidden: options.includeHidden,
     maxFiles: 20_000
   });
-  const matches: Array<{ path: string; line: number; text: string }> = [];
+  // Matching admission: broad scans keep the response-budget-derived ceiling;
+  // explicit file targets match under the independent scan policy instead.
+  const scanBytes = explicitFile ? SOURCE_SCAN_LIMIT_BYTES : textScanByteLimit(config);
+  const pending: Array<{ path: string; line: number }> = [];
   let visibleMatches = 0;
-  const scanBytes = textScanByteLimit(config);
   for (const rel of files) {
     if (visibleMatches > options.maxResults) break;
     const resolved = guard.resolve(workspace, rel);
@@ -371,14 +614,12 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
       const source = decodeSearchText(buffer);
       if (source === null) continue;
       const lines = source.split(/\r?\n/);
-      const redactedLines = redactSearchBuffer(buffer, rel);
       for (let i = 0; i < lines.length; i += 1) {
-        const line = lines[i];
-        const hit = line.includes(options.query);
+        const hit = lines[i].includes(options.query);
         if (hit) {
           visibleMatches += 1;
-          if (matches.length < options.maxResults) {
-            matches.push({ path: rel, line: i + 1, text: selectRedactedSearchLine(redactedLines, i + 1) });
+          if (pending.length < options.maxResults) {
+            pending.push({ path: rel, line: i + 1 });
           }
           if (visibleMatches > options.maxResults) break;
         }
@@ -387,6 +628,29 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
       // Skip unreadable files.
     }
   }
+  // Hydrate through the shared pipeline (one scan per file), so match evidence
+  // carries honest available/redacted/unavailable status like the read routes.
+  const linesByPath = new Map<string, number[]>();
+  for (const hit of pending) {
+    const wanted = linesByPath.get(hit.path);
+    if (wanted) wanted.push(hit.line);
+    else linesByPath.set(hit.path, [hit.line]);
+  }
+  const hydratedByPath = new Map<string, Map<number, HydratedSearchLine>>();
+  for (const [matchPath, wanted] of linesByPath) {
+    hydratedByPath.set(matchPath, await hydrateSearchLines(config, guard, workspace, matchPath, wanted));
+  }
+  const matches: SearchMatch[] = pending.map((hit) => {
+    const line = hydratedByPath.get(hit.path)?.get(hit.line) ??
+      { line: hit.line, text: UNAVAILABLE_SEARCH_CONTEXT, text_status: "unavailable" as const, reason: "io-error" as const };
+    return {
+      path: hit.path,
+      line: hit.line,
+      text: line.text,
+      text_status: line.text_status,
+      ...(line.reason === undefined ? {} : { reason: line.reason })
+    };
+  });
   const text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
   return { text, matches, truncated: visibleMatches > matches.length, used: "node" };
 }
@@ -463,19 +727,31 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
     // needed when structured analysis has no scheduled records (for example,
     // an eligible lexical producer can be independent of the analyzed source).
     if (!options.regex && structured.intent !== "text" && structured.matches.length > 0) {
-      lexical.matches = structured.matches.map(({ path, line, text, source, reasons }) => ({
-        path,
-        line,
+      lexical.matches = structured.matches.map(({ path, line, text, text_status, reason, source, reasons }) => {
         // Relationship producers synthesize text from graph paths rather than
         // a complete source line. Keep that derived text redacted before the
         // server's compatibility-preserving text restoration pass.
-        text: source === "built-in analysis" && reasons.includes("exact text match")
+        const body = source === "built-in analysis" && reasons.includes("exact text match")
           ? text
           : redactSensitiveTextPreservingLines(text, {
             context: "source",
             language: sourceLanguageForPath(path)
-          })
-      }));
+          });
+        // Invariant: the unavailable marker is never available/redacted, and a
+        // missing status defaults from actual marker evidence.
+        const status: SearchTextStatus = body === UNAVAILABLE_SEARCH_CONTEXT
+          ? "unavailable"
+          : (text_status ?? statusForDerivedSearchText(body));
+        return {
+          path,
+          line,
+          text: body,
+          text_status: status,
+          ...(reason !== undefined
+            ? { reason }
+            : status === "unavailable" ? { reason: "io-error" as const } : {})
+        };
+      });
       lexical.text = lexical.matches.map((match) => `${match.path}:${match.line}: ${match.text}`).join("\n") || "No matches.";
     }
     lexical.analysis = structured;

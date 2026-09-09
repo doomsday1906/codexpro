@@ -20,6 +20,7 @@
 import { createHash } from "node:crypto";
 import type fsp from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
+import { TextDecoder } from "node:util";
 import { CodexProError } from "./guard.js";
 import { createPrivateKeyScanner } from "./redact.js";
 
@@ -136,6 +137,8 @@ export interface SourceScan {
    * overflow signal: treat as triggered at source start).
    */
   readonly nukeOffset: number;
+  /** False when the source is not strictly valid UTF-8 (lossy decoding was applied). */
+  readonly utf8Valid: boolean;
   /** Exact mask state at the first selected line (null when no window was requested). */
   readonly maskAtWindowStart: MaskSnapshot | null;
   /** True when the window starts in plain code (flank-after masking is then exact). */
@@ -367,6 +370,8 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
   const scanLimit = Math.max(1, Math.floor(options.scanLimitBytes));
   const hash = createHash("sha256");
   const decoder = new StringDecoder("utf8");
+  const strictDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+  let utf8Valid = true;
   const privateKeyScanner = createPrivateKeyScanner();
   const mask = new TriviaMaskStream();
   const nuke = new NukeDetectorStream();
@@ -377,6 +382,10 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
   let selectedBytes = 0;
   let selectionCapped = false;
   let capturedThroughLine = selectStart - 1;
+  // Capture is always a contiguous prefix of the requested window: once a
+  // line is skipped, nothing is stored again. Holes would break line-number
+  // arithmetic and span mapping downstream.
+  let captureClosed = false;
   let totalBytes = 0;
   let completed = 0;
   let nulFound = false;
@@ -476,8 +485,13 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       }
     }
     if (wantSelect && completed >= selectStart && completed <= selectEnd) {
-      if (!giant && selectedBytes + lineBytes > selectMaxBytes) {
-        selectionCapped = true; // keep counting; content stays on the source
+      if (captureClosed) {
+        selectionCapped = true;
+      } else if (!giant && selected.length > 0 && selectedBytes + lineBytes > selectMaxBytes) {
+        // The first stored line always fits (keeps capture contiguous from the
+        // window start); framing decides giant/over-budget fate deterministically.
+        selectionCapped = true;
+        captureClosed = true;
       } else {
         if (!giant) selectedBytes += lineBytes;
         selected.push({ lineNo: completed, text: giant ? "" : line, bytes: lineBytes, giant });
@@ -496,6 +510,13 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       if (totalBytes > scanLimit) throw new SourceScanError("source_scan_limit", { observed: totalBytes, limit: scanLimit });
       hash.update(chunk);
       if (!nulFound && chunk.includes(0)) nulFound = true;
+      if (utf8Valid) {
+        try {
+          strictDecoder.decode(chunk, { stream: true });
+        } catch {
+          utf8Valid = false;
+        }
+      }
       let text = decoder.write(chunk);
       track(chunk.byteLength + Buffer.byteLength(text, "utf8") + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length);
       if (pendingCR) {
@@ -612,6 +633,13 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
     }
     flushObserveAcc();
     privateKeyScanner.push("", true);
+    if (utf8Valid) {
+      try {
+        strictDecoder.decode();
+      } catch {
+        utf8Valid = false;
+      }
+    }
     if (maskedPending) {
       nuke.feed(maskedPending, maskedFed);
       maskedFed += maskedPending.length;
@@ -634,6 +662,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       selected,
       selectionCapped,
       capturedThroughLine,
+      utf8Valid,
       giants,
       privateKeySpans: privateKeyScanner.spans().map((span) => ({ start: span.start, end: span.end })),
       nukeOffset: nuke.result(),
@@ -759,6 +788,11 @@ export function frameRawWindow(
   }
   if (display.length === 0 || budget.length === 0 || display.length !== budget.length) {
     throw new CodexProError("Window framing requires aligned display and budget lines.");
+  }
+  for (let i = 0; i < display.length; i += 1) {
+    if (display[i].lineNo !== startLine + i || budget[i].lineNo !== startLine + i) {
+      throw new CodexProError("Window framing requires contiguous window lines.");
+    }
   }
   // Numbering width derives from the requested (clamped) end line so pages of
   // one request share stable columns; full windows match the accepted oracle.
@@ -895,8 +929,11 @@ export function applyNukeOffsetToLines(
 
 export interface LargeWindowProjectionRequest {
   readonly scan: SourceScan;
-  /** Raw window line contents in order (giant entries carry text "" and are never rendered). */
-  readonly rawLines: string[];
+  /**
+   * Captured window entries in order (a contiguous prefix of the requested
+   * window; giant entries carry text "" and are never rendered).
+   */
+  readonly window: ScannedLine[];
   /** Decoded-string offset of the first window byte (for exact span mapping). */
   readonly windowStartOffset: number;
 }
@@ -935,7 +972,14 @@ export function projectLargeWindow(
   request: LargeWindowProjectionRequest,
   redactSlice: (slice: string) => string
 ): LargeWindowProjection {
-  const { scan, rawLines, windowStartOffset } = request;
+  const { scan, window, windowStartOffset } = request;
+  if (window.length === 0) throw new CodexProError("Projection requires a non-empty window.");
+  for (let i = 1; i < window.length; i += 1) {
+    if (window[i].lineNo !== window[i - 1].lineNo + 1) {
+      throw new CodexProError("Projection requires contiguous window lines.");
+    }
+  }
+  const rawLines = window.map((entry) => entry.text);
   const flankBefore = scan.flankBefore;
   const flankAfter = scan.flankAfter;
   const bridgeSuspect = scan.bridgeSuspect;
@@ -949,8 +993,9 @@ export function projectLargeWindow(
   }
   // Stage 1: exact private-key mapping from full-stream spans.
   const keyMapped = applyPrivateKeySpansToLines(rawLines, lineStarts, scan.privateKeySpans);
-  // Stage 2: credential/direct patterns over the flanked slice.
-  const slice = `${flankBefore}${keyMapped.join("\n")}${flankAfter}`;
+  // Stage 2: credential/direct patterns over the flanked slice. The window is
+  // explicitly terminated so its last line can never fuse with flankAfter.
+  const slice = `${flankBefore}${keyMapped.join("\n")}\n${flankAfter}`;
   const sliceWindowBase = flankBefore.length;
   const redactedSlice = redactSlice(slice);
   const sliceLines = redactedSlice.split("\n");

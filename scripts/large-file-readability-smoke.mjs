@@ -304,6 +304,100 @@ try {
   });
   assert.equal(badBudget2.isError, true, 'over-maximum max_bytes accepted');
   console.log('ok max_bytes schema bounds agree across read/read_at_ref');
+
+  // TASK-006 search hydration (AP-016/AP-017/AP-018) through compiled MCP + direct.
+  const { searchWorkspace } = await import('../dist/searchOps.js');
+  const directWs = { id: 'lfsearch', root: tmp };
+  // benign witnesses + real secrets in the large fixtures; undecodable file for unavailable.
+  await fsp.appendFile(path.join(tmp, 'big20m.txt'), 'class CampaignRepo {}\nconst CampaignStorageTopology = 9\ncompose_campaign_storage()\n');
+  await fsp.writeFile(path.join(tmp, 'latin1.txt'), Buffer.from('benign CampaignStorageTopology caf\xe9 line\nsecond line\n', 'latin1'));
+  await fsp.writeFile(path.join(tmp, 'secret-line.txt'), 'harmless header\napi_token = "ghp_SEARCHTASK006SEARCHTASK0060123456789ab"\ntrailer\n');
+  // The witness append changed big20m after f20 was recorded; refresh expectations.
+  {
+    const stat = await fsp.stat(path.join(tmp, 'big20m.txt'));
+    const content = await fsp.readFile(path.join(tmp, 'big20m.txt'), 'utf8');
+    f20.bytes = stat.size;
+    f20.lines = content.replace(/\r\n/g, '\n').split('\n').length;
+  }
+
+  // AP-016 direct: explicit-file search finds benign witnesses in the 20MiB file as available.
+  for (const witness of ['class CampaignRepo', 'CampaignStorageTopology', 'compose_campaign_storage']) {
+    const found = await searchWorkspace(config, guard, directWs, { query: witness, regex: false, includeHidden: false, maxResults: 10, root: 'big20m.txt' });
+    assert.ok(found.matches.length > 0, `explicit search missed ${witness}`);
+    for (const match of found.matches) {
+      assert.equal(match.text_status, 'available', `${witness} not available: ${JSON.stringify(match)}`);
+      assert.ok(!match.text.includes('[REDACTED_SECRET]') && !match.text.includes('[SOURCE_CONTEXT_UNAVAILABLE]'), `${witness} mislabeled`);
+    }
+  }
+  console.log('ok explicit-file large search: benign witnesses available');
+
+  // AP-017 direct: actual credentials stay redacted across lexical routes.
+  {
+    const found = await searchWorkspace(config, guard, directWs, { query: 'api_token', regex: false, includeHidden: false, maxResults: 10, root: 'secret-line.txt' });
+    const credentialMatch = found.matches.find((m) => m.line === 2);
+    assert.ok(credentialMatch, 'credential line not found');
+    assert.equal(credentialMatch.text_status, 'redacted');
+    assert.ok(credentialMatch.text.includes('[REDACTED_SECRET]'), 'redaction marker missing');
+    assert.ok(!credentialMatch.text.includes('ghp_SEARCHTASK006'), 'credential leaked in match text');
+    assert.ok(!found.text.includes('ghp_SEARCHTASK006'), 'credential leaked in search text');
+    console.log('ok credential matches genuinely redacted');
+  }
+
+  // AP-018 direct: undecodable context is unavailable (never secret-labeled).
+  {
+    const found = await searchWorkspace(config, guard, directWs, { query: 'CampaignStorageTopology', regex: false, includeHidden: false, maxResults: 10, root: 'latin1.txt' });
+    assert.ok(found.matches.length > 0, 'latin1 match missing');
+    for (const match of found.matches) {
+      assert.equal(match.text_status, 'unavailable');
+      assert.ok(typeof match.reason === 'string' && match.reason.length > 0, 'unavailable lacks reason');
+      assert.equal(match.text, '[SOURCE_CONTEXT_UNAVAILABLE]');
+      assert.ok(!match.text.includes('[REDACTED_SECRET]'), 'unavailable masquerades as secret');
+    }
+    console.log(`ok unavailable distinguished (reason=${found.matches[0].reason})`);
+  }
+
+  // AP-016/018 MCP: same contract through compiled stdio search.
+  {
+    const mcpWitness = assertToolSuccess(await stdioClient.request('tools/call', {
+      name: 'search', arguments: { workspace_id: ws, query: 'class CampaignRepo', path: 'big20m.txt' }
+    }), 'mcp explicit search');
+    const witnessMatch = mcpWitness.structuredContent.matches.find((m) => m.path === 'big20m.txt');
+    assert.ok(witnessMatch, 'mcp explicit search missed witness');
+    assert.equal(witnessMatch.text_status, 'available');
+    assert.ok(witnessMatch.text.includes('class CampaignRepo'), 'witness text wrong');
+
+    const mcpSecret = assertToolSuccess(await stdioClient.request('tools/call', {
+      name: 'search', arguments: { workspace_id: ws, query: 'api_token', path: 'secret-line.txt' }
+    }), 'mcp secret search');
+    const secretMatch = mcpSecret.structuredContent.matches.find((m) => m.line === 2);
+    assert.ok(secretMatch && secretMatch.text_status === 'redacted', `secret not redacted: ${JSON.stringify(secretMatch)}`);
+
+    const mcpLatin = assertToolSuccess(await stdioClient.request('tools/call', {
+      name: 'search', arguments: { workspace_id: ws, query: 'CampaignStorageTopology', path: 'latin1.txt' }
+    }), 'mcp latin1 search');
+    assert.ok(mcpLatin.structuredContent.matches.length > 0, 'mcp latin1 missed');
+    for (const m of mcpLatin.structuredContent.matches) {
+      assert.equal(m.text_status, 'unavailable');
+      assert.ok(typeof m.reason === 'string');
+      assert.ok(!m.text.includes('[REDACTED_SECRET]'), 'mcp unavailable masquerades as secret');
+    }
+
+    // Structured intent keeps statuses and never substitutes secret markers for failures.
+    const mcpStructured = assertToolSuccess(await stdioClient.request('tools/call', {
+      name: 'search', arguments: { workspace_id: ws, query: 'CampaignStorageTopology', path: 'latin1.txt', intent: 'text' }
+    }), 'mcp structured search');
+    for (const m of mcpStructured.structuredContent.matches) {
+      assert.ok(['available', 'redacted', 'unavailable'].includes(m.text_status), `bad status ${m.text_status}`);
+      if (m.text_status === 'unavailable') {
+        assert.ok(typeof m.reason === 'string');
+        assert.ok(!m.text.includes('[REDACTED_SECRET]'));
+      }
+    }
+    for (const m of mcpStructured.structuredContent.analysis?.matches ?? []) {
+      assert.ok(['available', 'redacted', 'unavailable'].includes(m.text_status), `analysis bad status ${m.text_status}`);
+    }
+    console.log('ok mcp search statuses end-to-end (lexical + structured)');
+  }
   await stdioClient.close();
   stdioClient = null;
 

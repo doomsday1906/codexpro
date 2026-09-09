@@ -939,7 +939,7 @@ async function readPublicLargeFile(
   const projected = projectLargeWindow(
     {
       scan,
-      rawLines: captured.map((line) => line.text),
+      window: captured,
       windowStartOffset: scan.maskAtWindowStart.offset
     },
     (slice) => redactSensitiveTextPreservingLines(slice, { context: "source" })

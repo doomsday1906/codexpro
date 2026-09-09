@@ -38,7 +38,7 @@ async function oracleMeta(p) {
   return { raw, text: raw.toString('utf8'), bytes: raw.byteLength, sha: sha256(raw) };
 }
 
-async function checkEdge(name, content, sel) {
+async function checkEdge(name, content, sel, expectUtf8Valid) {
   const p = await writeTmp(name, content);
   const { raw, text, bytes, sha } = await oracleMeta(p);
   const oracleLines = splitLines(text);
@@ -47,6 +47,7 @@ async function checkEdge(name, content, sel) {
   assert.equal(scan.sha256, sha, `${name} sha`);
   assert.equal(scan.totalLines, oracleLines.length, `${name} totalLines`);
   assert.equal(scan.nulFound, raw.includes(0), `${name} nul`);
+  if (expectUtf8Valid !== undefined) assert.equal(scan.utf8Valid, expectUtf8Valid, `${name} utf8Valid`);
   assert.equal(scan.race, false, `${name} race`);
   if (sel) {
     const a = Math.max(1, sel.startLine ?? 1);
@@ -75,11 +76,18 @@ async function main() {
     await checkEdge('loner', 'a\rb\nc\rd', { startLine: 1, endLine: 2 });
     await checkEdge('lone-cr-end', 'abc\r', { startLine: 1, endLine: 1 });
     await checkEdge('crlf-split', `${'x'.repeat(70000)}\r\ny\n`, { startLine: 1, endLine: 2 });
-    await checkEdge('utf8', 'héllo wörld ✓\nline2 ’quotes’\n', { startLine: 1, endLine: 2 });
-    await checkEdge('utf8-split', `${'a'.repeat(65534)}✓✓✓\nend\n`, { startLine: 1, endLine: 2 });
+    await checkEdge('utf8', 'héllo wörld ✓\nline2 ’quotes’\n', { startLine: 1, endLine: 2 }, true);
+    await checkEdge('utf8-split', `${'a'.repeat(65534)}✓✓✓\nend\n`, { startLine: 1, endLine: 2 }, true);
     await checkEdge('nul-before', 'line1\n\x00bin\nline3\nline4\n', { startLine: 3, endLine: 3 });
     await checkEdge('nul-after', 'line1\nline2\nline3\nla\x00te\n', { startLine: 2, endLine: 2 });
-    await checkEdge('giant-mid', `top\n${'G'.repeat(500000)}\nbottom\n`, { startLine: 1, endLine: 3 });
+    await checkEdge('giant-mid', `top\n${'G'.repeat(500000)}\nbottom\n`, { startLine: 1, endLine: 3 }, true);
+    {
+      const p = await writeTmp('latin1', Buffer.from('caf\xe9 latin-1\nsecond\n', 'latin1'));
+      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 1, endLine: 2, chunkBytes: 3 });
+      assert.equal(scan.utf8Valid, false, 'latin1 utf8Valid');
+      assert.equal(scan.totalLines, 3, 'latin1 totalLines');
+      console.log('ok edge latin1 utf8Valid=false');
+    }
 
     // giant first line: flagged, content withheld, exact bytes
     {
@@ -185,6 +193,25 @@ async function main() {
       assert.equal(framed.nextStartLine, framed.endLine + 1);
       assert.ok(framed.nextStartLine <= scan.capturedThroughLine + 1);
       console.log(`ok capture-cap lines=${scan.totalLines} capturedThrough=${scan.capturedThroughLine} retained=${scan.maxRetainedBytes}`);
+    }
+
+    // Capture is always a contiguous prefix of the requested window (no holes):
+    // downstream line arithmetic and span mapping depend on it.
+    {
+      const p = path.join(tmpRoot, 'contig-victim.bin');
+      const handle = await fsp.open(p, 'w');
+      for (let i = 0; i < 20000; i += 1) {
+        await handle.write(`contig line ${String(i).padStart(7, '0')} ${'w'.repeat(60)}\n`);
+      }
+      await handle.close();
+      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 100, endLine: 20000, selectMaxBytes: 32768 });
+      assert.equal(scan.selectionCapped, true);
+      assert.ok(scan.selected.length > 1);
+      scan.selected.forEach((entry, index) => {
+        assert.equal(entry.lineNo, 100 + index, `capture hole at index ${index}`);
+      });
+      assert.equal(scan.capturedThroughLine, 100 + scan.selected.length - 1);
+      console.log(`ok contiguous-prefix capture (${scan.selected.length} lines through ${scan.capturedThroughLine})`);
     }
 
     // AP-006: no source-size gate derived from output/read budgets.

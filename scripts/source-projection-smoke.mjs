@@ -42,11 +42,13 @@ function lineOffsets(text) {
 
 async function projectWindow(absPath, text, startLine, endLine, chunkBytes = 4096) {
   const scan = await scanWorkingTreeFile(fsp, { absPath, startLine, endLine, chunkBytes });
-  const { lines, offsets } = lineOffsets(text);
+  const { offsets } = lineOffsets(text);
   const winStart = offsets[startLine - 1];
+  const window = scan.selected.filter((entry) => entry.lineNo >= startLine && entry.lineNo <= endLine);
+  assert.ok(window.length > 0, 'scan captured the requested window');
   const projected = projectLargeWindow({
     scan,
-    rawLines: lines.slice(startLine - 1, endLine),
+    window,
     windowStartOffset: winStart,
   }, redactSlice);
   // the scan-derived flanks must reproduce the caller-visible window context
@@ -207,8 +209,10 @@ async function main() {
       const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 2, endLine: 2, chunkBytes: 5 });
       assert.equal(scan.windowStartsInCode, false);
       const { lines, offsets } = lineOffsets(text);
+      const window = scan.selected.filter((entry) => entry.lineNo >= 2 && entry.lineNo <= 2);
+      assert.equal(window.length, 1);
       const projected = projectLargeWindow({
-        scan, rawLines: lines.slice(1, 2), windowStartOffset: offsets[1],
+        scan, window, windowStartOffset: offsets[1],
       }, redactSlice);
       // The whole-source oracle redacts comment-embedded credential shapes (fail-closed);
       // the uncertain path must not allow what the oracle denies.
@@ -240,8 +244,10 @@ async function main() {
       // Simulate a trimmed flank: the 30-byte pre-window chunk was one partial
       // line (trimmed to empty) carrying the label, so the match may bridge in.
       const bridgedScan = { ...scan, flankBefore: '', bridgeSuspect: true };
+      const window = scan.selected.filter((entry) => entry.lineNo >= 2 && entry.lineNo <= 3);
+      assert.equal(window.length, 2);
       const projected = projectLargeWindow({
-        scan: bridgedScan, rawLines: lines.slice(1, 3), windowStartOffset: offsets[1],
+        scan: bridgedScan, window, windowStartOffset: offsets[1],
       }, redactSlice);
       assert.ok(projected.forcedLines.includes(0), 'R4 did not force the bridged first line');
       const joined = projected.lines.join('\n');

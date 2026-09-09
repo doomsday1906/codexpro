@@ -87,7 +87,18 @@ try {
   const hiddenFalseAnalysis = analysisOf(hiddenFalseResult);
   const hiddenMatchesWhenFalse = hiddenFalseAnalysis.matches.filter((m) => m.path.includes('.hidden'));
   assert.equal(hiddenMatchesWhenFalse.length, 0, 'Hidden file leaked into includeHidden=false');
-  assert.equal(hiddenFalseAnalysis.matches.length, 20, 'Expected 20 visible matches');
+  // Saturation binds on payload bytes, not on a fixed count: additive per-match
+  // evidence fields (text_status for honest redaction status) cost ~26 bytes per
+  // match, so the structured byte budget binds just before maxResults=20 here.
+  // The honest invariant is full visibility of what fits plus flagged truncation.
+  assert.ok(hiddenFalseAnalysis.matches.length >= 19 && hiddenFalseAnalysis.matches.length <= 20,
+    `Visible saturation collapsed (count=${hiddenFalseAnalysis.matches.length})`);
+  assert.equal(hiddenFalseAnalysis.coverage.truncated, true, 'Budget saturation left coverage unflagged');
+  assert.ok(hiddenFalseAnalysis.warnings.some((warning) => warning.includes('structured payload budget')),
+    'Budget saturation omitted its coverage warning');
+  for (const match of hiddenFalseAnalysis.matches) {
+    assert.equal(match.text_status, 'available', `Benign marker mislabeled: ${JSON.stringify(match)}`);
+  }
   console.log('PASS: AP-010 (negative): include_hidden=false strictly admits zero hidden files.');
 
   // 2b: include_hidden=true -> hidden candidate is reserved and participates alongside visible

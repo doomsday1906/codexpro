@@ -478,8 +478,11 @@ try {
     ""
   ].join("\n"), "utf8");
   const binaryBytes = Buffer.concat([Buffer.from(BINARY_SECRET, "utf8"), Buffer.from([0x00, 0xff, 0x00])]);
-  const oversizedBytes = Buffer.from(`${OVERSIZED_SECRET}\n${"O".repeat(4_200)}`, "utf8");
-  const rangeBytes = Buffer.from(["range first", "range second", "R".repeat(240), ""].join("\n"), "utf8");
+  const oversizedBytes = Buffer.concat([
+    Buffer.from(`${OVERSIZED_SECRET}\n`, "utf8"),
+    Buffer.alloc(100 * 1024 * 1024, 0x4f)
+  ]);
+  const rangeBytes = Buffer.from(["range first", `range second ${"S".repeat(1500)}`, "R".repeat(240), ""].join("\n"), "utf8");
   const rootSubject = `review root OPENAI_API_KEY=${COMMIT_SECRET}`;
   const rootBody = `Authorization: Bearer ${BODY_SECRET}\nroot body exact\n`;
   const rootDeletedPath = "deleted old π.txt";
@@ -576,11 +579,14 @@ try {
   assert.equal(directEntryBlob(targetRoot, privateEntry).includes(Buffer.from(SOURCE_SECRET, "utf8")), true);
   assert.deepEqual(directEntryBlob(targetRoot, symlinkEntry), Buffer.from(symlinkTargetPath, "utf8"));
   assert.deepEqual(directEntryBlob(targetRoot, binaryEntry), binaryBytes);
-  assert.equal(directEntryBlob(targetRoot, oversizedEntry).includes(Buffer.from(OVERSIZED_SECRET, "utf8")), true);
+  // Bounded sentinel proof without materializing the 100MiB blob (SIGPIPE bounds git).
+  const oversizedHead = spawnSync("sh", ["-c", `git -C ${JSON.stringify(targetRoot)} cat-file blob ${oversizedEntry.oid} | head -c 128`], { encoding: "utf8", maxBuffer: 64 * 1024 });
+  assert.equal(String(oversizedHead.stdout).includes(OVERSIZED_SECRET), true);
+  const { SOURCE_SCAN_LIMIT_BYTES } = await import("../dist/sourceProjection.js");
   assert.deepEqual(directEntryBlob(targetRoot, rangeEntry), rangeBytes);
   assert.equal(rangeBytes.byteLength <= 4_000, true);
   assert.equal(oversizedBytes.byteLength, oversizedEntry.size);
-  assert.equal(oversizedBytes.byteLength > 4_000, true);
+  assert.equal(oversizedBytes.byteLength > SOURCE_SCAN_LIMIT_BYTES, true);
   assert.equal(rootCommit.parents.length, 0);
   assert.equal(mergeCommit.parents.length, 2);
   assert.deepEqual(directBases, [linearSha]);
@@ -846,7 +852,7 @@ try {
     workspace_id: workspaceId,
     ref: rootSha,
     path: rangePath,
-    max_bytes: rangeBytes.byteLength
+    max_bytes: 4_000
   });
   const unRangedWithinResult = expectSuccess(unRangedWithinOutput, "un-ranged historical blob within max_bytes");
   const unRangedWithinData = unRangedWithinResult.structuredContent;
@@ -868,8 +874,9 @@ try {
     path: rangePath,
     max_bytes: 16
   });
-  expectError(unRangedBelowOutput, "un-ranged historical blob below requested max_bytes");
-  assertHostileEnvelope(unRangedBelowOutput, [DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], "un-ranged historical blob below requested max_bytes");
+  expectError(unRangedBelowOutput, "un-ranged historical blob below the max_bytes schema floor");
+  assert.match(unRangedBelowOutput.text ?? "", /greater than or equal to 1000/u, "sub-floor max_bytes did not report its schema bound");
+  assertHostileEnvelope(unRangedBelowOutput, [DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], "un-ranged historical blob below the schema floor");
   const unRangedOversizedOutput = await callTool(secondClient, "read_at_ref", {
     workspace_id: workspaceId,
     ref: rootSha,
@@ -878,9 +885,9 @@ try {
   });
   expectError(unRangedOversizedOutput, "un-ranged historical blob over max_bytes");
   assertHostileEnvelope(unRangedOversizedOutput, [OVERSIZED_SECRET, DEFAULT_SENTINEL, SOURCE_SECRET, COMMIT_SECRET], "un-ranged historical blob over max_bytes");
-  console.log("PASS un-ranged historical max_bytes: real blob at its exact requested limit returns full metadata, while smaller requested and configured limits fail before projection.");
+  console.log("PASS un-ranged historical max_bytes: real blob within a valid requested budget returns full metadata; sub-floor budgets fail at validation and scan-limit blobs fail before acquisition.");
 
-  const selectedRangeBytes = Buffer.from("range second", "utf8");
+  const selectedRangeBytes = Buffer.from(`range second ${"S".repeat(1500)}`, "utf8");
   const selectedRangeText = numberLines(selectedRangeBytes, 2);
   const selectedRangeBudget = Buffer.byteLength(selectedRangeText, "utf8");
   assert.equal(rangeBytes.byteLength > selectedRangeBudget, true);

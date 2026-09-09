@@ -221,7 +221,11 @@ try {
   assert.equal(lexicalOnlyOverflow.matches.length, 20, 'Overflow fixture did not produce the raw lexical max-results window');
   assert(lexicalOnlyOverflow.matches.length > overflowAnalysis.matches.length, 'Overflow fixture did not exercise fewer scheduled structured matches');
   const expectedLegacyMatches = overflowAnalysis.matches.map(({ path, line, text }) => ({ path, line, text }));
-  assert.deepEqual(overflowResult.matches, expectedLegacyMatches, 'Legacy structured-search matches diverged from scheduled structured matches');
+  const actualLegacyMatches = overflowResult.matches.map(({ path, line, text }) => ({ path, line, text }));
+  assert.deepEqual(actualLegacyMatches, expectedLegacyMatches, 'Legacy structured-search matches diverged from scheduled structured matches');
+  for (const match of overflowResult.matches) {
+    assert.ok(['available', 'redacted', 'unavailable'].includes(match.text_status), `Legacy match lost evidence status: ${JSON.stringify(match)}`);
+  }
   const expectedLegacyText = expectedLegacyMatches.map((match) => `${match.path}:${match.line}: ${match.text}`).join('\n') || 'No matches.';
   assert.equal(overflowResult.text, expectedLegacyText, 'Legacy structured-search text was not rebuilt from scheduled matches');
   assert.equal(overflowAnalysis.schemaVersion, 2, 'Structured overflow regression lost schema v2');
