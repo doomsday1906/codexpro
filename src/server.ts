@@ -1193,6 +1193,125 @@ function preserveSearchMatchText(response: any, result: any): any {
   return response;
 }
 
+// R3-1: final-response output bound for search. The collection budget
+// (evidence bytes) limits producer-side records, but hydration, coverage
+// text, the optional analysis payload, and JSON framing all grow AFTER it —
+// so the complete serialized tool result is independently fitted here.
+// Only whole match records are ever admitted or dropped: the serialized JSON
+// is never cut, one structured match is never split, and one public line is
+// never split mid-line or mid-code-point (no string is ever sliced — records
+// are admitted/dropped as whole array elements and the public text is
+// rebuilt from the admitted records). If the next complete record cannot
+// fit, the fit stops before admitting it with truthful truncation and
+// output-limit facts; if even the minimum valid response cannot fit, a
+// bounded specific output-envelope error is returned. maxOutputBytes stays
+// the output policy for the whole serialized response; it is never redefined
+// as only a ripgrep-record budget.
+const SEARCH_RESPONSE_RESERVE_BYTES = 1_024;
+
+function searchResponseBudgetTrailer(budgetBytes: number): string {
+  return `Coverage incomplete: the search response exceeded the ${budgetBytes}-byte output budget and was cut to whole records.`;
+}
+
+function stripSearchAnalysisForOutputBudget(analysis: any): any {
+  if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) return analysis;
+  const groupsOut: Record<string, unknown> = {};
+  if (analysis.groups && typeof analysis.groups === "object" && !Array.isArray(analysis.groups)) {
+    for (const group of Object.keys(analysis.groups)) groupsOut[group] = [];
+  }
+  return {
+    ...analysis,
+    groups: groupsOut,
+    matches: [],
+    coverage: analysis.coverage && typeof analysis.coverage === "object" && !Array.isArray(analysis.coverage)
+      ? { ...analysis.coverage, truncated: true }
+      : analysis.coverage
+  };
+}
+
+function analysisVariableRecordCount(analysis: any): number {
+  if (!analysis || typeof analysis !== "object" || Array.isArray(analysis)) return 0;
+  const matches = Array.isArray(analysis.matches) ? analysis.matches.length : 0;
+  let grouped = 0;
+  if (analysis.groups && typeof analysis.groups === "object" && !Array.isArray(analysis.groups)) {
+    for (const group of Object.values(analysis.groups)) {
+      if (Array.isArray(group)) grouped += group.length;
+    }
+  }
+  return matches + grouped;
+}
+
+function buildSearchToolResponse(workspace: { id: string; root: string }, result: any): any {
+  const structured: Record<string, unknown> = {
+    workspace_id: workspace.id,
+    root: workspace.root,
+    matches: result.matches,
+    truncated: result.truncated,
+    used: result.used,
+    coverage: result.coverage
+  };
+  if (result.analysis) structured.analysis = result.analysis;
+  return preserveSearchMatchText(textResult(result.text, structured), result);
+}
+
+function fitSearchResponseEnvelope(
+  config: CodexProConfig,
+  workspace: { id: string; root: string },
+  result: any
+): any {
+  const budget = Math.max(0, config.maxOutputBytes);
+  const measuredBytes = (response: any): number => Buffer.byteLength(JSON.stringify(response ?? {}), "utf8");
+  const fits = (response: any): boolean => measuredBytes(response) + SEARCH_RESPONSE_RESERVE_BYTES <= budget;
+  // Exact final object first: the complete case returns byte-identical output
+  // to the pre-bound behavior (a pure no-op when it fits).
+  let response = buildSearchToolResponse(workspace, result);
+  if (fits(response)) return response;
+  // Every shrunk response below carries truthful truncation/output-limit
+  // facts plus the bounded public explanation alongside any earlier trailer.
+  const trailer = searchResponseBudgetTrailer(budget);
+  if (result.truncated !== true) result.truncated = true;
+  if (result.coverage && typeof result.coverage === "object" && !Array.isArray(result.coverage)) {
+    result.coverage.truncated = true;
+    result.coverage.outputLimited = true;
+  }
+  if (typeof result.coverageText !== "string") result.coverageText = "";
+  if (!result.coverageText.includes(trailer)) {
+    result.coverageText = result.coverageText ? `${result.coverageText}\n${trailer}` : trailer;
+  }
+  // The optional analysis payload is auxiliary to the primary public
+  // text+matches contract, so whole-analysis stripping precedes any primary
+  // record cut. Analysis coverage facts, warnings, and cache stay intact.
+  if (result.analysis && analysisVariableRecordCount(result.analysis) > 0) {
+    result.analysis = stripSearchAnalysisForOutputBudget(result.analysis);
+    response = buildSearchToolResponse(workspace, result);
+    if (fits(response)) return response;
+  }
+  // Binary search the largest whole-record prefix that fits. Serialized size
+  // is monotonic non-decreasing in the prefix length for fixed facts and a
+  // fixed trailer, so the maximal fitting prefix is well-defined and the
+  // same input always yields the same prefix (deterministic). No partial
+  // records: only the prefix is kept, and the public text is rebuilt from
+  // exactly those records by the shared restoration pass.
+  const fullMatches = Array.isArray(result.matches) ? result.matches : [];
+  let lo = 0;
+  let hi = fullMatches.length;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi + 1) / 2);
+    const candidate = buildSearchToolResponse(workspace, { ...result, matches: fullMatches.slice(0, mid) });
+    if (fits(candidate)) lo = mid;
+    else hi = mid - 1;
+  }
+  result.matches = fullMatches.slice(0, lo);
+  response = buildSearchToolResponse(workspace, result);
+  if (fits(response)) return response;
+  // Minimum valid response (no matches, facts-only analysis, bounded
+  // explanation) still exceeds the budget: bounded specific error carrying
+  // numbers only, never source.
+  throw new CodexProError(
+    `Search response does not fit the configured output envelope: minimum search response measured ${measuredBytes(response)} serialized bytes for a ${budget}-byte output budget (reserve ${SEARCH_RESPONSE_RESERVE_BYTES} bytes). Narrow the search with path/glob/max_results or raise maxOutputBytes.`
+  );
+}
+
 function diagnosticResult(result: any): any {
   if (!result || typeof result !== "object" || Array.isArray(result)) return result;
   const safe = { ...result };
@@ -3746,16 +3865,14 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         symbol: args.symbol,
         includeTests: args.include_tests === undefined ? undefined : parseBool(args.include_tests, false)
       });
-      const structured: Record<string, unknown> = {
-        workspace_id: workspace.id,
-        root: workspace.root,
-        matches: result.matches,
-        truncated: result.truncated,
-        used: result.used,
-        coverage: result.coverage
-      };
-      if (result.analysis) structured.analysis = result.analysis;
-      return preserveSearchMatchText(textResult(result.text, structured), result);
+      // R3-1: the collection budget limits producer-side evidence, but
+      // hydration, coverage text, the optional analysis payload, and JSON
+      // framing all grow after it — so the complete serialized tool result
+      // is fitted here to the output policy, admitting only whole records.
+      // maxOutputBytes stays the output policy; it is never redefined as a
+      // ripgrep-record budget. Plain lexical and structured-intent routes
+      // share this single choke point, so both stay consistent.
+      return fitSearchResponseEnvelope(config, workspace, result);
     }
   );
 
