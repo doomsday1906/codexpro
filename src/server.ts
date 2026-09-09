@@ -1169,12 +1169,17 @@ function preserveSearchMatchText(response: any, result: any): any {
 
   if (Array.isArray(response.content)) {
     const safeMatches = Array.isArray(structured.matches) ? structured.matches : [];
+    // R2-3: preserve the already-projected match text AND the public
+    // coverage explanation. The explanation rides in result.coverageText
+    // (bounded reason/count sentences, never source), so a zero-match
+    // partial search no longer collapses to a bare "No matches."
+    const coverageText = typeof result?.coverageText === "string" ? result.coverageText : "";
     response.content = response.content.map((part: any) => {
       if (!part || part.type !== "text") return part;
       const text = safeMatches
         .map((match: any) => `${match.path}:${match.line}: ${match.text}`)
         .join("\n") || "No matches.";
-      return { ...part, text };
+      return { ...part, text: coverageText ? `${text}\n${coverageText}` : text };
     });
   }
   return response;
@@ -3738,7 +3743,8 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         root: workspace.root,
         matches: result.matches,
         truncated: result.truncated,
-        used: result.used
+        used: result.used,
+        coverage: result.coverage
       };
       if (result.analysis) structured.analysis = result.analysis;
       return preserveSearchMatchText(textResult(result.text, structured), result);
