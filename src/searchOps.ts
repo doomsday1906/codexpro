@@ -962,26 +962,37 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
         // only — regex has no bounded matcher and keeps disclosure. When the
         // fallback scan is clean, coverage is complete through it and the
         // partial-search trailer is dropped; any fallback error keeps it.
+        // R2-2: reconcile fallback results against existing line identities
+        // while preserving total-match evidence. The scanner retention is the
+        // FULL result budget (not budget-minus-admitted): admitted rg records
+        // must not consume the fallback's retention, or fresh wide-line
+        // occurrences are lost. Duplicates (already admitted) fill no result
+        // slot but are subtracted from the evidence only once — they were
+        // already counted in the rg stream — while keptLines AND extraCount
+        // always join completeness accounting, even when no result slot is
+        // free or nothing was retained.
         let recoveredClean = false;
         if (explicitFile && explicitSkipped && !options.regex) {
           try {
             const queryBytes = Buffer.from(options.query, "utf8");
             if (queryBytes.length > 0 && queryBytes.length <= NODE_SEARCH_MAX_QUERY_BYTES) {
-              const remaining = Math.max(0, options.maxResults - admittedMatches.length);
-              const rec = await scanNodeFallbackFile(target.absPath, queryBytes, fileSizeCeiling, remaining);
+              const rec = await scanNodeFallbackFile(target.absPath, queryBytes, fileSizeCeiling, Math.max(0, options.maxResults));
               const recReason = nodeFallbackFileReason(rec);
-              if (rec.keptLines.length > 0) {
-                const have = new Set(admittedMatches.map((m) => m.line));
-                const fresh = rec.keptLines.filter((lineNo) => !have.has(lineNo));
+              const have = new Set(admittedMatches.map((m) => m.line));
+              const fresh = rec.keptLines.filter((lineNo) => !have.has(lineNo));
+              visibleMatches += rec.keptLines.length + rec.extraCount - (rec.keptLines.length - fresh.length);
+              if (fresh.length > 0) {
+                const slots = Math.max(0, options.maxResults - admittedMatches.length);
+                const toAdd = fresh.slice(0, slots);
                 let recHydrated: Map<number, HydratedSearchLine> | undefined;
-                if (recReason === null || (recReason !== "scan-limit" && recReason !== "race" && recReason !== "io-error")) {
+                if (toAdd.length > 0 && (recReason === null || (recReason !== "scan-limit" && recReason !== "race" && recReason !== "io-error"))) {
                   try {
-                    recHydrated = await hydrateSearchLines(config, guard, workspace, target.relPath, fresh);
+                    recHydrated = await hydrateSearchLines(config, guard, workspace, target.relPath, toAdd);
                   } catch {
                     recHydrated = undefined;
                   }
                 }
-                for (const lineNo of fresh) {
+                for (const lineNo of toAdd) {
                   const h = recHydrated?.get(lineNo) ??
                     (recReason !== null
                       ? { line: lineNo, text: UNAVAILABLE_SEARCH_CONTEXT, text_status: "unavailable" as const, reason: recReason }
@@ -997,7 +1008,6 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
                   });
                 }
                 matches.sort((a, b) => a.line - b.line);
-                visibleMatches += rec.keptLines.length + rec.extraCount;
                 if (recReason === null) recoveredClean = true;
               } else if (recReason === null) {
                 recoveredClean = true;
