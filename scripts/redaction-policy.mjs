@@ -623,6 +623,22 @@ export function createPrivateKeyScanner() {
     pending = '';
     let output = '';
 
+    // Streaming-finalize exactness (large-file surgical readability): the
+    // streaming scanner finalizes with an empty push after the last content
+    // was already fed non-final. When a block is still open and nothing is
+    // retained, `source` is empty and the loop below would skip recording the
+    // unterminated span — while the single-push oracle (non-empty final input)
+    // records it. Close the span at exact EOF instead. Single-push callers are
+    // unaffected (non-empty input still takes the loop path; empty text was
+    // never inside a block).
+    if (!source && final && inPrivateBlock && privateBlockStart !== null) {
+      spans.push({ start: privateBlockStart, end: sourceOffset });
+      privateBlockStart = null;
+      inPrivateBlock = false;
+      privateEndPattern = null;
+      return output;
+    }
+
     while (source) {
       if (inPrivateBlock) {
         privateEndPattern.lastIndex = 0;

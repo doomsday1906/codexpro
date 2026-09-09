@@ -344,7 +344,18 @@ async function main() {
       const p = path.join(tmpRoot, 'crlf-map.txt');
       await fsp.writeFile(p, text);
       const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 150, endLine: 155, chunkBytes: 64 });
-      assert.ok(scan.privateKeySpans.length > 0, 'key spans missing');
+      // F2-C: spans entirely outside the captured window are not retained;
+      // every retained span must touch the capture range.
+      assert.ok(scan.selected.length > 0, 'window must be captured');
+      {
+        const firstStart = scan.selected[0].startOffset;
+        const last = scan.selected[scan.selected.length - 1];
+        const lastEnd = last.startOffset + last.text.length;
+        assert.ok(
+          scan.privateKeySpans.every((s) => s.end > firstStart && s.start < lastEnd),
+          'retained spans must touch the captured window'
+        );
+      }
       const { lines, offsets } = lineOffsets(text);
       const window = scan.selected.filter((entry) => entry.lineNo >= 150 && entry.lineNo <= 155);
       // entries carry exact offsets: verify against oracle string offsets
@@ -357,6 +368,29 @@ async function main() {
       const oracleWindow = oracle.map((line) => (line.endsWith('\r') ? line.slice(0, -1) : line)).slice(149, 155);
       assert.deepEqual(projected.lines, oracleWindow, 'CRLF projection diverged from oracle');
       console.log('ok reviewer-R5 CRLF span mapping exact');
+    }
+
+    // F2-C companion: a window covering the key block retains its spans and
+    // redacts exactly like the oracle.
+    {
+      const CRLF_BEGIN = '-----' + 'BEG' + 'IN RSA PRI' + 'VATE KEY' + '-----';
+      const CRLF_END = '-----' + 'EN' + 'D RSA PRI' + 'VATE KEY' + '-----';
+      const CRLF_BODY_A = 'CRLFMAPBODY' + 'ONE7X9';
+      const CRLF_BODY_B = 'CRLFMAPBODY' + 'TWO7X9';
+      const keyBlock = `${CRLF_BEGIN}\r\n${CRLF_BODY_A}\r\n${CRLF_BODY_B}\r\n${CRLF_END}\r\n`;
+      const crlfFiller = Array.from({ length: 200 }, (_, i) => `filler line ${i} data data data\r\n`).join('');
+      const text = `${keyBlock}${crlfFiller}postlude line here\r\n`;
+      const p = path.join(tmpRoot, 'crlf-block.txt');
+      await fsp.writeFile(p, text);
+      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 1, endLine: 6, chunkBytes: 64 });
+      assert.ok(scan.privateKeySpans.length > 0, 'block-covering window must retain spans');
+      assert.equal(scan.spansOverflowed, false);
+      const projected = projectLargeWindow({ scan, window: scan.selected }, redactSlice);
+      const oracle = redactSensitiveTextPreservingLines(text, { context: 'source' })
+        .split('\n').map((line) => (line.endsWith('\r') ? line.slice(0, -1) : line)).slice(0, 6);
+      assert.deepEqual(projected.lines, oracle, 'block projection diverged from oracle');
+      assert.ok(!projected.lines.some((line) => line.includes('CRLFMAPBODY')), 'key body exposed');
+      console.log('ok F2-C block-covering window retains spans');
     }
 
     // AP-009: large benign source stays fully visible (no secret-treating).

@@ -38,6 +38,32 @@ export const SOURCE_SCAN_LIMIT_BYTES = 96 << 20;
  * explicit range can never pin memory proportional to the source.
  */
 export const SELECT_CAPTURE_CAP_BYTES = 4 << 20;
+/**
+ * Explicit selected-record cardinality bound, independent of content bytes
+ * (F2-B). A newline-only or tiny-line source can otherwise create millions of
+ * selected records while content bytes stay tiny. Capture is always a
+ * contiguous prefix of the requested window; past the cap, counting continues
+ * and framing reports a truthful continuation — never holes.
+ */
+export const SELECT_CAPTURE_CAP_RECORDS = 50_000;
+/**
+ * Conservative retained-cost estimate per selected record, counted against the
+ * byte cap alongside content bytes: covers the record object/cardinality
+ * overhead plus numbered framing prefixes/terminators (F2-B).
+ */
+export const SELECT_RECORD_OVERHEAD_BYTES = 256;
+/** Cap on retained private-key spans; overflow fails closed (F2-C). */
+export const PRIVATE_KEY_SPAN_CAP = 4096;
+/** Estimated retained bytes per private-key span, for honest retention accounting. */
+const PRIVATE_KEY_SPAN_ESTIMATE_BYTES = 128;
+/** Conservative retained-bytes estimate for bounded nuke-detector state. */
+const NUKE_STATE_ESTIMATE_BYTES = 65536;
+/**
+ * Post-snapshot observer staging flushes past this size, so giant-line
+ * fragments can never accumulate source-sized staging before finalization
+ * (F2-A). Flushing never moves the window-start snapshot (already captured).
+ */
+const OBSERVE_ACC_FLUSH_CHARS = 64 * 1024;
 /** Flanking context retained around a projected window for bounded redaction decisions. */
 export const WINDOW_FLANK_BYTES = 64 * 1024;
 /** Cap on simultaneously tracked paren-nuke candidates; overflow is conservative (nuke-all). */
@@ -135,6 +161,12 @@ export interface SourceScan {
   readonly giants: GiantLineRecord[];
   /** Full-stream private-key spans (decoded-string offsets; streaming-exact). */
   readonly privateKeySpans: PrivateKeySpan[];
+  /**
+   * True when private-key span discovery exceeded PRIVATE_KEY_SPAN_CAP and the
+   * scanner feed was stopped: the captured window is conservatively
+   * fully redacted and no span history grew with source size (F2-C).
+   */
+  readonly spansOverflowed: boolean;
   /**
    * Whole-source credential-paren-nuke trigger offset: -1 when absent,
    * otherwise the first unmatched offset (0 doubles as the conservative
@@ -479,6 +511,21 @@ function normalizeSelectEnd(value: number | undefined): number {
 }
 
 /**
+ * Keep only spans that can touch the captured window (F2-C). A span starting
+ * before the first captured line but ending inside it is kept (it still
+ * protects the window); spans entirely outside are dropped so span history
+ * never grows with source size. With no captured lines there is no window to
+ * protect, so nothing is retained.
+ */
+export function filterSpansToCapture(spans: PrivateKeySpan[], captured: ScannedLine[]): PrivateKeySpan[] {
+  if (spans.length === 0 || captured.length === 0) return [];
+  const firstStart = captured[0].startOffset;
+  const last = captured[captured.length - 1];
+  const lastEnd = last.startOffset + last.text.length;
+  return spans.filter((span) => span.end > firstStart && span.start < lastEnd);
+}
+
+/**
  * Source-agnostic streaming scan core. Frames physical lines from a decoded
  * byte stream, computes exact metadata, detects NUL anywhere, captures only
  * the selected raw window, records giant lines without retaining them, and
@@ -555,30 +602,60 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
   // other byte is fed in whole-chunk batches. The stream stays exact either way.
   let snapshotDone = !wantSelect;
   let observeAcc = "";
+  // Private-key span overflow (F2-C): the accepted scanner retains one record
+  // per block, so a span-dense source would grow span history with source
+  // size. Past the cap the feed stops and the window is conservatively fully
+  // redacted — fail closed, never expose.
+  let spansOverflowed = false;
+  let pkFeedingStopped = false;
+  let pkSpansSeen = 0;
   const flushObserveAcc = (): void => {
-    if (!observeAcc) return;
-    privateKeyScanner.push(observeAcc, false);
-    feedMasked(mask.feed(observeAcc));
-    maskOffset += observeAcc.length;
-    observeAcc = "";
+    if (observeAcc) {
+      if (!pkFeedingStopped) privateKeyScanner.push(observeAcc, false);
+      feedMasked(mask.feed(observeAcc));
+      maskOffset += observeAcc.length;
+      observeAcc = "";
+    }
+    if (!pkFeedingStopped) {
+      const spanCount = privateKeyScanner.spans().length;
+      if (spanCount > pkSpansSeen) pkSpansSeen = spanCount;
+      if (spanCount > PRIVATE_KEY_SPAN_CAP) {
+        pkFeedingStopped = true;
+        spansOverflowed = true;
+      }
+    }
   };
   /** Feed one exact source piece (content plus terminator where present). */
   const observe = (piece: string, lineNo: number): void => {
-    if (!piece) return;
+    if (!piece) {
+      // An empty final piece can still be the window start (a newline-
+      // terminated source's final empty physical line): capture the exact mask
+      // state so projection has state instead of a missing-snapshot error.
+      if (!snapshotDone && windowSnapshots.start === null && lineNo >= selectStart) {
+        flushObserveAcc();
+        windowSnapshots.start = mask.snapshot(maskOffset);
+        snapshotDone = true;
+      }
+      return;
+    }
     if (snapshotDone) {
       observeAcc += piece;
-      return;
+    } else {
+      flushObserveAcc();
+      if (windowSnapshots.start === null && lineNo >= selectStart) {
+        windowSnapshots.start = mask.snapshot(maskOffset);
+        snapshotDone = true;
+        observeAcc += piece;
+      } else {
+        if (!pkFeedingStopped) privateKeyScanner.push(piece, false);
+        feedMasked(mask.feed(piece));
+        maskOffset += piece.length;
+      }
     }
-    flushObserveAcc();
-    if (windowSnapshots.start === null && lineNo >= selectStart) {
-      windowSnapshots.start = mask.snapshot(maskOffset);
-      snapshotDone = true;
-      observeAcc += piece;
-      return;
-    }
-    privateKeyScanner.push(piece, false);
-    feedMasked(mask.feed(piece));
-    maskOffset += piece.length;
+    // Bound post-snapshot staging: giant fragments flush incrementally so a
+    // source-sized line is counted and security-scanned without ever being
+    // retained (F2-A). The snapshot was captured above; flushing cannot move it.
+    if (observeAcc.length > OBSERVE_ACC_FLUSH_CHARS) flushObserveAcc();
   };
 
   // Flank context (fixed bounds; context only, never returned).
@@ -641,13 +718,17 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
     if (wantSelect && completed >= selectStart && completed <= selectEnd) {
       if (captureClosed) {
         selectionCapped = true;
-      } else if (!giant && selected.length > 0 && selectedBytes + lineBytes > selectMaxBytes) {
+      } else if (!giant && selected.length > 0 &&
+        (selectedBytes + lineBytes + SELECT_RECORD_OVERHEAD_BYTES > selectMaxBytes ||
+          selected.length >= SELECT_CAPTURE_CAP_RECORDS)) {
         // The first stored line always fits (keeps capture contiguous from the
         // window start); framing decides giant/over-budget fate deterministically.
+        // Both the content-byte cap (with per-record overhead) and the explicit
+        // record-count cap stop capture as a contiguous prefix with continuation.
         selectionCapped = true;
         captureClosed = true;
       } else {
-        if (!giant) selectedBytes += lineBytes;
+        if (!giant) selectedBytes += lineBytes + SELECT_RECORD_OVERHEAD_BYTES;
         selected.push({ lineNo: completed, text: giant ? "" : line, bytes: lineBytes, giant, startOffset });
         capturedThroughLine = completed;
       }
@@ -672,7 +753,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         }
       }
       let text = decoder.write(chunk);
-      track(chunk.byteLength + Buffer.byteLength(text, "utf8") + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length);
+      track(chunk.byteLength + Buffer.byteLength(text, "utf8") + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length + observeAcc.length + pkSpansSeen * PRIVATE_KEY_SPAN_ESTIMATE_BYTES + NUKE_STATE_ESTIMATE_BYTES);
       if (pendingCR) {
         text = `\r${text}`;
         pendingCR = false;
@@ -704,7 +785,10 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
           carry += parts[0];
           carryBytes += fragBytes;
         }
-        track(chunk.byteLength + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length);
+        // Same per-chunk observer cadence as the multi-line path: bounds
+        // staging, feeds detector streams promptly, and runs the span-cap check.
+        flushObserveAcc();
+        track(chunk.byteLength + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length + observeAcc.length + pkSpansSeen * PRIVATE_KEY_SPAN_ESTIMATE_BYTES + NUKE_STATE_ESTIMATE_BYTES);
         continue;
       }
       // Head completes the carried fragment and its line (content + terminator fed exactly).
@@ -747,7 +831,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         carryBytes = tailBytes;
       }
       flushObserveAcc();
-      track(chunk.byteLength + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length);
+      track(chunk.byteLength + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length + observeAcc.length + pkSpansSeen * PRIVATE_KEY_SPAN_ESTIMATE_BYTES + NUKE_STATE_ESTIMATE_BYTES);
     }
     checkAborted();
     if (pendingCR) {
@@ -793,8 +877,19 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         carryBytes += tailBytes;
       }
     }
+    // Oracle line semantics: always one final (possibly empty) line.
+    // F1: the final carry is observed AND emitted BEFORE any security observer
+    // finalizes, so the last line reaches the private-key scanner, trivia
+    // masker, and nuke detector exactly like every other line. Finalization
+    // (flush, scanner close, mask flush, nuke drain) happens exactly once.
+    if (giantActive) {
+      emit("", giantBytes, true, "", giantChars, false);
+    } else {
+      observe(carry, completed + 1);
+      emit(carry, carryBytes, false, carry, carry.length, false);
+    }
     flushObserveAcc();
-    privateKeyScanner.push("", true);
+    if (!pkFeedingStopped) privateKeyScanner.push("", true);
     if (utf8Valid) {
       try {
         strictDecoder.decode();
@@ -809,13 +904,13 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       maskedFed += maskedPending.length;
       maskedPending = "";
     }
-    // Oracle line semantics: always one final (possibly empty) line.
-    if (giantActive) {
-      emit("", giantBytes, true, "", giantChars, false);
-    } else {
-      observe(carry, completed + 1);
-      emit(carry, carryBytes, false, carry, carry.length, false);
-    }
+    // F2-C: retain only span state necessary to protect the captured window.
+    // Blocks entirely outside it must not accumulate unbounded records. On
+    // overflow the feed already stopped and the window is fully redacted.
+    const rawSpans = spansOverflowed
+      ? []
+      : privateKeyScanner.spans().map((span) => ({ start: span.start, end: span.end }));
+    const privateKeySpans = filterSpansToCapture(rawSpans, selected);
     const windowStartSnapshot: MaskSnapshot | null = windowSnapshots.start;
     const digest = hash.digest("hex");
     return {
@@ -828,7 +923,8 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       capturedThroughLine,
       utf8Valid,
       giants,
-      privateKeySpans: privateKeyScanner.spans().map((span) => ({ start: span.start, end: span.end })),
+      privateKeySpans,
+      spansOverflowed,
       nukeOffset: nuke.result(),
       maskAtWindowStart: windowStartSnapshot,
       windowStartsInCode: windowStartSnapshot === null ? true : windowStartSnapshot.state === "code",
@@ -1149,6 +1245,20 @@ export function projectLargeWindow(
     throw new CodexProError("Projection window offsets disagree with the scan snapshot.");
   }
   const rawLines = window.map((entry) => entry.text);
+  // F2-C fail-closed: span discovery overflowed, so whole-stream key-block
+  // protection is no longer provable. Redact the entire window rather than
+  // risk exposing an untracked block. The scan-level `spansOverflowed` flag is
+  // the bounded machine-readable state for this condition.
+  if (scan.spansOverflowed) {
+    const forcedAll = window.map((_, index) => index);
+    const lines = window.map(() => forceRedactLine());
+    return {
+      lines,
+      redacted: lines.map((line, index) => line !== window[index].text),
+      nukeApplied: scan.nukeOffset >= 0,
+      forcedLines: forcedAll
+    };
+  }
   const flankBefore = scan.flankBefore;
   const flankAfter = scan.flankAfter;
   const bridgeSuspect = scan.bridgeSuspect;
