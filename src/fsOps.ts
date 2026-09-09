@@ -889,12 +889,23 @@ async function readPublicSnapshotFile(
     throw new CodexProError("Source projection broke physical line correspondence.");
   }
   const window = resolveWindow(options, rawLines.length);
+  // Exact decoded-string offsets (terminator-aware, so CRLF counts two).
+  const lineStarts: number[] = [];
+  {
+    let cursor = 0;
+    const pieces = text.split(/(\r\n|\n)/);
+    for (let i = 0; i < pieces.length; i += 2) {
+      lineStarts.push(cursor);
+      cursor += pieces[i].length + (pieces[i + 1] ?? "").length;
+    }
+  }
   const toScanned = (lines: string[]): ScannedLine[] =>
     lines.map((line, index) => ({
       lineNo: window.startLine + index,
       text: line,
       bytes: Buffer.byteLength(line, "utf8"),
-      giant: false
+      giant: false,
+      startOffset: lineStarts[window.startLine - 1 + index] ?? 0
     }));
   const display = toScanned(redactedLines.slice(window.startLine - 1, window.endLine));
   const budget = toScanned(rawLines.slice(window.startLine - 1, window.endLine));
@@ -939,8 +950,7 @@ async function readPublicLargeFile(
   const projected = projectLargeWindow(
     {
       scan,
-      window: captured,
-      windowStartOffset: scan.maskAtWindowStart.offset
+      window: captured
     },
     (slice) => redactSensitiveTextPreservingLines(slice, { context: "source" })
   );
@@ -948,7 +958,8 @@ async function readPublicLargeFile(
     lineNo: line.lineNo,
     text: projected.lines[index] ?? "",
     bytes: line.bytes,
-    giant: line.giant
+    giant: line.giant,
+    startOffset: line.startOffset
   }));
   const framed = frameRawWindow(display, captured, {
     startLine: window.startLine,

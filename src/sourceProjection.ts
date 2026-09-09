@@ -87,6 +87,8 @@ export interface ScannedLine {
   /** Exact UTF-8 byte length of the raw line content (terminator excluded). */
   readonly bytes: number;
   readonly giant: boolean;
+  /** Exact decoded-string offset of the line's first byte (for span mapping). */
+  readonly startOffset: number;
 }
 
 export interface GiantLineRecord {
@@ -106,6 +108,8 @@ export interface MaskSnapshot {
   readonly offset: number;
   readonly state: TriviaMaskState;
   readonly quote: string;
+  /** Lookahead-held tail chars at snapshot time (usually empty; restored exactly). */
+  readonly pending?: string;
 }
 
 export interface FileIdentity {
@@ -177,18 +181,35 @@ export interface ScanOptions extends ScanWindow {
 export class TriviaMaskStream {
   private state: TriviaMaskState = "code";
   private quote = "";
+  /**
+   * Held trailing chars (≤2) whose masking needs lookahead past the current
+   * feed (`//`, `/*`, `*​/`, backslash escapes, ``` fences split across
+   * chunks). Held output is always emitted on the next feed or `flush`, so
+   * the masked stream stays exact and contiguous. Holds only ever span
+   * mid-line content: a newline-terminated tail is always fully decidable.
+   */
+  private pending = "";
   snapshot(offset: number): MaskSnapshot {
-    return { offset, state: this.state, quote: this.quote };
+    return { offset, state: this.state, quote: this.quote, pending: this.pending };
   }
   restore(snapshot: MaskSnapshot): void {
     this.state = snapshot.state;
     this.quote = snapshot.quote;
+    this.pending = snapshot.pending ?? "";
+  }
+  /** Masked length already emitted (source offsets for the next output start here). */
+  get pendingLength(): number {
+    return this.pending.length;
   }
   feed(chunk: string): string {
-    const out = chunk.split("");
-    for (let i = 0; i < chunk.length; i += 1) {
-      const current = chunk[i];
-      const next = chunk[i + 1] ?? "";
+    const text = this.pending + chunk;
+    this.pending = "";
+    const out = text.split("");
+    let stop = text.length;
+    for (let i = 0; i < text.length; i += 1) {
+      const current = text[i];
+      const next = i + 1 < text.length ? text[i + 1] : null;
+      const nextNext = i + 2 < text.length ? text[i + 2] : null;
       const blank = (): void => {
         if (out[i] !== "\n" && out[i] !== "\r") out[i] = " ";
       };
@@ -203,13 +224,20 @@ export class TriviaMaskStream {
           out[i + 1] = out[i + 1] === "\n" || out[i + 1] === "\r" ? out[i + 1] : " ";
           i += 1;
           this.state = "code";
+        } else if (current === "*" && next === null) {
+          stop = i;
+          break;
         } else blank();
         continue;
       }
       if (this.state === "string") {
         if (current === "\\") {
+          if (next === null) {
+            stop = i;
+            break;
+          }
           blank();
-          if (i + 1 < chunk.length) {
+          if (i + 1 < text.length) {
             if (out[i + 1] !== "\n" && out[i + 1] !== "\r") out[i + 1] = " ";
             i += 1;
           }
@@ -234,13 +262,80 @@ export class TriviaMaskStream {
         this.state = "block-comment";
         continue;
       }
+      if (current === "/" && next === null) {
+        stop = i;
+        break;
+      }
+      if (current === "`") {
+        // A fence needs three consecutive ticks; a newline in the lookahead
+        // rules one out without holding.
+        if (next === null || (next === "`" && nextNext === null)) {
+          stop = i;
+          break;
+        }
+        if (next === "`" && nextNext === "`") {
+          i += 2;
+          continue;
+        }
+        blank();
+        this.state = "string";
+        this.quote = current;
+        continue;
+      }
       if (current === "#") {
         blank();
         this.state = "line-comment";
         continue;
       }
-      if (current === "\"" || current === "'" || current === "`") {
+      if (current === "\"" || current === "'") {
         blank();
+        this.state = "string";
+        this.quote = current;
+      }
+    }
+    this.pending = text.slice(stop);
+    return out.slice(0, stop).join("");
+  }
+  /**
+   * Decide held trailing chars with end-of-stream lookahead (nothing can
+   * follow). Concatenated after the last feed output, the masked stream is
+   * then complete and exact.
+   */
+  flush(): string {
+    const tail = this.pending;
+    this.pending = "";
+    if (!tail) return "";
+    const out = tail.split("");
+    for (let i = 0; i < tail.length; i += 1) {
+      const current = tail[i];
+      if (this.state === "line-comment") {
+        if (current === "\n" || current === "\r") this.state = "code";
+        else if (out[i] !== "\n" && out[i] !== "\r") out[i] = " ";
+        continue;
+      }
+      if (this.state === "block-comment") {
+        if (out[i] !== "\n" && out[i] !== "\r") out[i] = " ";
+        continue;
+      }
+      if (this.state === "string") {
+        if (current === "\\") {
+          if (out[i] !== "\n" && out[i] !== "\r") out[i] = " ";
+          continue;
+        }
+        if (current === this.quote) {
+          if (out[i] !== "\n" && out[i] !== "\r") out[i] = " ";
+          this.state = "code";
+          this.quote = "";
+          continue;
+        }
+        if (out[i] !== "\n" && out[i] !== "\r") out[i] = " ";
+        continue;
+      }
+      // At true end of stream no multi-char token can complete. Plain code
+      // chars pass through exactly like the whole-string oracle; quotes still
+      // open (blanked) since that decision needs no lookahead.
+      if (current === "\"" || current === "'" || current === "`") {
+        if (out[i] !== "\n" && out[i] !== "\r") out[i] = " ";
         this.state = "string";
         this.quote = current;
       }
@@ -282,7 +377,6 @@ export class NukeDetectorStream {
     }
     openings.sort((a, b) => a.off - b.off);
     let next = 0;
-    const openingAt = new Set(openings.map((o) => o.at));
     for (let i = 0; i < maskedSegment.length; i += 1) {
       while (next < openings.length && openings[next].at === i) {
         if (this.candidates.length < this.cap) {
@@ -295,9 +389,11 @@ export class NukeDetectorStream {
       }
       const c = maskedSegment[i];
       if (c !== "(" && c !== ")") continue;
-      if (c === "(" && openingAt.has(i)) continue;
       const cursor = baseOffset + i;
       for (const candidate of this.candidates) {
+        // Every paren strictly after a candidate's own opening counts toward
+        // it — including other candidates' openings, exactly like the oracle's
+        // depth scan. Only the candidate's own opening is already counted.
         if (candidate.opening >= cursor) continue;
         candidate.balance += c === "(" ? 1 : -1;
         if (candidate.balance < candidate.min) candidate.min = candidate.balance;
@@ -394,6 +490,10 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
   let pendingCR = false;
   let giantActive = false;
   let giantBytes = 0;
+  // Exact decoded-string accounting for line starts (terminator-aware, so CRLF
+  // and non-ASCII giant fragments keep span mapping exact).
+  let giantChars = 0;
+  let nextLineStart = 0;
   const selected: ScannedLine[] = [];
   const giants: GiantLineRecord[] = [];
   let maxRetained = 0;
@@ -460,8 +560,18 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
   let flankAfter = "";
   const FLANK_RING_CHARS = WINDOW_FLANK_BYTES + 4096;
 
-  const emit = (line: string, lineBytes: number, giant: boolean, record: string): void => {
+  const emit = (
+    line: string,
+    lineBytes: number,
+    giant: boolean,
+    record: string,
+    contentChars: number,
+    terminated: boolean
+  ): void => {
     completed += 1;
+    const startOffset = nextLineStart;
+    if (terminated) nextLineStart = startOffset + contentChars + 1;
+    else nextLineStart = startOffset + contentChars;
     if (giant) giants.push({ lineNo: completed, bytes: lineBytes });
     if (wantSelect && completed < selectStart) {
       // Pre-window context for the credential slice.
@@ -494,7 +604,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         captureClosed = true;
       } else {
         if (!giant) selectedBytes += lineBytes;
-        selected.push({ lineNo: completed, text: giant ? "" : line, bytes: lineBytes, giant });
+        selected.push({ lineNo: completed, text: giant ? "" : line, bytes: lineBytes, giant, startOffset });
         capturedThroughLine = completed;
       }
     }
@@ -536,6 +646,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
           if (carry) {
             observe(carry, completed + 1);
             giantBytes += carryBytes;
+            giantChars += carry.length;
             carry = "";
             carryBytes = 0;
           }
@@ -544,6 +655,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         if (giantActive) {
           observe(parts[0], completed + 1);
           giantBytes += fragBytes;
+          giantChars += parts[0].length;
         } else {
           carry += parts[0];
           carryBytes += fragBytes;
@@ -558,11 +670,12 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       const contentBytes = headBytes - (hadCR ? 1 : 0);
       const lineText = giantActive ? "" : headContent.endsWith("\r") ? headContent.slice(0, -1) : headContent;
       observe(`${headContent}\n`, completed + 1);
-      emit(lineText, contentBytes, giantActive, giantActive ? "" : `${lineText}\n`);
+      emit(lineText, contentBytes, giantActive, giantActive ? "" : `${lineText}\n`, giantChars + carry.length + parts[0].length, true);
       carry = "";
       carryBytes = 0;
       giantActive = false;
       giantBytes = 0;
+      giantChars = 0;
       for (let i = 1; i < parts.length - 1; i += 1) {
         const raw = parts[i];
         const stripped = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
@@ -570,10 +683,10 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         if (rawBytes > LINE_FRAG_CAP_BYTES) {
           // A middle giant line arrives whole within one chunk: feed exactly, retain nothing.
           observe(`${raw}\n`, completed + 1);
-          emit("", rawBytes - (raw.endsWith("\r") ? 1 : 0), true, "");
+          emit("", rawBytes - (raw.endsWith("\r") ? 1 : 0), true, "", raw.length, true);
         } else {
           observe(`${raw}\n`, completed + 1);
-          emit(stripped, Buffer.byteLength(stripped, "utf8"), false, `${stripped}\n`);
+          emit(stripped, Buffer.byteLength(stripped, "utf8"), false, `${stripped}\n`, raw.length, true);
         }
       }
       const tail = parts[parts.length - 1];
@@ -581,6 +694,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       if (tailBytes > LINE_FRAG_CAP_BYTES) {
         giantActive = true;
         giantBytes = tailBytes;
+        giantChars = tail.length;
         observe(tail, completed + 1);
         carry = "";
         carryBytes = 0;
@@ -597,6 +711,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         if (carry) {
           observe(carry, completed + 1);
           giantBytes += carryBytes;
+          giantChars += carry.length;
           carry = "";
           carryBytes = 0;
         }
@@ -605,6 +720,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       if (giantActive) {
         observe("\r", completed + 1);
         giantBytes += 1;
+        giantChars += 1;
       } else {
         carry += "\r";
         carryBytes += 1;
@@ -618,6 +734,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         if (carry) {
           observe(carry, completed + 1);
           giantBytes += carryBytes;
+          giantChars += carry.length;
           carry = "";
           carryBytes = 0;
         }
@@ -626,6 +743,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       if (giantActive) {
         observe(tail, completed + 1);
         giantBytes += tailBytes;
+        giantChars += tail.length;
       } else {
         carry += tail;
         carryBytes += tailBytes;
@@ -640,6 +758,8 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         utf8Valid = false;
       }
     }
+    // Flush lookahead-held mask tail so the detector sees the complete stream.
+    feedMasked(mask.flush());
     if (maskedPending) {
       nuke.feed(maskedPending, maskedFed);
       maskedFed += maskedPending.length;
@@ -647,10 +767,10 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
     }
     // Oracle line semantics: always one final (possibly empty) line.
     if (giantActive) {
-      emit("", giantBytes, true, "");
+      emit("", giantBytes, true, "", giantChars, false);
     } else {
       observe(carry, completed + 1);
-      emit(carry, carryBytes, false, carry);
+      emit(carry, carryBytes, false, carry, carry.length, false);
     }
     const windowStartSnapshot: MaskSnapshot | null = windowSnapshots.start;
     const digest = hash.digest("hex");
@@ -931,11 +1051,10 @@ export interface LargeWindowProjectionRequest {
   readonly scan: SourceScan;
   /**
    * Captured window entries in order (a contiguous prefix of the requested
-   * window; giant entries carry text "" and are never rendered).
+   * window carrying exact startOffsets; giant entries carry text "" and are
+   * never rendered).
    */
   readonly window: ScannedLine[];
-  /** Decoded-string offset of the first window byte (for exact span mapping). */
-  readonly windowStartOffset: number;
 }
 
 export interface LargeWindowProjection {
@@ -972,13 +1091,20 @@ export function projectLargeWindow(
   request: LargeWindowProjectionRequest,
   redactSlice: (slice: string) => string
 ): LargeWindowProjection {
-  const { scan, window, windowStartOffset } = request;
+  const { scan, window } = request;
   if (window.length === 0) throw new CodexProError("Projection requires a non-empty window.");
   for (let i = 1; i < window.length; i += 1) {
     if (window[i].lineNo !== window[i - 1].lineNo + 1) {
       throw new CodexProError("Projection requires contiguous window lines.");
     }
   }
+  // Two independent exact offset computations must agree: framing-loop
+  // accounting (entries) and the observer-stream mask snapshot. Any drift
+  // (e.g. terminator miscounting) fails closed instead of misplacing spans.
+  if (scan.maskAtWindowStart === null || scan.maskAtWindowStart.offset !== window[0].startOffset) {
+    throw new CodexProError("Projection window offsets disagree with the scan snapshot.");
+  }
+  const windowStartOffset = window[0].startOffset;
   const rawLines = window.map((entry) => entry.text);
   const flankBefore = scan.flankBefore;
   const flankAfter = scan.flankAfter;
@@ -1012,7 +1138,8 @@ export function projectLargeWindow(
   windowLines = nuke.lines;
   // Stage 4: conservative force rules for slice-edge uncertainty.
   const forcedLines: number[] = [];
-  const maskedSlice = new TriviaMaskStream().feed(slice);
+  const sliceMasker = new TriviaMaskStream();
+  const maskedSlice = sliceMasker.feed(slice) + sliceMasker.flush();
   const forceLine = (index: number): void => {
     windowLines[index] = forceRedactLine();
     if (!forcedLines.includes(index)) forcedLines.push(index);

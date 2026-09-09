@@ -242,13 +242,16 @@ async function main() {
       const scanComment = await scanWorkingTreeFile(fsp, { absPath: inComment, startLine: 3, endLine: 3, chunkBytes: 5 });
       assert.equal(scanComment.windowStartsInCode, false);
       assert.equal(scanComment.maskAtWindowStart.state, 'block-comment');
-      // mask snapshot agrees with whole-string masker at the same offset
+      // mask snapshot agrees with whole-string masker at the same offset.
+      // Only the interior is compared: the final two positions may depend on
+      // lookahead past the slice end (streaming holds them for exactness).
       const masker = new TriviaMaskStream();
-      const fullMasked = masker.feed(hostile);
+      const fullMasked = masker.feed(hostile) + masker.flush();
       const sliceCheck = fullMasked.slice(scan.maskAtWindowStart.offset);
       const reseeded = new TriviaMaskStream();
       reseeded.restore(scan.maskAtWindowStart);
-      assert.equal(reseeded.feed(hostile.slice(scan.maskAtWindowStart.offset, scan.maskAtWindowStart.offset + 40)), sliceCheck.slice(0, 40));
+      const reseededOut = reseeded.feed(hostile.slice(scan.maskAtWindowStart.offset, scan.maskAtWindowStart.offset + 40)) + reseeded.flush();
+      assert.equal(reseededOut.slice(0, 38), sliceCheck.slice(0, 38));
       console.log('ok security observers (spans/nuke/mask snapshots)');
     }
 

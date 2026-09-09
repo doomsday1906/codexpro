@@ -559,16 +559,32 @@ async function runMaxReadSearchStress() {
   const client = await initClient(root, { CODEXPRO_MAX_READ_BYTES: '1000' });
   try {
     const opened = await client.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
-    const manyLinesRead = await client.request('tools/call', {
-      name: 'read',
-      arguments: { workspace_id: opened.structuredContent.workspace_id, path: 'many-lines.txt' }
-    });
-    assert(manyLinesRead.isError !== true && manyLinesRead.structuredContent.endLine === 1201, `full read under maxReadBytes failed after line numbering: ${JSON.stringify(manyLinesRead.structuredContent)}`);
+    // NOTE: CODEXPRO_MAX_READ_BYTES floors at 4000, so the effective window
+    // budget here is 4000 bytes. Unbounded reads page instead of failing on
+    // total size: collect every page and prove complete ordered coverage.
+    const pages = [];
+    let startLine = 1;
+    for (let page = 0; page < 10; page += 1) {
+      const numbered = await client.request('tools/call', {
+        name: 'read',
+        arguments: { workspace_id: opened.structuredContent.workspace_id, path: 'many-lines.txt', ...(startLine === 1 ? {} : { start_line: startLine }) }
+      });
+      assert(numbered.isError !== true, `paged read failed: ${JSON.stringify(numbered.structuredContent)}`);
+      pages.push(numbered.structuredContent);
+      if (numbered.structuredContent.nextStartLine === undefined || numbered.structuredContent.nextStartLine === null) break;
+      startLine = numbered.structuredContent.nextStartLine;
+    }
+    const lastPage = pages[pages.length - 1];
+    assert(lastPage.endLine === 1201 && (lastPage.nextStartLine === undefined || lastPage.nextStartLine === null),
+      `paged read did not cover all 1201 lines: ${JSON.stringify(pages.map((item) => [item.startLine, item.endLine]))}`);
+    assert(pages[0].budgetTruncated === true && typeof pages[0].nextStartLine === 'number', 'first page omitted pagination metadata');
     const fullRead = await client.request('tools/call', {
       name: 'read',
       arguments: { workspace_id: opened.structuredContent.workspace_id, path: 'large.txt' }
     });
-    assert(fullRead.isError === true && String(fullRead.structuredContent.error).includes('too large'), 'full read ignored maxReadBytes');
+    assert(fullRead.isError !== true && fullRead.structuredContent.budgetTruncated === true &&
+      typeof fullRead.structuredContent.nextStartLine === 'number',
+      `unbounded read did not page instead of failing on total size: ${JSON.stringify(fullRead.structuredContent)}`);
     const rangedRead = await client.request('tools/call', {
       name: 'read',
       arguments: { workspace_id: opened.structuredContent.workspace_id, path: 'large.txt', start_line: 3, end_line: 3 }

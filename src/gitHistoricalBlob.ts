@@ -441,6 +441,12 @@ export function streamGitBlobToScan(
       chunkBytes: 64 * 1024,
       selectMaxBytes: request.selectMaxBytes
     });
+    // The scan rejects as soon as the stream fails (e.g. advertised/observed
+    // mismatch), well before the close handler consumes it below. Observe the
+    // rejection immediately so a deterministic failure never surfaces as a
+    // process-level unhandled rejection; the close handler still awaits the
+    // same promise for the authoritative outcome.
+    scanPromise.then(undefined, () => undefined);
 
     child.once("close", (exitCode: number | null, signal: NodeJS.Signals | null) => {
       closed = true;
@@ -612,12 +618,23 @@ function projectHistoricalSnapshot(
   const redactedLines = splitLines(redacted);
   if (redactedLines.length !== rawLines.length) throw failure("projection");
   const window = resolveHistoricalWindow(options, rawLines.length);
+  // Exact decoded-string offsets (terminator-aware, so CRLF counts two).
+  const lineStarts: number[] = [];
+  {
+    let cursor = 0;
+    const pieces = text.split(/(\r\n|\n)/);
+    for (let i = 0; i < pieces.length; i += 2) {
+      lineStarts.push(cursor);
+      cursor += pieces[i].length + (pieces[i + 1] ?? "").length;
+    }
+  }
   const toScanned = (lines: string[]): ScannedLine[] =>
     lines.map((line, index) => ({
       lineNo: window.startLine + index,
       text: line,
       bytes: Buffer.byteLength(line, "utf8"),
-      giant: false
+      giant: false,
+      startOffset: lineStarts[window.startLine - 1 + index] ?? 0
     }));
   const framed = frameRawWindow(
     toScanned(redactedLines.slice(window.startLine - 1, window.endLine)),
@@ -648,8 +665,7 @@ function projectHistoricalLarge(
   const projected = projectLargeWindow(
     {
       scan,
-      window: captured,
-      windowStartOffset: scan.maskAtWindowStart.offset
+      window: captured
     },
     (slice) => redactSensitiveTextPreservingLines(slice, { context: "source" })
   );
@@ -657,7 +673,8 @@ function projectHistoricalLarge(
     lineNo: line.lineNo,
     text: projected.lines[index] ?? "",
     bytes: line.bytes,
-    giant: line.giant
+    giant: line.giant,
+    startOffset: line.startOffset
   }));
   const framed = frameRawWindow(display, captured, {
     startLine: window.startLine,

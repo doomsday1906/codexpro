@@ -463,6 +463,35 @@ try {
     (error) => error instanceof HistoricalBlobError && error.reason === "timeout"
   );
   console.log("RAW_OBSERVATION: 20MiB stream with a 1ms ceiling fails timeout with bounded facts");
+  // Reviewer F2 regression: a deterministic stream failure (advertised size lie)
+  // must reach the caller with NO process-level unhandled rejection.
+  {
+    let unhandled = 0;
+    const counter = () => {
+      unhandled += 1;
+    };
+    process.on("unhandledRejection", counter);
+    try {
+      await assert.rejects(
+        streamGitBlobToScan(workspace, {
+          oid: big20mOid,
+          advertised: big20mAdvertised - 1,
+          timeoutMs: 60_000,
+          stderrMaxBytes: 120_000,
+          startLine: 1,
+          endLine: 2,
+          selectMaxBytes: 256 * 1024,
+          retainUpToBytes: 0
+        }),
+        (error) => error instanceof HistoricalBlobError && error.reason === "blob-size-mismatch"
+      );
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      assert.equal(unhandled, 0, "stream failure emitted an unhandled rejection");
+    } finally {
+      process.removeListener("unhandledRejection", counter);
+    }
+    console.log("RAW_OBSERVATION: blob-size-mismatch reaches the caller with zero unhandled rejections");
+  }
   console.log("PASS historical binary-after-window and timeout fail-closed");
 
   // In-policy blobs stream through cat-file (already proven above: the 20MiB

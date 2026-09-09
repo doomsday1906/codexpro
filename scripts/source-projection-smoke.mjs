@@ -46,11 +46,7 @@ async function projectWindow(absPath, text, startLine, endLine, chunkBytes = 409
   const winStart = offsets[startLine - 1];
   const window = scan.selected.filter((entry) => entry.lineNo >= startLine && entry.lineNo <= endLine);
   assert.ok(window.length > 0, 'scan captured the requested window');
-  const projected = projectLargeWindow({
-    scan,
-    window,
-    windowStartOffset: winStart,
-  }, redactSlice);
+  const projected = projectLargeWindow({ scan, window }, redactSlice);
   // the scan-derived flanks must reproduce the caller-visible window context
   assert.ok(scan.flankBefore.length <= 65536, 'flankBefore bound');
   assert.ok(scan.flankAfter.length <= 65536, 'flankAfter bound');
@@ -211,9 +207,7 @@ async function main() {
       const { lines, offsets } = lineOffsets(text);
       const window = scan.selected.filter((entry) => entry.lineNo >= 2 && entry.lineNo <= 2);
       assert.equal(window.length, 1);
-      const projected = projectLargeWindow({
-        scan, window, windowStartOffset: offsets[1],
-      }, redactSlice);
+      const projected = projectLargeWindow({ scan, window }, redactSlice);
       // The whole-source oracle redacts comment-embedded credential shapes (fail-closed);
       // the uncertain path must not allow what the oracle denies.
       const oracleLine = redactSlice(text).split('\n')[1];
@@ -246,13 +240,43 @@ async function main() {
       const bridgedScan = { ...scan, flankBefore: '', bridgeSuspect: true };
       const window = scan.selected.filter((entry) => entry.lineNo >= 2 && entry.lineNo <= 3);
       assert.equal(window.length, 2);
-      const projected = projectLargeWindow({
-        scan: bridgedScan, window, windowStartOffset: offsets[1],
-      }, redactSlice);
+      const projected = projectLargeWindow({ scan: bridgedScan, window }, redactSlice);
       assert.ok(projected.forcedLines.includes(0), 'R4 did not force the bridged first line');
       const joined = projected.lines.join('\n');
       assert.ok(!joined.includes(SECRET), 'bridged secret leaked');
       console.log('ok AP-008c bridge force-redact');
+    }
+
+    // Reviewer F1 regression: nested credential-paren candidates. The oracle counts
+    // every paren from each opening (the inner candidate's paren keeps the outer
+    // unmatched); the streaming detector must agree exactly, at any segmentation.
+    {
+      const poison = 'api_key: foo(1\nsecret: bar(2)\n';
+      const p = path.join(tmpRoot, 'nested-paren.txt');
+      await fsp.writeFile(p, poison);
+      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 1, endLine: 3, chunkBytes: 5 });
+      assert.ok(scan.nukeOffset >= 0, 'nested candidate trigger missed');
+      // The trigger is the FIRST candidate opening, not the inner one.
+      assert.equal(scan.nukeOffset, poison.indexOf('('));
+      const scan64 = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 1, endLine: 3, chunkBytes: 64 });
+      assert.equal(scan64.nukeOffset, scan.nukeOffset, 'nuke trigger depends on segmentation');
+      console.log('ok reviewer-F1 nested paren trigger (segmentation-independent)');
+    }
+
+    // Reviewer residual: mask chunk-split closers (//, /*, */, escapes, fences).
+    {
+      const { TriviaMaskStream } = await import('../dist/sourceProjection.js');
+      const tricky = 'a = 1; /* split closer */ x = "q\\"y"; // tail\ncode `tmpl ${v}` end\nfence ```\ncode after\napi_key = getToken()\n';
+      const wholeMasker = new TriviaMaskStream();
+      const whole = wholeMasker.feed(tricky) + wholeMasker.flush();
+      for (const seg of [1, 2, 3, 7, 64]) {
+        const m = new TriviaMaskStream();
+        let out = '';
+        for (let i = 0; i < tricky.length; i += seg) out += m.feed(tricky.slice(i, i + seg));
+        out += m.flush();
+        assert.equal(out, whole, `mask segmentation diverged at seg=${seg}`);
+      }
+      console.log('ok reviewer residual mask segmentation equivalence (closers/escapes/fences)');
     }
 
     // AP-009: large benign source stays fully visible (no secret-treating).

@@ -284,7 +284,7 @@ function hydrateLargeLines(
   let projected: readonly string[];
   try {
     projected = projectLargeWindow(
-      { scan, window: scan.selected, windowStartOffset: scan.maskAtWindowStart.offset },
+      { scan, window: scan.selected },
       (slice) => redactSensitiveTextPreservingLines(slice, { context: "source" })
     ).lines;
   } catch {
