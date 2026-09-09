@@ -1312,6 +1312,51 @@ function fitSearchResponseEnvelope(
   );
 }
 
+// R4-1: search-specific bounded error envelope. Successful results pass
+// through fitSearchResponseEnvelope, but exceptions thrown by
+// searchWorkspace (producer diagnostics up to maxOutputBytes, spawn
+// failures, validation, or the success-fitter's own envelope error) bypass
+// it and are duplicated by the generic error contract into BOTH content text
+// and structuredContent.error — so the final error result can exceed the
+// output policy. This builder bounds exactly the search error outcome and
+// leaves the generic errorResult contract (every other tool) untouched.
+// The classified `Name: message` string is preserved while it fits; larger
+// diagnostics shrink by halves (UTF-8 safe, never a cut of serialized
+// JSON) keeping a short truthful truncation marker; the tiny static
+// fallback carries no command output, query text, file content, or path
+// material and fits the lawful minimum output configuration by
+// construction (proven in hestia-r4-search-error-envelope-proof).
+const SEARCH_ERROR_TRUNCATION_MARKER = "…[search error detail truncated]";
+const SEARCH_ERROR_FALLBACK_TEXT = "Search failed: error detail withheld by the output budget.";
+
+export function buildSearchErrorResponse(config: CodexProConfig, error: unknown): any {
+  const budget = Math.max(0, config.maxOutputBytes);
+  const measuredBytes = (response: any): number => Buffer.byteLength(JSON.stringify(response ?? {}), "utf8");
+  const fits = (response: any): boolean => measuredBytes(response) + SEARCH_RESPONSE_RESERVE_BYTES <= budget;
+  const candidate = (detail: string): any => diagnosticResult({
+    isError: true,
+    content: [{ type: "text", text: detail }],
+    structuredContent: { error: detail },
+    _meta: {}
+  });
+  // errorText keeps the `Name: message` classification every other tool
+  // surfaces, redacted; the final measurement below is post-redaction, so
+  // the bound holds exactly as transported.
+  let detail = errorText(error);
+  for (;;) {
+    const text = detail || SEARCH_ERROR_FALLBACK_TEXT;
+    const response = candidate(text);
+    if (fits(response)) return response;
+    if (detail.length === 0) return response;
+    // Strict halving: terminates in O(log n) without assuming redaction
+    // monotonicity (each step is exactly measured, never assumed).
+    const currentBytes = Buffer.byteLength(detail, "utf8");
+    const markerBytes = Buffer.byteLength(SEARCH_ERROR_TRUNCATION_MARKER, "utf8");
+    const target = Math.max(0, Math.floor(currentBytes / 2) - markerBytes - 32);
+    detail = target <= 0 ? "" : truncateUtf8(detail, target, SEARCH_ERROR_TRUNCATION_MARKER);
+  }
+}
+
 function diagnosticResult(result: any): any {
   if (!result || typeof result !== "object" || Array.isArray(result)) return result;
   const safe = { ...result };
@@ -3854,25 +3899,34 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
-      const result = await searchWorkspace(config, guard, workspace, {
-        query: args.query,
-        regex: parseBool(args.regex, false),
-        root: args.path ?? ".",
-        glob: args.glob,
-        includeHidden: parseBool(args.include_hidden, false),
-        maxResults: limitInt(args.max_results, config.maxSearchResults, 1, config.maxSearchResults),
-        intent: args.intent,
-        symbol: args.symbol,
-        includeTests: args.include_tests === undefined ? undefined : parseBool(args.include_tests, false)
-      });
-      // R3-1: the collection budget limits producer-side evidence, but
-      // hydration, coverage text, the optional analysis payload, and JSON
-      // framing all grow after it — so the complete serialized tool result
-      // is fitted here to the output policy, admitting only whole records.
-      // maxOutputBytes stays the output policy; it is never redefined as a
-      // ripgrep-record budget. Plain lexical and structured-intent routes
-      // share this single choke point, so both stay consistent.
-      return fitSearchResponseEnvelope(config, workspace, result);
+      try {
+        const result = await searchWorkspace(config, guard, workspace, {
+          query: args.query,
+          regex: parseBool(args.regex, false),
+          root: args.path ?? ".",
+          glob: args.glob,
+          includeHidden: parseBool(args.include_hidden, false),
+          maxResults: limitInt(args.max_results, config.maxSearchResults, 1, config.maxSearchResults),
+          intent: args.intent,
+          symbol: args.symbol,
+          includeTests: args.include_tests === undefined ? undefined : parseBool(args.include_tests, false)
+        });
+        // R3-1: the collection budget limits producer-side evidence, but
+        // hydration, coverage text, the optional analysis payload, and JSON
+        // framing all grow after it — so the complete serialized tool result
+        // is fitted here to the output policy, admitting only whole records.
+        // maxOutputBytes stays the output policy; it is never redefined as a
+        // ripgrep-record budget. Plain lexical and structured-intent routes
+        // share this single choke point, so both stay consistent.
+        return fitSearchResponseEnvelope(config, workspace, result);
+      } catch (error) {
+        // R4-1: search errors (producer diagnostics, spawn failures,
+        // validation, or the success fitter's own envelope error) bypass the
+        // success fitter and would be duplicated unbounded by the generic
+        // error contract — bound them with the search-specific envelope
+        // instead. Narrowly search-scoped; errorResult is untouched.
+        return buildSearchErrorResponse(config, error);
+      }
     }
   );
 
