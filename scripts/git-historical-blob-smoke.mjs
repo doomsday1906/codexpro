@@ -169,6 +169,19 @@ try {
   await writeFile(path.join(repoRoot, "binary-after.txt"), binaryAfterChunks.join(""), "utf8");
   await writeFile(path.join(repoRoot, "huge.bin"), Buffer.alloc(100 * 1024 * 1024, 0x61));
 
+  // F1-B fixture: >2MiB blob (large historical path), private-key BEGIN before
+  // the window, >64KiB of body, final body line WITHOUT trailing newline.
+  // Fragments keep token-shaped literals out of tracked source (F7).
+  const F1B_BEGIN = "-----" + "BEG" + "IN RSA PRIVATE " + "KEY-----";
+  const F1B_BODY = "F1BHISTBODY7X9_";
+  const f1bFiller = "historical eof-order filler padding 0123456789 abcdef\n";
+  const f1bFillerReps = Math.ceil(2_200_000 / f1bFiller.length);
+  const f1bBodyLine = `${F1B_BODY}${"x".repeat(1000)}\n`;
+  const f1bFinal = `${F1B_BODY}FINAL${"y".repeat(1000)}`; // NO trailing newline
+  const f1bRaw = `${f1bFiller.repeat(f1bFillerReps)}${F1B_BEGIN}\n${f1bBodyLine.repeat(70)}${f1bFinal}`;
+  await writeFile(path.join(repoRoot, "eof-block.txt"), f1bRaw, "utf8");
+  const f1bTotalLines = f1bRaw.split("\n").length;
+
   // The index cache entry is a real gitlink in the produced commit tree.
   git(repoRoot, ["add", "-A"]);
   git(repoRoot, ["update-index", "--add", "--cacheinfo", `160000,${subrepoCommit},gitlink-entry`]);
@@ -239,6 +252,16 @@ try {
   assert.equal(privateBody.truncated, true);
   console.log("RAW_OBSERVATION: complete real blob contains private declaration/body/delimiter; selected line is body-only");
   console.log("SANITY_VERDICT: MATCH — selected public projection hides the body after full-snapshot policy evaluation");
+
+  // F1-B: immutable bounded historical read of the unterminated final body
+  // line of a >2MiB blob. No body material in any result field.
+  const f1b = await readAtRef(config, guard, workspace, { ref: rootSha, path: "eof-block.txt", startLine: f1bTotalLines, endLine: f1bTotalLines });
+  assert.ok(f1b.bytes > 2 * 1024 * 1024, "F1-B fixture must take the large historical path");
+  const f1bSerialized = JSON.stringify(f1b);
+  assert.equal(f1bSerialized.includes(F1B_BODY), false, "F1-B: historical final body material visible");
+  assert.ok(f1b.text.includes("[REDACTED_PRIVATE_KEY]"), "F1-B: private marker missing");
+  console.log("RAW_OBSERVATION: >2MiB historical blob with unterminated trailing key body returns only the marker on its final line");
+  console.log("PASS historical EOF-block final line redacted (F1-B)");
 
   const range = await readAtRef(config, guard, workspace, { ref: rootSha, path: "private.txt", startLine: 1, endLine: 1 });
   assert.equal(range.text, "1 | const before = true;");

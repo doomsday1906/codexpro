@@ -166,6 +166,37 @@ try {
     console.log('ok direct out-of-range key + credential safety');
   }
 
+  // F1-A: EOF observer ordering. >2MiB source, private-key BEGIN before the
+  // window, >64KiB of body, final body line WITHOUT trailing newline, only
+  // that line requested. The final line must be redacted in every field.
+  // F1-D: a newline-terminated large source's final empty line is a stable
+  // result, not a missing-projection-state error.
+  {
+    const F1_BEGIN = '-----' + 'BEG' + 'IN RSA PRIVATE ' + 'KEY-----';
+    const F1_BODY = 'F1EOFBODY7X9_';
+    const filler66 = 'eof-order filler line padding 0123456789 abcdef\n';
+    const fillerReps = Math.ceil((2_200_000) / filler66.length);
+    const bodyLine = `${F1_BODY}${'x'.repeat(1000)}\n`;
+    const bodyReps = 70; // >64KiB of body separates BEGIN from the final line
+    const finalLine = `${F1_BODY}FINAL${'y'.repeat(1000)}`; // NO trailing newline
+    const src = `${filler66.repeat(fillerReps)}${F1_BEGIN}\n${bodyLine.repeat(bodyReps)}${finalLine}`;
+    await fsp.writeFile(path.join(tmp, 'eof-block.txt'), src);
+    const totalLines = src.split('\n').length;
+    const only = await readPublicTextFile(config, guard, workspace, 'eof-block.txt', { startLine: totalLines, endLine: totalLines });
+    const serialized = JSON.stringify(only);
+    assert.ok(!serialized.includes(F1_BODY), 'F1-A: final key-body material visible in the read result');
+    assert.ok(only.text.includes('[REDACTED_PRIVATE_KEY]'), 'F1-A: private marker missing');
+    console.log('ok F1-A working-tree EOF block redacted');
+
+    const src2 = `${filler66.repeat(fillerReps)}tail\n`;
+    await fsp.writeFile(path.join(tmp, 'eof-empty.txt'), src2);
+    const total2 = src2.split('\n').length;
+    const emptyFinal = await readPublicTextFile(config, guard, workspace, 'eof-empty.txt', { startLine: total2, endLine: total2 });
+    assert.equal(emptyFinal.startLine, total2);
+    assert.equal(emptyFinal.endLine, total2);
+    console.log('ok F1-D final empty line stable');
+  }
+
   // NUL after the requested range still rejects (full-source binary law preserved).
   {
     await assert.rejects(
@@ -346,6 +377,21 @@ try {
     assert.ok(!credentialMatch.text.includes(SEARCH_SECRET.slice(0, 17)), 'credential leaked in match text');
     assert.ok(!found.text.includes(SEARCH_SECRET.slice(0, 17)), 'credential leaked in search text');
     console.log('ok credential matches genuinely redacted');
+  }
+
+  // F1-C: a query matching text inside the final key-body line of the >2MiB
+  // EOF-block fixture is redacted, never available; neither the match text,
+  // the query echo, nor structured metadata reconstructs the value.
+  {
+    const found = await searchWorkspace(config, guard, directWs, { query: 'F1EOFBODY7X9_FINAL', regex: false, includeHidden: false, maxResults: 10, root: 'eof-block.txt' });
+    assert.ok(found.matches.length > 0, 'final body line not found');
+    for (const match of found.matches) {
+      assert.equal(match.text_status, 'redacted', `final body line not redacted: ${JSON.stringify(match)}`);
+      assert.ok(!match.text.includes('F1EOFBODY7X9_'), 'body value in match text');
+    }
+    const serialized = JSON.stringify(found);
+    assert.ok(!serialized.includes('F1EOFBODY7X9_'), 'body value reconstructed in search envelope');
+    console.log('ok F1-C final body line search redacted');
   }
 
   // AP-018 direct: undecodable context is unavailable (never secret-labeled).
