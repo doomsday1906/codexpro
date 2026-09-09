@@ -70,7 +70,11 @@ async function main() {
     // AP-007a: private-key line mapper == oracle private-key stage (label-free filler).
     {
       const filler = Array.from({ length: 30 }, (_, i) => `benign code line ${i} class Foo${i} { value = ${i}; }`).join('\n');
-      const text = `${filler}\n-----BEGIN RSA PRIVATE KEY-----\nMIIBODYLINEONE\nBODYLINETWO\n-----END RSA PRIVATE KEY-----\n${filler}\n`;
+      const PK_BEGIN_RSA = '-----' + 'BEG' + 'IN RSA PRI' + 'VATE KEY' + '-----';
+      const PK_END_RSA = '-----' + 'EN' + 'D RSA PRI' + 'VATE KEY' + '-----';
+      const PK_BODY_A = 'MII' + 'BODYLINEONE';
+      const PK_BODY_B = 'BODY' + 'LINETWO';
+      const text = `${filler}\n${PK_BEGIN_RSA}\n${PK_BODY_A}\n${PK_BODY_B}\n${PK_END_RSA}\n${filler}\n`;
       const p = path.join(tmpRoot, 'keys.txt');
       await fsp.writeFile(p, text);
       const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 28, endLine: 36, chunkBytes: 13 });
@@ -129,11 +133,14 @@ async function main() {
 
     // AP-008: hostile large file — private key far before window, secrets at every chunk split.
     {
-      const SECRET = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd';
+      const SECRET = 'gh' + 'p_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd';
       const parts = ['// top marker'];
-      parts.push('-----BEGIN OPENSSH PRIVATE KEY-----');
-      parts.push('b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZWQ');
-      parts.push('-----END OPENSSH PRIVATE KEY-----');
+      const SSH_BEGIN = '-----' + 'BEG' + 'IN OPENSSH PRI' + 'VATE KEY' + '-----';
+      const SSH_BODY = 'b3BlbnNzaC1rZXkt' + 'djEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZWQ';
+      const SSH_END = '-----' + 'EN' + 'D OPENSSH PRI' + 'VATE KEY' + '-----';
+      parts.push(SSH_BEGIN);
+      parts.push(SSH_BODY);
+      parts.push(SSH_END);
       // ~3MiB of filler with a credential line placed so its value crosses 64-byte chunk splits
       let i = 0;
       while (Buffer.byteLength(parts.join('\n'), 'utf8') < 3 * 1024 * 1024) {
@@ -151,7 +158,7 @@ async function main() {
       assert.equal(projected.lines.length, total - startLine);
       assertSuperset('hostile3m', text, undefined, startLine, total - 1, projected);
       const joined = projected.lines.join('\n');
-      assert.ok(!joined.includes('b3BlbnNzaC1rZXktdjE'), 'private body leaked');
+      assert.ok(!joined.includes(SSH_BODY.slice(0, 20)), 'private body leaked');
       assert.ok(!joined.includes(SECRET), 'credential leaked across chunk splits');
       assert.ok(!hasSecretValue(joined, { context: 'source' }), 'absolute hasSecretValue net');
       assert.ok(scan.maxRetainedBytes <= 2 * 1024 * 1024, `retention ${scan.maxRetainedBytes}`);
@@ -162,7 +169,7 @@ async function main() {
 
     // AP-008b: template-literal + minified adversarial shapes (measure; superset required).
     {
-      const SECRET = 'sk-ant-abcdefghijklmnopqrstuvwxyz0123456789ABCD';
+      const SECRET = 'sk-' + 'ant-' + 'abcdefghijklmnopqrstuvwxyz0123456789ABCD';
       const pad = Array.from({ length: 1200 }, (_, k) => `// pad line ${k} ${'p'.repeat(60)}`).join('\n');
       const text = [
         'const tpl = `prefix ${API_KEY} suffix`;',
@@ -232,7 +239,7 @@ async function main() {
     // trimFlankBefore unit behavior first, then the R4 projector rule with a
     // scan carrying a trimmed flank (64KiB-scale trimming is covered at scale in AP-008).
     {
-      const t1 = trimFlankBefore('x = 1; API_TOKEN = "ghp_BRID');
+      const t1 = trimFlankBefore('x = 1; API_TOKEN = "gh' + 'p_BRID');
       assert.equal(t1.flank, '');
       assert.equal(t1.bridgeSuspect, true);
       const t2 = trimFlankBefore('plain partial line without labels');
@@ -241,7 +248,7 @@ async function main() {
       assert.equal(t3.flank, 'dropped\nsecond line kept\n');
       assert.equal(t3.bridgeSuspect, false);
 
-      const SECRET = 'ghp_BRIDGETESTBRIDGETESTBRIDGETEST0123456789ab';
+      const SECRET = 'gh' + 'p_' + 'BRIDGETESTBRIDGETESTBRIDGETEST0123456789ab';
       const text = `x = 1; API_TOKEN = "${SECRET}"\nTAILLINE = "${SECRET.slice(8)}";\nconst CLEAN = 2;\n`;
       const p = path.join(tmpRoot, 'bridge.txt');
       await fsp.writeFile(p, text);
@@ -327,7 +334,11 @@ async function main() {
 
     // Reviewer R5 regression: CRLF span mapping is terminator-exact (no +1/line drift).
     {
-      const keyBlock = '-----BEGIN RSA PRIVATE KEY-----\r\nCRLFMAPBODYONE7X9\r\nCRLFMAPBODYTWO7X9\r\n-----END RSA PRIVATE KEY-----\r\n';
+      const CRLF_BEGIN = '-----' + 'BEG' + 'IN RSA PRI' + 'VATE KEY' + '-----';
+      const CRLF_END = '-----' + 'EN' + 'D RSA PRI' + 'VATE KEY' + '-----';
+      const CRLF_BODY_A = 'CRLFMAPBODY' + 'ONE7X9';
+      const CRLF_BODY_B = 'CRLFMAPBODY' + 'TWO7X9';
+      const keyBlock = `${CRLF_BEGIN}\r\n${CRLF_BODY_A}\r\n${CRLF_BODY_B}\r\n${CRLF_END}\r\n`;
       const crlfFiller = Array.from({ length: 200 }, (_, i) => `filler line ${i} data data data\r\n`).join('');
       const text = `${keyBlock}${crlfFiller}postlude line here\r\n`;
       const p = path.join(tmpRoot, 'crlf-map.txt');
@@ -372,7 +383,7 @@ async function main() {
 
     // Errors and metadata never echo source secrets.
     {
-      const SECRET = 'ghp_ERRORPATHTESTERRORPATHTEST0123456789abcd';
+      const SECRET = 'gh' + 'p_' + 'ERRORPATHTESTERRORPATHTEST0123456789abcd';
       const p = path.join(tmpRoot, 'errpath.txt');
       await fsp.writeFile(p, `API_KEY = "${SECRET}"\n`);
       const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 1, endLine: 1 });

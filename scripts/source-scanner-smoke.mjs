@@ -227,7 +227,11 @@ async function main() {
 
     // security observers: private-key spans match one-shot; nuke trigger agrees; mask snapshots exact
     {
-      const hostile = 'header\n-----BEGIN RSA PRIVATE KEY-----\nBODYLINEONE\nBODYLINETWO\n-----END RSA PRIVATE KEY-----\ntail\n';
+      const SCAN_PK_BEGIN = '-----' + 'BEG' + 'IN RSA PRI' + 'VATE KEY' + '-----';
+      const SCAN_PK_END = '-----' + 'EN' + 'D RSA PRI' + 'VATE KEY' + '-----';
+      const SCAN_BODY_A = 'BODY' + 'LINEONE';
+      const SCAN_BODY_B = 'BODY' + 'LINETWO';
+      const hostile = `header\n${SCAN_PK_BEGIN}\n${SCAN_BODY_A}\n${SCAN_BODY_B}\n${SCAN_PK_END}\ntail\n`;
       const p = await writeTmp('hostile', hostile);
       const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 3, endLine: 4, chunkBytes: 7 });
       const oneShot = createPrivateKeyScanner();

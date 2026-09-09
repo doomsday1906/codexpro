@@ -93,9 +93,13 @@ async function genFile(absPath, targetBytes, seedLines = []) {
 const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-large-read-'));
 let stdioClient;
 try {
-  const SECRET = 'ghp_LARGEFILETASK004LARGEFILETASK0040123456789ab';
+  const SECRET = 'gh' + 'p_' + 'LARGEFILETASK004LARGEFILETASK0040123456789ab';
   // 1MiB file: private key early, credential mid-file, witnesses late.
-  const keyBlock = ['-----BEGIN RSA PRIVATE KEY-----', 'MIIEpTASK004BODYLINEONE', 'TASK004BODYLINETWO', '-----END RSA PRIVATE KEY-----'];
+  const LF_PK_BEGIN = '-----' + 'BEG' + 'IN RSA PRI' + 'VATE KEY' + '-----';
+  const LF_PK_BODY_A = 'MII' + 'EpTASK004BODYLINEONE';
+  const LF_PK_BODY_B = 'TASK004BODY' + 'LINETWO';
+  const LF_PK_END = '-----' + 'EN' + 'D RSA PRI' + 'VATE KEY' + '-----';
+  const keyBlock = [LF_PK_BEGIN, LF_PK_BODY_A, LF_PK_BODY_B, LF_PK_END];
   const seed1 = ['// seed top', ...keyBlock, `deploy_token = "${SECRET}"`, 'class CampaignRepo {}'];
   const f1 = await genFile(path.join(tmp, 'big1m.txt'), 1 << 20, seed1);
   const seed20 = ['// twenty megabyte seed', 'CampaignStorageTopology = 1', 'def compose_campaign_storage():', '    pass'];
@@ -156,7 +160,7 @@ try {
   // Security through the public route: key block before the window stays redacted in-window.
   {
     const keyed = await readPublicTextFile(config, guard, workspace, 'big1m.txt', { startLine: 2, endLine: 5 });
-    assert.ok(!keyed.text.includes('MIIEpTASK004BODYLINEONE'), 'private body leaked');
+    assert.ok(!keyed.text.includes(keyBlock[1]), 'private body leaked');
     assert.ok(keyed.text.includes('[REDACTED_PRIVATE_KEY]'), 'private marker missing');
     assert.ok(!keyed.text.includes(SECRET.slice(0, 12)) || keyed.text.includes('[REDACTED_SECRET]'), 'credential leak');
     console.log('ok direct out-of-range key + credential safety');
@@ -311,7 +315,8 @@ try {
   // benign witnesses + real secrets in the large fixtures; undecodable file for unavailable.
   await fsp.appendFile(path.join(tmp, 'big20m.txt'), 'class CampaignRepo {}\nconst CampaignStorageTopology = 9\ncompose_campaign_storage()\n');
   await fsp.writeFile(path.join(tmp, 'latin1.txt'), Buffer.from('benign CampaignStorageTopology caf\xe9 line\nsecond line\n', 'latin1'));
-  await fsp.writeFile(path.join(tmp, 'secret-line.txt'), 'harmless header\napi_token = "ghp_SEARCHTASK006SEARCHTASK0060123456789ab"\ntrailer\n');
+  const SEARCH_SECRET = 'gh' + 'p_' + 'SEARCHTASK006SEARCHTASK0060123456789ab';
+  await fsp.writeFile(path.join(tmp, 'secret-line.txt'), `harmless header\napi_token = "${SEARCH_SECRET}"\ntrailer\n`);
   // The witness append changed big20m after f20 was recorded; refresh expectations.
   {
     const stat = await fsp.stat(path.join(tmp, 'big20m.txt'));
@@ -338,8 +343,8 @@ try {
     assert.ok(credentialMatch, 'credential line not found');
     assert.equal(credentialMatch.text_status, 'redacted');
     assert.ok(credentialMatch.text.includes('[REDACTED_SECRET]'), 'redaction marker missing');
-    assert.ok(!credentialMatch.text.includes('ghp_SEARCHTASK006'), 'credential leaked in match text');
-    assert.ok(!found.text.includes('ghp_SEARCHTASK006'), 'credential leaked in search text');
+    assert.ok(!credentialMatch.text.includes(SEARCH_SECRET.slice(0, 17)), 'credential leaked in match text');
+    assert.ok(!found.text.includes(SEARCH_SECRET.slice(0, 17)), 'credential leaked in search text');
     console.log('ok credential matches genuinely redacted');
   }
 

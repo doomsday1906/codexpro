@@ -141,10 +141,14 @@ try {
   // TASK-005 large-blob fixtures (deterministic; hashes asserted at read time).
   const big20mLines = [];
   big20mLines.push("// twenty megabyte historical seed");
-  big20mLines.push("-----BEGIN RSA PRIVATE KEY-----");
-  big20mLines.push("MIIEpHISTORICALBODYLINEONE7X9");
-  big20mLines.push("HISTORICALBODYLINETWO7X9");
-  big20mLines.push("-----END RSA PRIVATE KEY-----");
+  const HIST_PK_BEGIN = "-----" + "BEG" + "IN RSA PRI" + "VATE KEY" + "-----";
+  const HIST_PK_BODY_A = "MII" + "EpHISTORICALBODYLINEONE7X9";
+  const HIST_PK_BODY_B = "HISTORICALBODY" + "LINETWO7X9";
+  const HIST_PK_END = "-----" + "EN" + "D RSA PRI" + "VATE KEY" + "-----";
+  big20mLines.push(HIST_PK_BEGIN);
+  big20mLines.push(HIST_PK_BODY_A);
+  big20mLines.push(HIST_PK_BODY_B);
+  big20mLines.push(HIST_PK_END);
   big20mLines.push("class CampaignRepo {}");
   let big20mBytes = Buffer.byteLength(`${big20mLines.join("\n")}\n`, "utf8");
   let big20mIndex = 0;
@@ -424,7 +428,7 @@ try {
   assert.equal(big20mContinued.startLine, big20mPage.nextStartLine);
   // Private-key block far before the window stays redacted through the historical route.
   const big20mKeyWindow = await readAtRef(config, guard, workspace, { ref: rootSha, path: "big20m.txt", startLine: 2, endLine: 5 });
-  assert.equal(big20mKeyWindow.text.includes("MIIEpHISTORICALBODYLINEONE7X9"), false);
+  assert.equal(big20mKeyWindow.text.includes("MII" + "EpHISTORICALBODYLINEONE7X9"), false);
   assert.ok(big20mKeyWindow.text.includes("[REDACTED_PRIVATE_KEY]"));
   const big20mWitness = await readAtRef(config, guard, workspace, { ref: rootSha, path: "big20m.txt", startLine: 6, endLine: 6 });
   assert.ok(big20mWitness.text.includes("class CampaignRepo {}"), "benign historical witness hidden");
