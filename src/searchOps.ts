@@ -75,34 +75,198 @@ function truncateLine(line: string, max = 400): string {
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const RIPGREP_PARTIAL_RECORD_MAX_BYTES = 64 * 1024;
 
-function decodeSearchText(buffer: Buffer): string | null {
-  if (buffer.includes(0)) return null;
-  try {
-    return UTF8_DECODER.decode(buffer);
-  } catch {
-    return null;
+const NODE_SEARCH_SLAB_BYTES = 64 * 1024;
+const NODE_SEARCH_MAX_QUERY_BYTES = 1024 * 1024;
+
+function countLfBytes(buf: Buffer, start: number, end: number): number {
+  let total = 0;
+  for (let i = start; i < end; i += 1) {
+    if (buf[i] === 10) total += 1;
   }
+  return total;
 }
 
-async function readSearchBufferBounded(absPath: string, limit: number): Promise<Buffer | null> {
-  const handle = await fsp.open(absPath, "r");
+interface NodeFallbackFileScan {
+  keptLines: number[];
+  extraCount: number;
+  nulFound: boolean;
+  utf8Valid: boolean;
+  race: boolean;
+  scanLimited: boolean;
+  ioError: boolean;
+}
+
+function nodeFallbackFileReason(scan: NodeFallbackFileScan): SearchUnavailableReason | null {
+  if (scan.ioError) return "io-error";
+  if (scan.scanLimited) return "scan-limit";
+  if (scan.race) return "race";
+  if (scan.nulFound) return "binary";
+  if (!scan.utf8Valid) return "invalid-encoding";
+  return null;
+}
+
+/**
+ * F3 bounded streaming literal matcher for the Node fallback. Reads one file
+ * in fixed 64KiB slabs (never the scan ceiling, never the whole file), matches
+ * on raw UTF-8 query bytes so invalid-encoding files still yield locations,
+ * counts exact 1-based lines via 0x0A, and tracks binary / encoding / race /
+ * scan-limit per file. Retained line numbers stay bounded by the caller budget;
+ * anything past the budget is counted but not kept so truncation stays honest.
+ */
+async function scanNodeFallbackFile(
+  absPath: string,
+  queryBytes: Buffer,
+  limit: number,
+  retainBudget: number
+): Promise<NodeFallbackFileScan> {
+  const failed = (partial: Partial<NodeFallbackFileScan>): NodeFallbackFileScan => ({
+    keptLines: [],
+    extraCount: 0,
+    nulFound: false,
+    utf8Valid: true,
+    race: false,
+    scanLimited: false,
+    ioError: false,
+    ...partial
+  });
+  if (queryBytes.length === 0) return failed({ ioError: true });
+  const qlen = queryBytes.length;
+  const overlap = qlen > 1 ? qlen - 1 : 0;
+  let handle;
   try {
-    const stat = await handle.stat();
-    if (!stat.isFile() || stat.size > limit) return null;
-    const buffer = Buffer.allocUnsafe(limit + 1);
-    let offset = 0;
-    while (offset < buffer.length) {
-      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
-      if (bytesRead === 0) break;
-      offset += bytesRead;
+    handle = await fsp.open(absPath, "r");
+  } catch {
+    return failed({ ioError: true });
+  }
+  try {
+    let pre;
+    try {
+      pre = await handle.stat();
+    } catch {
+      return failed({ ioError: true });
     }
-    if (offset > limit || offset < stat.size) return null;
-    const finalStat = await handle.stat();
-    if (finalStat.size !== offset || finalStat.mtimeMs !== stat.mtimeMs || finalStat.ctimeMs !== stat.ctimeMs) return null;
-    const result = buffer.subarray(0, offset);
-    return result.includes(0) ? null : result;
+    if (!pre.isFile()) return failed({ ioError: true });
+    const cap = Math.max(1, Math.floor(limit));
+    let scanLimited = pre.size > cap;
+    const slab = Buffer.allocUnsafe(NODE_SEARCH_SLAB_BYTES);
+    const strict = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+    let nulFound = false;
+    let utf8Valid = true;
+    let race = false;
+    let ioError = false;
+    const kept: number[] = [];
+    let extra = 0;
+    let carry = Buffer.alloc(0);
+    let currentLine = 1;
+    let totalRead = 0;
+    let reachedEof = false;
+    let lastReportedLine = 0;
+    const report = (lineNo: number): void => {
+      if (lineNo === lastReportedLine) return;
+      lastReportedLine = lineNo;
+      if (kept.length < retainBudget) kept.push(lineNo);
+      else extra += 1;
+    };
+    for (;;) {
+      if (totalRead >= cap) {
+        if (scanLimited) break;
+        const probe = Buffer.allocUnsafe(1);
+        let probeRead = 0;
+        try {
+          const r = await handle.read(probe, 0, 1, null);
+          probeRead = r.bytesRead;
+        } catch {
+          ioError = true;
+          break;
+        }
+        if (probeRead === 0) {
+          reachedEof = true;
+          break;
+        }
+        scanLimited = true;
+        break;
+      }
+      const toRead = Math.min(slab.length, cap - totalRead);
+      let bytesRead = 0;
+      try {
+        const r = await handle.read(slab, 0, toRead, null);
+        bytesRead = r.bytesRead;
+      } catch {
+        ioError = true;
+        break;
+      }
+      if (bytesRead === 0) {
+        reachedEof = true;
+        break;
+      }
+      const chunk = slab.subarray(0, bytesRead);
+      if (!nulFound && chunk.includes(0)) nulFound = true;
+      if (utf8Valid) {
+        try {
+          strict.decode(chunk, { stream: true });
+        } catch {
+          utf8Valid = false;
+        }
+      }
+      let window: Buffer;
+      let windowStartLine: number;
+      if (carry.length === 0) {
+        window = Buffer.from(chunk);
+        windowStartLine = currentLine;
+      } else {
+        window = Buffer.concat([carry, chunk]);
+        windowStartLine = currentLine - countLfBytes(carry, 0, carry.length);
+      }
+      const idxs: number[] = [];
+      let from = 0;
+      for (;;) {
+        const idx = window.indexOf(queryBytes, from);
+        if (idx < 0) break;
+        if (idx + qlen > carry.length) idxs.push(idx);
+        from = idx + 1;
+        if (from > window.length) break;
+      }
+      if (idxs.length > 0) {
+        let newlinesSoFar = 0;
+        let prev = 0;
+        for (const idx of idxs) {
+          newlinesSoFar += countLfBytes(window, prev, idx);
+          prev = idx;
+          report(windowStartLine + newlinesSoFar);
+        }
+      }
+      currentLine += countLfBytes(chunk, 0, chunk.length);
+      totalRead += bytesRead;
+      if (totalRead > cap) {
+        scanLimited = true;
+        break;
+      }
+      if (overlap === 0) {
+        carry = Buffer.alloc(0);
+      } else if (window.length <= overlap) {
+        carry = Buffer.from(window);
+      } else {
+        carry = Buffer.from(window.subarray(window.length - overlap));
+      }
+    }
+    if (utf8Valid && reachedEof && !scanLimited) {
+      try {
+        strict.decode();
+      } catch {
+        utf8Valid = false;
+      }
+    }
+    try {
+      const post = await handle.stat();
+      if (!post.isFile() || post.size !== pre.size || post.mtimeMs !== pre.mtimeMs || post.ctimeMs !== pre.ctimeMs) {
+        if (!scanLimited) race = true;
+      }
+    } catch {
+      if (!scanLimited) race = true;
+    }
+    return { keptLines: kept, extraCount: extra, nulFound, utf8Valid, race, scanLimited, ioError };
   } finally {
-    await handle.close();
+    await handle.close().catch(() => undefined);
   }
 }
 
@@ -593,6 +757,10 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
       "Regex search requires ripgrep. Install rg or retry with regex=false; the Node fallback only supports literal search."
     );
   }
+  const queryByteLength = Buffer.byteLength(options.query, "utf8");
+  if (queryByteLength > NODE_SEARCH_MAX_QUERY_BYTES) {
+    throw new CodexProError("Node fallback query exceeds the 1MiB literal limit; narrow the query and retry.");
+  }
   const explicitFile = await isExplicitFileTarget(guard, workspace, options.root ?? ".");
   const files = await listFiles(guard, workspace, {
     root: options.root,
@@ -603,33 +771,54 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
   // Matching admission: broad scans keep the response-budget-derived ceiling;
   // explicit file targets match under the independent scan policy instead.
   const scanBytes = explicitFile ? SOURCE_SCAN_LIMIT_BYTES : textScanByteLimit(config);
+  const queryBytes = Buffer.from(options.query, "utf8");
   const pending: Array<{ path: string; line: number }> = [];
+  const scanInfoByPath = new Map<string, NodeFallbackFileScan>();
   let visibleMatches = 0;
+  let hasIncomplete = false;
+  const incompleteExplicit: Array<{ path: string; reason: SearchUnavailableReason }> = [];
   for (const rel of files) {
-    if (visibleMatches > options.maxResults) break;
-    const resolved = guard.resolve(workspace, rel);
+    // Explicit targets scan every admitted file fully (correctness over speed).
+    // Broad scans stop between files once truncation is proven; each scanned
+    // file is still read fully so its error state cannot be hidden.
+    if (!explicitFile && visibleMatches > options.maxResults) break;
+    let resolved;
     try {
-      const buffer = await readSearchBufferBounded(resolved.absPath, scanBytes);
-      if (!buffer) continue;
-      const source = decodeSearchText(buffer);
-      if (source === null) continue;
-      const lines = source.split(/\r?\n/);
-      for (let i = 0; i < lines.length; i += 1) {
-        const hit = lines[i].includes(options.query);
-        if (hit) {
-          visibleMatches += 1;
-          if (pending.length < options.maxResults) {
-            pending.push({ path: rel, line: i + 1 });
-          }
-          if (visibleMatches > options.maxResults) break;
-        }
-      }
+      resolved = guard.resolve(workspace, rel);
     } catch {
-      // Skip unreadable files.
+      hasIncomplete = true;
+      if (explicitFile) incompleteExplicit.push({ path: rel, reason: "io-error" });
+      continue;
+    }
+    let scan: NodeFallbackFileScan;
+    try {
+      const retainBudget = Math.max(0, options.maxResults - pending.length);
+      scan = await scanNodeFallbackFile(resolved.absPath, queryBytes, scanBytes, retainBudget);
+    } catch {
+      hasIncomplete = true;
+      if (explicitFile) incompleteExplicit.push({ path: rel, reason: "io-error" });
+      continue;
+    }
+    const totalInFile = scan.keptLines.length + scan.extraCount;
+    visibleMatches += totalInFile;
+    for (const line of scan.keptLines) {
+      if (pending.length < options.maxResults) pending.push({ path: rel, line });
+    }
+    if (scan.keptLines.length > 0) scanInfoByPath.set(rel, scan);
+    const reason = nodeFallbackFileReason(scan);
+    if (totalInFile === 0) {
+      if (reason !== null) {
+        hasIncomplete = true;
+        if (explicitFile) incompleteExplicit.push({ path: rel, reason });
+      }
+    } else if (scan.scanLimited || scan.race || scan.ioError) {
+      hasIncomplete = true;
     }
   }
   // Hydrate through the shared pipeline (one scan per file), so match evidence
   // carries honest available/redacted/unavailable status like the read routes.
+  // Scan-limit files bypass hydration (it cannot run under their ceiling) and
+  // are constructed directly with the same unavailable marker, never a secret.
   const linesByPath = new Map<string, number[]>();
   for (const hit of pending) {
     const wanted = linesByPath.get(hit.path);
@@ -637,11 +826,20 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
     else linesByPath.set(hit.path, [hit.line]);
   }
   const hydratedByPath = new Map<string, Map<number, HydratedSearchLine>>();
+  const directByPath = new Map<string, Map<number, HydratedSearchLine>>();
   for (const [matchPath, wanted] of linesByPath) {
-    hydratedByPath.set(matchPath, await hydrateSearchLines(config, guard, workspace, matchPath, wanted));
+    const info = scanInfoByPath.get(matchPath);
+    if (info?.scanLimited) {
+      const reason = nodeFallbackFileReason(info) ?? "scan-limit";
+      const direct = new Map<number, HydratedSearchLine>();
+      for (const line of wanted) direct.set(line, unavailableLine(line, reason));
+      directByPath.set(matchPath, direct);
+    } else {
+      hydratedByPath.set(matchPath, await hydrateSearchLines(config, guard, workspace, matchPath, wanted));
+    }
   }
   const matches: SearchMatch[] = pending.map((hit) => {
-    const line = hydratedByPath.get(hit.path)?.get(hit.line) ??
+    const line = directByPath.get(hit.path)?.get(hit.line) ?? hydratedByPath.get(hit.path)?.get(hit.line) ??
       { line: hit.line, text: UNAVAILABLE_SEARCH_CONTEXT, text_status: "unavailable" as const, reason: "io-error" as const };
     return {
       path: hit.path,
@@ -651,8 +849,19 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
       ...(line.reason === undefined ? {} : { reason: line.reason })
     };
   });
-  const text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
-  return { text, matches, truncated: visibleMatches > matches.length, used: "node" };
+  const truncated = visibleMatches > matches.length || hasIncomplete;
+  let text: string;
+  if (matches.length === 0) {
+    if (explicitFile && incompleteExplicit.length > 0) {
+      const details = incompleteExplicit.map((e) => `${e.path}: could not be fully covered (${e.reason}).`).join(" ");
+      text = `No matches. ${details} Coverage is incomplete.`;
+    } else {
+      text = "No matches.";
+    }
+  } else {
+    text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
+  }
+  return { text, matches, truncated, used: "node" };
 }
 
 export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, workspace: Workspace, rawOptions: Partial<SearchOptions>): Promise<SearchResult> {
