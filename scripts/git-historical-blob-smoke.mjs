@@ -547,12 +547,29 @@ try {
   try {
     // Beyond the independent scan policy, tree metadata alone rejects the blob:
     // cat-file never runs (the wrapper would exit 91 and drop the sentinel).
+    // F6: the reason is the operational source_scan_limit — never a
+    // max_bytes/read-budget refusal — with bounded numeric facts only.
     await expectHistoricalFailure(
       "scan-limit pre-acquisition rejection",
       () => readAtRef(config, guard, workspace, { ref: rootSha, path: "huge.bin" }),
-      "oversized"
+      "source_scan_limit"
     );
     await assert.rejects(access(sentinel, fsConstants.F_OK));
+    // F6 proof: the 100MiB blob's typed reason, message, and facts.
+    {
+      const error = await readAtRef(config, guard, workspace, { ref: rootSha, path: "huge.bin" }).then(
+        () => { throw new Error("expected scan-limit rejection"); },
+        (e) => e
+      );
+      assert.equal(error.reason, "source_scan_limit");
+      assert.ok(error.message.includes("scan limit"), `message must name the scan policy: ${error.message}`);
+      assert.equal(error.message.includes("max_bytes"), false, "message must not blame the range budget");
+      assert.equal(error.message.includes("read limit"), false, "message must not blame a read-response limit");
+      assert.ok(error.facts.advertised > 96 * 1024 * 1024 && error.facts.limit === 96 * 1024 * 1024, "bounded numeric facts");
+      const serialized = JSON.stringify(error);
+      assert.equal(serialized.includes(rootSha), false, "ref material in error");
+      console.log("RAW_OBSERVATION: 100MiB historical blob fails source_scan_limit with scan-policy message and numeric facts only");
+    }
     // A window that would fail its budget still acquires first: through the
     // sabotaged wrapper, acquisition itself fails (execution) AND the sentinel
     // proves cat-file ran before any window decision could reject the request.

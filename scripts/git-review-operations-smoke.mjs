@@ -669,7 +669,7 @@ try {
   await expectFailure("missing historical path", () => readAtRef(config, guard, workspace, { ref: rootSha, path: "missing-HOSTILE_PATH_SECRET_7X9.txt" }), HistoricalBlobError, "missing-path", ["missing-HOSTILE_PATH_SECRET_7X9.txt"]);
   await expectFailure("blocked .env path", () => readAtRef(config, guard, workspace, { ref: rootSha, path: ".env" }), HistoricalBlobError, "blocked-path", ["ENV_SECRET_7X9"]);
   await expectFailure("binary historical blob", () => readAtRef(config, guard, workspace, { ref: rootSha, path: "binary.bin" }), HistoricalBlobError, "binary", ["BIN"]);
-  await expectFailure("oversized historical blob", () => readAtRef(config, guard, workspace, { ref: rootSha, path: "oversized.txt" }), HistoricalBlobError, "oversized", ["OOOOOOOOOOOO"]);
+  await expectFailure("over-budget historical blob", () => readAtRef(config, guard, workspace, { ref: rootSha, path: "oversized.txt" }), HistoricalBlobError, "range-too-large", ["OOOOOOOOOOOO"]);
   await expectFailure("directory historical entry", () => readAtRef(config, guard, workspace, { ref: rootSha, path: "directory" }), HistoricalBlobError, "directory", []);
   await expectFailure("gitlink historical entry", () => readAtRef(config, guard, workspace, { ref: rootSha, path: "vendor/subrepo" }), HistoricalBlobError, "gitlink", []);
   await expectFailure("hostile commit encoding", () => gitShowCommit(config, workspace, hostileEncodingSha), GitHistoryOperationError, "unsupported-encoding", ["x-integrated-hostile-SECRET", "hostile encoding subject"]);

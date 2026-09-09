@@ -48,7 +48,7 @@ export type HistoricalBlobFailureReason =
   | "directory"
   | "gitlink"
   | "type-mismatch"
-  | "oversized"
+  | "source_scan_limit"
   | "execution"
   | "timeout"
   | "stdout-overflow"
@@ -71,7 +71,7 @@ const FAILURE_MESSAGES: Record<HistoricalBlobFailureReason, string> = {
   directory: "Historical path is a directory.",
   gitlink: "Historical path is a gitlink.",
   "type-mismatch": "Historical tree entry type is not supported.",
-  oversized: "Historical blob exceeds the configured read limit.",
+  source_scan_limit: "Historical blob exceeds the operational source scan limit.",
   execution: "Historical blob Git execution failed.",
   timeout: "Historical blob Git execution timed out.",
   "stdout-overflow": "Historical blob Git output exceeded its bound.",
@@ -261,7 +261,7 @@ function mapProjectionFailure(error: unknown): HistoricalBlobError {
 function mapScanFailure(error: unknown, advertised: number): HistoricalBlobError {
   if (error instanceof HistoricalBlobError) return error;
   if (error instanceof SourceScanError) {
-    if (error.reason === "source_scan_limit") return failure("oversized", { advertised, limit: SOURCE_SCAN_LIMIT_BYTES });
+    if (error.reason === "source_scan_limit") return failure("source_scan_limit", { advertised, limit: SOURCE_SCAN_LIMIT_BYTES });
     return failure("execution", { advertised });
   }
   if (error instanceof CodexProError && error.message.startsWith("end_line")) {
@@ -532,7 +532,7 @@ export async function readAtRef(
   // The only total-blob gate is the independent operational scan policy, never
   // a response budget. Bounded requests stream regardless of blob size.
   if (entry.size > SOURCE_SCAN_LIMIT_BYTES) {
-    throw failure("oversized", { advertised: entry.size, limit: SOURCE_SCAN_LIMIT_BYTES });
+    throw failure("source_scan_limit", { advertised: entry.size, limit: SOURCE_SCAN_LIMIT_BYTES });
   }
   const effectiveMaxBytes = validatedOptions.projectionMaxBytes;
 
