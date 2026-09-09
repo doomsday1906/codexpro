@@ -720,14 +720,17 @@ const READ_AT_REF_TRANSPORT_SCHEMA = z.object({
 }).passthrough();
 
 function readAtRefArgumentsSchema(maxReadBytes: number) {
-  const boundedMaxReadBytes = Math.max(1, Math.floor(maxReadBytes));
+  void maxReadBytes;
+  // Aligned with working-tree read: max_bytes governs the selected/paged raw
+  // numbered window, not the total blob. No transport constraint requires a
+  // different historical maximum: blobs stream with backpressure.
   return z.object({
     workspace_id: REVIEW_WORKSPACE_ID_SCHEMA,
     ref: REVIEW_REF_SCHEMA,
     path: REVIEW_PATH_SCHEMA,
     start_line: REVIEW_LINE_SCHEMA.optional(),
     end_line: REVIEW_LINE_SCHEMA.optional(),
-    max_bytes: z.number().int().min(1).max(boundedMaxReadBytes).optional()
+    max_bytes: z.number().int().min(1000).max(2000000).optional().describe("Budget in bytes for the selected/paged raw numbered line window. Total blob size is never rejected from this budget; oversized windows return the largest fitting complete-line page plus continuation. Capped by server config.")
   }).strict();
 }
 
@@ -3714,10 +3717,13 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         maxBytes: args.max_bytes
       });
       const body = publicSourceBody(result.text);
+      const continuation = result.nextStartLine === undefined
+        ? ""
+        : `\nNext start line: ${result.nextStartLine}${result.budgetTruncated ? " (response budget shortened the window)" : ""}`;
       const text = [
         {
           kind: "normal" as const,
-          text: `# Read File\n\nPath: ${result.path}\nLines: ${result.startLine}-${result.endLine} of ${result.totalLines}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}\n\n\`\`\`text\n`
+          text: `# Read File\n\nPath: ${result.path}\nLines: ${result.startLine}-${result.endLine} of ${result.totalLines}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}${continuation}\n\n\`\`\`text\n`
         },
         body,
         { kind: "normal" as const, text: "\n\`\`\`" }
@@ -4551,6 +4557,9 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         maxBytes: args.max_bytes
       });
       const body = publicSourceBody(result.text);
+      const continuation = result.nextStartLine === undefined
+        ? []
+        : [`Next start line: ${result.nextStartLine}${result.budgetTruncated ? " (response budget shortened the window)" : ""}`];
       const text = [
         {
           kind: "normal" as const,
@@ -4567,6 +4576,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
             `Blob SHA: ${result.blobSha}`,
             `SHA-256: ${result.sha256}`,
             `Truncated: ${result.truncated}`,
+            ...continuation,
             "",
             "```text"
           ].join("\n")
@@ -4591,7 +4601,10 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         total_lines: result.totalLines,
         bytes: result.bytes,
         sha256: result.sha256,
-        truncated: result.truncated
+        truncated: result.truncated,
+        returned_bytes: result.returnedBytes,
+        budget_truncated: result.budgetTruncated,
+        ...(result.nextStartLine === undefined ? {} : { next_start_line: result.nextStartLine })
       }, {}, {
         sourceFields: [{ path: ["text"], body }]
       });

@@ -259,6 +259,51 @@ try {
   }), 'mcp read_many continued item');
   assert.equal(continuedItem.structuredContent.results[0].result.startLine, bigItem.result.nextStartLine);
   console.log('ok mcp read_many per-file continuation disjoint from aggregate cursor');
+  // AP-015 (working-tree half): read_many per-file continuation already proven above.
+  // AP-015 historical: compiled public read_at_ref over a real local repository.
+  const { execFileSync } = await import('node:child_process');
+  execFileSync('git', ['init', '--quiet'], { cwd: tmp });
+  execFileSync('git', ['config', 'user.name', 'lf-smoke'], { cwd: tmp });
+  execFileSync('git', ['config', 'user.email', 'lf-smoke@example.test'], { cwd: tmp });
+  execFileSync('git', ['add', 'big1m.txt', 'small.txt'], { cwd: tmp });
+  execFileSync('git', ['commit', '--quiet', '-m', 'lf fixtures'], { cwd: tmp });
+  const headSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: tmp, encoding: 'utf8' }).trim();
+  const headOid = execFileSync('git', ['rev-parse', 'HEAD:big1m.txt'], { cwd: tmp, encoding: 'utf8' }).trim();
+
+  const mcpHistRange = assertToolSuccess(await stdioClient.request('tools/call', {
+    name: 'read_at_ref', arguments: { workspace_id: ws, ref: 'HEAD', path: 'big1m.txt', start_line: 536, end_line: 565 }
+  }), 'mcp read_at_ref range');
+  assert.equal(mcpHistRange.structuredContent.start_line, 536);
+  assert.equal(mcpHistRange.structuredContent.end_line, 565);
+  assert.equal(mcpHistRange.structuredContent.bytes, f1.bytes);
+  assert.equal(mcpHistRange.structuredContent.total_lines, f1.lines);
+  assert.equal(mcpHistRange.structuredContent.blob_sha, headOid);
+  assert.equal(mcpHistRange.structuredContent.commit_sha, headSha);
+  assert.equal(mcpHistRange.structuredContent.budget_truncated, false);
+  console.log('ok mcp read_at_ref range with immutable metadata');
+
+  const mcpHistUnbounded = assertToolSuccess(await stdioClient.request('tools/call', {
+    name: 'read_at_ref', arguments: { workspace_id: ws, ref: 'HEAD', path: 'big1m.txt' }
+  }), 'mcp read_at_ref unbounded');
+  assert.equal(mcpHistUnbounded.structuredContent.start_line, 1);
+  assert.equal(mcpHistUnbounded.structuredContent.budget_truncated, true);
+  assert.ok(typeof mcpHistUnbounded.structuredContent.next_start_line === 'number');
+  const mcpHistNext = assertToolSuccess(await stdioClient.request('tools/call', {
+    name: 'read_at_ref', arguments: { workspace_id: ws, ref: 'HEAD', path: 'big1m.txt', start_line: mcpHistUnbounded.structuredContent.next_start_line }
+  }), 'mcp read_at_ref continued');
+  assert.equal(mcpHistNext.structuredContent.start_line, mcpHistUnbounded.structuredContent.next_start_line);
+  console.log('ok mcp read_at_ref unbounded paging + continuation');
+
+  // LAW-009 schema/runtime agreement: sub-1000 max_bytes is rejected at validation.
+  const badBudget = await stdioClient.request('tools/call', {
+    name: 'read_at_ref', arguments: { workspace_id: ws, ref: 'HEAD', path: 'big1m.txt', max_bytes: 500 }
+  });
+  assert.equal(badBudget.isError, true, 'sub-minimum max_bytes accepted');
+  const badBudget2 = await stdioClient.request('tools/call', {
+    name: 'read', arguments: { workspace_id: ws, path: 'big1m.txt', max_bytes: 2000001 }
+  });
+  assert.equal(badBudget2.isError, true, 'over-maximum max_bytes accepted');
+  console.log('ok max_bytes schema bounds agree across read/read_at_ref');
   await stdioClient.close();
   stdioClient = null;
 

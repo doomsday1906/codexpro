@@ -104,7 +104,11 @@ try {
     ""
   ].join("\n");
   const largeBytes = Buffer.from("L".repeat(150 * 1024), "utf8");
-  const tooLargeBytes = Buffer.from("O".repeat(config.maxReadBytes + 1), "utf8");
+  // Multi-line blob just above the configured read budget: the historical route
+  // pages it (snapshot envelope) instead of rejecting the total size.
+  const tooLargeLines = Array.from({ length: 3000 }, (_, index) => `oversized line ${String(index).padStart(5, "0")} ${"O".repeat(40)}`);
+  const tooLargeBytes = Buffer.from(`${tooLargeLines.join("\n")}\n`, "utf8");
+  assert.ok(tooLargeBytes.byteLength > config.maxReadBytes);
   const rangeRaw = Array.from({ length: 12_000 }, (_, index) => `line-${String(index).padStart(5, "0")}`).join("\n") + "\n";
   const unrangedRaw = [
     "historical first line",
@@ -133,6 +137,33 @@ try {
   await writeFile(path.join(repoRoot, "dir", "nested.txt"), "nested\n", "utf8");
   await writeFile(path.join(repoRoot, "link-target.txt"), "link target is not secret\n", "utf8");
   await symlink("target-secret.txt", path.join(repoRoot, "historical-link"));
+
+  // TASK-005 large-blob fixtures (deterministic; hashes asserted at read time).
+  const big20mLines = [];
+  big20mLines.push("// twenty megabyte historical seed");
+  big20mLines.push("-----BEGIN RSA PRIVATE KEY-----");
+  big20mLines.push("MIIEpHISTORICALBODYLINEONE7X9");
+  big20mLines.push("HISTORICALBODYLINETWO7X9");
+  big20mLines.push("-----END RSA PRIVATE KEY-----");
+  big20mLines.push("class CampaignRepo {}");
+  let big20mBytes = Buffer.byteLength(`${big20mLines.join("\n")}\n`, "utf8");
+  let big20mIndex = 0;
+  const big20mChunks = [`${big20mLines.join("\n")}\n`];
+  while (big20mBytes < 20 * 1024 * 1024) {
+    const line = `historical body line ${String(big20mIndex).padStart(9, "0")} ${"y".repeat(60)}\n`;
+    big20mChunks.push(line);
+    big20mBytes += Buffer.byteLength(line, "utf8");
+    big20mIndex += 1;
+  }
+  await writeFile(path.join(repoRoot, "big20m.txt"), big20mChunks.join(""), "utf8");
+  const big20mTotalLines = big20mIndex + big20mLines.length + 1;
+  const binaryAfterChunks = ["first selected line here\n", "second line\n"];
+  while (Buffer.byteLength(binaryAfterChunks.join(""), "utf8") < 3 * 1024 * 1024) {
+    binaryAfterChunks.push(`padding ${binaryAfterChunks.length} ${"q".repeat(70)}\n`);
+  }
+  binaryAfterChunks.push("late\x00nul byte\n");
+  await writeFile(path.join(repoRoot, "binary-after.txt"), binaryAfterChunks.join(""), "utf8");
+  await writeFile(path.join(repoRoot, "huge.bin"), Buffer.alloc(100 * 1024 * 1024, 0x61));
 
   // The index cache entry is a real gitlink in the produced commit tree.
   git(repoRoot, ["add", "-A"]);
@@ -214,7 +245,21 @@ try {
   await expectHistoricalFailure("binary", () => readAtRef(config, guard, workspace, { ref: rootSha, path: "binary.bin" }), "binary");
   await expectHistoricalFailure("blocked path", () => readAtRef(config, guard, workspace, { ref: rootSha, path: ".env" }), "blocked-path");
   await expectHistoricalFailure("missing historical path", () => readAtRef(config, guard, workspace, { ref: afterSha, path: "deleted.txt" }), "missing-path");
-  await expectHistoricalFailure("oversized blob", () => readAtRef(config, guard, workspace, { ref: rootSha, path: "too-large.txt" }), "oversized");
+  // TASK-005: the just-over-budget multi-line blob is no longer "oversized" — it
+  // pages through the snapshot route with continuation metadata and byte-exact identity.
+  const tooLargePaged = await readAtRef(config, guard, workspace, { ref: rootSha, path: "too-large.txt" });
+  assert.equal(tooLargePaged.bytes, tooLargeBytes.byteLength);
+  assert.equal(tooLargePaged.startLine, 1);
+  assert.equal(tooLargePaged.budgetTruncated, true);
+  assert.ok(typeof tooLargePaged.nextStartLine === "number");
+  assert.equal(tooLargePaged.sha256, sha256Bytes(tooLargeBytes));
+  const tooLargeContinued = await readAtRef(config, guard, workspace, {
+    ref: rootSha,
+    path: "too-large.txt",
+    startLine: tooLargePaged.nextStartLine
+  });
+  assert.equal(tooLargeContinued.startLine, tooLargePaged.nextStartLine);
+  console.log(`RAW_OBSERVATION: ${tooLargeBytes.byteLength}-byte blob pages (1-${tooLargePaged.endLine} then ${tooLargeContinued.startLine}-) with exact sha ${tooLargePaged.sha256.slice(0, 12)}`);
   await expectHistoricalFailure("invalid max_bytes", () => readAtRef(config, guard, workspace, { ref: rootSha, path: "empty.txt", maxBytes: 0 }), "invalid-max-bytes");
 
   const large = await readAtRef({ ...config, maxOutputBytes: 120_000, maxReadBytes: 180_000 }, guard, workspace, {
@@ -284,14 +329,22 @@ try {
     () => readPublicTextFile(config, filesystemGuard, workspace, "range-budget.txt", { startLine: 1, endLine: 1, maxBytes: 5 }),
     /Selected line 1 is too large/u
   );
-  await expectHistoricalFailure(
-    "raw numbered range budget",
-    () => readAtRef(config, guard, workspace, { ref: rootSha, path: "range-budget.txt", startLine: 1, endLine: 12_000, maxBytes: config.maxReadBytes }),
-    "range-too-large"
-  );
+  // TASK-005: an over-budget bounded historical range pages (largest fitting
+  // complete-line prefix + continuation) instead of failing range-too-large.
+  const fullRangePaged = await readAtRef(config, guard, workspace, { ref: rootSha, path: "range-budget.txt", startLine: 1, endLine: 12_000, maxBytes: config.maxReadBytes });
+  assert.equal(fullRangePaged.startLine, 1);
+  assert.ok(fullRangePaged.endLine < 12_000);
+  assert.equal(fullRangePaged.budgetTruncated, true);
+  assert.equal(fullRangePaged.nextStartLine, fullRangePaged.endLine + 1);
+  const fullRangeWorking = await readPublicTextFile(config, filesystemGuard, workspace, "range-budget.txt", { startLine: 1, endLine: 12_000, maxBytes: config.maxReadBytes });
+  assert.equal(fullRangePaged.text, fullRangeWorking.text, "historical first page diverged from working-tree first page");
+  assert.equal(fullRangePaged.nextStartLine, fullRangeWorking.nextStartLine);
+  const fullRangeContinued = await readAtRef(config, guard, workspace, { ref: rootSha, path: "range-budget.txt", startLine: fullRangePaged.nextStartLine, endLine: 12_000, maxBytes: config.maxReadBytes });
+  assert.equal(fullRangeContinued.startLine, fullRangePaged.nextStartLine);
+  console.log(`RAW_OBSERVATION: historical full-range pages 1-${fullRangePaged.endLine} then ${fullRangeContinued.startLine}-, byte-identical to the working-tree first page`);
   console.log(`RAW_OBSERVATION: real ${advertisedRangeBytes}-byte blob exceeded requested 20-byte budget while selected line was 18 bytes`);
   console.log("RAW_OBSERVATION: historical and current filesystem selected-range projections matched; inverse 5-byte budget is a bounded selected-line error on both");
-  console.log("RAW_OBSERVATION: range-budget blob stayed below acquisition cap while numbered full-range projection exceeded max_bytes");
+  console.log("RAW_OBSERVATION: range-budget blob stayed below acquisition cap; numbered full-range projection pages identically on both routes");
   console.log("PASS raw range-byte admission and truthful line/truncation metadata");
 
   const advertisedUnrangedBytes = Number(gitText(repoRoot, ["cat-file", "-s", `${rootSha}:unranged-budget.txt`]));
@@ -299,16 +352,14 @@ try {
   await expectHistoricalFailure(
     "unranged requested max_bytes",
     () => readAtRef(config, guard, workspace, { ref: rootSha, path: "unranged-budget.txt", maxBytes: 12 }),
-    "oversized"
+    "range-too-large"
   );
   await assert.rejects(
     () => readPublicTextFile(config, filesystemGuard, workspace, "unranged-budget.txt", { maxBytes: 12 }),
     /Selected line 1 is too large/u
   );
-  // TASK-005 restores max_bytes=81 here: the working-tree route now pages the
-  // 93-byte numbered body (first two lines + continuation) while the historical
-  // route still returns the whole file, so the shared comparison only runs at 100.
-  for (const maxBytes of [100]) {
+  // TASK-005: at 81 the 93-byte numbered body pages identically on both routes.
+  for (const maxBytes of [81, 100]) {
     const historicalUnranged = await readAtRef(config, guard, workspace, {
       ref: rootSha,
       path: "unranged-budget.txt",
@@ -339,10 +390,84 @@ try {
       `historical un-ranged projection diverged from current filesystem semantics at max_bytes=${maxBytes}`
     );
     assert.equal(historicalUnranged.bytes, advertisedUnrangedBytes);
+    // New-contract pagination metadata agrees on both routes (page at 81, whole at 100).
+    assert.equal(historicalUnranged.budgetTruncated, currentUnranged.budgetTruncated);
+    assert.equal(historicalUnranged.nextStartLine ?? null, currentUnranged.nextStartLine ?? null);
+    if (maxBytes === 81) {
+      assert.equal(historicalUnranged.endLine, 2);
+      assert.equal(historicalUnranged.nextStartLine, 3);
+    }
   }
   console.log("RAW_OBSERVATION: real 81-byte un-ranged blob takes bounded selected-line errors at max_bytes=12 and succeeds at within budgets");
   console.log("RAW_OBSERVATION: historical and current filesystem un-ranged max_bytes behavior matched");
 
+  // AP-013: 20MiB historical blob — deep range, unbounded page, bounded retention.
+  const big20mOid = gitText(repoRoot, ["rev-parse", `${rootSha}:big20m.txt`]);
+  const big20mAdvertised = Number(gitText(repoRoot, ["cat-file", "-s", big20mOid]));
+  assert.ok(big20mAdvertised > 20 * 1024 * 1024);
+  const big20mRange = await readAtRef(config, guard, workspace, { ref: rootSha, path: "big20m.txt", startLine: 100000, endLine: 100029 });
+  assert.equal(big20mRange.startLine, 100000);
+  assert.equal(big20mRange.endLine, 100029);
+  assert.equal(big20mRange.bytes, big20mAdvertised);
+  assert.equal(big20mRange.totalLines, big20mTotalLines);
+  assert.equal(big20mRange.truncated, true);
+  assert.equal(big20mRange.budgetTruncated, false);
+  assert.equal(big20mRange.blobSha, big20mOid);
+  const big20mOracleSha = execFileSync("sh", ["-c", `git -C ${JSON.stringify(repoRoot)} cat-file blob ${big20mOid} | sha256sum`], { encoding: "utf8" }).split(/\s+/)[0];
+  assert.equal(big20mRange.sha256, big20mOracleSha);
+  const big20mPage = await readAtRef(config, guard, workspace, { ref: rootSha, path: "big20m.txt" });
+  assert.equal(big20mPage.startLine, 1);
+  assert.equal(big20mPage.budgetTruncated, true);
+  assert.ok(typeof big20mPage.nextStartLine === "number");
+  assert.ok(big20mPage.returnedBytes <= config.maxReadBytes);
+  const big20mContinued = await readAtRef(config, guard, workspace, { ref: rootSha, path: "big20m.txt", startLine: big20mPage.nextStartLine });
+  assert.equal(big20mContinued.startLine, big20mPage.nextStartLine);
+  // Private-key block far before the window stays redacted through the historical route.
+  const big20mKeyWindow = await readAtRef(config, guard, workspace, { ref: rootSha, path: "big20m.txt", startLine: 2, endLine: 5 });
+  assert.equal(big20mKeyWindow.text.includes("MIIEpHISTORICALBODYLINEONE7X9"), false);
+  assert.ok(big20mKeyWindow.text.includes("[REDACTED_PRIVATE_KEY]"));
+  const big20mWitness = await readAtRef(config, guard, workspace, { ref: rootSha, path: "big20m.txt", startLine: 6, endLine: 6 });
+  assert.ok(big20mWitness.text.includes("class CampaignRepo {}"), "benign historical witness hidden");
+  // Bounded retention measured directly at the streaming consumer.
+  const { streamGitBlobToScan } = await import("../dist/gitHistoricalBlob.js");
+  const streamed = await streamGitBlobToScan(workspace, {
+    oid: big20mOid,
+    advertised: big20mAdvertised,
+    timeoutMs: 60_000,
+    stderrMaxBytes: 120_000,
+    startLine: 100000,
+    endLine: 100029,
+    selectMaxBytes: 256 * 1024,
+    retainUpToBytes: 0
+  });
+  assert.equal(streamed.scan.bytes, big20mAdvertised);
+  assert.ok(streamed.scan.maxRetainedBytes <= 2 * 1024 * 1024, `historical retention ${streamed.scan.maxRetainedBytes}`);
+  console.log(`RAW_OBSERVATION: 20MiB historical range+page stream with retention ${streamed.scan.maxRetainedBytes}; key-before-range redacted; benign witness visible`);
+  console.log("PASS historical 20MiB bounded streaming with exact immutable metadata");
+
+  // AP-014: binary after the window, timeout, and surviving fail-closed laws.
+  await expectHistoricalFailure("binary after window", () => readAtRef(config, guard, workspace, { ref: rootSha, path: "binary-after.txt", startLine: 1, endLine: 1 }), "binary");
+  // A 1ms streaming timeout cannot beat a 20MiB pipe: deterministic timeout proof
+  // at the streaming consumer (readAtRef threads config.maxGitTimeoutMs through).
+  await assert.rejects(
+    streamGitBlobToScan(workspace, {
+      oid: big20mOid,
+      advertised: big20mAdvertised,
+      timeoutMs: 1,
+      stderrMaxBytes: 120_000,
+      startLine: 100000,
+      endLine: 100029,
+      selectMaxBytes: 256 * 1024,
+      retainUpToBytes: 0
+    }),
+    (error) => error instanceof HistoricalBlobError && error.reason === "timeout"
+  );
+  console.log("RAW_OBSERVATION: 20MiB stream with a 1ms ceiling fails timeout with bounded facts");
+  console.log("PASS historical binary-after-window and timeout fail-closed");
+
+  // In-policy blobs stream through cat-file (already proven above: the 20MiB
+  // range, pages, and continuation all succeeded); the armed wrapper below
+  // proves pre-acquisition rejection never invokes cat-file at all.
   const binDir = path.join(fixtureRoot, "armed-git");
   await mkdir(binDir, { recursive: true });
   const sentinel = path.join(fixtureRoot, "cat-file-sentinel");
@@ -364,21 +489,27 @@ try {
   process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
   process.env.HISTORICAL_BLOB_SENTINEL = sentinel;
   try {
+    // Beyond the independent scan policy, tree metadata alone rejects the blob:
+    // cat-file never runs (the wrapper would exit 91 and drop the sentinel).
     await expectHistoricalFailure(
-      "oversized pre-read rejection",
-      () => readAtRef(config, guard, workspace, { ref: rootSha, path: "too-large.txt" }),
+      "scan-limit pre-acquisition rejection",
+      () => readAtRef(config, guard, workspace, { ref: rootSha, path: "huge.bin" }),
       "oversized"
     );
     await assert.rejects(access(sentinel, fsConstants.F_OK));
+    // A window that would fail its budget still acquires first: through the
+    // sabotaged wrapper, acquisition itself fails (execution) AND the sentinel
+    // proves cat-file ran before any window decision could reject the request.
+    await rm(sentinel, { force: true });
     await expectHistoricalFailure(
-      "unranged requested max_bytes pre-read rejection",
+      "window decision happens after acquisition",
       () => readAtRef(config, guard, workspace, { ref: rootSha, path: "unranged-budget.txt", maxBytes: 12 }),
-      "oversized"
+      "execution"
     );
-    await assert.rejects(access(sentinel, fsConstants.F_OK));
-    console.log("RAW_OBSERVATION: armed real-git wrapper saw no cat-file invocation for advertised oversized blob");
-    console.log("RAW_OBSERVATION: armed real-git wrapper also saw no cat-file invocation for un-ranged request budget below blob size");
-    console.log("PASS configured/requested un-ranged oversized blobs rejected before content acquisition");
+    await access(sentinel, fsConstants.F_OK);
+    console.log("RAW_OBSERVATION: armed real-git wrapper saw no cat-file invocation for a blob beyond the scan policy");
+    console.log("RAW_OBSERVATION: the same wrapper saw cat-file attempted for an in-policy blob before any window decision");
+    console.log("PASS scan-limit blobs rejected from tree metadata; window decisions happen after acquisition");
   } finally {
     if (previousPath === undefined) delete process.env.PATH;
     else process.env.PATH = previousPath;

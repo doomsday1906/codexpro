@@ -97,7 +97,7 @@ export class GitExecutionError extends CodexProError {
   }
 }
 
-const GIT_REVIEWER_GLOBAL_ARGS = ["--no-replace-objects", "--no-pager", "-c", "color.ui=false"] as const;
+export const GIT_REVIEWER_GLOBAL_ARGS = ["--no-replace-objects", "--no-pager", "-c", "color.ui=false"] as const;
 const GIT_ISOLATION_MARKER = ".codexpro-git-isolation.json";
 const GIT_ISOLATION_MARKER_KIND = "codexpro-git-isolation";
 const GIT_ISOLATION_VERSION = 1;
@@ -129,7 +129,7 @@ interface GitMutationOptions {
   readonly clearPushOptions?: boolean;
 }
 
-function gitReviewerEnvironment(overrides?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function gitReviewerEnvironment(overrides?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // Git has a large and growing environment surface for repository routing,
   // object lookup, shallow history, pathspec behavior, tracing, credentials,
   // and external helpers. Preserve PATH and other non-Git process essentials,
@@ -191,7 +191,7 @@ class BoundedGitOutput {
   }
 }
 
-function terminateGitProcess(child: ChildProcess, signal: NodeJS.Signals): void {
+export function terminateGitProcess(child: ChildProcess, signal: NodeJS.Signals): void {
   if (!child.pid) return;
   if (process.platform !== "win32") {
     try {

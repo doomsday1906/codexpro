@@ -206,7 +206,7 @@ export function textScanByteLimit(config: CodexProConfig): number {
   return Math.min(2_000_000, config.maxReadBytes * 4);
 }
 
-function splitLines(text: string): string[] {
+export function splitLines(text: string): string[] {
   return text.replace(/\r\n/g, "\n").split("\n");
 }
 

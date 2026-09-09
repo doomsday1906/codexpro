@@ -1,8 +1,24 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { CodexProConfig } from "./config.js";
-import { projectPublicSourceText, type ReadFileResult } from "./fsOps.js";
-import { GitExecutionError, runGitReadOnly } from "./gitOps.js";
+import {
+  FIXED_SNAPSHOT_BYTES,
+  LINE_FRAG_CAP_BYTES,
+  SOURCE_SCAN_LIMIT_BYTES,
+  SourceScanError,
+  SelectedLineTooLargeError,
+  frameRawWindow,
+  projectLargeWindow,
+  resolveWindow,
+  scanStream,
+  type ScannedLine,
+  type SourceScan,
+  type StreamChunkSource
+} from "./sourceProjection.js";
+import { splitLines, type ReadFileResult } from "./fsOps.js";
+import { GIT_REVIEWER_GLOBAL_ARGS, GitExecutionError, gitReviewerEnvironment, runGitReadOnly, terminateGitProcess } from "./gitOps.js";
 import { CodexProError, type PathGuard, type Workspace } from "./guard.js";
+import { redactSensitiveTextPreservingLines, sourceLanguageForPath } from "./redact.js";
 import { validateHistoricalPath } from "./historicalPath.js";
 import { GitRefResolutionError, resolveGitRef, type GitObjectFormat, type GitReviewRef } from "./gitReviewRef.js";
 
@@ -122,8 +138,6 @@ function validateLineOption(value: unknown): void {
 }
 
 interface ValidatedHistoricalBlobOptions {
-  /** Whole-blob ceiling: configured for ranges, requested/configured for full reads. */
-  readonly acquisitionMaxBytes: number;
   /** The bounded budget passed to the shared projector. */
   readonly projectionMaxBytes: number;
 }
@@ -143,10 +157,8 @@ function validateOptions(
   if (!isPositiveInteger(config.maxReadBytes)) throw failure("invalid-max-bytes");
   if (options.maxBytes !== undefined && !isPositiveInteger(options.maxBytes)) throw failure("invalid-max-bytes");
   const projectionMaxBytes = Math.min(options.maxBytes ?? config.maxReadBytes, config.maxReadBytes);
-  const hasRange = options.startLine !== undefined || options.endLine !== undefined;
-  const acquisitionMaxBytes = hasRange ? config.maxReadBytes : projectionMaxBytes;
   if (!isPositiveInteger(projectionMaxBytes)) throw failure("invalid-max-bytes");
-  return { acquisitionMaxBytes, projectionMaxBytes };
+  return { projectionMaxBytes };
 }
 
 function objectIdPattern(objectFormat: GitObjectFormat): RegExp {
@@ -239,10 +251,236 @@ function mapPathFailure(error: unknown): HistoricalBlobError {
 
 function mapProjectionFailure(error: unknown): HistoricalBlobError {
   if (error instanceof HistoricalBlobError) return error;
+  if (error instanceof SelectedLineTooLargeError) return failure("range-too-large");
   if (error instanceof CodexProError && error.message.startsWith("Selected line range is too large.")) {
     return failure("range-too-large");
   }
   return failure("projection");
+}
+
+function mapScanFailure(error: unknown, advertised: number): HistoricalBlobError {
+  if (error instanceof HistoricalBlobError) return error;
+  if (error instanceof SourceScanError) {
+    if (error.reason === "source_scan_limit") return failure("oversized", { advertised, limit: SOURCE_SCAN_LIMIT_BYTES });
+    return failure("execution", { advertised });
+  }
+  if (error instanceof CodexProError && error.message.startsWith("end_line")) {
+    return failure("invalid-range");
+  }
+  return failure("execution", { advertised });
+}
+
+/** Bounded queue cap between the Git pipe and the sequential scanner (backpressure via pause/resume). */
+const GIT_STREAM_QUEUE_CAP_BYTES = 1 << 20;
+
+export interface GitBlobStreamRequest {
+  readonly oid: string;
+  readonly advertised: number;
+  readonly timeoutMs: number;
+  readonly stderrMaxBytes: number;
+  readonly startLine?: number;
+  readonly endLine?: number;
+  readonly selectMaxBytes: number;
+  /** Retain up to this many leading content bytes (snapshot materialization); 0 disables retention. */
+  readonly retainUpToBytes: number;
+}
+
+export interface GitBlobStreamResult {
+  readonly scan: SourceScan;
+  /** Leading content bytes (exactly the full blob when retainUpToBytes covered it). */
+  readonly retained: Buffer;
+  readonly exitCode: number | null;
+}
+
+/**
+ * Consume `git cat-file blob` through a bounded streaming path: stdout is
+ * never captured whole, the pipe applies backpressure, advertised-vs-observed
+ * byte counts are enforced with early exit, and the process group is always
+ * reaped. Mirrors `runGitReadOnly` lifecycle semantics (reviewer globals,
+ * isolated environment, no shell, SIGTERM→SIGKILL escalation, timeout,
+ * bounded stderr) without its stdout capture.
+ */
+export function streamGitBlobToScan(
+  workspace: Workspace,
+  request: GitBlobStreamRequest
+): Promise<GitBlobStreamResult> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const settleResolve = (result: GitBlobStreamResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutTimer);
+      if (escalationTimer !== undefined) clearTimeout(escalationTimer);
+      resolve(result);
+    };
+    const settleReject = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutTimer);
+      if (escalationTimer !== undefined) clearTimeout(escalationTimer);
+      terminateGitProcess(child, "SIGKILL");
+      reject(error);
+    };
+    const child: ChildProcess = spawn("git", [...GIT_REVIEWER_GLOBAL_ARGS, "cat-file", "blob", request.oid], {
+      cwd: workspace.root,
+      env: gitReviewerEnvironment(),
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: false,
+      detached: process.platform !== "win32",
+      windowsHide: true
+    });
+    let timedOut = false;
+    let closed = false;
+    let terminationStarted = false;
+    let escalationTimer: NodeJS.Timeout | undefined;
+    const terminateWithEscalation = (): void => {
+      if (closed || terminationStarted) return;
+      terminationStarted = true;
+      terminateGitProcess(child, "SIGTERM");
+      escalationTimer = setTimeout(() => {
+        if (!closed) terminateGitProcess(child, "SIGKILL");
+      }, 250);
+      escalationTimer.unref();
+    };
+    const timeoutTimer = setTimeout(() => {
+      if (closed) return;
+      timedOut = true;
+      terminateWithEscalation();
+    }, Math.max(1, Math.floor(request.timeoutMs)));
+    timeoutTimer.unref();
+
+    const queue: Buffer[] = [];
+    let queuedBytes = 0;
+    let paused = false;
+    let eof = false;
+    let streamFailed: unknown = null;
+    let readWake: (() => void) | null = null;
+    let observed = 0;
+    const retained: Buffer[] = [];
+    let retainedBytes = 0;
+    let stderrOverflow = false;
+    let stderrBytes = 0;
+    const stderrHead: Buffer[] = [];
+
+    const wakeReader = (): void => {
+      if (readWake !== null) {
+        const wake = readWake;
+        readWake = null;
+        wake();
+      }
+    };
+    const failStream = (error: unknown): void => {
+      if (streamFailed === null) streamFailed = error;
+      terminateWithEscalation();
+      wakeReader();
+    };
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      if (settled) return;
+      const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      observed += incoming.length;
+      if (observed > request.advertised) {
+        failStream(failure("blob-size-mismatch", { actual: observed, advertised: request.advertised }));
+        return;
+      }
+      if (retainedBytes < request.retainUpToBytes) {
+        const take = Math.min(incoming.length, request.retainUpToBytes - retainedBytes);
+        retained.push(incoming.subarray(0, take));
+        retainedBytes += take;
+      }
+      queue.push(incoming);
+      queuedBytes += incoming.length;
+      if (!paused && queuedBytes > GIT_STREAM_QUEUE_CAP_BYTES) {
+        paused = true;
+        child.stdout?.pause();
+      }
+      wakeReader();
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      if (settled) return;
+      const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      stderrBytes += incoming.length;
+      if (stderrHead.length < 4) stderrHead.push(incoming.subarray(0, 65536));
+      if (stderrBytes > request.stderrMaxBytes) {
+        stderrOverflow = true;
+        failStream(failure("stdout-overflow", { advertised: request.advertised }));
+      }
+    });
+    child.once("error", (error: Error) => {
+      failStream(failure("execution", { advertised: request.advertised }));
+      void error;
+    });
+
+    const source: StreamChunkSource = {
+      read: async () => {
+        for (;;) {
+          if (settled) throw new CodexProError("Git blob stream ended.");
+          const next = queue.shift();
+          if (next !== undefined) {
+            queuedBytes -= next.length;
+            if (paused && queuedBytes < GIT_STREAM_QUEUE_CAP_BYTES / 2) {
+              paused = false;
+              child.stdout?.resume();
+            }
+            return next;
+          }
+          if (streamFailed !== null) throw streamFailed;
+          if (eof) return null;
+          await new Promise<void>((wake) => {
+            readWake = wake;
+          });
+        }
+      },
+      close: async () => undefined
+    };
+
+    const scanPromise = scanStream(source, {
+      startLine: request.startLine,
+      endLine: request.endLine,
+      scanLimitBytes: SOURCE_SCAN_LIMIT_BYTES,
+      chunkBytes: 64 * 1024,
+      selectMaxBytes: request.selectMaxBytes
+    });
+
+    child.once("close", (exitCode: number | null, signal: NodeJS.Signals | null) => {
+      closed = true;
+      eof = true;
+      void signal;
+      if (timedOut) {
+        failStream(failure("timeout", { advertised: request.advertised }));
+      } else if (exitCode !== 0) {
+        const stderrText = Buffer.concat(stderrHead).toString("utf8").toLowerCase();
+        void stderrText;
+        failStream(failure("execution", { advertised: request.advertised }));
+      }
+      wakeReader();
+      void (async () => {
+        try {
+          const scan = await scanPromise;
+          if (timedOut) {
+            settleReject(failure("timeout", { advertised: request.advertised }));
+            return;
+          }
+          if (exitCode !== 0) {
+            settleReject(failure("execution", { advertised: request.advertised }));
+            return;
+          }
+          if (stderrOverflow) {
+            settleReject(failure("stdout-overflow", { advertised: request.advertised }));
+            return;
+          }
+          if (scan.bytes !== request.advertised) {
+            settleReject(failure("blob-size-mismatch", { actual: scan.bytes, advertised: request.advertised }));
+            return;
+          }
+          settleResolve({ scan, retained: Buffer.concat(retained), exitCode });
+        } catch (error) {
+          if (error instanceof HistoricalBlobError) settleReject(error);
+          else settleReject(mapScanFailure(error, request.advertised));
+        }
+      })();
+    });
+  });
 }
 
 /**
@@ -285,40 +523,43 @@ export async function readAtRef(
   ]);
   const entry = parseTreeEntry(treeEntryResult.copyStdoutBytes(), canonicalPath, resolved.objectFormat);
   if (entry.size === undefined || entry.entryKind === undefined) throw failure("type-mismatch");
-  if (entry.size > validatedOptions.acquisitionMaxBytes) {
-    throw failure("oversized", { advertised: entry.size, limit: validatedOptions.acquisitionMaxBytes });
+  // The only total-blob gate is the independent operational scan policy, never
+  // a response budget. Bounded requests stream regardless of blob size.
+  if (entry.size > SOURCE_SCAN_LIMIT_BYTES) {
+    throw failure("oversized", { advertised: entry.size, limit: SOURCE_SCAN_LIMIT_BYTES });
   }
+  const effectiveMaxBytes = validatedOptions.projectionMaxBytes;
 
-  let blobResult;
+  let streamed: GitBlobStreamResult;
   try {
-    blobResult = await runGitReadOnly(config, workspace, ["cat-file", "blob", entry.oid], {
-      stdoutMaxBytes: entry.size
+    streamed = await streamGitBlobToScan(workspace, {
+      oid: entry.oid,
+      advertised: entry.size,
+      timeoutMs: Number.isFinite(config.maxGitTimeoutMs)
+        ? Math.max(1, Math.min(300_000, Math.floor(config.maxGitTimeoutMs)))
+        : 60_000,
+      stderrMaxBytes: Number.isFinite(config.maxOutputBytes) ? Math.max(1, Math.floor(config.maxOutputBytes)) : 1,
+      startLine: options.startLine ?? 1,
+      endLine: options.endLine,
+      selectMaxBytes: effectiveMaxBytes + LINE_FRAG_CAP_BYTES + 65536,
+      retainUpToBytes: entry.size <= FIXED_SNAPSHOT_BYTES ? entry.size : 0
     });
   } catch (error) {
-    throw executionFailure(error);
+    throw mapScanFailure(error, entry.size);
   }
-  if (blobResult.stdoutOverflow) {
-    throw failure("stdout-overflow", { advertised: entry.size });
+  const scan = streamed.scan;
+  if (scan.nulFound) throw failure("binary", { bytes: scan.bytes });
+  if (scan.bytes !== entry.size) {
+    throw failure("blob-size-mismatch", { actual: scan.bytes, advertised: entry.size });
   }
-  const blobBytes = blobResult.copyStdoutBytes();
-  if (blobBytes.byteLength !== entry.size) {
-    throw failure("blob-size-mismatch", { actual: blobBytes.byteLength, advertised: entry.size });
-  }
-  if (blobBytes.includes(0)) throw failure("binary", { bytes: blobBytes.byteLength });
 
-  const blobSha = createHash("sha256").update(blobBytes).digest("hex");
-  const decodedText = blobBytes.toString("utf8");
   let projected: ReadFileResult;
   try {
-    projected = projectPublicSourceText({
-      logicalPath: canonicalPath,
-      text: decodedText,
-      bytes: blobBytes.byteLength,
-      sha256: blobSha,
-      startLine: options.startLine,
-      endLine: options.endLine,
-      maxBytes: validatedOptions.projectionMaxBytes
-    });
+    if (scan.bytes <= FIXED_SNAPSHOT_BYTES) {
+      projected = projectHistoricalSnapshot(canonicalPath, streamed.retained, scan, options, effectiveMaxBytes);
+    } else {
+      projected = projectHistoricalLarge(canonicalPath, scan, options, effectiveMaxBytes);
+    }
   } catch (error) {
     throw mapProjectionFailure(error);
   }
@@ -332,6 +573,103 @@ export async function readAtRef(
     entryKind: entry.entryKind,
     blobSha: entry.oid
   };
+}
+
+function resolveHistoricalWindow(
+  options: GitHistoricalBlobOptions,
+  totalLines: number
+): { startLine: number; endLine: number } {
+  try {
+    return resolveWindow({ startLine: options.startLine, endLine: options.endLine }, totalLines);
+  } catch {
+    throw failure("invalid-range");
+  }
+}
+
+/**
+ * Snapshot route for blobs within the fixed envelope: the accepted
+ * `projectPublicSourceText` redaction runs verbatim over the streamed bytes;
+ * only over-budget/unbounded framing uses the shared pager (byte-identical to
+ * the accepted projector whenever it admits the window).
+ */
+function projectHistoricalSnapshot(
+  canonicalPath: string,
+  retained: Buffer,
+  scan: SourceScan,
+  options: GitHistoricalBlobOptions,
+  maxBytes: number
+): ReadFileResult {
+  const text = retained.toString("utf8");
+  if (Buffer.byteLength(text, "utf8") !== scan.bytes ||
+    createHash("sha256").update(text, "utf8").digest("hex") !== scan.sha256) {
+    throw failure("blob-size-mismatch", { actual: retained.byteLength, advertised: scan.bytes });
+  }
+  const redacted = redactSensitiveTextPreservingLines(text, {
+    context: "source",
+    language: sourceLanguageForPath(canonicalPath)
+  });
+  const rawLines = splitLines(text);
+  const redactedLines = splitLines(redacted);
+  if (redactedLines.length !== rawLines.length) throw failure("projection");
+  const window = resolveHistoricalWindow(options, rawLines.length);
+  const toScanned = (lines: string[]): ScannedLine[] =>
+    lines.map((line, index) => ({
+      lineNo: window.startLine + index,
+      text: line,
+      bytes: Buffer.byteLength(line, "utf8"),
+      giant: false
+    }));
+  const framed = frameRawWindow(
+    toScanned(redactedLines.slice(window.startLine - 1, window.endLine)),
+    toScanned(rawLines.slice(window.startLine - 1, window.endLine)),
+    {
+      startLine: window.startLine,
+      endLine: window.endLine,
+      totalLines: rawLines.length,
+      bytes: scan.bytes,
+      sha256: scan.sha256,
+      maxBytes
+    }
+  );
+  return { path: canonicalPath, ...framed };
+}
+
+/** Large-blob route: shared secure projector over the streamed window. */
+function projectHistoricalLarge(
+  canonicalPath: string,
+  scan: SourceScan,
+  options: GitHistoricalBlobOptions,
+  maxBytes: number
+): ReadFileResult {
+  const window = resolveHistoricalWindow(options, scan.totalLines);
+  if (scan.maskAtWindowStart === null) throw failure("projection");
+  const captured = scan.selected.filter((line) => line.lineNo >= window.startLine && line.lineNo <= window.endLine);
+  if (captured.length === 0) throw failure("invalid-range");
+  const projected = projectLargeWindow(
+    {
+      scan,
+      rawLines: captured.map((line) => line.text),
+      windowStartOffset: scan.maskAtWindowStart.offset
+    },
+    (slice) => redactSensitiveTextPreservingLines(slice, { context: "source" })
+  );
+  const display: ScannedLine[] = captured.map((line, index) => ({
+    lineNo: line.lineNo,
+    text: projected.lines[index] ?? "",
+    bytes: line.bytes,
+    giant: line.giant
+  }));
+  const framed = frameRawWindow(display, captured, {
+    startLine: window.startLine,
+    endLine: window.endLine,
+    totalLines: scan.totalLines,
+    bytes: scan.bytes,
+    sha256: scan.sha256,
+    maxBytes,
+    capped: scan.selectionCapped,
+    capturedThroughLine: scan.capturedThroughLine
+  });
+  return { path: canonicalPath, ...framed };
 }
 
 // Operation-oriented aliases keep the internal primitive easy to consume
