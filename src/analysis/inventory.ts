@@ -69,9 +69,15 @@ export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuar
 
   files.sort((a, b) => Number(isHiddenRelativePath(a.path)) - Number(isHiddenRelativePath(b.path)) || compareCodeUnit(a.path, b.path));
   oversizedSkipped.sort(compareCodeUnit);
+  // R2 review R1-T1: traversal-capacity truncation is also cache identity.
+  // Without it, filling the inventory to its file cap returns the same
+  // fingerprint after one more file arrives, and a stale complete result
+  // masks the fresh truncation. The flag pair below is exactly the input the
+  // warnings derive from, so equal fingerprints imply fact-equal coverage.
+  const truncationMark = `\n\x00truncation:${truncated ? 1 : 0}:${traversalResult.traversal?.capacityExhausted ? 1 : 0}`;
   const fingerprint = createHash("sha256")
     .update(files.map((file) => `${file.path}:${file.bytes}:${file.modifiedMs}`).join("\n") +
-      "\n\x00oversized-skipped:\n" + oversizedSkipped.join("\n"))
+      "\n\x00oversized-skipped:\n" + oversizedSkipped.join("\n") + truncationMark)
     .digest("hex");
   const warnings = truncated
     ? traversalResult.traversal?.capacityExhausted

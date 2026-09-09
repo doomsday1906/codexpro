@@ -22,15 +22,19 @@ let child;
 const pending = new Map();
 let nextId = 1;
 let buffer = "";
-try {
-  await fsp.writeFile(path.join(tmp, "a.txt"), "alpha one\n");
-  await fsp.writeFile(path.join(tmp, "b.txt"), "beta two\n");
-
-  child = spawn(process.execPath, [
-    "dist/stdio.js", "--root", tmp, "--allow-root", tmp,
+const requestOn = (kid, method, params, timeoutMs = 120000) => new Promise((resolve, reject) => {
+  const id = nextId++;
+  const timer = setTimeout(() => reject(new Error(`timeout ${method}`)), timeoutMs);
+  timer.unref();
+  pending.set(id, (msg) => { clearTimeout(timer); resolve(msg); });
+  kid.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+});
+const launch = (root, extraEnv = {}) => {
+  const kid = spawn(process.execPath, [
+    "dist/stdio.js", "--root", root, "--allow-root", root,
     "--bash", "off", "--write", "off", "--tool-mode", "full"
-  ], { cwd: path.resolve("."), env: { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp } });
-  child.stdout.on("data", (chunk) => {
+  ], { cwd: path.resolve("."), env: { ...process.env, CODEXPRO_ROOT: root, CODEXPRO_ALLOWED_ROOTS: root, ...extraEnv } });
+  kid.stdout.on("data", (chunk) => {
     buffer += String(chunk);
     for (;;) {
       const nl = buffer.indexOf("\n");
@@ -45,16 +49,17 @@ try {
       }
     }
   });
-  child.stderr.on("data", () => {});
-  const request = (method, params, timeoutMs = 120000) => new Promise((resolve, reject) => {
-    const id = nextId++;
-    const timer = setTimeout(() => reject(new Error(`timeout ${method}`)), timeoutMs);
-    timer.unref();
-    pending.set(id, (msg) => { clearTimeout(timer); resolve(msg); });
-    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-  });
-  const inspect = async () => {
-    const msg = await request("tools/call", {
+  kid.stderr.on("data", () => {});
+  return kid;
+};
+try {
+  await fsp.writeFile(path.join(tmp, "a.txt"), "alpha one\n");
+  await fsp.writeFile(path.join(tmp, "b.txt"), "beta two\n");
+
+  child = launch(tmp);
+  const request = (method, params, timeoutMs = 120000) => requestOn(child, method, params, timeoutMs);
+  const inspect = async (req = request) => {
+    const msg = await req("tools/call", {
       name: "inspect_workspace",
       arguments: { include_symbols: false, include_relationships: false }
     });
@@ -105,6 +110,32 @@ try {
   assert.equal(over.coverage.truncated, true, "boundary crossing must truncate");
   assert.notEqual(over.cache.key, keyUnder, "boundary crossing must change cache identity");
   assert.equal(over.cache.hit, false, "boundary crossing must compute fresh");
+
+  // D (R2 review R1-T1): traversal-capacity truncation is cache identity.
+  // With the inventory capped at 100 files, the 101st file must produce a
+  // fresh truncated result under a new key — never a stale cached complete.
+  child.kill("SIGKILL");
+  const capTmp = await fsp.mkdtemp(path.join(os.tmpdir(), "codexpro-r2-cache-cap-"));
+  let capChild;
+  try {
+    for (let i = 0; i < 100; i += 1) {
+      await fsp.writeFile(path.join(capTmp, `f${String(i).padStart(3, "0")}.txt`), `cap file ${i}\n`);
+    }
+    capChild = launch(capTmp, { CODEXPRO_ANALYSIS_MAX_INVENTORY_FILES: "100" });
+    const capReq = (method, params, t) => requestOn(capChild, method, params, t);
+    const full = await inspect(capReq);
+    assert.equal(full.coverage.truncated, false, "100 files at cap 100 must be complete");
+    assert.equal(full.cache.hit, false, "capped baseline must compute");
+    const keyFull = full.cache.key;
+    await fsp.writeFile(path.join(capTmp, "zzz_last.txt"), "one file past the cap\n");
+    const past = await inspect(capReq);
+    assert.equal(past.coverage.truncated, true, "101st file must truncate coverage");
+    assert.notEqual(past.cache.key, keyFull, "truncation onset must change cache identity");
+    assert.equal(past.cache.hit, false, "REGRESSION: stale cached complete masked fresh truncation");
+  } finally {
+    if (capChild) capChild.kill("SIGKILL");
+    await fsp.rm(capTmp, { recursive: true, force: true });
+  }
 
   console.log("HESTIA_R2_CACHE_PROOF: PASS");
 } finally {
