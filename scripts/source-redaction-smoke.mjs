@@ -3386,7 +3386,7 @@ try {
     name: 'read',
     arguments: { workspace_id: workspaceId, path: 'ranged-byte-limit.ts', start_line: 1, end_line: 1, max_bytes: 1_000 }
   }), 'ranged read selected max_bytes limit');
-  assert.match(resultText(rangedByteLimitedError), /Selected line range is too large/i, 'ranged read selected max_bytes limit changed its bounded error');
+  assert.match(resultText(rangedByteLimitedError), /Selected line 1 is too large/i, 'ranged read selected max_bytes limit changed its bounded error');
   expectNoRawLiterals(rangedByteLimitedError, ['x'.repeat(128)], 'ranged read selected max_bytes error');
 
   const rangedByteTail = assertToolSuccess(await client.request('tools/call', {

@@ -746,7 +746,7 @@ const READ_MANY_ITEM_SCHEMA = z.object({
     .refine((value) => value.trim().length > 0, "path must not be empty"),
   start_line: z.number().int().min(1).optional().describe("First line to read. Default: 1."),
   end_line: z.number().int().min(1).optional().describe("Last line to read. Default: end of file."),
-  max_bytes: z.number().int().min(1000).max(2000000).optional().describe("Maximum file bytes. Capped by server config.")
+  max_bytes: z.number().int().min(1000).max(2000000).optional().describe("Budget in bytes for the selected/paged raw numbered line window. Total source size is never rejected from this budget; oversized windows return the largest fitting complete-line page plus continuation. Capped by server config.")
 }).strict();
 
 const READ_MANY_ARGUMENTS_SCHEMA = z.object({
@@ -3697,7 +3697,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         path: z.string().describe("File path relative to workspace root."),
         start_line: z.number().int().min(1).optional().describe("First line to read. Default: 1."),
         end_line: z.number().int().min(1).optional().describe("Last line to read. Default: end of file."),
-        max_bytes: z.number().int().min(1000).max(2000000).optional().describe("Maximum file bytes. Capped by server config.")
+        max_bytes: z.number().int().min(1000).max(2000000).optional().describe("Budget in bytes for the selected/paged raw numbered line window. Total source size is never rejected from this budget; oversized windows return the largest fitting complete-line page plus continuation. Capped by server config.")
       },
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {

@@ -96,6 +96,7 @@
     "source-redaction:smoke": "npm run build && node scripts/source-redaction-smoke.mjs",
     "source-scanner:smoke": "npm run build && node scripts/source-scanner-smoke.mjs",
     "source-projection:smoke": "npm run build && node scripts/source-projection-smoke.mjs",
+    "large-file-readability:smoke": "npm run build && node scripts/large-file-readability-smoke.mjs",
     "apply-patch:smoke": "npm run build && node scripts/apply-patch-matrix-smoke.mjs",
     "diagnostic-output:smoke": "npm run build && node scripts/diagnostic-output-smoke.mjs",
     "diagnostic-context:smoke": "npm run build && node scripts/diagnostic-context-smoke.mjs",

@@ -140,6 +140,19 @@ export interface SourceScan {
   readonly maskAtWindowStart: MaskSnapshot | null;
   /** True when the window starts in plain code (flank-after masking is then exact). */
   readonly windowStartsInCode: boolean;
+  /**
+   * Decoded source text immediately before the captured window, already trimmed
+   * to a line boundary (≤ WINDOW_FLANK_BYTES). Context only; never returned.
+   */
+  readonly flankBefore: string;
+  /**
+   * True when trimming flankBefore dropped a partial line, or the immediately
+   * preceding line was giant (content withheld): a multi-line match may bridge
+   * into the window, forcing conservative treatment of the first window line.
+   */
+  readonly bridgeSuspect: boolean;
+  /** Decoded source text immediately after the requested window end (≤ WINDOW_FLANK_BYTES). */
+  readonly flankAfter: string;
   readonly race: boolean;
   readonly maxRetainedBytes: number;
 }
@@ -430,9 +443,38 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
     maskOffset += piece.length;
   };
 
-  const emit = (line: string, lineBytes: number, giant: boolean): void => {
+  // Flank context (fixed bounds; context only, never returned).
+  let preTail = "";
+  let preGiant = false;
+  let flankBefore = "";
+  let flankBridgeSuspect = false;
+  let flankAfter = "";
+  const FLANK_RING_CHARS = WINDOW_FLANK_BYTES + 4096;
+
+  const emit = (line: string, lineBytes: number, giant: boolean, record: string): void => {
     completed += 1;
     if (giant) giants.push({ lineNo: completed, bytes: lineBytes });
+    if (wantSelect && completed < selectStart) {
+      // Pre-window context for the credential slice.
+      if (giant) {
+        preGiant = true;
+      } else {
+        preTail += record;
+        if (preTail.length > FLANK_RING_CHARS) preTail = preTail.slice(-WINDOW_FLANK_BYTES);
+      }
+    }
+    if (wantSelect && completed === selectStart) {
+      const trimmed = trimFlankBefore(preTail.slice(-WINDOW_FLANK_BYTES));
+      flankBefore = trimmed.flank;
+      flankBridgeSuspect = trimmed.bridgeSuspect || preGiant;
+      preTail = "";
+    }
+    if (wantSelect && (completed > selectEnd || (selectionCapped && completed > capturedThroughLine))) {
+      if (!giant && flankAfter.length < WINDOW_FLANK_BYTES) {
+        flankAfter += record;
+        if (flankAfter.length > WINDOW_FLANK_BYTES) flankAfter = flankAfter.slice(0, WINDOW_FLANK_BYTES);
+      }
+    }
     if (wantSelect && completed >= selectStart && completed <= selectEnd) {
       if (!giant && selectedBytes + lineBytes > selectMaxBytes) {
         selectionCapped = true; // keep counting; content stays on the source
@@ -455,7 +497,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       hash.update(chunk);
       if (!nulFound && chunk.includes(0)) nulFound = true;
       let text = decoder.write(chunk);
-      track(chunk.byteLength + Buffer.byteLength(text, "utf8") + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes);
+      track(chunk.byteLength + Buffer.byteLength(text, "utf8") + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length);
       if (pendingCR) {
         text = `\r${text}`;
         pendingCR = false;
@@ -485,7 +527,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
           carry += parts[0];
           carryBytes += fragBytes;
         }
-        track(chunk.byteLength + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes);
+        track(chunk.byteLength + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length);
         continue;
       }
       // Head completes the carried fragment and its line (content + terminator fed exactly).
@@ -495,7 +537,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       const contentBytes = headBytes - (hadCR ? 1 : 0);
       const lineText = giantActive ? "" : headContent.endsWith("\r") ? headContent.slice(0, -1) : headContent;
       observe(`${headContent}\n`, completed + 1);
-      emit(lineText, contentBytes, giantActive);
+      emit(lineText, contentBytes, giantActive, giantActive ? "" : `${lineText}\n`);
       carry = "";
       carryBytes = 0;
       giantActive = false;
@@ -507,10 +549,10 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         if (rawBytes > LINE_FRAG_CAP_BYTES) {
           // A middle giant line arrives whole within one chunk: feed exactly, retain nothing.
           observe(`${raw}\n`, completed + 1);
-          emit("", rawBytes - (raw.endsWith("\r") ? 1 : 0), true);
+          emit("", rawBytes - (raw.endsWith("\r") ? 1 : 0), true, "");
         } else {
           observe(`${raw}\n`, completed + 1);
-          emit(stripped, Buffer.byteLength(stripped, "utf8"), false);
+          emit(stripped, Buffer.byteLength(stripped, "utf8"), false, `${stripped}\n`);
         }
       }
       const tail = parts[parts.length - 1];
@@ -526,7 +568,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         carryBytes = tailBytes;
       }
       flushObserveAcc();
-      track(chunk.byteLength + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes);
+      track(chunk.byteLength + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length);
     }
     checkAborted();
     if (pendingCR) {
@@ -577,10 +619,10 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
     }
     // Oracle line semantics: always one final (possibly empty) line.
     if (giantActive) {
-      emit("", giantBytes, true);
+      emit("", giantBytes, true, "");
     } else {
       observe(carry, completed + 1);
-      emit(carry, carryBytes, false);
+      emit(carry, carryBytes, false, carry);
     }
     const windowStartSnapshot: MaskSnapshot | null = windowSnapshots.start;
     const digest = hash.digest("hex");
@@ -597,6 +639,9 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       nukeOffset: nuke.result(),
       maskAtWindowStart: windowStartSnapshot,
       windowStartsInCode: windowStartSnapshot === null ? true : windowStartSnapshot.state === "code",
+      flankBefore,
+      bridgeSuspect: flankBridgeSuspect,
+      flankAfter,
       race: false,
       maxRetainedBytes: maxRetained
     };
@@ -852,17 +897,8 @@ export interface LargeWindowProjectionRequest {
   readonly scan: SourceScan;
   /** Raw window line contents in order (giant entries carry text "" and are never rendered). */
   readonly rawLines: string[];
-  /** Decoded-string offset of the first window byte. */
+  /** Decoded-string offset of the first window byte (for exact span mapping). */
   readonly windowStartOffset: number;
-  /** Source text immediately before the window (line-boundary trimmed by the caller). */
-  readonly flankBefore: string;
-  /** Source text immediately after the window. */
-  readonly flankAfter: string;
-  /**
-   * True when trimming flankBefore to a line boundary dropped a partial line
-   * containing a credential label (a multi-line match may bridge into the window).
-   */
-  readonly bridgeSuspect: boolean;
 }
 
 export interface LargeWindowProjection {
@@ -899,7 +935,10 @@ export function projectLargeWindow(
   request: LargeWindowProjectionRequest,
   redactSlice: (slice: string) => string
 ): LargeWindowProjection {
-  const { scan, rawLines, windowStartOffset, flankBefore, flankAfter, bridgeSuspect } = request;
+  const { scan, rawLines, windowStartOffset } = request;
+  const flankBefore = scan.flankBefore;
+  const flankAfter = scan.flankAfter;
+  const bridgeSuspect = scan.bridgeSuspect;
   const lineStarts: number[] = [];
   {
     let cursor = windowStartOffset;
@@ -936,6 +975,13 @@ export function projectLargeWindow(
   rawLines.forEach((raw, index) => {
     if (raw.length === 0) return;
     if (!FORCE_LABEL_PATTERN.test(raw) || !FORCE_SHAPE_PATTERN.test(raw)) return;
+    // Uncertain mask state (window opens inside a string/block comment): the
+    // slice redactor may misread string content as code and grant allowances
+    // the whole-source oracle denies. Deny them all on labeled lines.
+    if (!scan.windowStartsInCode) {
+      forceLine(index);
+      return;
+    }
     // Offsets track the key-mapped slice (private-key markers change lengths).
     const lineStartInSlice = sliceWindowBase + keyMapped.slice(0, index).join("\n").length + (index > 0 ? 1 : 0);
     if (anchorReachesSliceStart(maskedSlice, lineStartInSlice)) {

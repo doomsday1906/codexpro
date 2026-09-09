@@ -7,6 +7,17 @@ import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, displayPath, normalizeRelPath, PathGuard } from "./guard.js";
 import { hasSecretValue, redactSensitiveText, redactSensitiveTextPreservingLines, sourceLanguageForPath } from "./redact.js";
+import {
+  FIXED_SNAPSHOT_BYTES,
+  LINE_FRAG_CAP_BYTES,
+  SOURCE_SCAN_LIMIT_BYTES,
+  SourceScanError,
+  frameRawWindow,
+  projectLargeWindow,
+  resolveWindow,
+  scanWorkingTreeFile,
+  type ScannedLine
+} from "./sourceProjection.js";
 
 export interface TreeOptions {
   path?: string;
@@ -30,6 +41,12 @@ export interface ReadFileResult {
   bytes: number;
   sha256: string;
   truncated: boolean;
+  /** UTF-8 bytes of the returned public source body. */
+  returnedBytes: number;
+  /** True only when the response budget shortened the requested window. */
+  budgetTruncated: boolean;
+  /** Next physical line continuing the same requested window, when one exists. */
+  nextStartLine?: number;
 }
 
 export interface PublicSourceProjectionInput {
@@ -259,7 +276,9 @@ function readFileWindow(
     totalLines,
     bytes: snapshot.bytes,
     sha256: snapshot.sha256,
-    truncated: startLine > 1 || endLine < totalLines
+    truncated: startLine > 1 || endLine < totalLines,
+    returnedBytes: Buffer.byteLength(numbered, "utf8"),
+    budgetTruncated: false
   };
 }
 
@@ -826,17 +845,144 @@ export async function readPublicTextFile(
   filePath: string,
   options: { startLine?: number; endLine?: number; maxBytes?: number } = {}
 ): Promise<ReadFileResult> {
-  const loaded = await loadTextFile(config, guard, workspace, filePath, options);
+  // PathGuard first, exactly as the internal reader does; no source bytes are
+  // touched before the path is resolved and admitted. stat errors (missing
+  // paths, permission failures) propagate raw, identical to the previous loader.
+  const resolved = guard.resolve(workspace, filePath);
   const maxBytes = Math.min(options.maxBytes ?? config.maxReadBytes, config.maxReadBytes);
-  return projectPublicSourceText({
-    logicalPath: loaded.resolved.relPath,
-    text: loaded.text,
-    bytes: loaded.buffer.byteLength,
-    sha256: sha256(loaded.text),
-    startLine: options.startLine,
-    endLine: options.endLine,
+  const preStat = await fsp.stat(resolved.absPath);
+  if (!preStat.isFile()) throw new CodexProError(`Not a file: ${resolved.absPath}`);
+  if (preStat.size > SOURCE_SCAN_LIMIT_BYTES) {
+    throw new SourceScanError("source_scan_limit", { observed: preStat.size, limit: SOURCE_SCAN_LIMIT_BYTES });
+  }
+  if (preStat.size <= FIXED_SNAPSHOT_BYTES) {
+    return readPublicSnapshotFile(resolved, preStat, options, maxBytes);
+  }
+  return readPublicLargeFile(resolved, options, maxBytes);
+}
+
+/**
+ * Bounded snapshot route for sources within the fixed complete-snapshot
+ * envelope. Redaction is the accepted `projectPublicSourceText` oracle
+ * verbatim; only over-budget/unbounded framing uses the shared pager, which
+ * is byte-identical to the oracle whenever the oracle admits the window.
+ */
+async function readPublicSnapshotFile(
+  resolved: { absPath: string; relPath: string },
+  preStat: { size: number; mtimeMs: number; ctimeMs: number },
+  options: { startLine?: number; endLine?: number; maxBytes?: number },
+  maxBytes: number
+): Promise<ReadFileResult> {
+  const buffer = await readBoundedBytes(resolved.absPath, preStat.size + 65536);
+  const postStat = await fsp.stat(resolved.absPath);
+  if (postStat.size !== preStat.size || postStat.mtimeMs !== preStat.mtimeMs || postStat.ctimeMs !== preStat.ctimeMs) {
+    throw new SourceScanError("race");
+  }
+  if (buffer.includes(0)) throw new CodexProError("Refusing to read binary file.");
+  const text = buffer.toString("utf8");
+  const digest = sha256(text);
+  const language = sourceLanguageForPath(resolved.relPath);
+  const redacted = redactSensitiveTextPreservingLines(text, { context: "source", language });
+  const rawLines = splitLines(text);
+  const redactedLines = splitLines(redacted);
+  if (redactedLines.length !== rawLines.length) {
+    throw new CodexProError("Source projection broke physical line correspondence.");
+  }
+  const window = resolveWindow(options, rawLines.length);
+  const toScanned = (lines: string[]): ScannedLine[] =>
+    lines.map((line, index) => ({
+      lineNo: window.startLine + index,
+      text: line,
+      bytes: Buffer.byteLength(line, "utf8"),
+      giant: false
+    }));
+  const display = toScanned(redactedLines.slice(window.startLine - 1, window.endLine));
+  const budget = toScanned(rawLines.slice(window.startLine - 1, window.endLine));
+  const framed = frameRawWindow(display, budget, {
+    startLine: window.startLine,
+    endLine: window.endLine,
+    totalLines: rawLines.length,
+    bytes: buffer.byteLength,
+    sha256: digest,
     maxBytes
   });
+  return { path: resolved.relPath, ...framed };
+}
+
+/**
+ * Bounded large-source route. One pinned scan supplies exact metadata,
+ * selected raw lines, security observations, and flank context; the secure
+ * projector redacts the captured window; shared framing pages it.
+ */
+async function readPublicLargeFile(
+  resolved: { absPath: string; relPath: string },
+  options: { startLine?: number; endLine?: number; maxBytes?: number },
+  maxBytes: number
+): Promise<ReadFileResult> {
+  // Unbounded requests still open an explicit scan window at line 1 so mask
+  // snapshots and flank context exist; capture is budget-capped and framing pages.
+  const scan = await scanWorkingTreeFile(fsp, {
+    absPath: resolved.absPath,
+    startLine: options.startLine ?? 1,
+    endLine: options.endLine,
+    selectMaxBytes: maxBytes + LINE_FRAG_CAP_BYTES + 65536
+  });
+  if (scan.nulFound) throw new CodexProError("Refusing to read binary file.");
+  const window = resolveWindow(options, scan.totalLines);
+  if (scan.maskAtWindowStart === null) {
+    throw new CodexProError("Source projection is unavailable for the requested window.");
+  }
+  const captured = scan.selected.filter((line) => line.lineNo >= window.startLine && line.lineNo <= window.endLine);
+  if (captured.length === 0) {
+    throw new CodexProError(`end_line (${window.endLine}) must be >= start_line (${window.startLine}).`);
+  }
+  const projected = projectLargeWindow(
+    {
+      scan,
+      rawLines: captured.map((line) => line.text),
+      windowStartOffset: scan.maskAtWindowStart.offset
+    },
+    (slice) => redactSensitiveTextPreservingLines(slice, { context: "source" })
+  );
+  const display: ScannedLine[] = captured.map((line, index) => ({
+    lineNo: line.lineNo,
+    text: projected.lines[index] ?? "",
+    bytes: line.bytes,
+    giant: line.giant
+  }));
+  const framed = frameRawWindow(display, captured, {
+    startLine: window.startLine,
+    endLine: window.endLine,
+    totalLines: scan.totalLines,
+    bytes: scan.bytes,
+    sha256: scan.sha256,
+    maxBytes,
+    capped: scan.selectionCapped,
+    capturedThroughLine: scan.capturedThroughLine
+  });
+  return { path: resolved.relPath, ...framed };
+}
+
+/** Read at most `cap` bytes; exceeding the cap fails closed (source grew mid-read). */
+async function readBoundedBytes(absPath: string, cap: number): Promise<Buffer> {
+  const handle = await fsp.open(absPath, "r");
+  try {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const slab = Buffer.allocUnsafe(64 * 1024);
+    for (;;) {
+      const { bytesRead } = await handle.read(slab, 0, slab.length, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > cap) {
+        throw new SourceScanError("race", { observed: total });
+      }
+      chunks.push(Buffer.from(slab.subarray(0, bytesRead)));
+    }
+    return Buffer.concat(chunks);
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
 }
 
 export async function writeTextFile(

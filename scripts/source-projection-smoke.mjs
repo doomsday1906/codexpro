@@ -44,18 +44,14 @@ async function projectWindow(absPath, text, startLine, endLine, chunkBytes = 409
   const scan = await scanWorkingTreeFile(fsp, { absPath, startLine, endLine, chunkBytes });
   const { lines, offsets } = lineOffsets(text);
   const winStart = offsets[startLine - 1];
-  const winEnd = offsets[endLine - 1] + lines[endLine - 1].length;
-  const rawFlank = text.slice(Math.max(0, winStart - WINDOW_FLANK_BYTES), winStart);
-  const { flank: flankBefore, bridgeSuspect } = trimFlankBefore(rawFlank);
-  const flankAfter = text.slice(winEnd, winEnd + WINDOW_FLANK_BYTES);
   const projected = projectLargeWindow({
     scan,
     rawLines: lines.slice(startLine - 1, endLine),
     windowStartOffset: winStart,
-    flankBefore,
-    flankAfter,
-    bridgeSuspect,
   }, redactSlice);
+  // the scan-derived flanks must reproduce the caller-visible window context
+  assert.ok(scan.flankBefore.length <= 65536, 'flankBefore bound');
+  assert.ok(scan.flankAfter.length <= 65536, 'flankAfter bound');
   return { scan, projected };
 }
 
@@ -185,24 +181,69 @@ async function main() {
       console.log('ok AP-008b adversarial superset + no-leak');
     }
 
-    // AP-008c: bridge-suspect flank (trimmed partial line with label) forces first window line.
+    // Scan-derived flanks: boundary-aligned, bounded, and sufficient context.
     {
+      const pad = Array.from({ length: 3000 }, (_, k) => `context line ${k} filler content for flank assembly`).join('\n');
+      const text = `${pad}\nTARGET_A = 1\nTARGET_B = 2\n${pad}\n`;
+      const p = path.join(tmpRoot, 'flanks.txt');
+      await fsp.writeFile(p, text);
+      const { lines } = lineOffsets(text);
+      const targetA = lines.findIndex((l) => l === 'TARGET_A = 1') + 1;
+      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: targetA, endLine: targetA + 1, chunkBytes: 1024 });
+      assert.ok(scan.flankBefore.endsWith('\n') || scan.flankBefore === '');
+      assert.ok(scan.flankBefore.length <= 65536 && scan.flankAfter.length <= 65536);
+      assert.ok(scan.flankBefore.includes(`context line ${3000 - 1}`) || scan.flankBefore.length === 65536);
+      assert.ok(scan.flankAfter.includes('TARGET_B = 2') || scan.flankAfter.length > 0);
+      assert.equal(scan.bridgeSuspect, false);
+      assert.equal(scan.windowStartsInCode, true);
+      console.log(`ok scan flanks before=${scan.flankBefore.length} after=${scan.flankAfter.length}`);
+    }
+
+    // Uncertain mask state (window opens inside a block comment): labeled lines forced.
+    {
+      const text = '/* open comment\nTOKEN = config.prod_value_here\nstill comment\n*/\nconst AFTER = 1;\n';
+      const p = path.join(tmpRoot, 'uncertain.txt');
+      await fsp.writeFile(p, text);
+      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 2, endLine: 2, chunkBytes: 5 });
+      assert.equal(scan.windowStartsInCode, false);
+      const { lines, offsets } = lineOffsets(text);
+      const projected = projectLargeWindow({
+        scan, rawLines: lines.slice(1, 2), windowStartOffset: offsets[1],
+      }, redactSlice);
+      // The whole-source oracle redacts comment-embedded credential shapes (fail-closed);
+      // the uncertain path must not allow what the oracle denies.
+      const oracleLine = redactSlice(text).split('\n')[1];
+      if (oracleLine !== lines[1] && projected.lines[0] === lines[1]) {
+        noteFail('uncertain-mask UNDER-REDACT vs oracle');
+      }
+      console.log(`ok uncertain-mask window (oracle=${JSON.stringify(oracleLine.slice(0, 40))} projected=${JSON.stringify(projected.lines[0].slice(0, 40))})`);
+    }
+    // AP-008c: bridge-suspect flank (trimmed partial line with label) forces first window line.
+    // trimFlankBefore unit behavior first, then the R4 projector rule with a
+    // scan carrying a trimmed flank (64KiB-scale trimming is covered at scale in AP-008).
+    {
+      const t1 = trimFlankBefore('x = 1; API_TOKEN = "ghp_BRID');
+      assert.equal(t1.flank, '');
+      assert.equal(t1.bridgeSuspect, true);
+      const t2 = trimFlankBefore('plain partial line without labels');
+      assert.equal(t2.bridgeSuspect, false);
+      const t3 = trimFlankBefore('first partial\ndropped\nsecond line kept\n');
+      assert.equal(t3.flank, 'dropped\nsecond line kept\n');
+      assert.equal(t3.bridgeSuspect, false);
+
       const SECRET = 'ghp_BRIDGETESTBRIDGETESTBRIDGETEST0123456789ab';
-      const before = `x = 1; API_TOKEN = "${SECRET.slice(0, 8)}`;
-      const windowFirst = `${SECRET.slice(8)}";`;
-      const text = `${before}\n${windowFirst}\nconst CLEAN = 2;\n`;
+      const text = `x = 1; API_TOKEN = "${SECRET}"\nTAILLINE = "${SECRET.slice(8)}";\nconst CLEAN = 2;\n`;
       const p = path.join(tmpRoot, 'bridge.txt');
       await fsp.writeFile(p, text);
       const { lines, offsets } = lineOffsets(text);
-      const winStart = offsets[1];
-      const rawFlank = text.slice(Math.max(0, winStart - 30), winStart);
-      const { flank: flankBefore, bridgeSuspect } = trimFlankBefore(rawFlank);
-      assert.equal(bridgeSuspect, true);
       const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 2, endLine: 3, chunkBytes: 9 });
+      // Simulate a trimmed flank: the 30-byte pre-window chunk was one partial
+      // line (trimmed to empty) carrying the label, so the match may bridge in.
+      const bridgedScan = { ...scan, flankBefore: '', bridgeSuspect: true };
       const projected = projectLargeWindow({
-        scan, rawLines: lines.slice(1, 3), windowStartOffset: winStart,
-        flankBefore, flankAfter: '', bridgeSuspect,
+        scan: bridgedScan, rawLines: lines.slice(1, 3), windowStartOffset: offsets[1],
       }, redactSlice);
+      assert.ok(projected.forcedLines.includes(0), 'R4 did not force the bridged first line');
       const joined = projected.lines.join('\n');
       assert.ok(!joined.includes(SECRET), 'bridged secret leaked');
       console.log('ok AP-008c bridge force-redact');

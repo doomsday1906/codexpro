@@ -1196,7 +1196,7 @@ if (
 ) {
   throw new Error(`read_many item-local failures did not preserve siblings/order: ${JSON.stringify(partialBatch.structuredContent)}`);
 }
-for (const [index, pattern] of [[1, /ENOENT|no such file/i], [2, /blocked/i], [3, /binary/i], [4, /too large/i], [5, /too large/i], [6, /symlink|outside workspace/i], [7, /not a file/i]]) {
+for (const [index, pattern] of [[1, /ENOENT|no such file/i], [2, /blocked/i], [3, /binary/i], [4, /Selected line 1 is too large/i], [5, /Selected line 1 is too large/i], [6, /symlink|outside workspace/i], [7, /not a file/i]]) {
   if (!pattern.test(partialResults[index].error)) throw new Error(`read_many item ${index} lost expected local error: ${partialResults[index].error}`);
 }
 await expectToolError('read_many', { workspace_id: ws, items: [] }, /Invalid arguments for read_many/);
