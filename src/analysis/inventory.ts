@@ -25,13 +25,30 @@ export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuar
   // F4-C: oversized exclusions are bounded skip facts, not silent ordinary
   // skips. Sized here from the pre-admission stat (already in hand) so no
   // error-message sniffing is needed.
-  // R2-1: the exclusion SET is cache identity, not just the count. The
-  // fingerprint below folds each excluded file's path/size/mtime in, so
-  // adding, removing, or growing a file across the admission boundary always
-  // changes the cache key and a fresh bounded coverage result can never be
-  // replaced by an older complete one.
+  // R2-1: the exclusion SET is cache identity, not just the count. Adding,
+  // removing, or growing a file across the admission boundary must change
+  // the cache key so a fresh bounded coverage result can never be replaced
+  // by an older complete one.
+  // R3-2: that identity is a bounded streaming digest, never a retained
+  // list. Excluded files do not consume maxInventoryFiles, so the exclusion
+  // set is unbounded (thousands of files) — retaining or sorting one string
+  // per exclusion is unbounded state. Instead each exclusion folds one
+  // SHA-256 into a 32-byte XOR accumulator plus an exact counter. XOR is
+  // order-independent (traversal order must not affect the key) and O(1)
+  // state; the counter guarantees cardinality changes always flip the key.
+  // NUL separators: POSIX paths cannot contain NUL, so distinct identities
+  // cannot share a preimage. Excluded paths are never exposed publicly —
+  // only the count and the digest survive this function.
   let oversizedSkippedFiles = 0;
-  const oversizedSkipped: string[] = [];
+  const exclusionFold = Buffer.alloc(32, 0);
+  const foldExclusion = (relPath: string, size: number, mtimeMs: number): void => {
+    const digest = createHash("sha256")
+      .update("\0").update(relPath)
+      .update("\0").update(String(size))
+      .update("\0").update(String(mtimeMs))
+      .digest();
+    for (let i = 0; i < exclusionFold.length; i += 1) exclusionFold[i] ^= digest[i];
+  };
   const traversalResult = await listFilesDetailed(guard, workspace, {
     root: ".",
     includeHidden: true,
@@ -44,7 +61,7 @@ export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuar
         if (!stat.isFile()) return undefined;
         if (stat.size > admissionBytes) {
           oversizedSkippedFiles += 1;
-          oversizedSkipped.push(`${resolved.relPath}:${stat.size}:${stat.mtimeMs}`);
+          foldExclusion(resolved.relPath, stat.size, stat.mtimeMs);
           return undefined;
         }
         await guard.assertTextFile(resolved.absPath, admissionBytes);
@@ -68,7 +85,6 @@ export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuar
   const files: InventoryFile[] = (traversalResult.preparedFiles ?? []).map(({ prepared }) => prepared);
 
   files.sort((a, b) => Number(isHiddenRelativePath(a.path)) - Number(isHiddenRelativePath(b.path)) || compareCodeUnit(a.path, b.path));
-  oversizedSkipped.sort(compareCodeUnit);
   // R2 review R1-T1: traversal-capacity truncation is also cache identity.
   // Without it, filling the inventory to its file cap returns the same
   // fingerprint after one more file arrives, and a stale complete result
@@ -77,7 +93,7 @@ export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuar
   const truncationMark = `\n\x00truncation:${truncated ? 1 : 0}:${traversalResult.traversal?.capacityExhausted ? 1 : 0}`;
   const fingerprint = createHash("sha256")
     .update(files.map((file) => `${file.path}:${file.bytes}:${file.modifiedMs}`).join("\n") +
-      "\n\x00oversized-skipped:\n" + oversizedSkipped.join("\n") + truncationMark)
+      "\n\x00oversized-skipped:\n" + exclusionFold.toString("hex") + `\n${oversizedSkippedFiles}` + truncationMark)
     .digest("hex");
   const warnings = truncated
     ? traversalResult.traversal?.capacityExhausted
