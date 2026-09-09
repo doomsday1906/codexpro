@@ -103,8 +103,13 @@ async function probeRipgrepSizeSkips(
     child.stderr.on("data", () => undefined);
     child.on("error", reject);
     child.on("close", (code) => {
-      // rg --files exits 0 even when nothing matches; any other close means
-      // the listing cannot be trusted, so the probe reports unverifiable.
+      // rg uses exit 1 for an empty listing (the usual no-match code): a
+      // legitimate zero count, not a probe failure. Only 2+ or a signal
+      // means the listing cannot be trusted.
+      if (code === 1) {
+        resolve(lines);
+        return;
+      }
       if (code !== 0) {
         reject(new Error(`rg --files exited ${code}`));
         return;
