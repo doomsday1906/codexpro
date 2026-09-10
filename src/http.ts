@@ -20,6 +20,7 @@ import {
   type WorkspaceProfile
 } from "./profileStore.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
+import { createResponseCompletionTracker } from "./responseCompletion.js";
 import { createDiagnosticContext, type CodexProDiagnosticContext, type HttpDiagnosticSnapshot, type HttpLifecycleEvent } from "./diagnosticContext.js";
 import type { WorkspaceDiagnosticReader } from "./guard.js";
 import { createCodexProServer } from "./server.js";
@@ -2191,31 +2192,42 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       }
 
       // Application-use classification is fixed at request start (envelope
-      // method only); scoring happens only on the normal completed-response
-      // path below, never on premature close (FIRST-APPLICATION-CLOSE-001).
+      // method only). Scoring additionally requires the real HTTP response
+      // completion boundary: BOTH successful handler settlement AND the
+      // response `finish` event (RESPONSE-FINISH-ORDER-001). Handler
+      // resolution alone is not completion — on a large normal response it
+      // can precede `finish` by milliseconds while the client only received
+      // a prefix. `close` before `finish` permanently suppresses scoring.
       const requestIsApplicationUse = isApplicationUseBody(req.body);
       const requestLifetime = trackRequestStart(requestRecord);
-      const postRequestStart = Date.now();
-      // Response-close truth: a close with an unfinished response means the
-      // client went away before receiving completion. Release the in-flight
-      // slot immediately, but record the early end so a later internal
-      // handler settlement cannot masquerade as successful completion.
-      // A close after finish is the normal lifecycle and only releases.
-      let responseEndedEarly = false;
-      res.on("close", () => {
-        if (!res.writableEnded) responseEndedEarly = true;
-        requestLifetime.releaseInFlight();
+      const completion = createResponseCompletionTracker(requestIsApplicationUse, {
+        releaseInFlight: requestLifetime.releaseInFlight,
+        markApplicationCompleted: requestLifetime.markApplicationCompleted
       });
+      const postRequestStart = Date.now();
+      // `finish` is the authoritative server-side completion boundary; `close`
+      // before `finish` means the client went away mid-response. The tracker
+      // reconciles every ordering to exactly-once release / at-most-once
+      // scoring; a premature close releases immediately so an ended
+      // connection cannot hold capacity.
+      res.on("finish", completion.onResponseFinish);
+      res.on("close", completion.onResponseClose);
       try {
         await transport.handleRequest(req, res, req.body);
-        // Normal completed-response path only: exceptions skip scoring, and a
-        // prematurely ended response never scores even if the handler settles
-        // internally afterwards. finish/close after this only release.
-        if (requestIsApplicationUse && !responseEndedEarly) {
-          requestLifetime.markApplicationCompleted();
-        }
+        completion.onHandlerSuccess();
+      } catch (error) {
+        // Exception path: conservative unscored release through the
+        // finalization path; a later error-middleware finish or close
+        // reconciles to harmless no-ops. Rethrown to preserve the existing
+        // 500 handling below.
+        completion.onHandlerError();
+        throw error;
       } finally {
-        requestLifetime.releaseInFlight();
+        // Release/marking flow exclusively through tracker events above:
+        // success reconciles on handler-resolution and on a later `finish`;
+        // exceptions release via onHandlerError; premature close releases
+        // immediately. Nothing here may force-release, or a record would go
+        // idle while its response is still being completed.
         ringEvent({
           event: "request_finish",
           method: "POST",
