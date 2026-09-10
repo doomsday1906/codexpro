@@ -9,6 +9,7 @@ export type BashTranscriptMode = "compact" | "full";
 export type CodexSessionsMode = "off" | "metadata" | "read";
 export type WriteMode = "off" | "handoff" | "workspace";
 export type ToolMode = "minimal" | "standard" | "full";
+export type HttpSessionMode = "stateless" | "retained";
 export const MIN_HTTP_TOKEN_BYTES = 24;
 
 export interface CodexProConfig {
@@ -35,6 +36,7 @@ export interface CodexProConfig {
   maxGitTimeoutMs: number;
   maxImportBytes: number;
   maxSearchResults: number;
+  httpSessionMode: HttpSessionMode;
   maxHttpSessions: number;
   httpSessionTtlMs: number;
   blockedGlobs: string[];
@@ -191,6 +193,12 @@ function writeModeFrom(value: string | undefined): WriteMode {
 function toolModeFrom(value: string | undefined): ToolMode {
   if (value === "minimal" || value === "standard" || value === "full") return value;
   return "standard";
+}
+
+function httpSessionModeFrom(value: string | undefined): HttpSessionMode {
+  if (value === undefined || value === "") return "stateless";
+  if (value === "stateless" || value === "retained") return value;
+  throw new Error("CODEXPRO_HTTP_SESSION_MODE must be exactly `stateless` or `retained` when set.");
 }
 
 function widgetDomainFrom(value: string | undefined): string {
@@ -353,6 +361,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     maxGitTimeoutMs: numberFrom(process.env.CODEXPRO_MAX_GIT_TIMEOUT_MS, 60_000, 1_000, 300_000),
     maxImportBytes: numberFrom(process.env.CODEXPRO_MAX_IMPORT_BYTES, 5_000_000, 1_000, 50_000_000),
     maxSearchResults: numberFrom(process.env.CODEXPRO_MAX_SEARCH_RESULTS, 200, 5, 2_000),
+    httpSessionMode: httpSessionModeFrom(process.env.CODEXPRO_HTTP_SESSION_MODE),
     maxHttpSessions: numberFrom(process.env.CODEXPRO_MAX_HTTP_SESSIONS, 64, 1, 512),
     httpSessionTtlMs: numberFrom(process.env.CODEXPRO_HTTP_SESSION_TTL_MS, 30 * 60_000, 60_000, 24 * 60 * 60_000),
     blockedGlobs: [...DEFAULT_BLOCKED_GLOBS, ...extraBlockedGlobs],

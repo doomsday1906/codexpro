@@ -41,7 +41,7 @@ import { hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnost
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { createDiagnosticContext, type CodexProDiagnosticContext } from "./diagnosticContext.js";
 import { normalizeGitPushPolicy, sanitizeGitPushPolicy } from "./gitPushPolicy.js";
-export type { CodexProDiagnosticContext, DiagnosticContextOptions, DiagnosticTransportKind, HttpDiagnosticCurrentSession, HttpDiagnosticSnapshot } from "./diagnosticContext.js";
+export type { CodexProDiagnosticContext, DiagnosticContextOptions, DiagnosticTransportKind, HttpDiagnosticCurrentRequest, HttpDiagnosticCurrentSession, HttpDiagnosticSnapshot } from "./diagnosticContext.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 const RUNTIME_STATUS_FAILURE_DETAIL_MAX_BYTES = 2_048;
@@ -1976,7 +1976,7 @@ function registerCodexTool(
   if (!SUPERTOOL_EXCLUDED_ACTIONS.has(name)) rememberRegisteredToolHandler(server, name, validatedHandler);
 }
 
-function serverInstructions(config: CodexProConfig): string {
+function serverInstructions(config: CodexProConfig, diagnosticContext?: CodexProDiagnosticContext): string {
   const editInstruction =
     config.connectionTest
       ? "5. Connection test mode is read-only. Write, patch, export, and handoff-writing tools are unavailable."
@@ -1990,11 +1990,15 @@ function serverInstructions(config: CodexProConfig): string {
       ? "6. Bash is disabled and the bash tool is unavailable. Do not attempt shell commands."
       : "6. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.";
 
+  const transportGuidance = diagnosticContext?.transportKind === "http" && diagnosticContext.httpSessionMode === "stateless"
+    ? "HTTP stateless mode creates a fresh request-local MCP server: always carry the explicit workspace_id returned by open_workspace/open_current_workspace into later calls, and treat show_changes as a fresh full comparison because last_shown checkpoints are not persisted across requests."
+    : "A transport or MCP session change can lose the prior session selection; ChatGPT is not required to preserve one connection, and diagnostics cannot force client transport reuse or refresh a stale direct tool catalog.";
+
   return [
     "CodexPro connects ChatGPT to explicitly allowed local development workspaces.",
     "",
     "Preferred workflow:",
-    "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects. A transport or MCP session change can lose the prior session selection; ChatGPT is not required to preserve one connection, and diagnostics cannot force client transport reuse or refresh a stale direct tool catalog.",
+    `1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects. ${transportGuidance}`,
     "2. list_workspaces is session-local, not a process-global workspace directory. When continuity is unclear, call session_workspace_diagnostics; it reports runtime/session/catalog truth and can classify an explicit workspace_id without selecting or opening it. A valid explicit-ID recovery targets that workspace without changing ambient or global selection.",
     "3. For correctness-sensitive Git tools (git_commit, git_push, git_retire_remote_branch, git_resolve_ref, git_merge_base, git_log, git_show_commit, read_at_ref, git_diff_range), always pass the explicit workspace_id returned by open_current_workspace/open_workspace. Harmless reads may omit it when ambient selection is clear.",
     "4. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
@@ -2946,11 +2950,12 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
   const guard = new PathGuard(config);
   const readAtRefSchemas = readAtRefPublicSchemas(config.maxReadBytes);
   const diagnosticContext = options.diagnosticContext ?? createDiagnosticContext({ transportKind: "stdio" });
+  const statelessHttp = diagnosticContext.transportKind === "http" && diagnosticContext.httpSessionMode === "stateless";
   const workspaceDiagnosticReader: WorkspaceDiagnosticReader = Object.freeze({
     getSnapshot: (workspaceId?: string) => workspaces.diagnosticSnapshot(workspaceId)
   });
   options.onWorkspaceDiagnosticReader?.(workspaceDiagnosticReader);
-  const server = new McpServer({ name: CODEXPRO_SERVER_NAME, version: CODEXPRO_SERVER_VERSION }, { instructions: serverInstructions(config) });
+  const server = new McpServer({ name: CODEXPRO_SERVER_NAME, version: CODEXPRO_SERVER_VERSION }, { instructions: serverInstructions(config, diagnosticContext) });
   registeredToolNamesByServer.set(server as object, []);
   registerToolCardResource(server, config);
 
@@ -3166,7 +3171,20 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
 
       const httpSnapshot = diagnosticContext.getHttpSnapshot?.() ?? null;
       const httpSessions = httpSnapshot
-        ? {
+          ? {
+            mode: httpSnapshot.mode,
+            http_session_mode: httpSnapshot.mode,
+            retention_enabled: httpSnapshot.retentionEnabled,
+            configured_max: httpSnapshot.configuredMax,
+            configured_ttl_ms: httpSnapshot.configuredTtlMs,
+            retained_settings: {
+              active: httpSnapshot.retentionEnabled,
+              ignored: !httpSnapshot.retentionEnabled,
+              max: httpSnapshot.configuredMax,
+              ttl_ms: httpSnapshot.configuredTtlMs
+            },
+            total_initialize_observations: httpSnapshot.totalInitializeObservations,
+            total_ordinary_requests: httpSnapshot.totalOrdinaryRequests,
             active: httpSnapshot.active,
             max: httpSnapshot.max,
             ttl_ms: httpSnapshot.ttlMs,
@@ -3177,10 +3195,14 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
             idle: httpSnapshot.idle,
             in_flight_sessions: httpSnapshot.inFlightSessions,
             in_flight_requests: httpSnapshot.inFlightRequests,
+            current_http_requests: httpSnapshot.currentHttpRequests,
             pending_initializations: httpSnapshot.pendingInitializations,
             high_watermark: httpSnapshot.highWatermark,
             total_capacity_rejected: httpSnapshot.totalCapacityRejected,
             total_inflight_eviction_prevented: httpSnapshot.totalInflightEvictionPrevented,
+            current_request: httpSnapshot.currentRequest
+              ? { in_flight_requests: httpSnapshot.currentRequest.inFlightRequests }
+              : null,
             recent_lifecycle_events: httpSnapshot.recentLifecycleEvents.map((entry) => ({
               seq: entry.seq,
               t: publicDiagnosticTimestamp(entry.t),
@@ -3250,7 +3272,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         `Server: ${serverCatalog.name} ${serverCatalog.version}; catalog ${serverCatalog.catalog_fingerprint}; ${serverCatalog.registered_tool_count} registered tools in ${serverCatalog.tool_mode} mode.`,
         `Session: ${session.transport}, generation ${session.generation}, fingerprint ${session.fingerprint}, age ${session.age_ms} ms.`,
         httpSessions
-          ? `HTTP sessions: ${httpSessions.active}/${httpSessions.max} active; TTL ${httpSessions.ttl_ms} ms; initialized ${httpSessions.total_initialized}; closed ${httpSessions.total_closed}; expired ${httpSessions.total_expired}; capacity evicted ${httpSessions.total_capacity_evicted}.`
+          ? `HTTP sessions: mode ${httpSessions.mode}; retention ${httpSessions.retention_enabled ? "enabled" : "disabled"}; ${httpSessions.active}/${httpSessions.max} active; TTL ${httpSessions.ttl_ms} ms; initialized ${httpSessions.total_initialized}; initialize observations ${httpSessions.total_initialize_observations}; ordinary requests ${httpSessions.total_ordinary_requests}; current HTTP requests ${httpSessions.current_http_requests}; closed ${httpSessions.total_closed}; expired ${httpSessions.total_expired}; capacity evicted ${httpSessions.total_capacity_evicted}.${httpSessions.retained_settings.ignored ? " Retained capacity/TTL settings are inactive and ignored in stateless mode." : ""}`
           : "HTTP sessions: not applicable for this transport.",
         `Workspace: default ${defaultId}; selected ${selectedId}; session-opened ${workspace.session_opened.length}; process-known valid ${workspace.process_known.valid}, stale ${workspace.process_known.stale}.`,
         ...(requestedWorkspace
@@ -3620,7 +3642,9 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     {
       title: "Open Current Workspace",
       description:
-        "Open and select the configured default workspace for this MCP session. Use this to return to the launch workspace after switching roots.",
+        statelessHttp
+          ? "Open the configured default workspace for this HTTP request. Return its workspace_id and pass that explicit id to later stateless requests; selection is not persistent across requests."
+          : "Open and select the configured default workspace for this MCP session. Use this to return to the launch workspace after switching roots.",
       inputSchema: {
         include_tree: z.boolean().optional().describe("Include a compact file tree. Default: false for speed."),
         max_depth: z.number().int().min(1).max(8).optional().describe("Tree depth when include_tree=true. Default: 2."),
@@ -3668,7 +3692,9 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     {
       title: "Open Workspace",
       description:
-        "Open and select an allowed local project for this MCP session. Later tool calls may omit workspace_id to use this selection.",
+        statelessHttp
+          ? "Open an allowed local project for this HTTP request. Later stateless requests must pass the returned workspace_id because selection is request-local and is not persistent across requests."
+          : "Open and select an allowed local project for this MCP session. Later tool calls may omit workspace_id to use this selection.",
       inputSchema: {
         root: z.string().optional().describe("Project directory to open. Omit to use CODEXPRO_ROOT/current working directory. Supports ~/ paths."),
         path: z.string().optional().describe("Alias for root. Useful for clients that naturally send path instead of root."),
@@ -5053,14 +5079,22 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     "show_changes",
     {
       title: "Show Changes",
-      description: "Summarize the current workspace changes in one review-oriented result with git status, diff stats, and optional diff. Use this instead of bash git status, bash git diff, git_status, or git_diff when reviewing work.",
+      description: statelessHttp
+        ? "Summarize a fresh full comparison of the current workspace with git status, diff stats, and optional diff. In stateless HTTP, last_shown is request-local and is treated as workspace so no cross-request checkpoint is claimed."
+        : "Summarize the current workspace changes in one review-oriented result with git status, diff stats, and optional diff. Use this instead of bash git status, bash git diff, git_status, or git_diff when reviewing work.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe(statelessHttp
+          ? "Workspace id from open_workspace. In stateless HTTP, pass it on every later request; omission uses this request's configured default."
+          : "Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         path: z.string().optional().describe("Optional file path relative to workspace root."),
         staged: z.boolean().optional().describe("Show staged diff. Default: false."),
         include_diff: z.boolean().optional().describe("Include the unified diff. Default: true."),
-        since: z.enum(["last_shown", "workspace"]).optional().describe("Use last_shown to suppress unchanged repeated reviews. Default: last_shown."),
-        mark_reviewed: z.boolean().optional().describe("Update the last-shown review checkpoint after this call. Default: true.")
+        since: z.enum(["last_shown", "workspace"]).optional().describe(statelessHttp
+          ? "Accepted for schema compatibility. In stateless HTTP, last_shown is treated as workspace for a fresh comparison and no cross-request checkpoint is persisted."
+          : "Use last_shown to suppress unchanged repeated reviews. Default: last_shown."),
+        mark_reviewed: z.boolean().optional().describe(statelessHttp
+          ? "Accepted for schema compatibility. In stateless HTTP, review checkpoints are request-local and are not persisted."
+          : "Update the last-shown review checkpoint after this call. Default: true.")
       },
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
@@ -5083,8 +5117,9 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
       const stats = diffStats(diff);
       const changedFiles = statusError ? [] : changedStatusLines(status);
       const untrackedFingerprint = statusError ? "" : await untrackedReviewFingerprint(config, guard, workspace, changedFiles);
-      const since = args.since === "workspace" ? "workspace" : "last_shown";
-      const markReviewed = parseBool(args.mark_reviewed, true);
+      const requestedSince = args.since === "workspace" ? "workspace" : "last_shown";
+      const since = statelessHttp ? "workspace" : requestedSince;
+      const markReviewed = !statelessHttp && parseBool(args.mark_reviewed, true);
       const checkpointKey = reviewCheckpointKey(workspace, { path: normalizedScopedPath, staged });
       const fingerprint = reviewFingerprint(status, `${diff}\0${untrackedFingerprint}`);
       const checkpointHit = includeDiff && since === "last_shown" && reviewCheckpoints.get(checkpointKey) === fingerprint;
@@ -5141,9 +5176,12 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
       const analysisText = analysis
         ? `\n\n## Analysis\n\nAffected areas: ${(analysis.affected_areas as string[]).join(", ") || "none"}\nRisks: ${((analysis.risk_signals as Array<{ label?: string }>) ?? []).map((risk) => risk.label).filter(Boolean).join(", ") || "none"}\nRelated tests: ${((analysis.related_tests as Array<{ path?: string }>) ?? []).map((file) => file.path).filter(Boolean).join(", ") || "none"}`
         : "";
+      const statelessReviewNote = statelessHttp
+        ? "\n\nStateless HTTP: this is a fresh full workspace comparison. The last_shown checkpoint is request-local and is not persisted across requests."
+        : "";
       const text: PublicTextSegment[] = [{
         kind: "normal",
-        text: `# Show Changes\n\nWorkspace: ${workspace.root}\n\n## Changed\n\n${changedText}\n\n## Diff stats\n\n+${responseStats.additions} -${responseStats.deletions}`
+        text: `# Show Changes\n\nWorkspace: ${workspace.root}${statelessReviewNote}\n\n## Changed\n\n${changedText}\n\n## Diff stats\n\n+${responseStats.additions} -${responseStats.deletions}`
       }];
       if (checkpointHit || !includeDiff || diffError || !diff) {
         text.push({ kind: "normal", text: diffText });
@@ -5167,8 +5205,11 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         changed: !statusError && (checkpointHit ? false : changedFiles.length > 0 || responseStats.changed),
         diff: responseDiff,
         review_since: since,
+        review_since_requested: requestedSince,
         review_marked: checkpointWritten,
         review_checkpoint_hit: checkpointHit,
+        review_checkpoint_persistent: !statelessHttp,
+        review_checkpoint_scope: statelessHttp ? "request" : "mcp_session",
         ...(analysis ? { analysis } : {})
       }, {}, responseDiffBody ? { sourceFields: [{ path: ["diff"], body: responseDiffBody }] } : {});
     }

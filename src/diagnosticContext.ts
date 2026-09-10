@@ -8,6 +8,11 @@ export interface HttpDiagnosticCurrentSession {
   readonly inFlightRequests: number;
 }
 
+export interface HttpDiagnosticCurrentRequest {
+  /** Number of ordinary HTTP MCP requests currently in flight in this process. */
+  readonly inFlightRequests: number;
+}
+
 export interface HttpLifecycleEvent {
   readonly seq: number;
   readonly t: number;
@@ -32,6 +37,15 @@ export interface HttpLifecycleEvent {
 }
 
 export interface HttpDiagnosticSnapshot {
+  /** Actual HTTP transport mode for this process, never inferred from config in the server. */
+  readonly mode: "stateless" | "retained";
+  /** Whether transport-session retention is active for this process. */
+  readonly retentionEnabled: boolean;
+  /** Configured retained-session settings, even when stateless mode ignores them. */
+  readonly configuredMax: number;
+  readonly configuredTtlMs: number;
+  readonly totalInitializeObservations: number;
+  readonly totalOrdinaryRequests: number;
   readonly active: number;
   readonly max: number;
   readonly ttlMs: number;
@@ -42,11 +56,15 @@ export interface HttpDiagnosticSnapshot {
   readonly idle: number;
   readonly inFlightSessions: number;
   readonly inFlightRequests: number;
+  /** Process-wide ordinary HTTP MCP requests currently in flight. */
+  readonly currentHttpRequests: number;
   readonly pendingInitializations: number;
   readonly highWatermark: number;
   readonly totalCapacityRejected: number;
   readonly totalInflightEvictionPrevented: number;
   readonly currentSession: HttpDiagnosticCurrentSession | null;
+  /** Request-local view for a diagnostic call; never contains a routing id. */
+  readonly currentRequest: HttpDiagnosticCurrentRequest | null;
   /** Process-local lifecycle ring tail (oldest-first, bounded by the HTTP layer). Additive. */
   readonly recentLifecycleEvents: ReadonlyArray<HttpLifecycleEvent>;
 }
@@ -55,12 +73,14 @@ export interface CodexProDiagnosticContext {
   readonly generation: number;
   readonly fingerprint: string;
   readonly transportKind: DiagnosticTransportKind;
+  readonly httpSessionMode?: "stateless" | "retained";
   readonly createdAt: number;
   readonly getHttpSnapshot?: () => HttpDiagnosticSnapshot;
 }
 
 export interface DiagnosticContextOptions {
   readonly transportKind: DiagnosticTransportKind;
+  readonly httpSessionMode?: "stateless" | "retained";
   readonly getHttpSnapshot?: () => HttpDiagnosticSnapshot;
 }
 
@@ -73,6 +93,7 @@ export function createDiagnosticContext(options: DiagnosticContextOptions): Code
     generation,
     fingerprint,
     transportKind: options.transportKind,
+    ...(options.httpSessionMode ? { httpSessionMode: options.httpSessionMode } : {}),
     createdAt: Date.now(),
     ...(options.getHttpSnapshot ? { getHttpSnapshot: options.getHttpSnapshot } : {})
   };

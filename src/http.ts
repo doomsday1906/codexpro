@@ -1489,6 +1489,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
   (app as any).verificationManager = verificationManager;
   const ptyRunManager = options.ptyRunManager ?? new PtyRunManager(config);
   (app as any).ptyRunManager = ptyRunManager;
+  const statelessHttp = config.httpSessionMode === "stateless";
   const logRequests = process.env.CODEXPRO_LOG_REQUESTS === "1";
   const authFailureWindow = new Map<string, { count: number; resetAt: number }>();
   const authFailureLimit = 10;
@@ -1624,7 +1625,13 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     firstUseProtectionUntil: number;
   };
 
-  const transports = new Map<string, TransportRecord>();
+  // The retained transport map is deliberately not allocated in stateless mode.
+  // The cast keeps the R4 implementation physically unchanged; every retained
+  // helper is reached only from the retained route below, while stateless
+  // diagnostics use the explicit zero-state branch in httpDiagnosticSnapshot.
+  const transports = (config.httpSessionMode === "retained"
+    ? new Map<string, TransportRecord>()
+    : undefined) as Map<string, TransportRecord> | undefined;
   const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   let totalInitialized = 0;
   let totalClosed = 0;
@@ -1650,6 +1657,33 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
   const lifecycleSalt = randomBytes(16).toString("hex");
   const lifecycleEvents: HttpLifecycleEvent[] = [];
   let lifecycleSeq = 0;
+  let inFlightHttpRequests = 0;
+  let totalInitializeObservations = 0;
+  let totalOrdinaryRequests = 0;
+
+  function observeHttpRequest(req: Request, res: Response, body?: unknown): void {
+    const startedAt = Date.now();
+    totalOrdinaryRequests += 1;
+    if (isInitializeRequest(body)) totalInitializeObservations += 1;
+    inFlightHttpRequests += 1;
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      inFlightHttpRequests = Math.max(0, inFlightHttpRequests - 1);
+      if (statelessHttp) {
+        ringEvent({
+          event: "request_finish",
+          method: req.method,
+          status: res.statusCode,
+          durationMs: Date.now() - startedAt
+        });
+      }
+    };
+    res.once("finish", release);
+    res.once("close", release);
+    req.once("aborted", release);
+  }
 
   function fingerprintSession(sessionId: string): string {
     return createHash("sha256").update(`${lifecycleSalt}:${sessionId}`).digest("hex").slice(0, 12);
@@ -1674,7 +1708,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       status: input.status ?? null,
       durationMs: input.durationMs ?? null,
       fp: input.fp ?? null,
-      active: transports.size,
+      active: transports?.size ?? 0,
       pending: pendingInitializations,
       reason: input.reason ?? null,
       completed: input.completed ?? null,
@@ -1734,7 +1768,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
   // that an expiry was refused. Never evicts for capacity (admission owns that).
   function pruneTransports(): void {
     const now = Date.now();
-    for (const [sessionId, record] of transports) {
+    for (const [sessionId, record] of transports!) {
       if (record.lifecycle !== "active") continue;
       if (record.inFlightRequests > 0) {
         if (now - record.lastSeenAt > config.httpSessionTtlMs) {
@@ -1745,7 +1779,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       if (now - record.lastSeenAt > config.httpSessionTtlMs) {
         const idleMs = now - record.lastSeenAt;
         const completed = record.completedApplicationRequests;
-        transports.delete(sessionId);
+        transports!.delete(sessionId);
         closeTransport(record, "expired");
         ringEvent({
           event: "ttl_expire",
@@ -1810,7 +1844,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       }
       return slot;
     };
-    for (const [sessionId, record] of transports) {
+    for (const [sessionId, record] of transports!) {
       if (!isIdleRecord(record)) continue;
       // Fixed deadline, not sliding idle age: protocol chatter refreshes
       // lastSeenAt but never moves firstUseProtectionUntil.
@@ -1833,7 +1867,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
   // busy/reserved and the new initialization must be cleanly rejected.
   function reserveInitializationSlot(): boolean {
     pruneTransports();
-    if (transports.size + pendingInitializations < config.maxHttpSessions) {
+    if (transports!.size + pendingInitializations < config.maxHttpSessions) {
       pendingInitializations += 1;
       ringEvent({ event: "initialize_admitted", method: "POST", reason: "free_slot" });
       return true;
@@ -1848,12 +1882,12 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     }
     // Every busy session older (by activity time) than the chosen idle victim
     // was spared by age order; count each refusal exactly once per admission.
-    for (const record of transports.values()) {
+    for (const record of transports!.values()) {
       if (record.lifecycle === "active" && record.inFlightRequests > 0 && record.lastSeenAt < victim.record.lastSeenAt) {
         totalInflightEvictionPrevented += 1;
       }
     }
-    transports.delete(victim.sessionId);
+    transports!.delete(victim.sessionId);
     closeTransport(victim.record, "capacity_evicted");
     ringEvent({
       event: "capacity_evict",
@@ -1944,7 +1978,35 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     };
   }
 
-  function httpDiagnosticSnapshot(currentRecord: TransportRecord | undefined): HttpDiagnosticSnapshot {
+  function httpDiagnosticSnapshot(currentRecord: TransportRecord | undefined, currentRequest = false): HttpDiagnosticSnapshot {
+    if (!transports) {
+      return Object.freeze({
+        mode: "stateless",
+        retentionEnabled: false,
+        configuredMax: config.maxHttpSessions,
+        configuredTtlMs: config.httpSessionTtlMs,
+        totalInitializeObservations,
+        totalOrdinaryRequests,
+        active: 0,
+        max: 0,
+        ttlMs: 0,
+        totalInitialized: 0,
+        totalClosed: 0,
+        totalExpired: 0,
+        totalCapacityEvicted: 0,
+        idle: 0,
+        inFlightSessions: 0,
+        inFlightRequests: inFlightHttpRequests,
+        currentHttpRequests: inFlightHttpRequests,
+        pendingInitializations: 0,
+        highWatermark: 0,
+        totalCapacityRejected: 0,
+        totalInflightEvictionPrevented: 0,
+        currentSession: null,
+        currentRequest: currentRequest ? Object.freeze({ inFlightRequests: inFlightHttpRequests }) : null,
+        recentLifecycleEvents: Object.freeze(lifecycleEvents.slice(-LIFECYCLE_RING_EXPOSED))
+      });
+    }
     const currentSession = currentRecord?.lifecycle === "active"
       ? Object.freeze({
           createdAt: currentRecord.createdAt,
@@ -1954,14 +2016,20 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       : null;
     let idle = 0;
     let inFlightSessions = 0;
-    let inFlightRequests = 0;
-    for (const record of transports.values()) {
+    let retainedInFlightRequests = 0;
+    for (const record of transports!.values()) {
       if (record.lifecycle !== "active") continue;
-      inFlightRequests += Math.max(0, record.inFlightRequests);
+      retainedInFlightRequests += Math.max(0, record.inFlightRequests);
       if (record.inFlightRequests > 0) inFlightSessions += 1;
       else idle += 1;
     }
     return Object.freeze({
+      mode: "retained",
+      retentionEnabled: true,
+      configuredMax: config.maxHttpSessions,
+      configuredTtlMs: config.httpSessionTtlMs,
+      totalInitializeObservations,
+      totalOrdinaryRequests,
       active: transports.size,
       max: config.maxHttpSessions,
       ttlMs: config.httpSessionTtlMs,
@@ -1971,20 +2039,22 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       totalCapacityEvicted,
       idle,
       inFlightSessions,
-      inFlightRequests,
+      inFlightRequests: retainedInFlightRequests,
+      currentHttpRequests: inFlightHttpRequests,
       pendingInitializations,
       highWatermark: retainedHighWatermark,
       totalCapacityRejected,
       totalInflightEvictionPrevented,
       currentSession,
+      currentRequest: null,
       recentLifecycleEvents: Object.freeze(lifecycleEvents.slice(-LIFECYCLE_RING_EXPOSED))
     });
   }
 
   function removeTransportRecord(record: TransportRecord): void {
-    for (const [sessionId, candidate] of transports) {
+    for (const [sessionId, candidate] of transports!) {
       if (candidate !== record) continue;
-      transports.delete(sessionId);
+      transports!.delete(sessionId);
       return;
     }
   }
@@ -1994,11 +2064,13 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
   function getTransportRecord(sessionId: string | undefined): TransportRecord | undefined {
     if (!sessionId || !sessionIdPattern.test(sessionId)) return undefined;
     pruneTransports();
-    return transports.get(sessionId);
+    return transports!.get(sessionId);
   }
 
-  const pruneTimer = setInterval(pruneTransports, Math.min(config.httpSessionTtlMs, 60_000));
-  pruneTimer.unref();
+  const pruneTimer = statelessHttp
+    ? undefined
+    : setInterval(pruneTransports, Math.min(config.httpSessionTtlMs, 60_000));
+  pruneTimer?.unref();
 
   app.get("/", (_req, res) => {
     res.type("html").send(onboardingPage(config));
@@ -2057,7 +2129,59 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     jsonError(res, 405, "method_not_allowed", "Use GET or POST for /admin/profile.");
   });
 
+  const handleStatelessRequest = async (req: express.Request, res: express.Response): Promise<void> => {
+    observeHttpRequest(req, res, req.body);
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    const diagnosticContext = createDiagnosticContext({
+      transportKind: "http",
+      httpSessionMode: "stateless",
+      getHttpSnapshot: () => httpDiagnosticSnapshot(undefined, true)
+    });
+    const server = createCodexProServer(config, {
+      diagnosticContext,
+      onWorkspaceDiagnosticReader: options.onWorkspaceDiagnosticReader,
+      verificationManager,
+      ptyRunManager
+    });
+    options.onDiagnosticContext?.(diagnosticContext);
+
+    let disposePromise: Promise<void> | undefined;
+    const dispose = (): Promise<void> => {
+      if (!disposePromise) {
+        disposePromise = Promise.allSettled([transport.close(), server.close()]).then(() => undefined);
+      }
+      return disposePromise;
+    };
+    const disposeOnLifecycleEnd = (): void => {
+      void dispose();
+    };
+    req.once("aborted", disposeOnLifecycleEnd);
+    res.once("finish", disposeOnLifecycleEnd);
+    res.once("close", disposeOnLifecycleEnd);
+
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal CodexPro MCP error. Check the local terminal for details." },
+          id: null
+        });
+      }
+    } finally {
+      await dispose();
+    }
+  };
+
   app.post("/mcp", express.json({ limit: "20mb" }), async (req, res) => {
+    if (!statelessHttp) observeHttpRequest(req, res, req.body);
+    if (statelessHttp) {
+      await handleStatelessRequest(req, res);
+      return;
+    }
     try {
       const sessionId = requestSessionId(req);
       let transport: StreamableHTTPServerTransport;
@@ -2128,8 +2252,8 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
               // (FIRST-USE-GRACE-RENEWAL-001).
               firstUseProtectionUntil: now + FIRST_USE_GRACE_MS
             };
-            transports.set(newSessionId, currentRecord);
-            if (transports.size > retainedHighWatermark) retainedHighWatermark = transports.size;
+            transports!.set(newSessionId, currentRecord);
+            if (transports!.size > retainedHighWatermark) retainedHighWatermark = transports!.size;
             totalInitialized += 1;
             // The reservation converts into the retained slot.
             releaseReservation();
@@ -2161,6 +2285,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
 
         const diagnosticContext = createDiagnosticContext({
           transportKind: "http",
+          httpSessionMode: "retained",
           getHttpSnapshot: () => httpDiagnosticSnapshot(currentRecord)
         });
         const server = createCodexProServer(config, {
@@ -2249,6 +2374,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
   });
 
   const handleSessionRequest = async (req: express.Request, res: express.Response) => {
+    observeHttpRequest(req, res);
     const sessionId = requestSessionId(req);
     const record = getTransportRecord(sessionId);
     if (!record) {
@@ -2278,8 +2404,13 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     }
   };
 
-  app.get("/mcp", handleSessionRequest);
-  app.delete("/mcp", handleSessionRequest);
+  if (statelessHttp) {
+    app.get("/mcp", handleStatelessRequest);
+    app.delete("/mcp", handleStatelessRequest);
+  } else {
+    app.get("/mcp", handleSessionRequest);
+    app.delete("/mcp", handleSessionRequest);
+  }
 
   app.use((error: unknown, req: Request, res: Response, next: NextFunction) => {
     if (!error || typeof error !== "object" || !("type" in error)) {
