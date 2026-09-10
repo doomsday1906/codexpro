@@ -1899,24 +1899,47 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
   }
 
   // Begin request-lifetime protection for one open handleRequest() on a retained
-  // record. Refreshes activity at acquisition; the returned releaser refreshes
-  // activity at completion, never drives the counter negative, and is idempotent
-  // so res-close and finally paths cannot double-release. Operates on the record
-  // object only: if onclose detaches the record mid-request, release still
-  // updates the detached object without reinserting it or double-counting.
-  // isApplicationUse marks a real MCP operation (POST with an application-use
-  // body): only those completions advance continuity scoring. Handshake,
-  // transport-lifetime, and failed-shape traffic never does.
-  function trackRequestStart(record: TransportRecord, isApplicationUse: boolean): () => void {
+  // record. Returns two INDEPENDENT idempotent operations (R3 separation):
+  //
+  // - releaseInFlight(): request-lifetime release. Decrements inFlightRequests
+  //   exactly once (never underflows) and refreshes activity. Always safe:
+  //   runs on premature response close so an ended connection cannot retain
+  //   an in-flight slot indefinitely, and runs again harmlessly from finally.
+  // - markApplicationCompleted(): application-completion accounting. Increments
+  //   completedApplicationRequests exactly once and ONLY when the caller has
+  //   established normal successful completion. NEVER runs merely because the
+  //   response close event fired: a close with an unfinished response means
+  //   the client went away before receiving completion, and scoring it would
+  //   strip first-use protection from a session whose first operation never
+  //   delivered (FIRST-APPLICATION-CLOSE-001).
+  //
+  // A normal lifecycle (resolve -> mark -> finally release -> finish/close
+  // release) counts exactly once and releases exactly once. A premature close
+  // (close-early -> release, later resolve skipped by the caller's ended-early
+  // flag) releases without scoring, and stays unscored even if the handler
+  // settles internally afterwards. Operates on the record object only: if
+  // onclose detaches the record mid-request, both operations still update the
+  // detached object without reinserting it or double-counting.
+  function trackRequestStart(record: TransportRecord): {
+    releaseInFlight: () => void;
+    markApplicationCompleted: () => void;
+  } {
     record.inFlightRequests += 1;
     record.lastSeenAt = Date.now();
     let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      record.inFlightRequests = Math.max(0, record.inFlightRequests - 1);
-      record.lastSeenAt = Date.now();
-      if (isApplicationUse) record.completedApplicationRequests += 1;
+    let marked = false;
+    return {
+      releaseInFlight: () => {
+        if (released) return;
+        released = true;
+        record.inFlightRequests = Math.max(0, record.inFlightRequests - 1);
+        record.lastSeenAt = Date.now();
+      },
+      markApplicationCompleted: () => {
+        if (marked) return;
+        marked = true;
+        record.completedApplicationRequests += 1;
+      }
     };
   }
 
@@ -2041,7 +2064,6 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       // complete handleRequest() lifetime. Undefined on the init path until
       // onsessioninitialized materializes the record mid-request.
       let requestRecord: TransportRecord | undefined;
-      let releaseRequest: (() => void) | undefined;
 
       const existingRecord = getTransportRecord(sessionId);
       if (existingRecord) {
@@ -2168,15 +2190,32 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
         return;
       }
 
-      releaseRequest = trackRequestStart(requestRecord, isApplicationUseBody(req.body));
+      // Application-use classification is fixed at request start (envelope
+      // method only); scoring happens only on the normal completed-response
+      // path below, never on premature close (FIRST-APPLICATION-CLOSE-001).
+      const requestIsApplicationUse = isApplicationUseBody(req.body);
+      const requestLifetime = trackRequestStart(requestRecord);
       const postRequestStart = Date.now();
-      // If the client disconnects and handleRequest never settles, the slot
-      // still releases; idempotent with the finally path below.
-      res.on("close", releaseRequest);
+      // Response-close truth: a close with an unfinished response means the
+      // client went away before receiving completion. Release the in-flight
+      // slot immediately, but record the early end so a later internal
+      // handler settlement cannot masquerade as successful completion.
+      // A close after finish is the normal lifecycle and only releases.
+      let responseEndedEarly = false;
+      res.on("close", () => {
+        if (!res.writableEnded) responseEndedEarly = true;
+        requestLifetime.releaseInFlight();
+      });
       try {
         await transport.handleRequest(req, res, req.body);
+        // Normal completed-response path only: exceptions skip scoring, and a
+        // prematurely ended response never scores even if the handler settles
+        // internally afterwards. finish/close after this only release.
+        if (requestIsApplicationUse && !responseEndedEarly) {
+          requestLifetime.markApplicationCompleted();
+        }
       } finally {
-        releaseRequest();
+        requestLifetime.releaseInFlight();
         ringEvent({
           event: "request_finish",
           method: "POST",
@@ -2206,16 +2245,17 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     }
     // GET SSE listener opens and DELETE session terminations are
     // transport-lifetime traffic: protected while in flight, but their
-    // completion never advances application-use scoring.
-    const releaseRequest = trackRequestStart(record, false);
+    // completion never advances application-use scoring (no mark call exists
+    // on this path).
+    const sessionLifetime = trackRequestStart(record);
     const sessionRequestStart = Date.now();
     // If the client disconnects and handleRequest never settles, the slot
     // still releases; idempotent with the finally path below.
-    res.on("close", releaseRequest);
+    res.on("close", sessionLifetime.releaseInFlight);
     try {
       await record.transport.handleRequest(req, res);
     } finally {
-      releaseRequest();
+      sessionLifetime.releaseInFlight();
       ringEvent({
         event: "request_finish",
         method: req.method,
