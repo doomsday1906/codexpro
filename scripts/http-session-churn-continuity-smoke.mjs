@@ -224,9 +224,12 @@ async function caseC1() {
   const obs = [];
   const server = await spawnServer({ maxSessions: 4 });
   const stopFlag = { stop: false };
-  // NOTE: churners count (never throw): admission always succeeds while idle exists
-  // (deterministic), but a churner's own immediate first call can lose a mutual
-  // contention race with the sibling loop (documented burst residual, not a gate).
+  // R1 GATE (HANDSHAKE-FIRST-CALL-001): every churn iteration is an
+  // initialize -> notifications/initialized -> first-call shape whose continuity
+  // is under test, so callsLost MUST equal 0. Any first-call loss fails the
+  // matrix: the foreground holds a settled session throughout, therefore a
+  // settled-or-expired idle victim always exists and first-use sessions must
+  // never be reclaimed. Loss here is never an acceptable "contention race".
   const churn = async (label) => {
     let inits = 0;
     let callsOk = 0;
@@ -276,6 +279,10 @@ async function caseC1() {
     const churnRes = await Promise.all([churnA, churnB]);
     const churned = churnRes.reduce((a, b) => a + (b.inits ?? 0), 0);
     obs.push(`gap reuses: ${JSON.stringify(steps)}; churn inits served meanwhile: ${churned} ${JSON.stringify(churnRes)}`);
+    for (const churner of churnRes) {
+      assert.equal(churner.error ?? null, null, `churn loop ${churner.label} errored: ${churner.error}`);
+      assert.equal(churner.callsLost ?? -1, 0, `churn loop ${churner.label} lost a first call under continuity protection (inits=${churner.inits} ok=${churner.callsOk} lost=${churner.callsLost})`);
+    }
     for (const [name, status, matches] of steps) {
       assert.equal(status, 200, `foreground ${name} stranded under churn`);
     }
@@ -412,7 +419,7 @@ async function caseC5() {
     const a = await rawSession(server.baseUrl);
     const b = await rawSession(server.baseUrl);
     void b;
-    await rawSession(server.baseUrl); // reclaims oldest settled (A)
+    await rawSession(server.baseUrl); // reclaims oldest first-use via burst fallback (A)
     const stale = await rawCall(server.baseUrl, a, "tools/list", {});
     assert.equal(stale.status, 404, "stale reuse did not 404");
     assert.equal(stale.envelope?.jsonrpc, "2.0", "stale response not JSON-RPC");

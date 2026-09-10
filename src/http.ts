@@ -1602,11 +1602,16 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     lastSeenAt: number;
     inFlightRequests: number;
     lifecycle: "active" | "closed" | "expired" | "capacity_evicted";
-    // Completed handleRequest() count on this record (transport-level only:
-    // every method counts the same; no tool/payload content affects it).
-    // Continuity signal for victim scoring: abandoned connects sit at the
-    // lowest counts, one-shot sessions next, recurrently reused sessions higher.
-    completedRequests: number;
+    // Completed APPLICATION requests on this record: inbound POST JSON-RPC
+    // calls that are real MCP operations. Protocol-handshake traffic
+    // (initialize, notifications/*) and transport-lifetime traffic (GET SSE
+    // listener open/close, DELETE termination) NEVER advance this count, so a
+    // newly initialized+notified session still scores 0 until its first real
+    // operation completes (HANDSHAKE-FIRST-CALL-001). Continuity signal for
+    // victim scoring: abandoned connects sit at 0, one-shot sessions at 1,
+    // recurrently reused sessions higher. Classification is protocol-phase
+    // only (envelope method name); no tool/query/path/size content affects it.
+    completedApplicationRequests: number;
   };
 
   const transports = new Map<string, TransportRecord>();
@@ -1729,7 +1734,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       }
       if (now - record.lastSeenAt > config.httpSessionTtlMs) {
         const idleMs = now - record.lastSeenAt;
-        const completed = record.completedRequests;
+        const completed = record.completedApplicationRequests;
         transports.delete(sessionId);
         closeTransport(record, "expired");
         ringEvent({
@@ -1749,31 +1754,32 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
   // A zero-in-flight record may still be expected by its client moments later,
   // and pure oldest-idle-first strands legitimate reusable sessions while
   // provably one-shot sessions exist to reclaim instead (CLASS-A). Idle
-  // candidates are therefore ordered in two bands:
+  // candidates are therefore ordered in two bands by APPLICATION-USE score:
   //
-  //   1. Settled sessions (completedRequests >= 2: the initialize handshake
-  //      finished and the session delivered value), ordered by
-  //      (completedRequests ASC, lastSeenAt ASC): abandoned connects that
-  //      settled but were never used meaningfully and one-shot sessions
-  //      reclaim first; recurrently reused sessions survive while any
-  //      less-used settled idle exists; among equals the oldest (least
-  //      recently seen) remains the best abandonment guess.
-  //   2. Unsettled-but-young sessions (completedRequests <= 1 and idle for
-  //      less than HANDSHAKE_GRACE_MS) are mid-handshake newborns, not proven
-  //      garbage: a session is idle with count 1 in the millisecond gap
-  //      between its initialize response and its next request. Evicting them
-  //      first would systematically murder fresh clients under burst churn
-  //      (LAW-007). They are protected while any settled idle exists.
+  //   1. Settled-or-expired sessions: everything with at least one completed
+  //      real operation, plus first-use sessions whose bounded protection has
+  //      expired. Ordered by (completedApplicationRequests ASC,
+  //      lastSeenAt ASC): abandoned connects and one-shot sessions reclaim
+  //      first; recurrently reused sessions survive while any less-used idle
+  //      exists; among equals the oldest (least recently seen) remains the
+  //      best abandonment guess.
+  //   2. First-use sessions (completedApplicationRequests == 0 and idle for
+  //      less than FIRST_USE_GRACE_MS): handshake-complete but not yet
+  //      application-used. A session is idle with score 0 in the gap between
+  //      its notifications/initialized and its first real operation; evicting
+  //      it first would strand that first call (HANDSHAKE-FIRST-CALL-001).
+  //      First-use sessions are protected while any band-1 idle exists.
   //
-  // Unsettled sessions older than the grace are abandoned connects: pure
-  // garbage that never delivered value, reclaimed before anything settled.
-  // When every idle session is mid-handshake young (pure burst), the oldest
-  // such session is reclaimed as a fallback so admission still always
-  // succeeds while any idle exists — fresh clients are never starved and 503
-  // stays reserved for true all-busy pressure. Busy records are never
-  // candidates (LAW-002). Counting is transport-level only (every method
-  // counts the same); tool/payload content never affects survival (LAW-008).
-  const HANDSHAKE_GRACE_MS = 10_000;
+  // First-use sessions older than the grace are expired protection, not proven
+  // garbage with value: they reclaim before anything settled (band 1 orders
+  // them first at score 0). When every idle session is first-use young (pure
+  // burst), the oldest such session is reclaimed as a fallback so admission
+  // still always succeeds while any idle exists — fresh clients are never
+  // starved and 503 stays reserved for true all-busy pressure. Busy records
+  // are never candidates (LAW-002). Scoring is protocol-phase only
+  // (handshake vs application vs transport-lifetime); tool/query/path/size
+  // content never affects survival (LAW-008).
+  const FIRST_USE_GRACE_MS = 10_000;
   function continuityAwareVictim(now: number): { sessionId: string; record: TransportRecord; handshakeFallback: boolean } | undefined {
     let victim: { sessionId: string; record: TransportRecord } | undefined;
     let fallback: { sessionId: string; record: TransportRecord } | undefined;
@@ -1783,16 +1789,16 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       record: TransportRecord
     ): { sessionId: string; record: TransportRecord } | undefined => {
       if (!slot
-        || record.completedRequests < slot.record.completedRequests
-        || (record.completedRequests === slot.record.completedRequests && record.lastSeenAt < slot.record.lastSeenAt)) {
+        || record.completedApplicationRequests < slot.record.completedApplicationRequests
+        || (record.completedApplicationRequests === slot.record.completedApplicationRequests && record.lastSeenAt < slot.record.lastSeenAt)) {
         return { sessionId, record };
       }
       return slot;
     };
     for (const [sessionId, record] of transports) {
       if (!isIdleRecord(record)) continue;
-      const midHandshake = record.completedRequests <= 1 && now - record.lastSeenAt < HANDSHAKE_GRACE_MS;
-      if (midHandshake) {
+      const firstUse = record.completedApplicationRequests <= 0 && now - record.lastSeenAt < FIRST_USE_GRACE_MS;
+      if (firstUse) {
         fallback = consider(fallback, sessionId, record);
       } else {
         victim = consider(victim, sessionId, record);
@@ -1837,7 +1843,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       method: "POST",
       fp: fingerprintSession(victim.sessionId),
       reason: victim.handshakeFallback ? "burst_newborn_fallback" : "idle_reclamation",
-      completed: victim.record.completedRequests,
+      completed: victim.record.completedApplicationRequests,
       idleMs: Date.now() - victim.record.lastSeenAt
     });
     pendingInitializations += 1;
@@ -1856,13 +1862,36 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     });
   }
 
+  // Protocol-phase classifier for application-use scoring (HANDSHAKE-FIRST-CALL-001).
+  // Returns true only for inbound POST JSON-RPC messages that are real MCP
+  // operations. Excluded: initialize and notifications/* (handshake/protocol
+  // traffic, including notifications/initialized) and ping (protocol
+  // keepalive). GET SSE listener activity and DELETE termination never reach
+  // this classifier. Batch arrays count when any element is application-use.
+  // Inspects the envelope method name only — never tool, query, path, size,
+  // or any payload content (LAW-008).
+  function isApplicationUseBody(body: unknown): boolean {
+    const check = (message: unknown): boolean => {
+      if (!message || typeof message !== "object") return false;
+      const method = (message as { method?: unknown }).method;
+      if (typeof method !== "string" || method.length === 0) return false;
+      if (method === "initialize" || method === "ping") return false;
+      if (method.startsWith("notifications/")) return false;
+      return true;
+    };
+    return Array.isArray(body) ? body.some(check) : check(body);
+  }
+
   // Begin request-lifetime protection for one open handleRequest() on a retained
   // record. Refreshes activity at acquisition; the returned releaser refreshes
   // activity at completion, never drives the counter negative, and is idempotent
   // so res-close and finally paths cannot double-release. Operates on the record
   // object only: if onclose detaches the record mid-request, release still
   // updates the detached object without reinserting it or double-counting.
-  function trackRequestStart(record: TransportRecord): () => void {
+  // isApplicationUse marks a real MCP operation (POST with an application-use
+  // body): only those completions advance continuity scoring. Handshake,
+  // transport-lifetime, and failed-shape traffic never does.
+  function trackRequestStart(record: TransportRecord, isApplicationUse: boolean): () => void {
     record.inFlightRequests += 1;
     record.lastSeenAt = Date.now();
     let released = false;
@@ -1871,7 +1900,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       released = true;
       record.inFlightRequests = Math.max(0, record.inFlightRequests - 1);
       record.lastSeenAt = Date.now();
-      record.completedRequests += 1;
+      if (isApplicationUse) record.completedApplicationRequests += 1;
     };
   }
 
@@ -2050,10 +2079,11 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
               createdAt: now,
               lastSeenAt: now,
               // This initialize request itself stays in flight until its
-              // response completes (LAW-007).
+              // response completes (LAW-007). Handshake traffic never advances
+              // application-use scoring (HANDSHAKE-FIRST-CALL-001).
               inFlightRequests: 1,
               lifecycle: "active",
-              completedRequests: 0
+              completedApplicationRequests: 0
             };
             transports.set(newSessionId, currentRecord);
             if (transports.size > retainedHighWatermark) retainedHighWatermark = transports.size;
@@ -2067,7 +2097,8 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
               if (currentRecord) {
                 currentRecord.inFlightRequests = Math.max(0, currentRecord.inFlightRequests - 1);
                 currentRecord.lastSeenAt = Date.now();
-                currentRecord.completedRequests += 1;
+                // Initialize completion is handshake, not application use:
+                // the score stays 0 until the first real operation.
               }
             };
             // If the client disconnects and handleRequest never settles, the
@@ -2117,7 +2148,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
         return;
       }
 
-      releaseRequest = trackRequestStart(requestRecord);
+      releaseRequest = trackRequestStart(requestRecord, isApplicationUseBody(req.body));
       const postRequestStart = Date.now();
       // If the client disconnects and handleRequest never settles, the slot
       // still releases; idempotent with the finally path below.
@@ -2153,7 +2184,10 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       sendSessionError(res, sessionId, req.method);
       return;
     }
-    const releaseRequest = trackRequestStart(record);
+    // GET SSE listener opens and DELETE session terminations are
+    // transport-lifetime traffic: protected while in flight, but their
+    // completion never advances application-use scoring.
+    const releaseRequest = trackRequestStart(record, false);
     const sessionRequestStart = Date.now();
     // If the client disconnects and handleRequest never settles, the slot
     // still releases; idempotent with the finally path below.
