@@ -74,6 +74,7 @@ function baseConfig(overrides = {}) {
     toolCards: false,
     maxHttpSessions: 10,
     httpSessionTtlMs: 60_000,
+    httpSessionMode: "retained",
     ...overrides
   };
 }
@@ -107,6 +108,13 @@ function waitForExit(child, timeoutMs = 5_000) {
   });
 }
 
+function assertGracefulHttpExit(exit, label) {
+  const signalTermination = exit?.signal === "SIGTERM" && exit.code === null;
+  const gracefulExit = exit?.signal === null && exit.code === 0;
+  assert.ok(signalTermination || gracefulExit,
+    `${label} did not complete graceful HTTP shutdown: ${JSON.stringify(exit)}`);
+}
+
 async function startHttpProcess({ bashMode = "off", maxHttpSessions = 10, httpSessionTtlMs = 60_000 } = {}) {
   const port = await freePort();
   const environment = {
@@ -123,6 +131,7 @@ async function startHttpProcess({ bashMode = "off", maxHttpSessions = 10, httpSe
     CODEXPRO_TOOL_CARDS: "0",
     CODEXPRO_HTTP_TOKEN: AUTH_TOKEN,
     CODEXPRO_ALLOW_NO_HTTP_TOKEN: "0",
+    CODEXPRO_HTTP_SESSION_MODE: "retained",
     CODEXPRO_HTTP_SESSION_TTL_MS: String(httpSessionTtlMs),
     CODEXPRO_MAX_HTTP_SESSIONS: String(maxHttpSessions),
     CODEXPRO_M004_ENV_SENTINEL: ENV_SENTINEL
@@ -787,9 +796,9 @@ try {
 
   assert.equal(processA, undefined, "A OS process was not killed before C");
   assert.equal(processC, undefined, "C OS process was not terminated");
-  assert.equal(processAExit?.signal, "SIGTERM", "A did not terminate as a killed OS process");
-  assert.equal(processCExit?.signal, "SIGTERM", "C did not terminate cleanly after proof");
-  assert.equal(processDExit?.signal, "SIGTERM", "D did not terminate cleanly after catalog proof");
+  assertGracefulHttpExit(processAExit, "A");
+  assertGracefulHttpExit(processCExit, "C");
+  assertGracefulHttpExit(processDExit, "D");
   assert.equal(diagCTarget?.requested_workspace?.classification, "unknown_or_invalid", "C resurrected process-local nested target identity");
   assert.equal(diagCTarget?.requested_workspace?.root, null, "C unknown target probe leaked a root");
   assert.equal(diagCConfigured?.requested_workspace?.classification, "configured_allowed_root_reconstructible", "C lost configured deterministic recovery");
@@ -806,7 +815,13 @@ try {
   assert.equal(diagC0?.runtime?.process?.pid, processCPid, "C runtime process PID did not identify the actual child");
   assert.notEqual(diagA0?.runtime?.process?.pid, diagC0?.runtime?.process?.pid, "A/C runtime process identity did not change");
   assert.equal(diagA0?.server?.catalog_fingerprint, diagC0?.server?.catalog_fingerprint, "identical A/C registered surfaces changed catalog fingerprint");
-  assert.equal([...new Set([...toolsA.listed.map((tool) => tool.name), ...toolsD.listed.map((tool) => tool.name)])].filter((name) => toolsA.listed.some((tool) => tool.name === name) !== toolsD.listed.some((tool) => tool.name === name)).join(","), "bash", "D tools/list did not show the deliberate registered-surface change");
+  assert.equal(
+    [...new Set([...toolsA.listed.map((tool) => tool.name), ...toolsD.listed.map((tool) => tool.name)])]
+      .filter((name) => toolsA.listed.some((tool) => tool.name === name) !== toolsD.listed.some((tool) => tool.name === name))
+      .join(","),
+    "bash,start_verification,wait_verification,cancel_verification,pty_run",
+    "D tools/list did not show the accepted deliberate registered-surface change"
+  );
   assert.notEqual(diagD?.server?.catalog_fingerprint, diagA0?.server?.catalog_fingerprint, "catalog fingerprint ignored actual tools/list change");
 
   assert.equal(lifecycleInitial?.http_sessions?.active, 1, "close fixture did not start with one active session");

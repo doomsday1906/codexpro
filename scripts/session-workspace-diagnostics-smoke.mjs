@@ -66,7 +66,8 @@ function configFor(bashMode) {
     toolMode: "full",
     toolCards: false,
     maxHttpSessions: 10,
-    httpSessionTtlMs: 60_000
+    httpSessionTtlMs: 60_000,
+    httpSessionMode: "retained"
   };
 }
 
@@ -628,7 +629,8 @@ try {
   const safeNames = new Set(safeListing.listed.map((tool) => tool.name));
   const offNames = new Set(listingA.listed.map((tool) => tool.name));
   const actualCatalogDifference = [...new Set([...safeNames, ...offNames])].filter((name) => safeNames.has(name) !== offNames.has(name));
-  assert.deepEqual(actualCatalogDifference, ["bash"], "bash mode did not produce an independently observed registered-tool-set difference");
+  assert.deepEqual(actualCatalogDifference, ["bash", "start_verification", "wait_verification", "cancel_verification", "pty_run"],
+    "bash mode did not produce the accepted independently observed registered-tool-set difference");
   const safeDiagnosticCall = await callHttp(safeSession, "session_workspace_diagnostics");
   emitRawHttpArtifact("RAW_HTTP_ARTIFACT:", "http-safe-diagnostic", safeDiagnosticCall);
   const safeDiagnostic = assertSuccess(safeDiagnosticCall, "safe-mode diagnostic");
@@ -713,7 +715,7 @@ try {
   console.log("AUTHORITY: MISSION_PLAN.md TASK-004/AP-007/AP-008; MISSION_ANCHOR.md A001 LAW-003/005/006/007/008/009/010/012/013/014.");
   console.log("TARGET_PRODUCER: actual createCodexProHttpApp -> StreamableHTTPServerTransport and dist/stdio.js -> StdioServerTransport MCP registrations/handlers.");
   console.log(`RAW_OBSERVATION: full HTTP tools/list exposed exactly one session_workspace_diagnostics with only workspace_id; repeated A diagnostics kept fingerprint/generation/creation identity; B had a distinct identity and no inherited selection; response JSON-RPC/SSE envelopes contained no MCP session IDs/auth/request/env sentinels.`);
-  console.log(`RAW_OBSERVATION: explicit B workspace probe classified ${targetId} as process_known_reconstructible without selecting/opening it; ordinary list_workspaces subsequently selected only the configured default; bash-off vs bash-safe actual catalogs differed by [bash] before catalog hashes were compared.`);
+  console.log(`RAW_OBSERVATION: explicit B workspace probe classified ${targetId} as process_known_reconstructible without selecting/opening it; ordinary list_workspaces subsequently selected only the configured default; bash-off vs bash-safe actual catalogs differed by ${JSON.stringify(actualCatalogDifference)} before catalog hashes were compared.`);
   console.log("RAW_OBSERVATION: full stdio diagnostic reported transport=stdio and http_sessions=null; standard/minimal tools/list and wrapper actions omitted the diagnostic and denied wrapper invocation.");
   console.log("SANITY_VERDICT: MATCH — direct MCP catalogs, response envelopes, continuity identities, state classifications, and transport facts match the accepted TASK-004 public outcome.");
   console.log("PREDICATE: TRUE — actual tools/list established the registered-surface difference independently before catalog fingerprint comparison; raw tool-call envelopes established the corresponding diagnostic results and hostile failures.");

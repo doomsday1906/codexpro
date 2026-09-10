@@ -28,6 +28,24 @@ import { defaultGitPushPolicy, normalizeGitPushPolicy, sanitizeGitPushPolicy, su
 import { VerificationManager } from "./verificationOps.js";
 import { PtyRunManager } from "./ptyRunManager.js";
 
+export type StatelessHttpLifecycleEventName =
+  | "handler_success"
+  | "handler_error"
+  | "response_finish"
+  | "response_close"
+  | "request_aborted"
+  | "cleanup_start"
+  | "listeners_removed"
+  | "observer_listeners_removed"
+  | "transport_close"
+  | "server_close"
+  | "cleanup_complete";
+
+export interface StatelessHttpLifecycleEvent {
+  readonly event: StatelessHttpLifecycleEventName;
+  readonly at: number;
+}
+
 export interface CodexProHttpAppOptions {
   /** Internal observer for the real server instances created by HTTP sessions. */
   readonly onDiagnosticContext?: (context: Readonly<CodexProDiagnosticContext>) => void;
@@ -37,6 +55,89 @@ export interface CodexProHttpAppOptions {
   readonly verificationManager?: VerificationManager;
   /** Process-scoped PTY execution manager shared across all HTTP sessions. */
   readonly ptyRunManager?: PtyRunManager;
+  /** Internal stateless lifecycle observer, intended for focused diagnostics/tests. */
+  readonly onStatelessLifecycleEvent?: (event: StatelessHttpLifecycleEvent) => void;
+  /** Internal stateless request seam for focused transport lifecycle tests. */
+  readonly onStatelessRequestCreated?: (
+    transport: StreamableHTTPServerTransport,
+    server: ReturnType<typeof createCodexProServer>
+  ) => void;
+}
+
+/**
+ * Coordinates one stateless request's handler and response lifecycle.
+ *
+ * A successful request is disposable only after both the MCP handler has
+ * settled successfully and Node has emitted response `finish`, regardless of
+ * which arrives first. A premature `close`/`aborted` is terminal and releases
+ * the request immediately. Handler errors wait for the error response's
+ * finish/close boundary unless the caller explicitly terminates an already
+ * committed response.
+ */
+export interface StatelessResponseCoordinator {
+  onHandlerSuccess(): void;
+  onHandlerError(): void;
+  onResponseFinish(): void;
+  onResponseClose(): void;
+  onRequestAborted(): void;
+  terminateAfterError(): void;
+  waitForCleanup(): Promise<void>;
+}
+
+export function createStatelessResponseCoordinator(cleanup: () => Promise<void>): StatelessResponseCoordinator {
+  let handlerOutcome: "pending" | "success" | "error" = "pending";
+  let responseFinished = false;
+  let responseClosedBeforeFinish = false;
+  let requestAborted = false;
+  let cleanupStarted = false;
+  let resolveCleanup!: () => void;
+  const cleanupComplete = new Promise<void>((resolve) => { resolveCleanup = resolve; });
+
+  const beginCleanup = (): void => {
+    if (cleanupStarted) return;
+    cleanupStarted = true;
+    Promise.resolve()
+      .then(cleanup)
+      .catch(() => undefined)
+      .then(resolveCleanup);
+  };
+
+  const reconcile = (): void => {
+    if (cleanupStarted || requestAborted || responseClosedBeforeFinish) {
+      if (requestAborted || responseClosedBeforeFinish) beginCleanup();
+      return;
+    }
+    if (responseFinished && (handlerOutcome === "success" || handlerOutcome === "error")) {
+      beginCleanup();
+    }
+  };
+
+  return {
+    onHandlerSuccess: (): void => {
+      if (handlerOutcome !== "pending") return;
+      handlerOutcome = "success";
+      reconcile();
+    },
+    onHandlerError: (): void => {
+      if (handlerOutcome !== "pending") return;
+      handlerOutcome = "error";
+      reconcile();
+    },
+    onResponseFinish: (): void => {
+      responseFinished = true;
+      reconcile();
+    },
+    onResponseClose: (): void => {
+      if (!responseFinished) responseClosedBeforeFinish = true;
+      reconcile();
+    },
+    onRequestAborted: (): void => {
+      requestAborted = true;
+      beginCleanup();
+    },
+    terminateAfterError: beginCleanup,
+    waitForCleanup: (): Promise<void> => cleanupComplete
+  };
 }
 
 function escapeHtml(value: unknown): string {
@@ -1670,8 +1771,12 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     const release = (): void => {
       if (released) return;
       released = true;
+      res.off("finish", release);
+      res.off("close", release);
+      req.off("aborted", release);
       inFlightHttpRequests = Math.max(0, inFlightHttpRequests - 1);
       if (statelessHttp) {
+        options.onStatelessLifecycleEvent?.({ event: "observer_listeners_removed", at: Date.now() });
         ringEvent({
           event: "request_finish",
           method: req.method,
@@ -2144,35 +2249,89 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       ptyRunManager
     });
     options.onDiagnosticContext?.(diagnosticContext);
+    options.onStatelessRequestCreated?.(transport, server);
 
+    const emit = (event: StatelessHttpLifecycleEventName): void => {
+      options.onStatelessLifecycleEvent?.({ event, at: Date.now() });
+    };
+
+    let onResponseFinish: () => void;
+    let onResponseClose: () => void;
+    let onRequestAborted: () => void;
     let disposePromise: Promise<void> | undefined;
     const dispose = (): Promise<void> => {
       if (!disposePromise) {
-        disposePromise = Promise.allSettled([transport.close(), server.close()]).then(() => undefined);
+        emit("cleanup_start");
+        const closeTransport = async (): Promise<void> => {
+          try {
+            await transport.close();
+          } finally {
+            emit("transport_close");
+          }
+        };
+        const closeServer = async (): Promise<void> => {
+          try {
+            await server.close();
+          } finally {
+            emit("server_close");
+          }
+        };
+        disposePromise = Promise.allSettled([closeTransport(), closeServer()]).then(() => {
+          emit("cleanup_complete");
+        });
       }
       return disposePromise;
     };
-    const disposeOnLifecycleEnd = (): void => {
-      void dispose();
+    const coordinator = createStatelessResponseCoordinator(async () => {
+      req.off("aborted", onRequestAborted);
+      res.off("finish", onResponseFinish);
+      res.off("close", onResponseClose);
+      emit("listeners_removed");
+      await dispose();
+    });
+    onResponseFinish = (): void => {
+      emit("response_finish");
+      coordinator.onResponseFinish();
     };
-    req.once("aborted", disposeOnLifecycleEnd);
-    res.once("finish", disposeOnLifecycleEnd);
-    res.once("close", disposeOnLifecycleEnd);
+    onResponseClose = (): void => {
+      emit("response_close");
+      coordinator.onResponseClose();
+    };
+    onRequestAborted = (): void => {
+      emit("request_aborted");
+      coordinator.onRequestAborted();
+    };
+    req.once("aborted", onRequestAborted);
+    res.once("finish", onResponseFinish);
+    res.once("close", onResponseClose);
 
     try {
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
+      emit("handler_success");
+      coordinator.onHandlerSuccess();
     } catch (error) {
       console.error(error instanceof Error ? error.stack ?? error.message : String(error));
-      if (!res.headersSent) {
+      emit("handler_error");
+      coordinator.onHandlerError();
+      if (!res.headersSent && !res.writableEnded && !res.destroyed) {
         res.status(500).json({
           jsonrpc: "2.0",
           error: { code: -32603, message: "Internal CodexPro MCP error. Check the local terminal for details." },
           id: null
         });
+      } else {
+        // Once headers are committed, terminate the response explicitly so an
+        // error cannot leave the coordinator waiting for a finish/close event
+        // that the HTTP stack will never deliver.
+        try {
+          res.destroy();
+        } finally {
+          coordinator.terminateAfterError();
+        }
       }
     } finally {
-      await dispose();
+      await coordinator.waitForCleanup();
     }
   };
 

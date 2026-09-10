@@ -286,6 +286,7 @@ const child = spawn('node', ['dist/http.js'], {
     CODEXPRO_HOST: '127.0.0.1',
     CODEXPRO_PORT: String(port),
     CODEXPRO_HTTP_TOKEN: token,
+    CODEXPRO_HTTP_SESSION_MODE: 'retained',
     CODEXPRO_BASH_MODE: 'safe',
     CODEXPRO_WRITE_MODE: 'handoff',
     CODEXPRO_TOOL_MODE: 'full',
@@ -900,6 +901,7 @@ const disabledChild = spawn('node', ['dist/http.js'], {
     CODEXPRO_ALLOWED_ROOTS: disabledRoot,
     CODEXPRO_PORT: String(disabledPort),
     CODEXPRO_HTTP_TOKEN: disabledToken,
+    CODEXPRO_HTTP_SESSION_MODE: 'retained',
     CODEXPRO_BASH_MODE: 'off',
     CODEXPRO_WRITE_MODE: 'off',
     CODEXPRO_TOOL_MODE: 'full'
@@ -972,7 +974,8 @@ const cliChild = spawn(process.execPath, [
   cwd: path.resolve('.'),
   env: {
     ...process.env,
-    CODEXPRO_HOME: await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-cli-http-home-'))
+    CODEXPRO_HOME: await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-cli-http-home-')),
+    CODEXPRO_HTTP_SESSION_MODE: 'retained'
   },
   stdio: ['ignore', 'pipe', 'pipe']
 });
@@ -1010,7 +1013,8 @@ const connectionTestChild = spawn(process.execPath, [
   cwd: path.resolve('.'),
   env: {
     ...process.env,
-    CODEXPRO_HOME: await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-connection-test-home-'))
+    CODEXPRO_HOME: await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-connection-test-home-')),
+    CODEXPRO_HTTP_SESSION_MODE: 'retained'
   },
   stdio: ['ignore', 'pipe', 'pipe']
 });
