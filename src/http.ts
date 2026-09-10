@@ -1612,6 +1612,15 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     // recurrently reused sessions higher. Classification is protocol-phase
     // only (envelope method name); no tool/query/path/size content affects it.
     completedApplicationRequests: number;
+    // Fixed, non-renewable first-use protection deadline (epoch ms), set ONCE
+    // when the retained session materializes and never moved afterwards
+    // (FIRST-USE-GRACE-RENEWAL-001). Protocol traffic (notifications, ping,
+    // GET/SSE, DELETE, malformed shapes) refreshes lastSeenAt for TTL/activity
+    // purposes but MUST NOT extend this deadline: a session that never
+    // completes a real operation loses first-use priority at this instant even
+    // if it keeps chatting protocol. A first real operation ends first-use
+    // status naturally by raising the score above 0.
+    firstUseProtectionUntil: number;
   };
 
   const transports = new Map<string, TransportRecord>();
@@ -1763,12 +1772,17 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
   //      first; recurrently reused sessions survive while any less-used idle
   //      exists; among equals the oldest (least recently seen) remains the
   //      best abandonment guess.
-  //   2. First-use sessions (completedApplicationRequests == 0 and idle for
-  //      less than FIRST_USE_GRACE_MS): handshake-complete but not yet
-  //      application-used. A session is idle with score 0 in the gap between
-  //      its notifications/initialized and its first real operation; evicting
-  //      it first would strand that first call (HANDSHAKE-FIRST-CALL-001).
-  //      First-use sessions are protected while any band-1 idle exists.
+  //   2. First-use sessions (completedApplicationRequests == 0 and now is
+  //      before the record's fixed firstUseProtectionUntil): handshake-complete
+  //      but not yet application-used. A session is idle with score 0 in the
+  //      gap between its notifications/initialized and its first real
+  //      operation; evicting it first would strand that first call
+  //      (HANDSHAKE-FIRST-CALL-001). First-use sessions are protected while
+  //      any band-1 idle exists. The deadline is fixed at materialization and
+  //      is NEVER renewed by later protocol activity (ping, notifications,
+  //      GET/SSE, DELETE): lastSeenAt refresh keeps the session inside TTL
+  //      but cannot restore first-use priority
+  //      (FIRST-USE-GRACE-RENEWAL-001).
   //
   // First-use sessions older than the grace are expired protection, not proven
   // garbage with value: they reclaim before anything settled (band 1 orders
@@ -1797,7 +1811,9 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     };
     for (const [sessionId, record] of transports) {
       if (!isIdleRecord(record)) continue;
-      const firstUse = record.completedApplicationRequests <= 0 && now - record.lastSeenAt < FIRST_USE_GRACE_MS;
+      // Fixed deadline, not sliding idle age: protocol chatter refreshes
+      // lastSeenAt but never moves firstUseProtectionUntil.
+      const firstUse = record.completedApplicationRequests <= 0 && now < record.firstUseProtectionUntil;
       if (firstUse) {
         fallback = consider(fallback, sessionId, record);
       } else {
@@ -2083,7 +2099,11 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
               // application-use scoring (HANDSHAKE-FIRST-CALL-001).
               inFlightRequests: 1,
               lifecycle: "active",
-              completedApplicationRequests: 0
+              completedApplicationRequests: 0,
+              // Fixed first-use deadline established once at materialization;
+              // never renewed by later protocol activity
+              // (FIRST-USE-GRACE-RENEWAL-001).
+              firstUseProtectionUntil: now + FIRST_USE_GRACE_MS
             };
             transports.set(newSessionId, currentRecord);
             if (transports.size > retainedHighWatermark) retainedHighWatermark = transports.size;

@@ -107,6 +107,13 @@ async function spawnServer({ maxSessions = 4, ttlMs = 60000 } = {}) {
   return { baseUrl: `http://127.0.0.1:${port}`, child, root, home };
 }
 
+// Remove this run's exact temporary directories after the child is stopped.
+// Only ever removes the two paths this run created via mkdtemp above.
+async function removeServerDirs(server) {
+  await fs.rm(server.root, { recursive: true, force: true });
+  await fs.rm(server.home, { recursive: true, force: true });
+}
+
 function authHeaders(extra = {}) {
   return {
     accept: "application/json, text/event-stream",
@@ -298,6 +305,7 @@ async function caseC1() {
   } finally {
     stopFlag.stop = true;
     await stopServer(server.child);
+    await removeServerDirs(server);
   }
 }
 
@@ -323,6 +331,7 @@ async function caseC2() {
     throw error;
   } finally {
     await stopServer(server.child);
+    await removeServerDirs(server);
   }
 }
 
@@ -362,6 +371,7 @@ async function caseC3() {
     throw error;
   } finally {
     await stopServer(server.child);
+    await removeServerDirs(server);
   }
 }
 
@@ -408,6 +418,7 @@ async function caseC4() {
     throw error;
   } finally {
     await stopServer(server.child);
+    await removeServerDirs(server);
   }
 }
 
@@ -448,6 +459,7 @@ async function caseC5() {
     throw error;
   } finally {
     await stopServer(server.child);
+    await removeServerDirs(server);
   }
 }
 
@@ -490,6 +502,7 @@ async function caseC6() {
     throw error;
   } finally {
     await stopServer(server.child);
+    await removeServerDirs(server);
   }
 }
 
