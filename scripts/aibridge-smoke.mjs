@@ -261,6 +261,8 @@ try {
     const envOffNoProfile = { ...cliEnv, CODEXPRO_AI_BRIDGE: 'off' };
     cliFail(['pro-apply', '--root', cliRoot, '--file', path.join(cliRoot, 'plan.md'), '--no-profile'], envOffNoProfile, bridgeErr);
     cliFail(['pro-bundle', '--root', cliRoot, '--no-diff', '--no-changed-files', '--no-profile'], envOffNoProfile, bridgeErr);
+    helperFail('pro-apply.mjs', ['--root', cliRoot, '--file', path.join(cliRoot, 'plan.md'), '--no-profile'], envOffNoProfile, bridgeErr);
+    helperFail('pro-bundle.mjs', ['--root', cliRoot, '--no-diff', '--no-changed-files', '--no-profile'], envOffNoProfile, bridgeErr);
     // Explicit CLI OFF still overrides --no-profile
     cliFail(['pro-apply', '--root', cliRoot, '--file', path.join(cliRoot, 'plan.md'), '--ai-bridge', 'off', '--no-profile'], cliEnv, bridgeErr);
     cliFail(['pro-bundle', '--root', cliRoot, '--no-diff', '--no-changed-files', '--ai-bridge', 'off', '--no-profile'], cliEnv, bridgeErr);
