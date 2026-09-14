@@ -7,7 +7,7 @@ import { createCodexProServer } from "./server.js";
 import { VerificationManager } from "./verificationOps.js";
 import { PtyRunManager } from "./ptyRunManager.js";
 
-const CODEXPRO_VERSION = "0.30.0";
+const CODEXPRO_VERSION = "0.31.0";
 
 function printHelp(): void {
   console.log(`CodexPro MCP stdio server

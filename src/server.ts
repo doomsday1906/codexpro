@@ -46,7 +46,7 @@ export type { CodexProDiagnosticContext, DiagnosticContextOptions, DiagnosticTra
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 const RUNTIME_STATUS_FAILURE_DETAIL_MAX_BYTES = 2_048;
 const CODEXPRO_SERVER_NAME = "CodexPro";
-const CODEXPRO_SERVER_VERSION = "0.30.0";
+const CODEXPRO_SERVER_VERSION = "0.31.0";
 // read_many owns a smaller aggregate response contract than the single-read
 // path. maxOutputBytes is not a universal read cap, but it remains the outer
 // configured ceiling when it is lower than this tool's own maximum.
