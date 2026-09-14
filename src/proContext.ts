@@ -308,6 +308,9 @@ export async function exportProContext(
   workspace: Workspace,
   options: ProContextOptions = {}
 ): Promise<ProContextResult> {
+  if ((config as { aiBridgeEnabled?: boolean }).aiBridgeEnabled === false) {
+    throw new CodexProError("AI Bridge is disabled. `.ai-bridge` handoff/context files are not created or consumed.");
+  }
   if (options.includeAiBridge !== false) {
     await ensureAiBridge(config, guard, workspace);
   }

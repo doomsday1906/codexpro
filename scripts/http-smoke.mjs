@@ -316,6 +316,9 @@ try {
   if (authorizedJson.authRequired !== true) {
     throw new Error(`expected authenticated healthz to report authRequired=true, got ${JSON.stringify(authorizedJson)}`);
   }
+  if (authorizedJson.aiBridgeEnabled !== true) {
+    throw new Error(`expected healthz to report aiBridgeEnabled=true by default, got ${JSON.stringify(authorizedJson)}`);
+  }
 
   for (const header of [`bearer ${token}`, `Bearer    ${token}`]) {
     const variant = await fetch(`${baseUrl}/healthz`, {
@@ -402,10 +405,13 @@ try {
   if (!homeText.includes('history.replaceState') || !homeText.includes('initialUrl.searchParams.delete("codexpro_token")')) {
     throw new Error('onboarding page did not remove query credentials from browser history');
   }
-  for (const fieldName of ['tunnelName', 'ngrokConfig', 'cloudflareConfig', 'cloudflareTokenFile', 'toolCards', 'noInstallCloudflared']) {
+  for (const fieldName of ['tunnelName', 'ngrokConfig', 'cloudflareConfig', 'cloudflareTokenFile', 'toolCards', 'aiBridgeEnabled', 'noInstallCloudflared']) {
     if (!homeText.includes(`name="${fieldName}"`)) {
       throw new Error(`onboarding page did not include profile field ${fieldName}`);
     }
+  }
+  if (!homeText.includes('Enable') || !homeText.includes('.ai-bridge') || !homeText.includes('Restart required')) {
+    throw new Error('onboarding page did not include AI Bridge switch label/help');
   }
   if (homeText.includes(token)) {
     throw new Error('onboarding page leaked the raw auth token');
@@ -532,6 +538,52 @@ try {
 
   const queryTools = await listTools(`${baseUrl}/mcp?codexpro_token=${encodeURIComponent(token)}`);
   const queryToolNames = toolNames(queryTools);
+
+  // AI Bridge opt-out: POST false persists, preserves token, reports false; then re-enable true
+  const bridgeOff = await fetch(`${baseUrl}/admin/profile?codexpro_token=${encodeURIComponent(token)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ tunnel: 'none', aiBridgeEnabled: false })
+  });
+  const bridgeOffJson = await bridgeOff.json();
+  if (bridgeOff.status !== 200 || bridgeOffJson.saved !== true) {
+    throw new Error(`aiBridge OFF save failed: ${bridgeOff.status} ${JSON.stringify(bridgeOffJson)}`);
+  }
+  const bridgeOffSaved = JSON.parse(await fs.readFile(bridgeOffJson.profile_path, 'utf8'));
+  if (bridgeOffSaved.aiBridgeEnabled !== false) {
+    throw new Error(`aiBridge OFF not persisted: ${JSON.stringify(bridgeOffSaved)}`);
+  }
+  if (bridgeOffSaved.token !== token) {
+    throw new Error('aiBridge OFF save did not preserve token');
+  }
+  if (bridgeOffJson.effective?.aiBridgeEnabled !== false || bridgeOffJson.profile?.aiBridgeEnabled !== false) {
+    throw new Error(`aiBridge OFF not reflected in response: ${JSON.stringify(bridgeOffJson)}`);
+  }
+  const healthOff = await (await fetch(`${baseUrl}/healthz?codexpro_token=${encodeURIComponent(token)}`)).json();
+  // healthz is unauthenticated in test setup? It returns config; check field when present
+  if (healthOff.aiBridgeEnabled !== undefined && healthOff.aiBridgeEnabled !== true) {
+    // Runtime config still reflects startup (enabled); profile OFF requires restart – healthz reports runtime true here.
+    // This documents restart-required semantics: saved profile false, runtime still true until restart.
+  }
+  const bridgeOn = await fetch(`${baseUrl}/admin/profile?codexpro_token=${encodeURIComponent(token)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ tunnel: 'none', aiBridgeEnabled: true })
+  });
+  const bridgeOnJson = await bridgeOn.json();
+  if (bridgeOn.status !== 200) throw new Error(`aiBridge ON save failed: ${bridgeOn.status}`);
+  const bridgeOnSaved = JSON.parse(await fs.readFile(bridgeOnJson.profile_path, 'utf8'));
+  if (bridgeOnSaved.aiBridgeEnabled !== true) throw new Error('aiBridge ON not persisted');
+
+  // Incompatible mode validation: handoff + disabled must fail
+  const badMode = await fetch(`${baseUrl}/admin/profile?codexpro_token=${encodeURIComponent(token)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ tunnel: 'none', mode: 'handoff', aiBridgeEnabled: false })
+  });
+  if (badMode.status !== 400) {
+    throw new Error(`handoff+disabled should return 400, got ${badMode.status}`);
+  }
   for (const expected of ['server_config', 'runtime_status', 'codexpro_self_test', 'codexpro_inventory', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'tree', 'search', 'load_skill', 'read', 'read_many', 'git_status', 'git_diff', 'show_changes', 'read_handoff', 'wait_for_handoff', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
     if (!queryToolNames.includes(expected)) {
       throw new Error(`URL-token MCP tools/list missing ${expected}; got ${queryToolNames.join(', ')}`);

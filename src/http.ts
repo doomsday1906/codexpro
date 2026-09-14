@@ -10,6 +10,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { expandHome, loadConfig, type CodexProConfig } from "./config.js";
 import {
+  aiBridgeEnabledFromProfile,
   profilePathForRoot,
   readRuntimeConnection,
   readWorkspaceProfile,
@@ -194,6 +195,7 @@ const AdminProfilePatch = z.object({
   write: z.enum(WRITE_MODES).optional(),
   toolMode: z.enum(TOOL_MODES).optional(),
   toolCards: z.boolean().optional(),
+  aiBridgeEnabled: z.boolean().optional(),
   gitPushPolicy: z.unknown().optional(),
   widgetDomain: textField(2048),
   tunnelName: textField(128),
@@ -223,6 +225,7 @@ interface ProfileFormValues {
   write: "off" | "handoff" | "workspace";
   toolMode: "minimal" | "standard" | "full";
   toolCards: boolean;
+  aiBridgeEnabled: boolean;
   gitPushPolicy: GitPushPolicy;
   widgetDomain: string;
   noInstallCloudflared: boolean;
@@ -309,6 +312,7 @@ function profileValues(config: CodexProConfig, profile = readWorkspaceProfile(co
     write,
     toolMode: oneOf(profile.toolMode ?? config.toolMode, TOOL_MODES, config.toolMode),
     toolCards: Boolean(profile.toolCards ?? config.toolCards),
+    aiBridgeEnabled: profile.aiBridgeEnabled === undefined ? config.aiBridgeEnabled !== false : aiBridgeEnabledFromProfile(profile),
     gitPushPolicy,
     widgetDomain: String(profile.widgetDomain ?? config.widgetDomain),
     noInstallCloudflared: Boolean(profile.noInstallCloudflared)
@@ -441,6 +445,8 @@ function profileForm(config: CodexProConfig): string {
           </div>
           <label class="check-row"><input name="toolCards" type="checkbox" value="true"${values.toolCards ? " checked" : ""}><span>Enable ChatGPT tool cards</span></label>
           <label class="check-row"><input name="requireBashSession" type="checkbox" value="true"${values.requireBashSession ? " checked" : ""}><span>Require matching bash session id</span></label>
+          <label class="check-row"><input name="aiBridgeEnabled" type="checkbox" value="true"${values.aiBridgeEnabled ? " checked" : ""}><span>Enable \`.ai-bridge\` handoff/context files</span></label>
+          <p class="field-help">Allows RepoConnect to create and consume \`.ai-bridge\` handoff files. Disabling this does not delete existing files. Restart required.</p>
         </fieldset>
         <fieldset class="profile-group readonly-group">
           <legend>Read-only this run</legend>
@@ -467,6 +473,7 @@ function buildProfilePayload(config: CodexProConfig, existing: WorkspaceProfile,
     ...profileInput,
     port: input.port ? String(input.port) : current.port,
     requireBashSession: input.requireBashSession ?? current.requireBashSession,
+    aiBridgeEnabled: input.aiBridgeEnabled ?? current.aiBridgeEnabled,
     noInstallCloudflared: input.noInstallCloudflared ?? current.noInstallCloudflared
   };
   next.hostname = normalizePublicHostname(next.hostname);
@@ -477,6 +484,9 @@ function buildProfilePayload(config: CodexProConfig, existing: WorkspaceProfile,
   }
   if (next.requireBashSession && !next.bashSession) {
     throw new Error("requireBashSession requires a bashSession value.");
+  }
+  if (next.mode === "handoff" && next.aiBridgeEnabled === false) {
+    throw new Error("handoff mode requires AI Bridge to be enabled. Enable `.ai-bridge` handoff/context files or choose mode agent.");
   }
 
   const token = typeof existing.token === "string" && existing.token ? existing.token : config.authToken ?? "";
@@ -510,6 +520,7 @@ function buildProfilePayload(config: CodexProConfig, existing: WorkspaceProfile,
     write,
     toolMode: next.toolMode,
     toolCards: next.toolCards,
+    aiBridgeEnabled: next.aiBridgeEnabled,
     ...(shouldSaveGitPushPolicy ? { gitPushPolicy } : {}),
     ...(next.widgetDomain ? { widgetDomain: next.widgetDomain } : {}),
     ...(existing.allowedRoots?.length ? { allowedRoots: existing.allowedRoots } : {}),
@@ -540,6 +551,7 @@ function profileResponse(config: CodexProConfig): Record<string, unknown> {
       writeMode: config.writeMode,
       toolMode: config.toolMode,
       toolCards: config.toolCards,
+      aiBridgeEnabled: config.aiBridgeEnabled !== false,
       gitPushPolicy: sanitizeGitPushPolicy(config.gitPushPolicy),
       widgetDomain: config.widgetDomain,
       authEnabled: Boolean(config.authToken)
@@ -1554,6 +1566,7 @@ function onboardingPage(config: CodexProConfig): string {
           codexDir: data.codexDir,
           bashSession: data.bashSession,
           requireBashSession: Boolean(form.elements.requireBashSession?.checked),
+          aiBridgeEnabled: Boolean(form.elements.aiBridgeEnabled?.checked),
           noInstallCloudflared: Boolean(form.elements.noInstallCloudflared?.checked)
         };
         if (status) status.textContent = "Saving...";
@@ -2200,6 +2213,7 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       toolMode: config.toolMode,
       widgetDomain: config.widgetDomain,
       contextDir: config.contextDir,
+      aiBridgeEnabled: config.aiBridgeEnabled !== false,
       authEnabled: Boolean(config.authToken),
       authRequired: Boolean(config.authToken)
     });

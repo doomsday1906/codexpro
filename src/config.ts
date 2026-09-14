@@ -28,6 +28,7 @@ export interface CodexProConfig {
   codexDir: string;
   writeMode: WriteMode;
   toolMode: ToolMode;
+  aiBridgeEnabled: boolean;
   inheritEnv: boolean;
   maxReadBytes: number;
   maxWriteBytes: number;
@@ -249,6 +250,14 @@ function boolFrom(value: string | undefined, fallback = false): boolean {
   return ["1", "true", "yes", "y", "on"].includes(value.toLowerCase());
 }
 
+function aiBridgeEnabledFrom(value: string | undefined): boolean {
+  if (value === undefined) return true;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on", "enabled", "enable"].includes(normalized)) return true;
+  if (["0", "false", "no", "n", "off", "disabled", "disable"].includes(normalized)) return false;
+  return true;
+}
+
 export function parseContainmentWrapper(raw: string | undefined): string[] | undefined {
   if (!raw?.trim()) return undefined;
   const tokens = raw.trim().match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
@@ -308,6 +317,14 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
       : typeof args["tool-cards"] === "string"
         ? args["tool-cards"]
         : undefined;
+  const aiBridgeArg =
+    typeof args["ai-bridge"] === "string"
+      ? args["ai-bridge"]
+      : typeof (args as Record<string, unknown>).aiBridge === "string"
+        ? String((args as Record<string, unknown>).aiBridge)
+        : typeof (args as Record<string, unknown>).aiBridge === "boolean"
+          ? ((args as Record<string, unknown>).aiBridge ? "on" : "off")
+          : undefined;
   const gitPushPolicyArg = typeof args["git-push-policy"] === "string" ? args["git-push-policy"] : undefined;
   const containmentWrapperArg =
     typeof args["containment-wrapper"] === "string" ? args["containment-wrapper"] : undefined;
@@ -351,6 +368,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     codexDir: expandHome(codexDirArg || process.env.CODEXPRO_CODEX_DIR || path.join(os.homedir(), ".codex")),
     writeMode: writeModeFrom(writeArg ?? process.env.CODEXPRO_WRITE_MODE),
     toolMode: toolModeFrom(toolModeArg ?? process.env.CODEXPRO_TOOL_MODE),
+    aiBridgeEnabled: aiBridgeEnabledFrom(aiBridgeArg ?? process.env.CODEXPRO_AI_BRIDGE),
     inheritEnv: process.env.CODEXPRO_INHERIT_ENV === "1",
     maxReadBytes: numberFrom(process.env.CODEXPRO_MAX_READ_BYTES, 180_000, 4_000, 2_000_000),
     maxWriteBytes: numberFrom(process.env.CODEXPRO_MAX_WRITE_BYTES, 1_000_000, 1_000, 10_000_000),

@@ -33,10 +33,19 @@ export interface WorkspaceProfile {
   write?: WriteMode | string;
   toolMode?: ToolMode | string;
   toolCards?: boolean;
+  aiBridgeEnabled?: boolean;
   gitPushPolicy?: GitPushPolicy;
   widgetDomain?: string;
   noInstallCloudflared?: boolean;
   allowedRoots?: string[];
+}
+
+export function aiBridgeEnabledFromProfile(profile: WorkspaceProfile | undefined | null): boolean {
+  if (!profile || profile.aiBridgeEnabled === undefined || profile.aiBridgeEnabled === null) return true;
+  if (typeof profile.aiBridgeEnabled === "boolean") return profile.aiBridgeEnabled;
+  const normalized = String(profile.aiBridgeEnabled).trim().toLowerCase();
+  if (["0", "false", "no", "n", "off", "disabled", "disable"].includes(normalized)) return false;
+  return true;
 }
 
 export interface RuntimeConnection {

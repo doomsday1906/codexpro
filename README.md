@@ -116,6 +116,16 @@ Opt-in tool cards:
 CODEXPRO_TOOL_CARDS=1 codexpro start
 ```
 
+Disable `.ai-bridge` handoff/context files (persistent workspace-profile switch):
+
+```bash
+codexpro settings set --ai-bridge off
+codexpro settings set --ai-bridge on
+codexpro settings show
+```
+
+When disabled, RepoConnect neither creates nor automatically consumes `.ai-bridge` artifacts. Existing files are left untouched. Restart required. `handoff` mode requires AI Bridge to be enabled.
+
 ## Public HTTPS options
 
 ChatGPT web needs HTTPS:
@@ -144,7 +154,7 @@ Prefer `Authorization: Bearer <token>` when the client supports headers. The `?c
 - Writes stay hidden unless write mode is `workspace`
 - Safe bash is the default
 - Blocked paths cover `.env`, keys, `.git`, build caches, and similar
-- Attachment import only accepts ChatGPT Apps SDK file objects from approved HTTPS hosts
+- Attachment import only accepts ChatGPT Apps SDK file objects from approved HTTPS hosts. Rejected hosts report a sanitized `hostname (initial URL / redirect N)` diagnostic without URL path, query, or signature.
 
 Read [SECURITY.md](SECURITY.md) before exposing a tunnel.
 

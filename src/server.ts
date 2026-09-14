@@ -1724,10 +1724,18 @@ function assertWriteToolAllowed(config: CodexProConfig, relPath: string): void {
   if (config.writeMode === "workspace") return;
   if (config.writeMode === "handoff" && isContextPath(config, relPath)) return;
   if (config.writeMode === "handoff") {
+    if (!aiBridgeEnabled(config)) {
+      throw new CodexProError(
+        "Source writes are disabled because CODEXPRO_WRITE_MODE=handoff and AI Bridge is disabled."
+      );
+    }
     throw new CodexProError(
       `Source writes are disabled because CODEXPRO_WRITE_MODE=handoff. ` +
         `Use handoff_to_agent or handoff_to_codex, or write/edit/apply_patch only inside ${config.contextDir}/.`
     );
+  }
+  if (!aiBridgeEnabled(config)) {
+    throw new CodexProError("write/edit/apply_patch tools are disabled because CODEXPRO_WRITE_MODE=off.");
   }
   throw new CodexProError("write/edit/apply_patch tools are disabled because CODEXPRO_WRITE_MODE=off. handoff_to_agent and handoff_to_codex are still available for planning.");
 }
@@ -1888,6 +1896,18 @@ function codexSessionToolNames(config: CodexProConfig): string[] {
     : ["codex_sessions"];
 }
 
+function aiBridgeEnabled(config: CodexProConfig): boolean {
+  return (config as { aiBridgeEnabled?: boolean }).aiBridgeEnabled !== false;
+}
+
+const AI_BRIDGE_TOOL_NAMES = new Set<string>([
+  "read_handoff",
+  "wait_for_handoff",
+  "export_pro_context",
+  "handoff_to_agent",
+  "handoff_to_codex"
+]);
+
 function toolNamesForMode(config: CodexProConfig): string[] {
   const names: string[] =
     config.toolMode === "full"
@@ -1916,6 +1936,12 @@ function toolNamesForMode(config: CodexProConfig): string[] {
     }
   }
   if (config.writeMode === "handoff" && !names.includes("handoff_to_agent")) names.push("handoff_to_agent");
+  if (!aiBridgeEnabled(config)) {
+    for (const bridgeTool of AI_BRIDGE_TOOL_NAMES) {
+      const idx = names.indexOf(bridgeTool);
+      if (idx !== -1) names.splice(idx, 1);
+    }
+  }
   if (!config.analysisEnabled) {
     const analysisIndex = names.indexOf("inspect_workspace");
     if (analysisIndex !== -1) names.splice(analysisIndex, 1);
@@ -1948,6 +1974,7 @@ function registeredToolNames(server: McpServer): string[] {
 }
 
 function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
+  if (!aiBridgeEnabled(config) && AI_BRIDGE_TOOL_NAMES.has(name)) return false;
   if (config.connectionTest && CONNECTION_TEST_HIDDEN_TOOLS.has(name)) return false;
   if ((name === "bash" || name === "start_verification" || name === "wait_verification" || name === "cancel_verification" || name === "pty_run") && config.bashMode === "off") return false;
   if ((name === "write" || name === "edit" || name === "apply_patch" || name === "import_file") && config.writeMode !== "workspace") return false;
@@ -1956,7 +1983,7 @@ function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
   if (name === "codex_sessions") return config.codexSessions !== "off";
   if (name === "read_codex_session") return config.codexSessions === "read";
   if (name === "inspect_workspace" && !config.analysisEnabled) return false;
-  if (name === "handoff_to_agent" && config.writeMode === "handoff") return true;
+  if (name === "handoff_to_agent" && config.writeMode === "handoff") return aiBridgeEnabled(config);
   if (config.toolMode === "full") return true;
   if (config.toolMode === "minimal") return MINIMAL_TOOLS.has(name);
   return STANDARD_TOOLS.has(name);
@@ -1977,10 +2004,13 @@ function registerCodexTool(
 }
 
 function serverInstructions(config: CodexProConfig, diagnosticContext?: CodexProDiagnosticContext): string {
+  const bridgeOff = !aiBridgeEnabled(config);
   const editInstruction =
     config.connectionTest
       ? "5. Connection test mode is read-only. Write, patch, export, and handoff-writing tools are unavailable."
-      : config.writeMode === "workspace"
+      : bridgeOff
+        ? "5. Edit source files with write/edit/apply_patch when authorized. AI Bridge handoff files are disabled on this server; do not create or reference .ai-bridge workflows."
+        : config.writeMode === "workspace"
       ? "5. Edit source files with write/edit/apply_patch. After edits, call show_changes once for git status, diff stats, and review diff."
       : config.writeMode === "handoff"
         ? "5. Source writes are disabled and generic write/edit/apply_patch tools are unavailable. Use handoff_to_agent/handoff_to_codex for plans."
@@ -2701,6 +2731,9 @@ async function writeAgentHandoff(
   prompt: string;
   writeResult: Awaited<ReturnType<typeof writeTextFile>>;
 }> {
+  if (!aiBridgeEnabled(config)) {
+    throw new CodexProError("AI Bridge is disabled. `.ai-bridge` handoff/context files are not created or consumed.");
+  }
   await ensureAiBridge(config, guard, workspace);
   const agent = normalizeAgentId(options.agent);
   const agentName = displayAgentName(agent, options.agentName);
@@ -2943,6 +2976,9 @@ export type {
 } from "./guard.js";
 
 export function createCodexProServer(config: CodexProConfig, options: CodexProServerOptions = {}): McpServer {
+  if (!aiBridgeEnabled(config) && config.writeMode === "handoff") {
+    throw new CodexProError("handoff mode requires AI Bridge to be enabled. Enable `.ai-bridge` handoff/context files or choose mode agent.");
+  }
   const workspaces = new WorkspaceManager(config);
   const verificationManager = options.verificationManager ?? new VerificationManager(config);
   const ptyRunManager = options.ptyRunManager ?? new PtyRunManager(config);
@@ -3081,6 +3117,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         writeMode: config.writeMode,
         toolMode: config.toolMode,
         toolCards: config.toolCards,
+        aiBridgeEnabled: aiBridgeEnabled(config),
         gitPushPolicy: sanitizeGitPushPolicy(config.gitPushPolicy),
         connectionTest: config.connectionTest,
         analysisEnabled: config.analysisEnabled,
@@ -3289,11 +3326,12 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     "codexpro_self_test",
     {
       title: "CodexPro Self Test",
-      description:
-        "Run one controlled, local-only CodexPro diagnostic. It checks modes, expected tools, workspace access, skills, git, safe bash policy, selected-only Pro context, and optional .ai-bridge write/edit probe without touching source files.",
+      description: aiBridgeEnabled(config)
+        ? "Run one controlled, local-only CodexPro diagnostic. It checks modes, expected tools, workspace access, skills, git, safe bash policy, selected-only Pro context, and optional .ai-bridge write/edit probe without touching source files."
+        : "Run one controlled, local-only CodexPro diagnostic. It checks modes, expected tools, workspace access, skills, git, safe bash policy, and selected-only Pro context without touching source files. AI Bridge is disabled on this server.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
-        write_probe: z.boolean().optional().describe("Create/edit only .ai-bridge/codexpro-self-test.md. Default: true."),
+        write_probe: z.boolean().optional().describe(aiBridgeEnabled(config) ? "Create/edit only .ai-bridge/codexpro-self-test.md. Default: true." : "AI Bridge is disabled on this server; no bridge probe is created. Default: true."),
         bash_probe: z.boolean().optional().describe("Check bash policy with safe local commands only. Default: true."),
         pro_context_probe: z.boolean().optional().describe("Build a selected-only Pro context bundle in memory without writing pro-context.md. Default: true."),
         include_global_skills: z.boolean().optional().describe("Include user/plugin skill discovery in the inventory check. Default: true."),
@@ -3363,7 +3401,9 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
       }
 
       if (parseBool(args.write_probe, true)) {
-        if (config.writeMode === "off") {
+        if (!aiBridgeEnabled(config)) {
+          check("write/edit probe", "warn", "skipped because AI Bridge is disabled");
+        } else if (config.writeMode === "off") {
           check("write/edit probe", "warn", "skipped because CODEXPRO_WRITE_MODE=off");
         } else {
           try {
@@ -3703,7 +3743,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         max_files: z.number().int().min(1).max(3000).optional().describe("Alias for maximum tree entries. Default: 500."),
         include_skills: z.boolean().optional().describe("Discover skills by name/description. Default: false for speed."),
         include_global_skills: z.boolean().optional().describe("Also scan installed user/plugin skills when include_skills=true. Default: false."),
-        bootstrap_context: z.boolean().optional().describe("Deprecated and ignored. Use handoff_to_agent to create .ai-bridge files.")
+        bootstrap_context: z.boolean().optional().describe(aiBridgeEnabled(config) ? "Deprecated and ignored. Use handoff_to_agent to create .ai-bridge files." : "Deprecated and ignored. AI Bridge is disabled on this server.")
       },
       annotations: SESSION_READ_ANNOTATIONS,
       _meta: {
@@ -3749,7 +3789,9 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     "workspace_snapshot",
     {
       title: "Workspace Snapshot",
-      description: "Return git status, recent commits, .ai-bridge context, and a compact tree for an opened workspace.",
+      description: aiBridgeEnabled(config)
+        ? "Return git status, recent commits, .ai-bridge context, and a compact tree for an opened workspace."
+        : "Return git status, recent commits, and a compact tree for an opened workspace. AI Bridge is disabled on this server.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         max_depth: z.number().int().min(1).max(8).optional().describe("Tree depth. Default: 3."),
@@ -3773,6 +3815,23 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         includeSkills: parseBool(args.include_skills, false),
         includeGlobalSkills: parseBool(args.include_global_skills, false)
       });
+      if (!aiBridgeEnabled(config)) {
+        return textResult(summary.text, {
+          workspace_id: workspace.id,
+          root: workspace.root,
+          agents_loaded: summary.agentsLoaded,
+          agents_path: summary.agentsPath,
+          skills: summary.skills,
+          skill_inventory: summary.skillInventory,
+          skill_counts: summary.skillCounts,
+          tree: summary.tree,
+          git_status: summary.gitStatus,
+          ai_context_files: [],
+          bash_mode: config.bashMode,
+          write_mode: config.writeMode,
+          tool_mode: config.toolMode
+        });
+      }
       const ai = await readAiBridgeContext(config, guard, workspace);
       const text = `${summary.text}\n\n## AI handoff context\n\n${ai.text}`;
       return textResult(text, {
@@ -5420,12 +5479,13 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     "codex_context",
     {
       title: "Codex Context",
-      description:
-        "Load Codex-style workspace context in one call: AGENTS instructions for a target path, .ai-bridge handoff files, and optional git status/diff.",
+      description: aiBridgeEnabled(config)
+        ? "Load Codex-style workspace context in one call: AGENTS instructions for a target path, .ai-bridge handoff files, and optional git status/diff."
+        : "Load Codex-style workspace context in one call: AGENTS instructions for a target path and optional git status/diff. AI Bridge is disabled on this server.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         target_path: z.string().optional().describe("Workspace-relative file or directory whose AGENTS instruction chain should be loaded. Default: ."),
-        include_ai_bridge: z.boolean().optional().describe("Include .ai-bridge plan, agent status, diff, decisions, questions, and execution log. Default: true."),
+        include_ai_bridge: z.boolean().optional().describe(aiBridgeEnabled(config) ? "Include .ai-bridge plan, agent status, diff, decisions, questions, and execution log. Default: true." : "AI Bridge is disabled on this server; this option is ignored. Default: true."),
         include_git: z.boolean().optional().describe("Include git status. Default: true."),
         include_diff: z.boolean().optional().describe("Include full git diff. Default: false for speed/noise."),
         max_agent_bytes: z.number().int().min(1000).max(200000).optional().describe("Maximum bytes per AGENTS file. Default: 60000.")
@@ -5441,7 +5501,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const context = await readCodexContext(config, guard, workspace, {
         targetPath: args.target_path,
-        includeAiBridge: args.include_ai_bridge,
+        includeAiBridge: aiBridgeEnabled(config) ? args.include_ai_bridge : false,
         includeGit: args.include_git,
         includeDiff: parseBool(args.include_diff, false),
         maxAgentBytes: args.max_agent_bytes

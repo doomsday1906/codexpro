@@ -151,7 +151,7 @@ export async function workspaceSummary(
   workspace: Workspace,
   options: { includeTree?: boolean; maxDepth?: number; maxEntries?: number; bootstrapContext?: boolean; includeSkills?: boolean; includeGlobalSkills?: boolean } = {}
 ): Promise<WorkspaceSummary> {
-  if (options.bootstrapContext) {
+  if (options.bootstrapContext && (config as { aiBridgeEnabled?: boolean }).aiBridgeEnabled !== false) {
     await ensureAiBridge(config, guard, workspace);
   }
   const skillInventory = options.includeSkills
@@ -203,6 +203,12 @@ export async function readAiBridgeContext(
   workspace: Workspace,
   options: { createIfMissing?: boolean } = {}
 ): Promise<{ text: string; files: string[] }> {
+  if ((config as { aiBridgeEnabled?: boolean }).aiBridgeEnabled === false) {
+    return {
+      text: "AI Bridge is disabled. `.ai-bridge` handoff/context files are not created or consumed.",
+      files: []
+    };
+  }
   if (options.createIfMissing) {
     await ensureAiBridge(config, guard, workspace);
   } else {

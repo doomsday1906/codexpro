@@ -106,6 +106,8 @@ Options:
   --widget-domain <origin>   Dedicated HTTPS origin for ChatGPT widget iframes.
                              Required for app submission. Default: https://rebel0789.github.io.
   --tool-cards <on|off>      Opt in to ChatGPT widget metadata on tool descriptors. Default: off.
+  --ai-bridge <on|off>       Enable .ai-bridge handoff/context files. Default: on.
+                              Use codexpro settings set --ai-bridge off to persist OFF.
   --git-push-policy <json>   Optional exact remote/endpoint/branch policy. Disabled when absent.
   --tunnel <none|cloudflare|cloudflare-named|ngrok|tailscale>
                              Expose local MCP. Default: cloudflare.
@@ -201,6 +203,8 @@ Workspace settings:
   codexpro settings show
   codexpro settings list
   codexpro settings set --tunnel ngrok --hostname your-domain.ngrok-free.dev
+  codexpro settings set --ai-bridge off
+  codexpro settings set --ai-bridge on
   codexpro settings set --git-push-policy '{"enabled":true,"rules":[{"remote":"origin","endpoint":"https://host/repo.git","branches":["main"]}]}'
   codexpro settings set --project /path/to/another/repo
   codexpro settings set --clear-projects
@@ -915,6 +919,37 @@ function toolCardsProfileEntry(args, profile = {}) {
 function toolCardsCliArgs(args, profile = {}) {
   if (!hasToolCardsInput(args, profile)) return [];
   return ['--tool-cards', optionBool(args, profile, 'toolCards', ['CODEXPRO_TOOL_CARDS'], false) ? 'on' : 'off'];
+}
+
+function aiBridgeFromValue(value, fallback = true) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'boolean') return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'y', 'on', 'enabled', 'enable'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'n', 'off', 'disabled', 'disable'].includes(normalized)) return false;
+  return fallback;
+}
+
+function aiBridgeOption(args, profile = {}) {
+  if (args.aiBridge !== undefined) return aiBridgeFromValue(args.aiBridge, true);
+  if (args['ai-bridge'] !== undefined) return aiBridgeFromValue(args['ai-bridge'], true);
+  for (const envName of ['CODEXPRO_AI_BRIDGE']) {
+    if (process.env[envName] !== undefined && process.env[envName] !== '') return aiBridgeFromValue(process.env[envName], true);
+  }
+  if (profile?.aiBridgeEnabled !== undefined && profile.aiBridgeEnabled !== '' && profile.aiBridgeEnabled !== null) {
+    return aiBridgeFromValue(profile.aiBridgeEnabled, true);
+  }
+  return true;
+}
+
+function hasAiBridgeInput(args, profile = {}) {
+  return args.aiBridge !== undefined || args['ai-bridge'] !== undefined || profile.aiBridgeEnabled !== undefined || (process.env.CODEXPRO_AI_BRIDGE !== undefined && process.env.CODEXPRO_AI_BRIDGE !== '');
+}
+
+function aiBridgeProfileEntry(args, profile = {}) {
+  const enabled = aiBridgeOption(args, profile);
+  if (!hasAiBridgeInput(args, profile) && enabled === true) return {};
+  return { aiBridgeEnabled: enabled };
 }
 
 function validateBashSession(value) {
@@ -2098,6 +2133,11 @@ async function runExecuteHandoff(argv) {
     usage();
     return;
   }
+  const handoffRoot = realDir(args.root ?? process.env.CODEXPRO_ROOT ?? process.cwd());
+  const handoffProfile = args.noProfile ? {} : loadWorkspaceProfile(handoffRoot);
+  if (aiBridgeOption(args, handoffProfile) === false) {
+    throw new Error('AI Bridge is disabled. `.ai-bridge` handoff commands are unavailable.');
+  }
   const request = loadHandoffExecution(args);
 
   if (args.dryRun) {
@@ -2191,6 +2231,10 @@ async function runWatchHandoff(argv) {
     return;
   }
   const root = realDir(args.root ?? process.env.CODEXPRO_ROOT ?? process.cwd());
+  const watchProfile = args.noProfile ? {} : loadWorkspaceProfile(root);
+  if (aiBridgeOption(args, watchProfile) === false) {
+    throw new Error('AI Bridge is disabled. `.ai-bridge` handoff commands are unavailable.');
+  }
   const contextDir = contextDirFromArgs(args);
   const bridgeDir = resolveWorkspaceFile(root, contextDir);
   const planPath = path.join(bridgeDir, 'current-plan.md');
@@ -2734,6 +2778,10 @@ async function runLoopHandoff(argv) {
   }
 
   const root = realDir(args.root ?? process.env.CODEXPRO_ROOT ?? process.cwd());
+  const loopProfile = args.noProfile ? {} : loadWorkspaceProfile(root);
+  if (aiBridgeOption(args, loopProfile) === false) {
+    throw new Error('AI Bridge is disabled. `.ai-bridge` handoff commands are unavailable.');
+  }
   const contextDir = contextDirFromArgs(args);
   const paths = loopArtifactPaths(root, contextDir);
   const maxIters = numberOption(args.maxIters ?? args.maxIterations, 3, 1, 25);
@@ -3370,6 +3418,7 @@ function profileFromPreference(root, args, profile, preference) {
     ...(toolMode ? { toolMode } : {}),
     ...(widgetDomain ? { widgetDomain } : {}),
     ...toolCardsProfileEntry(args, profile),
+    ...aiBridgeProfileEntry(args, profile),
     ...gitPushPolicyProfileEntry(args, profile),
     ...(allowedRoots.length ? { allowedRoots } : {}),
     ...(args.noInstallCloudflared ? { noInstallCloudflared: true } : {}),
@@ -3648,6 +3697,7 @@ function printProfile(root, profile) {
     ...(safe.write ? [labelValue('Write', safe.write)] : []),
     ...(safe.toolMode ? [labelValue('Tool mode', safe.toolMode)] : []),
     ...(safe.toolCards !== undefined ? [labelValue('Tool cards', safe.toolCards ? 'on' : 'off')] : []),
+    labelValue('AI Bridge', safe.aiBridgeEnabled === false ? 'off' : 'on'),
     ...(safe.gitPushPolicy
       ? [labelValue('Git push policy', safe.gitPushPolicy.enabled ? `enabled (${safe.gitPushPolicy.rules.length} rule${safe.gitPushPolicy.rules.length === 1 ? '' : 's'})` : 'disabled')]
       : []),
@@ -3717,6 +3767,10 @@ function saveSettingsFromArgs(root, args, profile) {
     ? optionValue(args, profile, 'token', ['CODEXPRO_HTTP_TOKEN', 'CODEBASE_BRIDGE_HTTP_TOKEN'], profile.token ?? '')
     : stableToken(optionValue(args, profile, 'token', ['CODEXPRO_HTTP_TOKEN', 'CODEBASE_BRIDGE_HTTP_TOKEN'], profile.token ?? ''));
   const allowedRoots = configuredProjectRoots(root, args, profile);
+  const aiBridgeEnabled = aiBridgeOption(args, profile);
+  if (mode === 'handoff' && aiBridgeEnabled === false) {
+    throw new Error('handoff mode requires AI Bridge to be enabled. Enable `.ai-bridge` handoff/context files or choose mode agent.');
+  }
   const savedPath = saveWorkspaceProfile(root, {
     port,
     mode,
@@ -3737,6 +3791,7 @@ function saveSettingsFromArgs(root, args, profile) {
     ...(toolMode ? { toolMode } : {}),
     ...(widgetDomain ? { widgetDomain } : {}),
     ...toolCardsProfileEntry(args, profile),
+    ...aiBridgeProfileEntry(args, profile),
     ...gitPushPolicyProfileEntry(args, profile),
     ...(allowedRoots.length ? { allowedRoots } : {}),
     ...(args.noInstallCloudflared ?? profile.noInstallCloudflared ? { noInstallCloudflared: true } : {})
@@ -4229,10 +4284,14 @@ async function main() {
   const toolMode = optionValue(args, profile, 'toolMode', ['CODEXPRO_TOOL_MODE'], 'standard');
   const widgetDomain = optionValue(args, profile, 'widgetDomain', ['CODEXPRO_WIDGET_DOMAIN'], 'https://rebel0789.github.io');
   const toolCards = optionBool(args, profile, 'toolCards', ['CODEXPRO_TOOL_CARDS'], false);
+  const aiBridgeEnabled = aiBridgeOption(args, profile);
   const gitPushPolicy = configuredGitPushPolicy(args, profile);
   validateChoice('bash', bash, ['off', 'safe', 'full']);
   validateChoice('write', write, ['off', 'handoff', 'workspace']);
   validateChoice('tool-mode', toolMode, ['minimal', 'standard', 'full']);
+  if (mode === 'handoff' && aiBridgeEnabled === false) {
+    throw new Error('handoff mode requires AI Bridge to be enabled. Enable `.ai-bridge` handoff/context files or choose mode agent.');
+  }
 
   if (args.token && args.tokenFile) throw new Error('Use either --token or --token-file, not both.');
   let token = args.noAuth
@@ -4257,6 +4316,7 @@ async function main() {
     CODEXPRO_TOOL_MODE: toolMode,
     CODEXPRO_WIDGET_DOMAIN: widgetDomain,
     CODEXPRO_TOOL_CARDS: toolCards ? '1' : '0',
+    CODEXPRO_AI_BRIDGE: aiBridgeEnabled ? '1' : '0',
     CODEXPRO_GIT_PUSH_POLICY: serializeGitPushPolicy(gitPushPolicy),
     CODEXPRO_CONNECTION_TEST: connectionTest ? '1' : '0',
     CODEXPRO_MODE: mode,

@@ -300,7 +300,7 @@ if (!saved.includes('Saved workspace settings')) {
 }
 
 const shown = run(['settings', 'show', '--root', root], env);
-for (const expected of ['Tunnel', 'ngrok', 'codexpro-test.ngrok-free.app', '19087', 'Tool cards', 'on', 'Bash transcript', 'full', 'Projects', realReuseRoot, '<saved>']) {
+for (const expected of ['Tunnel', 'ngrok', 'codexpro-test.ngrok-free.app', '19087', 'Tool cards', 'on', 'AI Bridge', 'on', 'Bash transcript', 'full', 'Projects', realReuseRoot, '<saved>']) {
   if (!shown.includes(expected)) {
     throw new Error(`settings show missing ${expected}\n${shown}`);
   }
@@ -329,6 +329,22 @@ const clearedProjectsProfile = await readProfile(root, home);
 if (clearedProjectsProfile.allowedRoots !== undefined) {
   throw new Error(`settings profile did not clear saved projects: ${JSON.stringify(clearedProjectsProfile)}`);
 }
+
+run(['settings', 'set', '--root', root, '--ai-bridge', 'off'], env);
+const bridgeOffProfile = await readProfile(root, home);
+if (bridgeOffProfile.aiBridgeEnabled !== false) {
+  throw new Error(`settings --ai-bridge off not persisted: ${JSON.stringify(bridgeOffProfile)}`);
+}
+const bridgeOffShown = run(['settings', 'show', '--root', root], env);
+if (!bridgeOffShown.includes('AI Bridge') || !bridgeOffShown.includes('off')) {
+  throw new Error(`settings show did not report AI Bridge off\n${bridgeOffShown}`);
+}
+run(['settings', 'set', '--root', root, '--ai-bridge', 'on'], env);
+const bridgeOnProfile = await readProfile(root, home);
+if (bridgeOnProfile.aiBridgeEnabled !== true) {
+  throw new Error(`settings --ai-bridge on not persisted: ${JSON.stringify(bridgeOnProfile)}`);
+}
+runFail(['settings', 'set', '--root', policyRoot, '--mode', 'handoff', '--ai-bridge', 'off'], env, /handoff mode requires AI Bridge/i);
 
 runFail([
   'settings',
