@@ -117,10 +117,64 @@ try {
   }
 
   try {
-    await assertSafeImportUrl('https://evil.example/file.bin');
+    await assertSafeImportUrl('https://evil.example/file.bin?token=secret123&sig=abc#/frag');
     throw new Error('unapproved host should be rejected');
   } catch (error) {
-    if (!String(error.message).includes('approved ChatGPT file origin')) throw error;
+    const msg = String(error.message);
+    if (!msg.includes('approved ChatGPT file origin')) throw error;
+    if (!msg.includes('evil.example')) throw new Error(`sanitized error missing hostname: ${msg}`);
+    if (!msg.includes('(initial URL)')) throw new Error(`sanitized error missing stage: ${msg}`);
+    if (msg.includes('token=secret123') || msg.includes('sig=abc') || msg.includes('/file.bin')) {
+      throw new Error(`sanitized error leaked URL path/query: ${msg}`);
+    }
+  }
+
+  try {
+    await assertSafeImportUrl('https://evil.example/secret?x=1', { stage: 1 });
+    throw new Error('redirect stage should be rejected');
+  } catch (error) {
+    const msg = String(error.message);
+    if (!msg.includes('evil.example') || !msg.includes('(redirect 1)')) {
+      throw new Error(`redirect stage diagnostic wrong: ${msg}`);
+    }
+    if (msg.includes('secret') && msg.includes('x=1')) {
+      const hasPath = msg.includes('/secret');
+      if (hasPath) throw new Error(`redirect error leaked path: ${msg}`);
+    }
+  }
+
+  try {
+    parseAttachmentFileReference('https://evil.example/file.bin');
+    throw new Error('bare URL should be rejected');
+  } catch (error) {
+    if (!String(error.message).includes('Unsupported attachment reference')) throw error;
+  }
+
+  try {
+    await assertSafeImportUrl('ftp://files.oaiusercontent.com/file.bin');
+    throw new Error('unsupported scheme should be rejected');
+  } catch (error) {
+    if (!String(error.message).includes('HTTPS')) throw error;
+  }
+
+  try {
+    await assertSafeImportUrl('https://user:pass@files.oaiusercontent.com/file.bin');
+    throw new Error('credential URL should be rejected');
+  } catch (error) {
+    if (!String(error.message).includes('credentials')) throw error;
+  }
+
+  for (const blocked of ['https://10.0.0.1/file.bin', 'https://192.168.1.1/x', 'https://169.254.169.254/latest', 'https://100.64.0.1/y', 'https://224.0.0.1/z']) {
+    try {
+      await assertSafeImportUrl(blocked);
+      throw new Error(`private address should be rejected: ${blocked}`);
+    } catch (error) {
+      const msg = String(error.message);
+      if (!msg.includes('rejected')) throw error;
+      if (msg.includes('/file.bin') || msg.includes('/latest') || msg.includes('/x') || msg.includes('/y') || msg.includes('/z')) {
+        throw new Error(`blocked-address error leaked path: ${msg}`);
+      }
+    }
   }
 
   try {

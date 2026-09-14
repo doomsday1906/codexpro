@@ -117,9 +117,20 @@ function hostAllowed(hostname: string, allowedHosts: string[]): boolean {
   return allowedHosts.some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
 }
 
+export function importStageLabel(stage: number | undefined): string {
+  if (!Number.isFinite(Number(stage)) || Number(stage) <= 0) return "(initial URL)";
+  const bounded = Math.max(1, Math.min(MAX_REDIRECTS + 1, Math.floor(Number(stage))));
+  return `(redirect ${bounded})`;
+}
+
+function sanitizedImportHostError(hostname: string, stage: number | undefined, reason: string): CodexProError {
+  const host = String(hostname || "").toLowerCase().replace(/\.$/, "") || "unknown";
+  return new CodexProError(`Attachment download host rejected: ${host} ${importStageLabel(stage)} — ${reason}`);
+}
+
 export async function assertSafeImportUrl(
   rawUrl: string,
-  options: { allowLoopback?: boolean; allowedHosts?: string[]; env?: NodeJS.ProcessEnv } = {}
+  options: { allowLoopback?: boolean; allowedHosts?: string[]; env?: NodeJS.ProcessEnv; stage?: number } = {}
 ): Promise<URL> {
   let parsed: URL;
   try {
@@ -135,18 +146,19 @@ export async function assertSafeImportUrl(
   }
   const host = parsed.hostname.toLowerCase();
   if (!host) throw new CodexProError("Attachment download_url is missing a hostname.");
+  const stage = options.stage ?? 0;
   const allowLoopback = options.allowLoopback ?? boolFrom((options.env ?? process.env).CODEXPRO_IMPORT_ALLOW_LOOPBACK, false);
   const allowedHosts = options.allowedHosts ?? importAllowedHosts(options.env);
   const isLoopbackHost = host === "localhost" || host === "127.0.0.1" || host === "::1";
   if (isLoopbackHost) {
-    if (!allowLoopback) throw new CodexProError("Attachment download_url points to a blocked host.");
+    if (!allowLoopback) throw sanitizedImportHostError(host, stage, "blocked host.");
   } else if (!hostAllowed(host, allowedHosts)) {
-    throw new CodexProError("Attachment download_url host is not an approved ChatGPT file origin.");
+    throw sanitizedImportHostError(host, stage, "not an approved ChatGPT file origin.");
   }
 
   if (net.isIP(host)) {
     if (isPrivateOrLocalIp(host) && !(allowLoopback && isLoopbackHost)) {
-      throw new CodexProError("Attachment download_url resolves to a blocked address.");
+      throw sanitizedImportHostError(host, stage, "resolves to a blocked address.");
     }
     return parsed;
   }
@@ -155,12 +167,12 @@ export async function assertSafeImportUrl(
   try {
     records = await dns.lookup(host, { all: true, verbatim: true });
   } catch {
-    throw new CodexProError("Attachment download_url hostname could not be resolved.");
+    throw sanitizedImportHostError(host, stage, "hostname could not be resolved.");
   }
-  if (!records.length) throw new CodexProError("Attachment download_url hostname could not be resolved.");
+  if (!records.length) throw sanitizedImportHostError(host, stage, "hostname could not be resolved.");
   for (const record of records) {
     if (isPrivateOrLocalIp(record.address) && !(allowLoopback && isLoopbackHost)) {
-      throw new CodexProError("Attachment download_url resolves to a blocked address.");
+      throw sanitizedImportHostError(host, stage, "resolves to a blocked address.");
     }
   }
   return parsed;
@@ -201,7 +213,7 @@ async function downloadToTempFile(
   const tempPath = path.join(os.tmpdir(), `codexpro-import-${process.pid}-${randomBytes(8).toString("hex")}.bin`);
   let current = url;
   for (let redirect = 0; redirect <= MAX_REDIRECTS; redirect += 1) {
-    await assertSafeImportUrl(current.href, options);
+    await assertSafeImportUrl(current.href, { ...options, stage: redirect });
     const result = await new Promise<{
       statusCode: number;
       headers: http.IncomingHttpHeaders;
