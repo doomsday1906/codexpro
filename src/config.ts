@@ -251,7 +251,7 @@ function boolFrom(value: string | undefined, fallback = false): boolean {
 }
 
 function aiBridgeEnabledFrom(value: string | undefined, source = "--ai-bridge"): boolean {
-  if (value === undefined) return true;
+  if (value === undefined || value === '') return true;
   const normalized = String(value).trim().toLowerCase();
   if (["1", "true", "yes", "y", "on", "enabled", "enable"].includes(normalized)) return true;
   if (["0", "false", "no", "n", "off", "disabled", "disable"].includes(normalized)) return false;

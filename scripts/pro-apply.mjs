@@ -30,6 +30,7 @@ function parseArgs(argv) {
     const key = eq === -1 ? raw.slice(2) : raw.slice(2, eq);
     const inlineValue = eq === -1 ? undefined : raw.slice(eq + 1);
     if (key === 'help') out.help = true;
+    else if (key === 'no-profile') out.noProfile = true;
     else if (key === 'stdin') out.stdin = true;
     else if (key === 'append') out.append = true;
     else {

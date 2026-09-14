@@ -41,7 +41,7 @@ export interface WorkspaceProfile {
 }
 
 export function aiBridgeEnabledFromProfile(profile: WorkspaceProfile | undefined | null): boolean {
-  if (!profile || profile.aiBridgeEnabled === undefined || profile.aiBridgeEnabled === null) return true;
+  if (!profile || profile.aiBridgeEnabled === undefined || profile.aiBridgeEnabled === null || (profile.aiBridgeEnabled as unknown) === '') return true;
   if (typeof profile.aiBridgeEnabled === "boolean") return profile.aiBridgeEnabled;
   const normalized = String(profile.aiBridgeEnabled).trim().toLowerCase();
   if (["1", "true", "yes", "y", "on", "enabled", "enable"].includes(normalized)) return true;

@@ -37,6 +37,7 @@ function parseArgs(argv) {
     const key = eq === -1 ? raw.slice(2) : raw.slice(2, eq);
     const inlineValue = eq === -1 ? undefined : raw.slice(eq + 1);
     if (key === 'help') out.help = true;
+    else if (key === 'no-profile') out.noProfile = true;
     else if (key === 'copy') out.copy = true;
     else if (key === 'no-important-files') out.noImportantFiles = true;
     else if (key === 'no-changed-files') out.noChangedFiles = true;
