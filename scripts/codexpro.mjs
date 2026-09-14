@@ -921,23 +921,23 @@ function toolCardsCliArgs(args, profile = {}) {
   return ['--tool-cards', optionBool(args, profile, 'toolCards', ['CODEXPRO_TOOL_CARDS'], false) ? 'on' : 'off'];
 }
 
-function aiBridgeFromValue(value, fallback = true) {
+function aiBridgeFromValue(value, fallback = true, source = '--ai-bridge') {
   if (value === undefined || value === null || value === '') return fallback;
   if (typeof value === 'boolean') return value;
   const normalized = String(value).trim().toLowerCase();
   if (['1', 'true', 'yes', 'y', 'on', 'enabled', 'enable'].includes(normalized)) return true;
   if (['0', 'false', 'no', 'n', 'off', 'disabled', 'disable'].includes(normalized)) return false;
-  return fallback;
+  throw new Error(`${source} must be on or off (accepted: on/off, true/false, 1/0, yes/no, enabled/disabled). Got: ${String(value).slice(0, 80)}`);
 }
 
 function aiBridgeOption(args, profile = {}) {
-  if (args.aiBridge !== undefined) return aiBridgeFromValue(args.aiBridge, true);
-  if (args['ai-bridge'] !== undefined) return aiBridgeFromValue(args['ai-bridge'], true);
+  if (args.aiBridge !== undefined) return aiBridgeFromValue(args.aiBridge, true, '--ai-bridge');
+  if (args['ai-bridge'] !== undefined) return aiBridgeFromValue(args['ai-bridge'], true, '--ai-bridge');
   for (const envName of ['CODEXPRO_AI_BRIDGE']) {
-    if (process.env[envName] !== undefined && process.env[envName] !== '') return aiBridgeFromValue(process.env[envName], true);
+    if (process.env[envName] !== undefined && process.env[envName] !== '') return aiBridgeFromValue(process.env[envName], true, envName);
   }
   if (profile?.aiBridgeEnabled !== undefined && profile.aiBridgeEnabled !== '' && profile.aiBridgeEnabled !== null) {
-    return aiBridgeFromValue(profile.aiBridgeEnabled, true);
+    return aiBridgeFromValue(profile.aiBridgeEnabled, true, 'aiBridgeEnabled profile value');
   }
   return true;
 }
@@ -950,6 +950,35 @@ function aiBridgeProfileEntry(args, profile = {}) {
   const enabled = aiBridgeOption(args, profile);
   if (!hasAiBridgeInput(args, profile) && enabled === true) return {};
   return { aiBridgeEnabled: enabled };
+}
+
+function assertAiBridgeAllowedForHelper(helperArgv, commandName) {
+  if (helperArgv.includes('--help')) return;
+  let helperRootRaw;
+  let helperAiBridge;
+  let helperNoProfile = false;
+  for (let i = 0; i < helperArgv.length; i += 1) {
+    const token = helperArgv[i];
+    if (token === '--root' || token === '--ai-bridge' || token === '--aiBridge') {
+      helperRootRaw = token === '--root' ? (helperArgv[i + 1] ?? helperRootRaw) : helperRootRaw;
+      if (token !== '--root') helperAiBridge = helperArgv[i + 1];
+      i += 1;
+    } else if (token.startsWith('--root=')) {
+      helperRootRaw = token.slice('--root='.length);
+    } else if (token.startsWith('--ai-bridge=')) {
+      helperAiBridge = token.slice('--ai-bridge='.length);
+    } else if (token.startsWith('--aiBridge=')) {
+      helperAiBridge = token.slice('--aiBridge='.length);
+    } else if (token === '--no-profile') {
+      helperNoProfile = true;
+    }
+  }
+  const helperArgs = helperAiBridge !== undefined ? { aiBridge: helperAiBridge } : {};
+  const helperRoot = realDir(helperRootRaw ?? process.env.CODEXPRO_ROOT ?? process.cwd());
+  const helperProfile = helperNoProfile ? {} : loadWorkspaceProfile(helperRoot);
+  if (aiBridgeOption(helperArgs, helperProfile) === false) {
+    throw new Error(`AI Bridge is disabled. \`.ai-bridge\` ${commandName} commands are unavailable. Enable with: codexpro settings set --root ${helperRoot} --ai-bridge on`);
+  }
 }
 
 function validateBashSession(value) {
@@ -4177,9 +4206,11 @@ async function main() {
     return;
   }
   if (subcommand === 'pro-bundle' || subcommand === 'bundle') {
+    assertAiBridgeAllowedForHelper(argv.slice(1), 'pro-bundle');
     runHelperScript('pro-bundle.mjs', argv.slice(1));
   }
   if (subcommand === 'pro-apply' || subcommand === 'apply') {
+    assertAiBridgeAllowedForHelper(argv.slice(1), 'pro-apply');
     runHelperScript('pro-apply.mjs', argv.slice(1));
   }
   if (subcommand === 'install-cloudflared') {

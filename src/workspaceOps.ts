@@ -258,9 +258,12 @@ export async function readCodexContext(
   const targetPath = options.targetPath ?? ".";
   guard.resolve(workspace, targetPath);
   const agents = await readAgentsChain(config, guard, workspace, targetPath, Math.min(options.maxAgentBytes ?? 60_000, config.maxReadBytes));
-  const ai = options.includeAiBridge === false
-    ? { text: "Skipped by request.", files: [] }
-    : await readAiBridgeContext(config, guard, workspace);
+  const bridgeOff = (config as { aiBridgeEnabled?: boolean }).aiBridgeEnabled === false;
+  const ai = bridgeOff
+    ? { text: "", files: [] as string[] }
+    : options.includeAiBridge === false
+      ? { text: "Skipped by request.", files: [] as string[] }
+      : await readAiBridgeContext(config, guard, workspace);
   const status = options.includeGit === false ? undefined : gitStatus(config, workspace);
   const diff = options.includeDiff ? gitDiff(config, guard, workspace) : undefined;
 
@@ -277,10 +280,7 @@ export async function readCodexContext(
     "## AGENTS Instructions",
     "",
     agents.text,
-    "",
-    "## AI Bridge Context",
-    "",
-    ai.text,
+    ...(bridgeOff ? [] : ["", "## AI Bridge Context", "", ai.text]),
     ...(status !== undefined ? ["", "## Git Status", "", status] : []),
     ...(diff !== undefined ? ["", "## Git Diff", "", diff] : [])
   ].join("\n");

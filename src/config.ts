@@ -250,12 +250,12 @@ function boolFrom(value: string | undefined, fallback = false): boolean {
   return ["1", "true", "yes", "y", "on"].includes(value.toLowerCase());
 }
 
-function aiBridgeEnabledFrom(value: string | undefined): boolean {
+function aiBridgeEnabledFrom(value: string | undefined, source = "--ai-bridge"): boolean {
   if (value === undefined) return true;
   const normalized = String(value).trim().toLowerCase();
   if (["1", "true", "yes", "y", "on", "enabled", "enable"].includes(normalized)) return true;
   if (["0", "false", "no", "n", "off", "disabled", "disable"].includes(normalized)) return false;
-  return true;
+  throw new Error(`${source} must be on or off (accepted: on/off, true/false, 1/0, yes/no, enabled/disabled). Got: ${String(value).slice(0, 80)}`);
 }
 
 export function parseContainmentWrapper(raw: string | undefined): string[] | undefined {
@@ -368,7 +368,10 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     codexDir: expandHome(codexDirArg || process.env.CODEXPRO_CODEX_DIR || path.join(os.homedir(), ".codex")),
     writeMode: writeModeFrom(writeArg ?? process.env.CODEXPRO_WRITE_MODE),
     toolMode: toolModeFrom(toolModeArg ?? process.env.CODEXPRO_TOOL_MODE),
-    aiBridgeEnabled: aiBridgeEnabledFrom(aiBridgeArg ?? process.env.CODEXPRO_AI_BRIDGE),
+    aiBridgeEnabled: aiBridgeEnabledFrom(
+      aiBridgeArg ?? process.env.CODEXPRO_AI_BRIDGE,
+      aiBridgeArg !== undefined ? "--ai-bridge" : "CODEXPRO_AI_BRIDGE"
+    ),
     inheritEnv: process.env.CODEXPRO_INHERIT_ENV === "1",
     maxReadBytes: numberFrom(process.env.CODEXPRO_MAX_READ_BYTES, 180_000, 4_000, 2_000_000),
     maxWriteBytes: numberFrom(process.env.CODEXPRO_MAX_WRITE_BYTES, 1_000_000, 1_000, 10_000_000),

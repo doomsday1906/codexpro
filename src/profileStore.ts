@@ -44,8 +44,9 @@ export function aiBridgeEnabledFromProfile(profile: WorkspaceProfile | undefined
   if (!profile || profile.aiBridgeEnabled === undefined || profile.aiBridgeEnabled === null) return true;
   if (typeof profile.aiBridgeEnabled === "boolean") return profile.aiBridgeEnabled;
   const normalized = String(profile.aiBridgeEnabled).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on", "enabled", "enable"].includes(normalized)) return true;
   if (["0", "false", "no", "n", "off", "disabled", "disable"].includes(normalized)) return false;
-  return true;
+  throw new Error(`Invalid aiBridgeEnabled profile value; expected boolean (accepted: on/off, true/false, 1/0, yes/no, enabled/disabled). Got: ${String(profile.aiBridgeEnabled).slice(0, 80)}`);
 }
 
 export interface RuntimeConnection {

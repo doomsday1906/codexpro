@@ -1,7 +1,8 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 class McpStdioClient {
@@ -47,33 +48,191 @@ class McpStdioClient {
   }
 }
 
+function cliRun(args, env) {
+  const result = spawnSync(process.execPath, ['scripts/codexpro.mjs', ...args], {
+    cwd: path.resolve('.'),
+    env,
+    encoding: 'utf8'
+  });
+  if (result.status !== 0) {
+    throw new Error(`codexpro ${args.join(' ')} failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  }
+  return `${result.stdout}\n${result.stderr}`;
+}
+
+function cliFail(args, env, pattern) {
+  const result = spawnSync(process.execPath, ['scripts/codexpro.mjs', ...args], {
+    cwd: path.resolve('.'),
+    env,
+    encoding: 'utf8'
+  });
+  if (result.status === 0) {
+    throw new Error(`codexpro ${args.join(' ')} unexpectedly succeeded\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  }
+  const output = `${result.stdout}\n${result.stderr}`;
+  if (pattern && !pattern.test(output)) {
+    throw new Error(`codexpro ${args.join(' ')} failed for the wrong reason\n${output}`);
+  }
+  return output;
+}
+
+function helperFail(script, args, env, pattern) {
+  const result = spawnSync(process.execPath, [path.join('scripts', script), ...args], {
+    cwd: path.resolve('.'),
+    env,
+    encoding: 'utf8'
+  });
+  if (result.status === 0) {
+    throw new Error(`node scripts/${script} ${args.join(' ')} unexpectedly succeeded\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  }
+  const output = `${result.stdout}\n${result.stderr}`;
+  if (pattern && !pattern.test(output)) {
+    throw new Error(`node scripts/${script} ${args.join(' ')} failed for the wrong reason\n${output}`);
+  }
+  return output;
+}
+
+async function readProfile(root, home) {
+  const realRoot = await fs.realpath(root);
+  const id = createHash('sha256').update(realRoot).digest('hex').slice(0, 24);
+  return JSON.parse(await fs.readFile(path.join(home, 'profiles', `${id}.json`), 'utf8'));
+}
+
+async function census(root) {
+  const entries = [];
+  async function walk(dir, rel) {
+    let names;
+    try {
+      names = await fs.readdir(dir);
+    } catch {
+      return;
+    }
+    for (const name of names.sort()) {
+      const abs = path.join(dir, name);
+      const r = rel ? `${rel}/${name}` : name;
+      const stat = await fs.stat(abs);
+      if (stat.isDirectory()) {
+        entries.push(`${r}/`);
+        await walk(abs, r);
+      } else {
+        entries.push(r);
+      }
+    }
+  }
+  await walk(root, '');
+  return entries;
+}
+
+const BRIDGE_TOOLS = ['read_handoff', 'wait_for_handoff', 'export_pro_context', 'handoff_to_agent', 'handoff_to_codex'];
+const BRIDGE_ALIASES = ['handoff_poll', 'pro_export', 'agent_handoff', 'codex_handoff'];
+
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-aibridge-smoke-'));
+const cliRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-aibridge-cli-'));
+const cliHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-aibridge-home-'));
+const tempDirs = [root, cliRoot, cliHome];
 try {
   const { loadConfig } = await import(pathToFileURL(path.join(path.resolve('.'), 'dist', 'config.js')).href);
   const { aiBridgeEnabledFromProfile } = await import(pathToFileURL(path.join(path.resolve('.'), 'dist', 'profileStore.js')).href);
 
-  // Default/enabled: missing key defaults to enabled
+  // ---- 1. Profile/config defaults + strict parsing ----
   if (aiBridgeEnabledFromProfile({}) !== true) throw new Error('missing profile key should default to enabled');
   if (aiBridgeEnabledFromProfile({ aiBridgeEnabled: undefined }) !== true) throw new Error('undefined should default to enabled');
+  if (aiBridgeEnabledFromProfile({ aiBridgeEnabled: null }) !== true) throw new Error('null should default to enabled');
   if (aiBridgeEnabledFromProfile({ aiBridgeEnabled: false }) !== false) throw new Error('false should stay disabled');
   if (aiBridgeEnabledFromProfile({ aiBridgeEnabled: true }) !== true) throw new Error('true should stay enabled');
+  for (const spelling of ['on', 'ON', 'off', 'OFF', 'true', 'false', '1', '0', 'yes', 'no', 'enabled', 'disabled']) {
+    const expected = ['on', 'true', '1', 'yes', 'enabled'].includes(spelling.toLowerCase());
+    const got = aiBridgeEnabledFromProfile({ aiBridgeEnabled: spelling });
+    if (got !== expected) throw new Error(`profile spelling ${spelling} should be ${expected}`);
+  }
+  let malformedProfileFailed = false;
+  try {
+    aiBridgeEnabledFromProfile({ aiBridgeEnabled: 'definitely-not-off' });
+  } catch (error) {
+    malformedProfileFailed = true;
+    if (!/Invalid aiBridgeEnabled profile value/i.test(String(error.message))) {
+      throw new Error(`malformed profile wrong error: ${error.message}`);
+    }
+  }
+  if (!malformedProfileFailed) throw new Error('malformed profile value should throw, not default ON');
 
   const defaultConfig = loadConfig(['--root', root, '--write', 'workspace', '--bash', 'off']);
   if (defaultConfig.aiBridgeEnabled !== true) throw new Error('default config should be enabled');
   const offConfig = loadConfig(['--root', root, '--write', 'workspace', '--bash', 'off', '--ai-bridge', 'off']);
   if (offConfig.aiBridgeEnabled !== false) throw new Error('--ai-bridge off should disable');
-  const envOff = loadConfig(['--root', root, '--write', 'workspace', '--bash', 'off']);
-  // env override check via explicit env
+  for (const spelling of ['on', 'off', 'true', 'false', '1', '0', 'yes', 'no', 'enabled', 'disabled']) {
+    const expected = ['on', 'true', '1', 'yes', 'enabled'].includes(spelling);
+    const c = loadConfig(['--root', root, '--write', 'workspace', '--bash', 'off', '--ai-bridge', spelling]);
+    if (c.aiBridgeEnabled !== expected) throw new Error(`CLI spelling ${spelling} should be ${expected}`);
+  }
+  let badCliFailed = false;
+  try {
+    loadConfig(['--root', root, '--write', 'workspace', '--bash', 'off', '--ai-bridge', 'garbage']);
+  } catch (error) {
+    badCliFailed = true;
+    if (!/--ai-bridge must be on or off/i.test(String(error.message))) {
+      throw new Error(`bad CLI wrong error: ${error.message}`);
+    }
+  }
+  if (!badCliFailed) throw new Error('invalid --ai-bridge should throw, not default ON');
   process.env.CODEXPRO_AI_BRIDGE = '0';
   try {
-    const fromEnv = (await import(pathToFileURL(path.join(path.resolve('.'), 'dist', 'config.js')).href + `?t=${Date.now()}`)).loadConfig;
-    const c = fromEnv(['--root', root, '--write', 'workspace', '--bash', 'off']);
-    if (c.aiBridgeEnabled !== false) throw new Error('CODEXPRO_AI_BRIDGE=0 should disable');
+    const fromEnv = loadConfig(['--root', root, '--write', 'workspace', '--bash', 'off']);
+    if (fromEnv.aiBridgeEnabled !== false) throw new Error('CODEXPRO_AI_BRIDGE=0 should disable');
   } finally {
     delete process.env.CODEXPRO_AI_BRIDGE;
   }
+  process.env.CODEXPRO_AI_BRIDGE = 'garbage';
+  let badEnvFailed = false;
+  try {
+    loadConfig(['--root', root, '--write', 'workspace', '--bash', 'off']);
+  } catch (error) {
+    badEnvFailed = true;
+    if (!/CODEXPRO_AI_BRIDGE must be on or off/i.test(String(error.message))) {
+      throw new Error(`bad env wrong error: ${error.message}`);
+    }
+  } finally {
+    delete process.env.CODEXPRO_AI_BRIDGE;
+  }
+  if (!badEnvFailed) throw new Error('invalid CODEXPRO_AI_BRIDGE should throw, not default ON');
 
-  // Seed pre-existing bridge file
+  // ---- 2. Saved-profile CLI behavior (persisted OFF) ----
+  const cliEnv = { ...process.env, CODEXPRO_HOME: cliHome };
+  await fs.writeFile(path.join(cliRoot, 'plan.md'), '# CLI Proof Plan\n\nDo things.\n', 'utf8');
+  const cliBridgeDir = path.join(cliRoot, '.ai-bridge');
+  await fs.mkdir(cliBridgeDir, { recursive: true });
+  const cliMarkerPath = path.join(cliBridgeDir, 'secret-marker.md');
+  const cliMarkerContent = '# secret-marker DO_NOT_INJECT_CLI_OFF\n';
+  await fs.writeFile(cliMarkerPath, cliMarkerContent, 'utf8');
+  cliRun(['settings', 'set', '--root', cliRoot, '--tunnel', 'none', '--ai-bridge', 'off'], cliEnv);
+  const offProfile = await readProfile(cliRoot, cliHome);
+  if (offProfile.aiBridgeEnabled !== false) throw new Error('saved OFF not persisted');
+  const beforeCensus = await census(cliRoot);
+
+  const bridgeErr = /AI Bridge is disabled/i;
+  cliFail(['pro-apply', '--root', cliRoot, '--file', path.join(cliRoot, 'plan.md')], cliEnv, bridgeErr);
+  cliFail(['apply', '--root', cliRoot, '--file', path.join(cliRoot, 'plan.md')], cliEnv, bridgeErr);
+  helperFail('pro-apply.mjs', ['--root', cliRoot, '--file', path.join(cliRoot, 'plan.md')], cliEnv, bridgeErr);
+  cliFail(['pro-bundle', '--root', cliRoot, '--no-diff', '--no-changed-files'], cliEnv, bridgeErr);
+  cliFail(['bundle', '--root', cliRoot, '--no-diff', '--no-changed-files'], cliEnv, bridgeErr);
+  helperFail('pro-bundle.mjs', ['--root', cliRoot, '--no-diff', '--no-changed-files'], cliEnv, bridgeErr);
+  cliFail(['execute-handoff', '--root', cliRoot, '--agent', 'opencode'], cliEnv, bridgeErr);
+  cliFail(['execute', '--root', cliRoot, '--agent', 'opencode'], cliEnv, bridgeErr);
+  cliFail(['watch-handoff', '--root', cliRoot, '--agent', 'opencode', '--yes'], cliEnv, bridgeErr);
+  cliFail(['watch', '--root', cliRoot, '--agent', 'opencode', '--yes'], cliEnv, bridgeErr);
+  cliFail(['loop-handoff', '--root', cliRoot, '--agent', 'opencode', '--yes', '--review-command', 'true'], cliEnv, bridgeErr);
+  cliFail(['loop', '--root', cliRoot, '--agent', 'opencode', '--yes', '--review-command', 'true'], cliEnv, bridgeErr);
+  const afterCensus = await census(cliRoot);
+  if (JSON.stringify(beforeCensus) !== JSON.stringify(afterCensus)) {
+    throw new Error(`OFF CLI created/modified files.\nbefore: ${JSON.stringify(beforeCensus)}\nafter: ${JSON.stringify(afterCensus)}`);
+  }
+  const markerAfter = await fs.readFile(cliMarkerPath, 'utf8');
+  if (markerAfter !== cliMarkerContent) throw new Error('pre-existing bridge marker was modified while OFF');
+
+  // Invalid CLI value must fail, never silently ON
+  cliFail(['settings', 'set', '--root', cliRoot, '--tunnel', 'none', '--ai-bridge', 'definitely-not-off'], cliEnv, /--ai-bridge must be on or off/i);
+
+  // ---- 3. MCP catalog/context neutrality with OFF ----
   const bridgeDir = path.join(root, '.ai-bridge');
   await fs.mkdir(bridgeDir, { recursive: true });
   const markerPath = path.join(bridgeDir, 'secret-marker.md');
@@ -81,15 +240,15 @@ try {
   await fs.writeFile(markerPath, markerContent, 'utf8');
 
   async function listTools(envExtra) {
-    const client = new McpStdioClient(process.execPath, ['dist/stdio.js', '--root', root, '--allow-root', root, '--write', 'workspace', '--bash', 'off', '--tool-mode', 'full'], {
+    const client = new McpStdioClient(process.execPath, ['dist/stdio.js', '--root', root, '--allow-root', root, '--write', 'workspace', '--bash', 'off', '--tool-mode', 'full', '--tool-cards', 'on'], {
       cwd: path.resolve('.'),
-      env: { ...process.env, CODEXPRO_ROOT: root, CODEXPRO_ALLOWED_ROOTS: root, CODEXPRO_WRITE_MODE: 'workspace', CODEXPRO_TOOL_MODE: 'full', CODEXPRO_ALLOW_NO_HTTP_TOKEN: '1', ...envExtra }
+      env: { ...process.env, CODEXPRO_ROOT: root, CODEXPRO_ALLOWED_ROOTS: root, CODEXPRO_WRITE_MODE: 'workspace', CODEXPRO_TOOL_MODE: 'full', CODEXPRO_BASH_MODE: 'off', CODEXPRO_TOOL_CARDS: '1', CODEXPRO_ALLOW_NO_HTTP_TOKEN: '1', ...envExtra }
     });
     try {
-      await client.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'aibridge-smoke', version: '0.1.0' } });
+      const init = await client.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'aibridge-smoke', version: '0.1.0' } });
       client.notify('notifications/initialized');
       const tools = await client.request('tools/list', {});
-      return { client, tools: tools.tools };
+      return { client, init, tools: tools.tools };
     } catch (e) {
       client.close();
       throw e;
@@ -101,37 +260,37 @@ try {
     const { client, tools } = await listTools({ CODEXPRO_AI_BRIDGE: '1' });
     try {
       const names = tools.map((t) => t.name);
-      for (const expected of ['read_handoff', 'wait_for_handoff', 'export_pro_context', 'handoff_to_agent', 'handoff_to_codex']) {
+      for (const expected of BRIDGE_TOOLS) {
         if (!names.includes(expected)) throw new Error(`enabled server missing bridge tool ${expected}`);
       }
       const opened = await client.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
       if (opened.isError) throw new Error(`open failed: ${JSON.stringify(opened)}`);
       const snap = await client.request('tools/call', { name: 'workspace_snapshot', arguments: { workspace_id: opened.structuredContent.workspace_id } });
       if (snap.isError) throw new Error(`enabled snapshot failed: ${JSON.stringify(snap)}`);
-      // server_config reports ON
       const cfg = await client.request('tools/call', { name: 'server_config', arguments: {} });
-      if (cfg.isError) throw new Error(`server_config failed: ${JSON.stringify(cfg)}`);
+      if (cfg.isError) throw new Error('server_config failed');
       if (cfg.structuredContent.aiBridgeEnabled !== true) throw new Error(`server_config should report true, got ${JSON.stringify(cfg.structuredContent)}`);
     } finally {
       client.close();
     }
   }
 
-  // Disabled: bridge tools absent, no creation/injection, writes preserved
+  // Disabled: full neutrality matrix
   {
-    const { client, tools } = await listTools({ CODEXPRO_AI_BRIDGE: '0' });
+    const { client, init, tools } = await listTools({ CODEXPRO_AI_BRIDGE: '0' });
     try {
+      const initBlob = JSON.stringify(init);
+      if (initBlob.includes('AI Bridge')) throw new Error('disabled init instructions mention AI Bridge');
+      if (initBlob.includes('.ai-bridge')) throw new Error('disabled init instructions mention .ai-bridge');
+
       const names = tools.map((t) => t.name);
-      for (const banned of ['read_handoff', 'wait_for_handoff', 'export_pro_context', 'handoff_to_agent', 'handoff_to_codex']) {
+      for (const banned of BRIDGE_TOOLS) {
         if (names.includes(banned)) throw new Error(`disabled server should not list ${banned}`);
       }
-      // Remaining descriptions must not advertise .ai-bridge
-      for (const tool of tools) {
-        const text = `${tool.name} ${tool.description ?? ''} ${JSON.stringify(tool.inputSchema ?? {})}`;
-        if (['workspace_snapshot', 'codex_context', 'codexpro_self_test'].includes(tool.name) && text.includes('.ai-bridge')) {
-          throw new Error(`disabled ${tool.name} advertises .ai-bridge: ${tool.description}`);
-        }
-      }
+      const toolsBlob = JSON.stringify(tools);
+      if (toolsBlob.includes('AI Bridge')) throw new Error('disabled tools/list advertises AI Bridge');
+      if (toolsBlob.includes('.ai-bridge')) throw new Error('disabled tools/list advertises .ai-bridge');
+
       const opened = await client.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
       if (opened.isError) throw new Error(`disabled open failed: ${JSON.stringify(opened)}`);
       const wsId = opened.structuredContent.workspace_id;
@@ -141,41 +300,64 @@ try {
       const snapText = JSON.stringify(snap);
       if (snapText.includes('DO_NOT_INJECT_7f3a9c')) throw new Error('disabled snapshot injected bridge contents');
       if (snapText.includes('.ai-bridge/current-plan')) throw new Error('disabled snapshot references bridge files');
+      if (snapText.includes('AI Bridge')) throw new Error('disabled snapshot mentions AI Bridge');
 
       const ctx = await client.request('tools/call', { name: 'codex_context', arguments: { workspace_id: wsId } });
       if (ctx.isError) throw new Error(`disabled codex_context failed: ${JSON.stringify(ctx)}`);
-      if (JSON.stringify(ctx).includes('DO_NOT_INJECT_7f3a9c')) throw new Error('disabled codex_context injected bridge');
+      const ctxText = JSON.stringify(ctx);
+      if (ctxText.includes('DO_NOT_INJECT_7f3a9c')) throw new Error('disabled codex_context injected bridge');
+      if (ctxText.includes('AI Bridge Context')) throw new Error('disabled codex_context has bridge section');
+      if (ctxText.includes('Skipped by request')) throw new Error('disabled codex_context has disabled placeholder');
+      if (ctxText.includes('AI Bridge')) throw new Error('disabled codex_context mentions AI Bridge');
+      if (ctxText.includes('.ai-bridge')) throw new Error('disabled codex_context mentions .ai-bridge');
 
       const self = await client.request('tools/call', { name: 'codexpro_self_test', arguments: { workspace_id: wsId } });
       if (self.isError) throw new Error(`disabled self-test failed: ${JSON.stringify(self)}`);
+      const selfText = JSON.stringify(self);
+      if (selfText.includes('AI Bridge')) throw new Error('disabled self-test mentions AI Bridge');
+      if (selfText.includes('.ai-bridge')) throw new Error('disabled self-test mentions .ai-bridge');
 
-      // Ordinary workspace write still works
       const written = await client.request('tools/call', { name: 'write', arguments: { workspace_id: wsId, path: 'notes/hello.txt', content: 'hello disabled bridge\n' } });
       if (written.isError) throw new Error(`disabled ordinary write failed: ${JSON.stringify(written)}`);
       const readBack = await fs.readFile(path.join(root, 'notes/hello.txt'), 'utf8');
       if (!readBack.includes('hello disabled bridge')) throw new Error('ordinary write content mismatch');
 
-      // server_config reports OFF
       const cfg = await client.request('tools/call', { name: 'server_config', arguments: {} });
-      if (cfg.isError) throw new Error(`disabled server_config failed`);
+      if (cfg.isError) throw new Error('disabled server_config failed');
       if (cfg.structuredContent.aiBridgeEnabled !== false) throw new Error('server_config should report false when disabled');
+
+      const sup = await client.request('tools/call', { name: 'codexpro', arguments: { action: 'list_actions' } });
+      if (sup.isError) throw new Error(`disabled list_actions failed: ${JSON.stringify(sup)}`);
+      const actions = sup.structuredContent.actions;
+      for (const banned of BRIDGE_TOOLS) {
+        if (actions.includes(banned)) throw new Error(`disabled supertool should not list action ${banned}`);
+      }
+      const aliases = sup.structuredContent.aliases;
+      for (const bannedAlias of BRIDGE_ALIASES) {
+        if (aliases[bannedAlias] !== undefined) throw new Error(`disabled supertool should not advertise alias ${bannedAlias}`);
+      }
+      const aliasBlob = JSON.stringify(aliases);
+      if (aliasBlob.includes('wait_for_handoff') || aliasBlob.includes('export_pro_context') || aliasBlob.includes('handoff_to_agent') || aliasBlob.includes('handoff_to_codex')) {
+        throw new Error(`disabled supertool aliases leak bridge targets: ${aliasBlob}`);
+      }
+      // Invoking an old bridge alias must not reach a hidden writer
+      const badAlias = await client.request('tools/call', { name: 'codexpro', arguments: { action: 'pro_export', args: {} } });
+      if (!badAlias.isError) throw new Error('disabled bridge alias unexpectedly succeeded');
     } finally {
       client.close();
     }
   }
 
-  // Filesystem census: no new .ai-bridge artifact created in disabled run (except seeded marker)
+  // Filesystem census: no new .ai-bridge artifact created in disabled run
   {
     const entries = await fs.readdir(bridgeDir);
     if (!entries.includes('secret-marker.md')) throw new Error('seeded marker missing');
-    // self-test probe must not exist
     try {
       await fs.access(path.join(bridgeDir, 'codexpro-self-test.md'));
       throw new Error('disabled self-test created bridge probe');
     } catch (e) {
       if (e.message.includes('created bridge probe')) throw e;
     }
-    // No pro-context created via disabled path (export tool absent, but check)
     const markerAfter = await fs.readFile(markerPath, 'utf8');
     if (markerAfter !== markerContent) throw new Error('pre-existing bridge file was modified');
   }
@@ -195,7 +377,23 @@ try {
     if (!failed) throw new Error('handoff+disabled should fail');
   }
 
+  // ---- 4. Enabled CLI regression (pro-apply/pro-bundle work when ON) ----
+  {
+    const enHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-aibridge-en-home-'));
+    const enRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-aibridge-en-root-'));
+    tempDirs.push(enHome, enRoot);
+    const enEnv = { ...process.env, CODEXPRO_HOME: enHome };
+    await fs.writeFile(path.join(enRoot, 'plan.md'), '# Enabled Plan\n\nWork.\n', 'utf8');
+    cliRun(['settings', 'set', '--root', enRoot, '--tunnel', 'none', '--ai-bridge', 'on'], enEnv);
+    cliRun(['pro-apply', '--root', enRoot, '--file', path.join(enRoot, 'plan.md')], enEnv);
+    cliRun(['pro-bundle', '--root', enRoot, '--no-diff', '--no-changed-files', '--no-ai-bridge'], enEnv);
+    const applied = await fs.readFile(path.join(enRoot, '.ai-bridge', 'current-plan.md'), 'utf8');
+    if (!applied.includes('Enabled Plan')) throw new Error('enabled pro-apply did not write plan');
+  }
+
   console.log('✓ aibridge smoke test passed');
 } finally {
-  await fs.rm(root, { recursive: true, force: true });
+  for (const dir of tempDirs) {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 }

@@ -86,13 +86,28 @@ async function main() {
   }
   requireBuild();
 
-  const [{ loadConfig }, { WorkspaceManager, PathGuard }, { ensureAiBridge, readTextFile, writeTextFile }] = await Promise.all([
+  const [{ loadConfig }, { WorkspaceManager, PathGuard }, { ensureAiBridge, readTextFile, writeTextFile }, { readWorkspaceProfile, aiBridgeEnabledFromProfile }] = await Promise.all([
     import('../dist/config.js'),
     import('../dist/guard.js'),
-    import('../dist/fsOps.js')
+    import('../dist/fsOps.js'),
+    import('../dist/profileStore.js')
   ]);
 
   const config = loadConfig(process.argv.slice(2));
+  {
+    const hasCliAiBridge = args.aiBridge !== undefined;
+    const hasEnvAiBridge = process.env.CODEXPRO_AI_BRIDGE !== undefined && process.env.CODEXPRO_AI_BRIDGE !== '';
+    if (!hasCliAiBridge && !hasEnvAiBridge) {
+      const savedProfile = readWorkspaceProfile(config.defaultRoot);
+      if (savedProfile.aiBridgeEnabled !== undefined && savedProfile.aiBridgeEnabled !== null) {
+        const effective = aiBridgeEnabledFromProfile(savedProfile);
+        config.aiBridgeEnabled = effective;
+      }
+    }
+    if (config.aiBridgeEnabled === false) {
+      throw new Error(`AI Bridge is disabled. \`.ai-bridge\` pro-apply commands are unavailable. Enable with: codexpro settings set --root ${config.defaultRoot} --ai-bridge on`);
+    }
+  }
   const guard = new PathGuard(config);
   const workspaces = new WorkspaceManager(config);
   const workspace = workspaces.openWorkspace(config.defaultRoot);

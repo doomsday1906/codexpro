@@ -1624,7 +1624,9 @@ function registerToolCardResource(server: McpServer, config: CodexProConfig): vo
       uri,
       {
         title: "CodexPro Tool Card",
-        description: "Compact visual renderer for CodexPro workspace orientation, source changes, and handoffs.",
+        description: aiBridgeEnabled(config)
+          ? "Compact visual renderer for CodexPro workspace orientation, source changes, and handoffs."
+          : "Compact visual renderer for CodexPro workspace orientation and source changes.",
         mimeType: TOOL_CARD_MIME_TYPE
       },
       async () => ({
@@ -1642,7 +1644,9 @@ function registerToolCardResource(server: McpServer, config: CodexProConfig): vo
                   resourceDomains: []
                 }
               },
-              "openai/widgetDescription": "Renders CodexPro workspace orientation, diagnostics, file diffs, change reviews, terminal checks, Pro context exports, and handoff plans as compact developer cards with bounded previews.",
+              "openai/widgetDescription": aiBridgeEnabled(config)
+                ? "Renders CodexPro workspace orientation, diagnostics, file diffs, change reviews, terminal checks, Pro context exports, and handoff plans as compact developer cards with bounded previews."
+                : "Renders CodexPro workspace orientation, diagnostics, file diffs, change reviews, and terminal checks as compact developer cards with bounded previews.",
               "openai/widgetPrefersBorder": true,
               "openai/widgetDomain": config.widgetDomain,
               "openai/widgetCSP": {
@@ -2009,7 +2013,9 @@ function serverInstructions(config: CodexProConfig, diagnosticContext?: CodexPro
     config.connectionTest
       ? "5. Connection test mode is read-only. Write, patch, export, and handoff-writing tools are unavailable."
       : bridgeOff
-        ? "5. Edit source files with write/edit/apply_patch when authorized. AI Bridge handoff files are disabled on this server; do not create or reference .ai-bridge workflows."
+        ? config.writeMode === "workspace"
+          ? "5. Edit source files with write/edit/apply_patch. After edits, call show_changes once for git status, diff stats, and review diff."
+          : "5. Write/edit/apply_patch tools are disabled. Do not attempt direct file writes."
         : config.writeMode === "workspace"
       ? "5. Edit source files with write/edit/apply_patch. After edits, call show_changes once for git status, diff stats, and review diff."
       : config.writeMode === "handoff"
@@ -3020,6 +3026,10 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         (name) => name !== SUPERTOOL_NAME && !SUPERTOOL_EXCLUDED_ACTIONS.has(name)
       );
       if (action === "list_actions" || action === "help") {
+        const availableAliases: Record<string, string> = {};
+        for (const [alias, target] of Object.entries(SUPERTOOL_ACTION_ALIASES)) {
+          if (target === "list_actions" || names.includes(target)) availableAliases[alias] = target;
+        }
         const text = [
           "# CodexPro Supertool",
           "",
@@ -3038,7 +3048,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         return textResult(text, {
           actions: names,
           action_count: names.length,
-          aliases: SUPERTOOL_ACTION_ALIASES,
+          aliases: availableAliases,
           tool_mode: config.toolMode,
           bash_mode: config.bashMode,
           write_mode: config.writeMode
@@ -3326,12 +3336,12 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     "codexpro_self_test",
     {
       title: "CodexPro Self Test",
-      description: aiBridgeEnabled(config)
-        ? "Run one controlled, local-only CodexPro diagnostic. It checks modes, expected tools, workspace access, skills, git, safe bash policy, selected-only Pro context, and optional .ai-bridge write/edit probe without touching source files."
-        : "Run one controlled, local-only CodexPro diagnostic. It checks modes, expected tools, workspace access, skills, git, safe bash policy, and selected-only Pro context without touching source files. AI Bridge is disabled on this server.",
+      description: "Run one controlled, local-only CodexPro diagnostic. It checks modes, expected tools, workspace access, skills, git, safe bash policy, and selected-only Pro context without touching source files.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
-        write_probe: z.boolean().optional().describe(aiBridgeEnabled(config) ? "Create/edit only .ai-bridge/codexpro-self-test.md. Default: true." : "AI Bridge is disabled on this server; no bridge probe is created. Default: true."),
+        ...(aiBridgeEnabled(config)
+          ? { write_probe: z.boolean().optional().describe("Create/edit only .ai-bridge/codexpro-self-test.md. Default: true.") }
+          : {}),
         bash_probe: z.boolean().optional().describe("Check bash policy with safe local commands only. Default: true."),
         pro_context_probe: z.boolean().optional().describe("Build a selected-only Pro context bundle in memory without writing pro-context.md. Default: true."),
         include_global_skills: z.boolean().optional().describe("Include user/plugin skill discovery in the inventory check. Default: true."),
@@ -3402,7 +3412,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
 
       if (parseBool(args.write_probe, true)) {
         if (!aiBridgeEnabled(config)) {
-          check("write/edit probe", "warn", "skipped because AI Bridge is disabled");
+          check("write/edit probe", "warn", "skipped (optional write probe unavailable in current configuration)");
         } else if (config.writeMode === "off") {
           check("write/edit probe", "warn", "skipped because CODEXPRO_WRITE_MODE=off");
         } else {
@@ -3743,7 +3753,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         max_files: z.number().int().min(1).max(3000).optional().describe("Alias for maximum tree entries. Default: 500."),
         include_skills: z.boolean().optional().describe("Discover skills by name/description. Default: false for speed."),
         include_global_skills: z.boolean().optional().describe("Also scan installed user/plugin skills when include_skills=true. Default: false."),
-        bootstrap_context: z.boolean().optional().describe(aiBridgeEnabled(config) ? "Deprecated and ignored. Use handoff_to_agent to create .ai-bridge files." : "Deprecated and ignored. AI Bridge is disabled on this server.")
+        bootstrap_context: z.boolean().optional().describe("Deprecated and ignored.")
       },
       annotations: SESSION_READ_ANNOTATIONS,
       _meta: {
@@ -3791,7 +3801,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
       title: "Workspace Snapshot",
       description: aiBridgeEnabled(config)
         ? "Return git status, recent commits, .ai-bridge context, and a compact tree for an opened workspace."
-        : "Return git status, recent commits, and a compact tree for an opened workspace. AI Bridge is disabled on this server.",
+        : "Return git status, recent commits, and a compact tree for an opened workspace.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         max_depth: z.number().int().min(1).max(8).optional().describe("Tree depth. Default: 3."),
@@ -5481,11 +5491,13 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
       title: "Codex Context",
       description: aiBridgeEnabled(config)
         ? "Load Codex-style workspace context in one call: AGENTS instructions for a target path, .ai-bridge handoff files, and optional git status/diff."
-        : "Load Codex-style workspace context in one call: AGENTS instructions for a target path and optional git status/diff. AI Bridge is disabled on this server.",
+        : "Load Codex-style workspace context in one call: AGENTS instructions for a target path and optional git status/diff.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         target_path: z.string().optional().describe("Workspace-relative file or directory whose AGENTS instruction chain should be loaded. Default: ."),
-        include_ai_bridge: z.boolean().optional().describe(aiBridgeEnabled(config) ? "Include .ai-bridge plan, agent status, diff, decisions, questions, and execution log. Default: true." : "AI Bridge is disabled on this server; this option is ignored. Default: true."),
+        ...(aiBridgeEnabled(config)
+          ? { include_ai_bridge: z.boolean().optional().describe("Include .ai-bridge plan, agent status, diff, decisions, questions, and execution log. Default: true.") }
+          : {}),
         include_git: z.boolean().optional().describe("Include git status. Default: true."),
         include_diff: z.boolean().optional().describe("Include full git diff. Default: false for speed/noise."),
         max_agent_bytes: z.number().int().min(1000).max(200000).optional().describe("Maximum bytes per AGENTS file. Default: 60000.")
