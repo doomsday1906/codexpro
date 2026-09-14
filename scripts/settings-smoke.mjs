@@ -344,6 +344,21 @@ const bridgeOnProfile = await readProfile(root, home);
 if (bridgeOnProfile.aiBridgeEnabled !== true) {
   throw new Error(`settings --ai-bridge on not persisted: ${JSON.stringify(bridgeOnProfile)}`);
 }
+// Malformed persisted value must fail display, never render as ON
+{
+  const realRoot = await fs.realpath(root);
+  const malformedId = createHash('sha256').update(realRoot).digest('hex').slice(0, 24);
+  const malformedPath = path.join(home, 'profiles', `${malformedId}.json`);
+  const savedRaw = await fs.readFile(malformedPath, 'utf8');
+  try {
+    const poisoned = JSON.parse(savedRaw);
+    poisoned.aiBridgeEnabled = 'garbage';
+    await fs.writeFile(malformedPath, `${JSON.stringify(poisoned, null, 2)}\n`, 'utf8');
+    runFail(['settings', 'show', '--root', root], env, /aiBridgeEnabled profile value must be on or off/i);
+  } finally {
+    await fs.writeFile(malformedPath, savedRaw, 'utf8');
+  }
+}
 runFail(['settings', 'set', '--root', policyRoot, '--mode', 'handoff', '--ai-bridge', 'off'], env, /handoff mode requires AI Bridge/i);
 
 runFail([

@@ -232,6 +232,97 @@ try {
   // Invalid CLI value must fail, never silently ON
   cliFail(['settings', 'set', '--root', cliRoot, '--tunnel', 'none', '--ai-bridge', 'definitely-not-off'], cliEnv, /--ai-bridge must be on or off/i);
 
+  // ---- 2b. --no-profile parity: saved OFF ignored, CLI > env > default ----
+  {
+    const noProfilePlan = await fs.readFile(path.join(cliRoot, '.ai-bridge', 'current-plan.md'), 'utf8').catch(() => null);
+    if (noProfilePlan !== null) throw new Error('current-plan.md should not exist before --no-profile runs');
+    cliRun(['pro-apply', '--root', cliRoot, '--file', path.join(cliRoot, 'plan.md'), '--no-profile'], cliEnv);
+    cliRun(['apply', '--root', cliRoot, '--file', path.join(cliRoot, 'plan.md'), '--no-profile'], cliEnv);
+    const directApply = spawnSync(process.execPath, ['scripts/pro-apply.mjs', '--root', cliRoot, '--file', path.join(cliRoot, 'plan.md'), '--no-profile'], {
+      cwd: path.resolve('.'),
+      env: cliEnv,
+      encoding: 'utf8'
+    });
+    if (directApply.status !== 0) throw new Error(`direct pro-apply --no-profile failed\n${directApply.stdout}\n${directApply.stderr}`);
+    cliRun(['pro-bundle', '--root', cliRoot, '--no-diff', '--no-changed-files', '--no-profile'], cliEnv);
+    cliRun(['bundle', '--root', cliRoot, '--no-diff', '--no-changed-files', '--no-profile'], cliEnv);
+    const directBundle = spawnSync(process.execPath, ['scripts/pro-bundle.mjs', '--root', cliRoot, '--no-diff', '--no-changed-files', '--no-profile'], {
+      cwd: path.resolve('.'),
+      env: cliEnv,
+      encoding: 'utf8'
+    });
+    if (directBundle.status !== 0) throw new Error(`direct pro-bundle --no-profile failed\n${directBundle.stdout}\n${directBundle.stderr}`);
+    const wrotePlan = await fs.readFile(path.join(cliRoot, '.ai-bridge', 'current-plan.md'), 'utf8');
+    if (!wrotePlan.includes('CLI Proof Plan')) throw new Error('--no-profile pro-apply did not write expected plan');
+    await fs.access(path.join(cliRoot, '.ai-bridge', 'pro-context.md'));
+    const markerNoProfile = await fs.readFile(cliMarkerPath, 'utf8');
+    if (markerNoProfile !== cliMarkerContent) throw new Error('--no-profile run modified pre-existing marker');
+    // Explicit env OFF still overrides --no-profile
+    const envOffNoProfile = { ...cliEnv, CODEXPRO_AI_BRIDGE: 'off' };
+    cliFail(['pro-apply', '--root', cliRoot, '--file', path.join(cliRoot, 'plan.md'), '--no-profile'], envOffNoProfile, bridgeErr);
+    cliFail(['pro-bundle', '--root', cliRoot, '--no-diff', '--no-changed-files', '--no-profile'], envOffNoProfile, bridgeErr);
+    // Explicit CLI OFF still overrides --no-profile
+    cliFail(['pro-apply', '--root', cliRoot, '--file', path.join(cliRoot, 'plan.md'), '--ai-bridge', 'off', '--no-profile'], cliEnv, bridgeErr);
+    cliFail(['pro-bundle', '--root', cliRoot, '--no-diff', '--no-changed-files', '--ai-bridge', 'off', '--no-profile'], cliEnv, bridgeErr);
+  }
+
+  // ---- 2c. Fresh-root OFF: blocked paths leave .ai-bridge absent ----
+  {
+    const freshRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-aibridge-fresh-'));
+    tempDirs.push(freshRoot);
+    await fs.writeFile(path.join(freshRoot, 'plan.md'), '# Fresh Plan\n\nWork.\n', 'utf8');
+    cliRun(['settings', 'set', '--root', freshRoot, '--tunnel', 'none', '--ai-bridge', 'off'], cliEnv);
+    cliFail(['pro-apply', '--root', freshRoot, '--file', path.join(freshRoot, 'plan.md')], cliEnv, bridgeErr);
+    helperFail('pro-apply.mjs', ['--root', freshRoot, '--file', path.join(freshRoot, 'plan.md')], cliEnv, bridgeErr);
+    cliFail(['pro-bundle', '--root', freshRoot, '--no-diff', '--no-changed-files'], cliEnv, bridgeErr);
+    helperFail('pro-bundle.mjs', ['--root', freshRoot, '--no-diff', '--no-changed-files'], cliEnv, bridgeErr);
+    cliFail(['execute-handoff', '--root', freshRoot, '--agent', 'opencode'], cliEnv, bridgeErr);
+    let bridgeExists = true;
+    try {
+      await fs.access(path.join(freshRoot, '.ai-bridge'));
+      bridgeExists = true;
+    } catch {
+      bridgeExists = false;
+    }
+    if (bridgeExists) throw new Error('fresh-root OFF run created .ai-bridge');
+  }
+
+  // ---- 2d. Malformed saved profile must never display as ON ----
+  {
+    const realCliRoot = await fs.realpath(cliRoot);
+    const malformedId = createHash('sha256').update(realCliRoot).digest('hex').slice(0, 24);
+    const malformedPath = path.join(cliHome, 'profiles', `${malformedId}.json`);
+    const savedRaw = await fs.readFile(malformedPath, 'utf8');
+    try {
+      const poisoned = JSON.parse(savedRaw);
+      poisoned.aiBridgeEnabled = 'garbage';
+      await fs.writeFile(malformedPath, `${JSON.stringify(poisoned, null, 2)}\n`, 'utf8');
+      const showResult = spawnSync(process.execPath, ['scripts/codexpro.mjs', 'settings', 'show', '--root', cliRoot], {
+        cwd: path.resolve('.'),
+        env: cliEnv,
+        encoding: 'utf8'
+      });
+      const showOutput = `${showResult.stdout}\n${showResult.stderr}`;
+      if (showResult.status === 0) throw new Error(`malformed settings show unexpectedly succeeded\n${showOutput}`);
+      if (!/aiBridgeEnabled profile value must be on or off/i.test(showOutput)) {
+        throw new Error(`malformed settings show wrong error\n${showOutput}`);
+      }
+      if (/AI Bridge\s+on/i.test(showOutput)) throw new Error(`malformed profile displayed as ON\n${showOutput}`);
+      const listResult = spawnSync(process.execPath, ['scripts/codexpro.mjs', 'settings', 'list'], {
+        cwd: path.resolve('.'),
+        env: cliEnv,
+        encoding: 'utf8'
+      });
+      if (/AI Bridge\s+on/i.test(`${listResult.stdout}\n${listResult.stderr}`)) {
+        throw new Error('settings list misreported malformed profile as ON');
+      }
+    } finally {
+      await fs.writeFile(malformedPath, savedRaw, 'utf8');
+    }
+    const restored = await readProfile(cliRoot, cliHome);
+    if (restored.aiBridgeEnabled !== false) throw new Error('profile restore after malformed test failed');
+  }
+
   // ---- 3. MCP catalog/context neutrality with OFF ----
   const bridgeDir = path.join(root, '.ai-bridge');
   await fs.mkdir(bridgeDir, { recursive: true });

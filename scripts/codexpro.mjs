@@ -3726,7 +3726,7 @@ function printProfile(root, profile) {
     ...(safe.write ? [labelValue('Write', safe.write)] : []),
     ...(safe.toolMode ? [labelValue('Tool mode', safe.toolMode)] : []),
     ...(safe.toolCards !== undefined ? [labelValue('Tool cards', safe.toolCards ? 'on' : 'off')] : []),
-    labelValue('AI Bridge', safe.aiBridgeEnabled === false ? 'off' : 'on'),
+    labelValue('AI Bridge', aiBridgeFromValue(profile.aiBridgeEnabled, true, 'aiBridgeEnabled profile value') ? 'on' : 'off'),
     ...(safe.gitPushPolicy
       ? [labelValue('Git push policy', safe.gitPushPolicy.enabled ? `enabled (${safe.gitPushPolicy.rules.length} rule${safe.gitPushPolicy.rules.length === 1 ? '' : 's'})` : 'disabled')]
       : []),

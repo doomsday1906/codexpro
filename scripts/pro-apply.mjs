@@ -98,7 +98,7 @@ async function main() {
   {
     const hasCliAiBridge = args.aiBridge !== undefined;
     const hasEnvAiBridge = process.env.CODEXPRO_AI_BRIDGE !== undefined && process.env.CODEXPRO_AI_BRIDGE !== '';
-    if (!hasCliAiBridge && !hasEnvAiBridge) {
+    if (!args.noProfile && !hasCliAiBridge && !hasEnvAiBridge) {
       const savedProfile = readWorkspaceProfile(config.defaultRoot);
       if (savedProfile.aiBridgeEnabled !== undefined && savedProfile.aiBridgeEnabled !== null) {
         const effective = aiBridgeEnabledFromProfile(savedProfile);
