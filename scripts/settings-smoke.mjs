@@ -11,6 +11,35 @@ import {
   readCloudflaredAssetResponse,
   verifyCloudflaredAsset
 } from './cloudflared-release.mjs';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import {
+  descendantProcessIds,
+  parseProcessTable,
+  processTableInvocation,
+  processTreeTerminationInvocation
+} from './launcher-process-tree.mjs';
+
+const portableMacProcessList = processTableInvocation('darwin');
+if (portableMacProcessList.command !== 'ps' || portableMacProcessList.args.join(' ') !== '-A -o pid=,ppid=') {
+  throw new Error(`macOS process discovery must use portable ps columns; got ${JSON.stringify(portableMacProcessList)}`);
+}
+const portableLinuxProcessList = processTableInvocation('linux');
+if (portableLinuxProcessList.command !== 'ps' || portableLinuxProcessList.args.join(' ') !== '-A -o pid=,ppid=') {
+  throw new Error(`Linux process discovery must use portable ps columns; got ${JSON.stringify(portableLinuxProcessList)}`);
+}
+const portableRows = parseProcessTable('41 7\n42 41\n43 42\nnot-a-process-row');
+if (JSON.stringify(descendantProcessIds(portableRows, 41).sort((a, b) => a - b)) !== JSON.stringify([42, 43])) {
+  throw new Error('portable process-table parser did not find transitive descendants');
+}
+const windowsTreeKill = processTreeTerminationInvocation('win32', 4242);
+if (
+  windowsTreeKill?.command !== 'taskkill.exe'
+  || windowsTreeKill.args.join(' ') !== '/PID 4242 /T /F'
+  || processTreeTerminationInvocation('linux', 4242) !== null
+) {
+  throw new Error(`Windows managed children must select recursive taskkill independently of wrapper type; got ${JSON.stringify(windowsTreeKill)}`);
+}
 
 const pinnedCloudflared = cloudflaredReleaseAsset('darwin', 'arm64');
 if (
@@ -176,13 +205,23 @@ async function processExists(pid) {
 }
 
 function directChildPids(pid) {
-  const result = process.platform === 'win32'
-    ? spawnSync('powershell.exe', ['-NoProfile', '-Command', `@(Get-CimInstance Win32_Process -Filter "ParentProcessId=${pid}" | ForEach-Object { $_.ProcessId }) -join ' '`], { encoding: 'utf8' })
-    : spawnSync('ps', ['-o', 'pid=', '--ppid', String(pid)], { encoding: 'utf8' });
+  const invocation = processTableInvocation();
+  const result = spawnSync(invocation.command, invocation.args, { encoding: 'utf8', windowsHide: true, timeout: 5_000 });
   if (result.error || result.status !== 0) {
     throw new Error(`could not inspect launcher child processes: ${result.error?.message ?? result.stderr}`);
   }
-  return result.stdout.trim().split(/\s+/).filter(Boolean).map(Number).filter(Number.isInteger);
+  return parseProcessTable(result.stdout)
+    .filter((row) => row.parentPid === pid)
+    .map((row) => row.pid);
+}
+
+function processSnapshot() {
+  const invocation = processTableInvocation();
+  const result = spawnSync(invocation.command, invocation.args, { encoding: 'utf8', windowsHide: true, timeout: 5_000 });
+  if (result.error || result.status !== 0) {
+    throw new Error(`could not inspect managed process tree: ${result.error?.message ?? result.stderr}`);
+  }
+  return parseProcessTable(result.stdout);
 }
 
 async function reapProcess(pid, label) {
@@ -242,6 +281,13 @@ async function startObservedLauncher(args, env, root, label) {
     }
     throw new Error(`${error.message}\n${label} output:\n${output}`);
   }
+}
+
+async function createLauncherMcpClient(port) {
+  const client = new Client({ name: 'launcher-supervision-smoke', version: '1.0.0' });
+  const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
+  await client.connect(transport);
+  return { client, close: () => client.close() };
 }
 
 async function startLauncherBeforeTunnelReady(args, env, tunnelPidPath, label) {
@@ -907,6 +953,110 @@ await recordShutdownCase('stubborn fake tunnel shutdown', async () => {
     }
   }
 });
+
+if (process.platform !== 'win32') {
+  await recordShutdownCase('active managed verification descendant shutdown', async () => {
+    const activeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-settings-active-verification-'));
+    const activePort = await getFreePort();
+    const descendantPidPath = path.join(home, 'active-verification-descendant.pid');
+    const descendantTermPath = path.join(home, 'active-verification-descendant.term');
+    const fixturePath = path.resolve('scripts/launcher-supervision-stubborn-child.mjs');
+    const quoteScriptArg = (value) => `"${String(value).replaceAll('"', '""')}"`;
+    await fs.writeFile(path.join(activeRoot, 'package.json'), JSON.stringify({
+      name: 'codexpro-launcher-supervision-fixture',
+      version: '1.0.0',
+      scripts: {
+        supervision_probe: [process.execPath, fixturePath, descendantPidPath, descendantTermPath]
+          .map(quoteScriptArg)
+          .join(' ')
+      }
+    }, null, 2));
+
+    let launch;
+    let client;
+    let descendantPid;
+    try {
+      launch = await startObservedLauncher([
+        '--root', activeRoot,
+        '--tunnel', 'none',
+        '--port', String(activePort),
+        '--headless',
+        '--no-auth',
+        '--bash', 'full',
+        '--tool-mode', 'full'
+      ], withoutProxyEnv(env), activeRoot, 'active managed verification descendant');
+      const opened = await createLauncherMcpClient(activePort);
+      client = opened.client;
+      const workspace = await client.callTool({ name: 'open_current_workspace', arguments: {} });
+      if (workspace.isError) throw new Error(`could not open disposable workspace: ${JSON.stringify(workspace)}`);
+      const workspaceId = workspace.structuredContent?.workspace_id;
+      if (typeof workspaceId !== 'string' || !workspaceId) {
+        throw new Error(`open_current_workspace did not return a workspace ID: ${JSON.stringify(workspace)}`);
+      }
+      const started = await client.callTool({
+        name: 'start_verification',
+        arguments: {
+          workspace_id: workspaceId,
+          runner: 'package_script',
+          package_manager: 'npm',
+          script: 'supervision_probe',
+          lifetime_ms: 60_000
+        }
+      });
+      if (started.isError) throw new Error(`managed verification fixture did not start: ${JSON.stringify(started)}`);
+      descendantPid = Number(await waitForFileText(descendantPidPath, 'managed verification descendant PID'));
+      if (!Number.isInteger(descendantPid) || descendantPid <= 0 || !await processExists(descendantPid)) {
+        throw new Error(`managed verification descendant is not alive at shutdown setup: ${descendantPid}`);
+      }
+      const descendants = descendantProcessIds(processSnapshot(), launch.runtime.runtimePid);
+      if (!descendants.includes(descendantPid)) {
+        throw new Error(`fixture PID ${descendantPid} is not below HTTP child ${launch.runtime.runtimePid}; descendants=${JSON.stringify(descendants)}`);
+      }
+      await opened.close();
+      client = undefined;
+
+      const startedAt = Date.now();
+      launch.child.kill('SIGTERM');
+      const closed = await waitForLauncherClose(launch.child, 'active managed verification launcher', 15_000);
+      const descendantAliveAtLauncherClose = await processExists(descendantPid);
+      if (descendantAliveAtLauncherClose) {
+        throw new Error(`managed verification descendant PID ${descendantPid} was still alive when launcher close was observed`);
+      }
+      const termText = await fs.readFile(descendantTermPath, 'utf8');
+      const termMatch = termText.match(/^(\d+) SIGTERM$/m);
+      if (!termMatch) throw new Error(`managed descendant did not record SIGTERM: ${termText}`);
+      const elapsedSinceTermMs = Date.now() - Number(termMatch[1]);
+      if (elapsedSinceTermMs < 1_200) {
+        throw new Error(`SIGTERM-resistant managed child ended after ${elapsedSinceTermMs}ms; expected internal escalation after its grace`);
+      }
+      if (closed.code !== 143) {
+        throw new Error(`launcher exited code=${closed.code} signal=${closed.signal}; expected intentional SIGTERM code 143`);
+      }
+      await waitForProcessExit(descendantPid, 'managed verification descendant after launcher shutdown');
+      await waitForProcessExit(launch.runtime.runtimePid, 'HTTP child after active verification shutdown');
+      await assertPortReusable(activePort, 'active managed verification shutdown');
+      await assertPathMissing(launch.runtimePath, 'runtime status after active verification shutdown');
+      await assertPathMissing(launch.failurePath, 'last-failure after active verification shutdown');
+      return {
+        elapsedMs: Date.now() - startedAt,
+        elapsedSinceTermMs,
+        launcherPid: launch.child.pid,
+        httpPid: launch.runtime.runtimePid,
+        descendantPid,
+        port: activePort
+      };
+    } catch (error) {
+      throw new Error(`${error.message}; launcherPid=${launch?.child.pid ?? 'unknown'}; httpPid=${launch?.runtime.runtimePid ?? 'unknown'}; descendantPid=${descendantPid ?? 'unknown'}; port=${activePort}; output=${launch?.output() ?? ''}`);
+    } finally {
+      if (client) await client.close().catch(() => {});
+      if (descendantPid) await reapProcess(descendantPid, 'active managed verification descendant');
+      if (launch) {
+        await reapProcess(launch.runtime.runtimePid, 'active verification HTTP child');
+        await reapProcess(launch.child.pid, 'active verification launcher');
+      }
+    }
+  });
+}
 if (shutdownCaseFailures.length) {
   throw new Error(`launcher shutdown regression cases failed:\n${shutdownCaseFailures.join('\n')}`);
 }
