@@ -1037,6 +1037,9 @@ if (process.platform !== 'win32') {
       await assertPortReusable(activePort, 'active managed verification shutdown');
       await assertPathMissing(launch.runtimePath, 'runtime status after active verification shutdown');
       await assertPathMissing(launch.failurePath, 'last-failure after active verification shutdown');
+      console.log(
+        `PASS active managed verification shutdown: launcherPid=${launch.child.pid} httpPid=${launch.runtime.runtimePid} descendantPid=${descendantPid} port=${activePort} exitCode=${closed.code} termToCloseMs=${elapsedSinceTermMs} portRebound=true runtimeCurrentRemoved=true lastFailureAbsent=true`
+      );
       return {
         elapsedMs: Date.now() - startedAt,
         elapsedSinceTermMs,
