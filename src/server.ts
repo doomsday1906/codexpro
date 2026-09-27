@@ -1666,7 +1666,7 @@ function registerToolCardResource(server: McpServer, config: CodexProConfig): vo
   }
 }
 
-type CodexToolHandler = (args: any) => Promise<any> | any;
+type CodexToolHandler = (args: any, extra?: { signal?: AbortSignal }) => Promise<any> | any;
 
 const SUPERTOOL_NAME = "codexpro";
 // Mutation tools with their own strict public contract must not be reachable
@@ -1748,12 +1748,12 @@ function registerToolCompat(
   server: McpServer,
   name: string,
   options: Record<string, unknown>,
-  handler: (args: any) => Promise<any> | any
+  handler: CodexToolHandler
 ): void {
-  const wrapped = async (args: any) => {
+  const wrapped = async (args: any, extra?: { signal?: AbortSignal }) => {
     const started = Date.now();
     try {
-      const result = tagToolResult(await handler(args ?? {}), name, options);
+      const result = tagToolResult(await handler(args ?? {}, extra), name, options);
       logToolCall(name, result?.isError ? "error" : "ok", started);
       return result;
     } catch (error) {
@@ -2001,7 +2001,7 @@ function registerCodexTool(
   handler: CodexToolHandler
 ): void {
   if (!shouldRegisterTool(config, name)) return;
-  const validatedHandler: CodexToolHandler = (args) => handler(validateToolArgs(name, options, args));
+  const validatedHandler: CodexToolHandler = (args, extra) => handler(validateToolArgs(name, options, args), extra);
   registerToolCompat(server, name, descriptorOptionsForConfig(config, name, options), validatedHandler);
   rememberRegisteredTool(server, name);
   if (!SUPERTOOL_EXCLUDED_ACTIONS.has(name)) rememberRegisteredToolHandler(server, name, validatedHandler);
@@ -3020,7 +3020,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         "openai/toolInvocation/invoked": "CodexPro supertool action complete"
       }
     },
-    async (args) => {
+    async (args, extra) => {
       const action = normalizeSupertoolAction(args.action);
       const names = registeredToolNames(server).filter(
         (name) => name !== SUPERTOOL_NAME && !SUPERTOOL_EXCLUDED_ACTIONS.has(name)
@@ -3077,7 +3077,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
           : {};
       let result: any;
       try {
-        result = await handler(childArgs);
+        result = await handler(childArgs, extra);
       } catch (error) {
         result = errorResult(error);
       }
@@ -5653,7 +5653,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
             "openai/toolInvocation/invoked": "Codex session read"
           }
         },
-        async (args) => {
+        async (args, extra) => {
           const result = await readCodexSession(config, {
             sessionId: args.session_id,
             sourcePath: args.source_path,
@@ -5662,7 +5662,8 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
             maxMessages: args.max_messages,
             maxTotalBytes: args.max_total_bytes,
             excludeToolOutputs: args.exclude_tool_outputs,
-            maxToolOutputBytes: args.max_tool_output_bytes
+            maxToolOutputBytes: args.max_tool_output_bytes,
+            signal: extra?.signal
           });
           return textResult(result.text, {
             session: result.session,
