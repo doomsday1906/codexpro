@@ -62,7 +62,13 @@ interface SessionMessageRecord {
 }
 
 const SESSION_READ_BLOCK_BYTES = 64 * 1024;
+const SESSION_READ_YIELD_BYTES = 1024 * 1024;
 const DEFAULT_TOOL_OUTPUT_BYTES = 20_000;
+
+async function yieldSessionRead(signal?: AbortSignal): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  signal?.throwIfAborted();
+}
 
 function codexDir(config: CodexProConfig): string {
   return path.resolve(config.codexDir || path.join(os.homedir(), ".codex"));
@@ -361,13 +367,15 @@ function clampCursor(value: number | undefined, size: number, direction: "head" 
   return value;
 }
 
-async function* readJsonlLinesFromHead(filePath: string, startOffset: number, endOffset: number): AsyncGenerator<JsonlLine> {
+async function* readJsonlLinesFromHead(filePath: string, startOffset: number, endOffset: number, signal?: AbortSignal): AsyncGenerator<JsonlLine> {
   const handle = await fsp.open(filePath, "r");
   try {
     let position = startOffset;
+    let bytesSinceYield = 0;
     let pending: Buffer[] = [];
     let pendingStart = startOffset;
     while (position < endOffset) {
+      signal?.throwIfAborted();
       const length = Math.min(SESSION_READ_BLOCK_BYTES, endOffset - position);
       const chunk = Buffer.alloc(length);
       const { bytesRead } = await handle.read(chunk, 0, length, position);
@@ -391,6 +399,11 @@ async function* readJsonlLinesFromHead(filePath: string, startOffset: number, en
       const remainder = current.subarray(lineStart);
       if (remainder.length) pending.push(remainder);
       position += bytesRead;
+      bytesSinceYield += bytesRead;
+      if (bytesSinceYield >= SESSION_READ_YIELD_BYTES) {
+        bytesSinceYield = 0;
+        await yieldSessionRead(signal);
+      }
     }
     if (pending.length) {
       const line = Buffer.concat(pending);
@@ -401,13 +414,15 @@ async function* readJsonlLinesFromHead(filePath: string, startOffset: number, en
   }
 }
 
-async function* readJsonlLinesFromTail(filePath: string, endOffset: number): AsyncGenerator<JsonlLine> {
+async function* readJsonlLinesFromTail(filePath: string, endOffset: number, signal?: AbortSignal): AsyncGenerator<JsonlLine> {
   const handle = await fsp.open(filePath, "r");
   try {
     let position = endOffset;
+    let bytesSinceYield = 0;
     let pending: Buffer[] = [];
     let pendingEnd = endOffset;
     while (position > 0) {
+      signal?.throwIfAborted();
       const start = Math.max(0, position - SESSION_READ_BLOCK_BYTES);
       const length = position - start;
       const chunk = Buffer.alloc(length);
@@ -433,6 +448,11 @@ async function* readJsonlLinesFromTail(filePath: string, endOffset: number): Asy
       const remainder = current.subarray(0, lineEnd);
       if (remainder.length) pending.push(remainder);
       position = start;
+      bytesSinceYield += bytesRead;
+      if (bytesSinceYield >= SESSION_READ_YIELD_BYTES) {
+        bytesSinceYield = 0;
+        await yieldSessionRead(signal);
+      }
     }
     if (pending.length) {
       const line = Buffer.concat(pending.slice().reverse());
@@ -506,19 +526,21 @@ async function loadSessionMessages(
     maxTotalBytes: number;
     excludeToolOutputs: boolean;
     maxToolOutputBytes: number;
+    signal?: AbortSignal;
   }
 ): Promise<{ messages: CodexSessionMessage[]; truncated: boolean; cursor: number; resumeCursor: number; nextCursor?: number; hasMore: boolean; sourceSizeBytes: number }> {
   const sourceSizeBytes = (await fsp.stat(filePath)).size;
   const cursor = clampCursor(options.cursor, sourceSizeBytes, options.direction);
   const lines = options.direction === "tail"
-    ? readJsonlLinesFromTail(filePath, cursor)
-    : readJsonlLinesFromHead(filePath, cursor, sourceSizeBytes);
+    ? readJsonlLinesFromTail(filePath, cursor, options.signal)
+    : readJsonlLinesFromHead(filePath, cursor, sourceSizeBytes, options.signal);
   const records: SessionMessageRecord[] = [];
   let usedBytes = 0;
   let truncated = false;
   let hasMore = false;
 
   for await (const line of lines) {
+    options.signal?.throwIfAborted();
     const parsed = messageFromJsonlLine(line.line, options);
     if (!parsed) continue;
     if (records.length >= options.maxMessages || usedBytes >= options.maxTotalBytes) {
@@ -569,9 +591,12 @@ export async function readCodexSession(
     maxTotalBytes?: number;
     excludeToolOutputs?: boolean;
     maxToolOutputBytes?: number;
+    signal?: AbortSignal;
   } = {}
 ): Promise<CodexSessionReadResult> {
+  options.signal?.throwIfAborted();
   const session = await resolveSessionSource(config, options.sessionId, options.sourcePath);
+  options.signal?.throwIfAborted();
   const direction = options.direction === "head" ? "head" : "tail";
   const maxMessages = Math.max(1, Math.min(Number(options.maxMessages ?? 80), 400));
   const maxTotalBytes = Math.max(4_000, Math.min(Number(options.maxTotalBytes ?? 80_000), 400_000));
@@ -582,7 +607,8 @@ export async function readCodexSession(
     maxMessages,
     maxTotalBytes,
     excludeToolOutputs: options.excludeToolOutputs === true,
-    maxToolOutputBytes
+    maxToolOutputBytes,
+    signal: options.signal
   });
   const transcript = messages.map((message) => {
     const when = message.ts ? ` ${new Date(message.ts).toISOString()}` : "";
