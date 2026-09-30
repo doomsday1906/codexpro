@@ -53,6 +53,7 @@ export interface PtyRunResult {
   transcript: string;
   raw_observed_bytes: number;
   truncated: boolean;
+  output_drain_incomplete?: boolean;
   steps: PtyStepResultMetadata[];
   terminal_profile: PtyTerminalProfile;
   containment_enabled: boolean;
@@ -70,6 +71,35 @@ export interface PtyOwnershipCapability {
 }
 
 export const DEFAULT_UNSHARE_PATH = "/usr/bin/unshare";
+
+type TerminalReader = {
+  closed?: boolean;
+  once?: (event: string, listener: () => void) => unknown;
+};
+
+function terminalReaderForDrain(terminal: zigpty.Terminal): TerminalReader | undefined {
+  // zigpty 0.2.x emits process exit before its Unix PTY reader has drained.
+  // Terminal's own data callback survives that process-exit notification; the
+  // reader close event is the boundary after its buffered PTY bytes are emitted.
+  return (terminal as unknown as { _readable?: TerminalReader })._readable;
+}
+
+function waitForTerminalReaderDrain(reader: TerminalReader | undefined, timeoutMs: number): Promise<boolean> {
+  const once = reader?.once;
+  if (!reader || typeof once !== "function") return Promise.resolve(false);
+  if (reader.closed) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (drained: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(drained);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    once.call(reader, "close", () => finish(true));
+  });
+}
 
 /**
  * Validate that kernel-backed descendant ownership is available via unshare (user/PID namespace).
@@ -443,6 +473,7 @@ export class PtyRunManager {
   private readonly maxActive: number;
   private readonly containmentWrapper?: string[];
   private readonly backend: PtyBackend;
+  private readonly useTerminalDataCallback: boolean;
   private readonly hardOutputCeilingBytes: number;
   private readonly maxControlPayloadChars: number;
   private readonly processGraceTimeoutMs: number;
@@ -465,6 +496,7 @@ export class PtyRunManager {
     this.config = config;
     this.maxActive = options.maxActive ?? PTY_LIMITS.maxActivePtys;
     this.backend = options.backend ?? (zigpty as unknown as PtyBackend);
+    this.useTerminalDataCallback = options.backend === undefined;
     this.hardOutputCeilingBytes = options.hardOutputCeilingBytes ?? PTY_LIMITS.hardOutputCeilingBytes;
     this.maxControlPayloadChars = options.maxControlPayloadChars ?? 4096;
     this.processGraceTimeoutMs = options.processGraceTimeoutMs ?? 1500;
@@ -608,6 +640,21 @@ export class PtyRunManager {
     // CI must not suppress interactive prompts in PTY mode
     delete ptyEnv.CI;
 
+    const pipeline = new PtyTranscriptPipeline({
+      maxOutputBytes: this.config.maxOutputBytes,
+      hardOutputCeilingBytes: this.hardOutputCeilingBytes,
+      maxControlPayloadChars: this.maxControlPayloadChars
+    });
+    let terminalDataHandler: ((chunk: Uint8Array) => void) | undefined;
+    const terminal = this.useTerminalDataCallback
+      ? new zigpty.Terminal({
+          cols: PTY_LIMITS.fixedCols,
+          rows: PTY_LIMITS.fixedRows,
+          name: "xterm-256color",
+          data: (_terminal, chunk) => terminalDataHandler?.(chunk)
+        })
+      : undefined;
+
     const ptyOptions: zigpty.IPtyOptions = {
       cols: PTY_LIMITS.fixedCols,
       rows: PTY_LIMITS.fixedRows,
@@ -617,6 +664,7 @@ export class PtyRunManager {
       pipe: false,
       shell: false
     };
+    if (terminal) ptyOptions.terminal = terminal;
 
     let pty: zigpty.IPty;
     try {
@@ -630,12 +678,14 @@ export class PtyRunManager {
       this.activeCount = Math.max(0, this.activeCount - 1);
       try {
         pty?.close?.();
+        terminal?.close();
       } catch {}
       throw new CodexProError("Failed to spawn PTY process: invalid process ID returned by backend.", "pty_spawn_failed");
     }
 
     const startTime = Date.now();
     const pid = pty.pid;
+    const terminalReader = terminal ? terminalReaderForDrain(terminal) : undefined;
 
     const knownDescendants = new Set<number>();
     knownDescendants.add(pid);
@@ -649,12 +699,6 @@ export class PtyRunManager {
     scanTimer.unref();
 
     return new Promise<PtyRunResult>((resolve, reject) => {
-      const pipeline = new PtyTranscriptPipeline({
-        maxOutputBytes: this.config.maxOutputBytes,
-        hardOutputCeilingBytes: this.hardOutputCeilingBytes,
-        maxControlPayloadChars: this.maxControlPayloadChars
-      });
-
       const stepResults: PtyStepResultMetadata[] = [];
       let currentStepIndex = 0;
       let stepStartTime = Date.now();
@@ -663,6 +707,7 @@ export class PtyRunManager {
       let overallTimer: NodeJS.Timeout | undefined;
 
       let finalized = false;
+      let outputDrainIncomplete = false;
       let exitCode: number | null = null;
       let signal: string | null = null;
 
@@ -727,6 +772,9 @@ export class PtyRunManager {
           try {
             pty.close();
           } catch {}
+          try {
+            terminal?.close();
+          } catch {}
 
           // 5. Complete uncompleted step metadata
           if (stepResults.length < request.steps.length) {
@@ -761,7 +809,8 @@ export class PtyRunManager {
             signal,
             transcript: pipeRes.transcript,
             raw_observed_bytes: pipeRes.rawObservedBytes,
-            truncated: pipeRes.truncated,
+            truncated: pipeRes.truncated || outputDrainIncomplete,
+            ...(outputDrainIncomplete ? { output_drain_incomplete: true } : {}),
             steps: stepResults,
             terminal_profile: {
               cols: PTY_LIMITS.fixedCols,
@@ -839,6 +888,9 @@ export class PtyRunManager {
         try {
           pty.close();
         } catch {}
+        try {
+          terminal?.close();
+        } catch {}
 
         this.activeRuns.delete(activeHandle);
         this.activeCount = Math.max(0, this.activeCount - 1);
@@ -857,7 +909,7 @@ export class PtyRunManager {
       };
 
       try {
-        dataSub = pty.onData((chunk) => {
+        const onOutput = (chunk: Buffer | Uint8Array | string) => {
           if (finalized) return;
           const sanitizedText = pipeline.push(chunk);
 
@@ -921,18 +973,25 @@ export class PtyRunManager {
               this.onMatcherBufferUpdate?.(matcherBuffer.length, matcherBuffer);
             }
           }
-        });
+        };
+        if (terminal) {
+          terminalDataHandler = onOutput;
+        } else {
+          dataSub = pty.onData(onOutput);
+        }
 
         exitSub = pty.onExit((info) => {
           exitCode = info.exitCode ?? null;
           const sigNum = typeof info.signal === "number" && info.signal > 0 ? info.signal : null;
           signal = sigNum !== null ? String(sigNum) : null;
           if (!finalized) {
-            if (exitCode === 0 && sigNum === null) {
-              void finalize("succeeded").catch(() => {});
-            } else {
-              void finalize("failed").catch(() => {});
-            }
+            const terminalState = exitCode === 0 && sigNum === null ? "succeeded" : "failed";
+            void (async () => {
+              if (terminal) {
+                outputDrainIncomplete = !(await waitForTerminalReaderDrain(terminalReader, this.processKillWaitTimeoutMs));
+              }
+              if (!finalized) await finalize(terminalState);
+            })().catch(() => {});
           }
         });
       } catch (listenerError) {

@@ -245,13 +245,19 @@ try {
       }
 
       const multiline = Array.from({ length: 135 }, () => "m".repeat(100)).join("\n") + "\n";
-      const multilineResult = await client.callTool({
-        name: "pty_run",
-        arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", `process.stdout.write(Array.from({length:135},()=>"m".repeat(100)).join("\\n")+"\\n")`] }
-      });
-      assert.equal(multilineResult.structuredContent?.truncated, false);
-      assert.equal(multilineResult.structuredContent?.transcript?.length, multiline.length, "multiline equivalent output length must survive intact");
-      assert.equal(multilineResult.structuredContent?.transcript, multiline, "multiline equivalent output must survive intact");
+      const multilineCode = `const fs=require("node:fs");const output=Buffer.from(Array.from({length:135},()=>"m".repeat(100)).join("\\n")+"\\n");let written=0;while(written<output.length)written+=fs.writeSync(1,output,written);fs.writeSync(2,Buffer.from("END:"+written+"\\n"))`;
+      const multilineWithCompletion = `${multiline}END:${Buffer.byteLength(multiline)}\n`;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const multilineResult = await client.callTool({
+          name: "pty_run",
+          arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", multilineCode] }
+        });
+        assert.equal(multilineResult.structuredContent?.truncated, false, `multiline output attempt ${attempt + 1} must not be truncated`);
+        assert.equal(multilineResult.structuredContent?.output_drain_incomplete, undefined, `multiline output attempt ${attempt + 1} must report a complete drain`);
+        assert.equal(multilineResult.structuredContent?.raw_observed_bytes, Buffer.byteLength(multilineWithCompletion) + 136, `multiline output attempt ${attempt + 1} must observe every emitted byte including PTY newline expansion; actual=${multilineResult.structuredContent?.raw_observed_bytes}, text=${multilineResult.structuredContent?.transcript?.length}, suffix=${JSON.stringify(multilineResult.structuredContent?.transcript?.slice(-40))}`);
+        assert.equal(multilineResult.structuredContent?.transcript?.length, multilineWithCompletion.length, `multiline output attempt ${attempt + 1} must preserve the full length`);
+        assert.equal(multilineResult.structuredContent?.transcript, multilineWithCompletion, `multiline output attempt ${attempt + 1} must survive intact`);
+      }
 
       const splitCredential = "API_TOKEN=chunk-cross-credential-value-9384756102";
       const splitCredentialCode = `process.stdout.write(${JSON.stringify(splitCredential.slice(0, 13))});setTimeout(()=>process.stdout.write(${JSON.stringify(splitCredential.slice(13) + "\\n")}),100)`;
