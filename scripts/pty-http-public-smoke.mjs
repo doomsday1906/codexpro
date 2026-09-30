@@ -194,6 +194,22 @@ try {
         ptyResult.structuredContent?.transcript?.includes("[REDACTED_SECRET]"),
         "Transcript must contain [REDACTED_SECRET] redaction marker"
       );
+
+      const missionControlValue = { mission_control: { response: "x".repeat(13_500) } };
+      const missionControlPayload = JSON.stringify(missionControlValue);
+      const missionControlCode = `process.stdout.write(JSON.stringify({mission_control:{response:"x".repeat(13500)}})+"\\n")`;
+      const longJsonResult = await client.callTool({
+        name: "pty_run",
+        arguments: {
+          workspace_id: wsIdA,
+          argv: ["node", "-e", missionControlCode]
+        }
+      });
+      assert.ok(!longJsonResult.isError, `long JSON pty_run over HTTP must succeed: ${JSON.stringify(longJsonResult)}`);
+      assert.equal(longJsonResult.structuredContent?.state, "succeeded");
+      assert.equal(longJsonResult.structuredContent?.truncated, false);
+      assert.equal(longJsonResult.structuredContent?.transcript, `${missionControlPayload}\n`);
+      assert.doesNotMatch(longJsonResult.structuredContent?.transcript ?? "", /\[REDACTED_SECRET\]/);
     } finally {
       await close();
     }

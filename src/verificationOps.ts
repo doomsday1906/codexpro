@@ -446,12 +446,22 @@ interface StreamChunk {
 export class StreamingRedactor {
   private readonly decoder = new StringDecoder("utf8");
   private readonly keyScanner = createPrivateKeyScanner();
+  private readonly maxPendingLineChars: number;
   private linePending = "";
   private suppressingOverlongLine = false;
   public hasSuppressedContent = false;
 
+  /** Default safety bound for callers without a tighter output-budget owner. */
   public static readonly MAX_PENDING_LINE_CHARS = 4096;
-  public static readonly SUPPRESSION_MARKER = "[REDACTED_SECRET]";
+  public static readonly OUTPUT_SUPPRESSION_MARKER = "[OUTPUT_SUPPRESSED: line exceeds configured retention limit]";
+
+  constructor(options: { maxPendingLineChars?: number } = {}) {
+    const maxPendingLineChars = options.maxPendingLineChars ?? StreamingRedactor.MAX_PENDING_LINE_CHARS;
+    if (!Number.isSafeInteger(maxPendingLineChars) || maxPendingLineChars <= 0) {
+      throw new CodexProError("maxPendingLineChars must be a positive safe integer.");
+    }
+    this.maxPendingLineChars = maxPendingLineChars;
+  }
 
   public push(chunk: Buffer): Buffer[] {
     const text = this.decoder.write(chunk);
@@ -494,11 +504,11 @@ export class StreamingRedactor {
       if (!nlMatch) {
         const combined = this.linePending + input;
         input = "";
-        if (combined.length > StreamingRedactor.MAX_PENDING_LINE_CHARS) {
+        if (combined.length > this.maxPendingLineChars) {
           this.hasSuppressedContent = true;
           this.suppressingOverlongLine = true;
           this.linePending = "";
-          outputChunks.push(Buffer.from(StreamingRedactor.SUPPRESSION_MARKER, "utf8"));
+          outputChunks.push(Buffer.from(StreamingRedactor.OUTPUT_SUPPRESSION_MARKER, "utf8"));
         } else {
           this.linePending = combined;
         }
@@ -510,9 +520,9 @@ export class StreamingRedactor {
       this.linePending = "";
       input = input.slice(nlMatch.index + nlMatch.separator.length);
 
-      if (fullLineBody.length > StreamingRedactor.MAX_PENDING_LINE_CHARS) {
+      if (fullLineBody.length > this.maxPendingLineChars) {
         this.hasSuppressedContent = true;
-        outputChunks.push(Buffer.from(StreamingRedactor.SUPPRESSION_MARKER + nlMatch.separator, "utf8"));
+        outputChunks.push(Buffer.from(StreamingRedactor.OUTPUT_SUPPRESSION_MARKER + nlMatch.separator, "utf8"));
       } else {
         const fullLineWithSep = fullLineBody + nlMatch.separator;
         const redacted = redactDiagnosticText(fullLineWithSep);
@@ -527,10 +537,10 @@ export class StreamingRedactor {
         this.suppressingOverlongLine = false;
         this.linePending = "";
       } else if (this.linePending) {
-        if (this.linePending.length > StreamingRedactor.MAX_PENDING_LINE_CHARS) {
+        if (this.linePending.length > this.maxPendingLineChars) {
           this.hasSuppressedContent = true;
           this.linePending = "";
-          outputChunks.push(Buffer.from(StreamingRedactor.SUPPRESSION_MARKER, "utf8"));
+          outputChunks.push(Buffer.from(StreamingRedactor.OUTPUT_SUPPRESSION_MARKER, "utf8"));
         } else {
           const redacted = redactDiagnosticText(this.linePending);
           this.linePending = "";
@@ -663,8 +673,8 @@ export class ManagedVerificationJob {
 
   private observedStdoutBytes = 0;
   private observedStderrBytes = 0;
-  private readonly stdoutRedactor = new StreamingRedactor();
-  private readonly stderrRedactor = new StreamingRedactor();
+  private readonly stdoutRedactor: StreamingRedactor;
+  private readonly stderrRedactor: StreamingRedactor;
   private combinedBuffer: CombinedRollingTailBuffer;
 
   private readonly waiters = new Set<() => void>();
@@ -704,6 +714,8 @@ export class ManagedVerificationJob {
     this.config = options.config;
     this.hardOutputCeilingBytes = options.hardOutputCeilingBytes ?? DEFAULT_VERIFICATION_LIMITS.hardOutputCeilingBytes;
     this.retainedTailBytes = options.retainedTailBytes ?? (options.config.maxOutputBytes || DEFAULT_VERIFICATION_LIMITS.retainedTailBytes);
+    this.stdoutRedactor = new StreamingRedactor({ maxPendingLineChars: this.retainedTailBytes });
+    this.stderrRedactor = new StreamingRedactor({ maxPendingLineChars: this.retainedTailBytes });
 
     const now = new Date();
     this.createdAt = now.toISOString();
