@@ -78,6 +78,11 @@ type TerminalReader = {
   destroy?: () => void;
 };
 
+// Linux can report child exit before the final PTY write callbacks arrive. Keep
+// the slave open through a bounded quiet window so delayed kernel/reader output
+// has time to reach the stream before EOF is allowed to finalize the transcript.
+const PTY_OUTPUT_DRAIN_QUIET_MS = 500;
+
 function terminalReaderForDrain(terminal: zigpty.Terminal): TerminalReader | undefined {
   // zigpty 0.2.x emits process exit before its Unix PTY reader has drained.
   // Terminal's own data callback survives that process-exit notification; the
@@ -111,7 +116,6 @@ function createTerminalOutputDrain(
   let started = false;
   let keeperClosed = false;
   let quietTimer: NodeJS.Timeout | undefined;
-  let closeTimer: NodeJS.Timeout | undefined;
   let hardTimer: NodeJS.Timeout | undefined;
   let resolveWait: ((drained: boolean) => void) | undefined;
   let waitPromise: Promise<boolean> | undefined;
@@ -125,21 +129,16 @@ function createTerminalOutputDrain(
     settled = true;
     if (hardTimer) clearTimeout(hardTimer);
     if (quietTimer) clearTimeout(quietTimer);
-    if (closeTimer) clearTimeout(closeTimer);
     closeKeeper();
     resolveWait?.(drained);
   };
   const closeAfterQuiet = () => {
     closeKeeper();
-    closeTimer = setTimeout(() => {
-      finish(false);
-      reader?.destroy?.();
-    }, 100);
   };
   const armQuietTimer = () => {
     if (!started || settled || keeperClosed) return;
     if (quietTimer) clearTimeout(quietTimer);
-    quietTimer = setTimeout(closeAfterQuiet, 50);
+    quietTimer = setTimeout(closeAfterQuiet, PTY_OUTPUT_DRAIN_QUIET_MS);
   };
   return {
     wait() {
@@ -157,12 +156,6 @@ function createTerminalOutputDrain(
           reader.destroy?.();
         }, timeoutMs);
         if (slaveKeeperFd !== undefined) armQuietTimer();
-        else {
-          closeTimer = setTimeout(() => {
-            finish(false);
-            reader.destroy?.();
-          }, timeoutMs);
-        }
       });
       return waitPromise;
     },
