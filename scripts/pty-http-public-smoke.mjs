@@ -19,6 +19,19 @@ function syncStdoutWriteCode(expression) {
   return `const fs=require("node:fs");const output=Buffer.from(${expression});let written=0;while(written<output.length){const count=fs.writeSync(1,output,written,output.length-written);if(count<=0)throw new Error("stdout write made no progress");written+=count}`;
 }
 
+function ptyResultSummary(result) {
+  const value = result.structuredContent ?? {};
+  const transcript = value.transcript ?? "";
+  return JSON.stringify({
+    state: value.state,
+    truncated: value.truncated,
+    output_drain_incomplete: value.output_drain_incomplete,
+    raw_observed_bytes: value.raw_observed_bytes,
+    transcript_chars: transcript.length,
+    transcript_suffix: transcript.slice(-40)
+  });
+}
+
 function findHostProcessesWithToken(token) {
   const survivors = [];
   try {
@@ -263,8 +276,8 @@ try {
         });
         assert.equal(multilineResult.structuredContent?.state, "succeeded", `multiline producer must exit normally: ${JSON.stringify(multilineResult.structuredContent)}`);
         assert.equal(multilineResult.structuredContent?.exit_code, 0, `multiline producer must exit 0: ${JSON.stringify(multilineResult.structuredContent)}`);
-        assert.equal(multilineResult.structuredContent?.truncated, false, `multiline output attempt ${attempt + 1} must not be truncated: ${JSON.stringify(multilineResult.structuredContent)}`);
-        assert.equal(multilineResult.structuredContent?.output_drain_incomplete, undefined, `multiline output attempt ${attempt + 1} must report a complete drain: ${JSON.stringify(multilineResult.structuredContent)}`);
+        assert.equal(multilineResult.structuredContent?.truncated, false, `multiline output attempt ${attempt + 1} must not be truncated: ${ptyResultSummary(multilineResult)}`);
+        assert.equal(multilineResult.structuredContent?.output_drain_incomplete, undefined, `multiline output attempt ${attempt + 1} must report a complete drain: ${ptyResultSummary(multilineResult)}`);
         assert.equal(multilineResult.structuredContent?.raw_observed_bytes, Buffer.byteLength(multilineWithCompletion) + 136, `multiline output attempt ${attempt + 1} must observe every emitted byte including PTY newline expansion; actual=${multilineResult.structuredContent?.raw_observed_bytes}, text=${multilineResult.structuredContent?.transcript?.length}, suffix=${JSON.stringify(multilineResult.structuredContent?.transcript?.slice(-40))}`);
         assert.equal(multilineResult.structuredContent?.transcript?.length, multilineWithCompletion.length, `multiline output attempt ${attempt + 1} must preserve the full length`);
         assert.equal(multilineResult.structuredContent?.transcript, multilineWithCompletion, `multiline output attempt ${attempt + 1} must survive intact`);

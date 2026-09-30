@@ -82,6 +82,7 @@ type TerminalReader = {
 // the slave open through a bounded quiet window so delayed kernel/reader output
 // has time to reach the stream before EOF is allowed to finalize the transcript.
 const PTY_OUTPUT_DRAIN_QUIET_MS = 500;
+const PTY_OUTPUT_DRAIN_TIMEOUT_MS = 5_000;
 
 function terminalReaderForDrain(terminal: zigpty.Terminal): TerminalReader | undefined {
   // zigpty 0.2.x emits process exit before its Unix PTY reader has drained.
@@ -759,7 +760,7 @@ export class PtyRunManager {
     const pid = pty.pid;
     const terminalReader = terminal ? terminalReaderForDrain(terminal) : undefined;
     const slaveKeeperFd = terminal ? holdPtySlaveOpen(pid) : undefined;
-    terminalOutputDrain = terminal ? createTerminalOutputDrain(terminalReader, slaveKeeperFd, this.processKillWaitTimeoutMs) : undefined;
+    terminalOutputDrain = terminal ? createTerminalOutputDrain(terminalReader, slaveKeeperFd, PTY_OUTPUT_DRAIN_TIMEOUT_MS) : undefined;
 
     const knownDescendants = new Set<number>();
     knownDescendants.add(pid);
