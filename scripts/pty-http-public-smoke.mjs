@@ -15,6 +15,10 @@ const repoRoot = path.resolve(process.env.CODEXPRO_TEST_PACKAGE_ROOT ?? path.res
 
 console.log("# RepoConnect M010 TASK-006: Public HTTP MCP Transport Smoke");
 
+function syncStdoutWriteCode(expression) {
+  return `const fs=require("node:fs");const output=Buffer.from(${expression});let written=0;while(written<output.length){const count=fs.writeSync(1,output,written,output.length-written);if(count<=0)throw new Error("stdout write made no progress");written+=count}`;
+}
+
 function findHostProcessesWithToken(token) {
   const survivors = [];
   try {
@@ -48,7 +52,9 @@ async function getFreePort() {
 async function waitForListening(child, port) {
   const deadline = Date.now() + 15_000;
   let stderr = "";
-  child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+  child.stderr.on("data", (chunk) => {
+    stderr += String(chunk);
+  });
   while (Date.now() < deadline) {
     if (child.exitCode !== null || child.signalCode !== null) throw new Error(`CodexPro exited before HTTP health was ready: ${child.exitCode ?? child.signalCode}\n${stderr}`);
     try {
@@ -199,7 +205,7 @@ try {
 
       const missionControlValue = { mission_control: { response: "x".repeat(13_500) } };
       const missionControlPayload = JSON.stringify(missionControlValue);
-      const missionControlCode = `process.stdout.write(JSON.stringify({mission_control:{response:"x".repeat(13500)}})+"\\n")`;
+      const missionControlCode = syncStdoutWriteCode(`JSON.stringify({mission_control:{response:"x".repeat(13500)}})+"\\n"`);
       const longJsonResult = await client.callTool({
         name: "pty_run",
         arguments: {
@@ -210,7 +216,10 @@ try {
       assert.ok(!longJsonResult.isError, `long JSON pty_run over HTTP must succeed: ${JSON.stringify(longJsonResult)}`);
       assert.equal(longJsonResult.structuredContent?.state, "succeeded");
       assert.equal(longJsonResult.structuredContent?.truncated, false);
-      assert.equal(longJsonResult.structuredContent?.transcript, `${missionControlPayload}\n`);
+      const longJsonTranscript = longJsonResult.structuredContent?.transcript ?? "";
+      const expectedLongJsonTranscript = `${missionControlPayload}\n`;
+      assert.equal(longJsonTranscript.length, expectedLongJsonTranscript.length, `long JSON output length mismatch: raw=${longJsonResult.structuredContent?.raw_observed_bytes}, actual=${longJsonTranscript.length}, expected=${expectedLongJsonTranscript.length}, suffix=${JSON.stringify(longJsonTranscript.slice(-40))}`);
+      assert.equal(longJsonTranscript, expectedLongJsonTranscript, "long JSON output must survive intact");
       assert.doesNotMatch(longJsonResult.structuredContent?.transcript ?? "", /\[REDACTED_SECRET\]/);
 
       const runtimeStatus = await client.callTool({ name: "runtime_status", arguments: {} });
@@ -227,15 +236,15 @@ try {
       }
 
       const lineCases = [
-        { text: "s".repeat(3_000), code: `process.stdout.write("s".repeat(3000)+"\\n")`, label: "below the former boundary" },
-        { text: "x".repeat(5_000), code: `process.stdout.write("x".repeat(5000)+"\\n")`, label: "above the former boundary" },
-        { text: "b".repeat(5_000), code: `process.stdout.write("b".repeat(5000)+"\\n")`, label: "repeated benign character line" },
-        { text: "L".repeat(100_000), code: `process.stdout.write("L".repeat(100000)+"\\n")`, label: "large within-budget line" }
+        { text: "s".repeat(3_000), label: "below the former boundary" },
+        { text: "x".repeat(5_000), label: "above the former boundary" },
+        { text: "b".repeat(5_000), label: "repeated benign character line" },
+        { text: "L".repeat(100_000), label: "large within-budget line" }
       ];
-      for (const { text, code, label } of lineCases) {
+      for (const { text, label } of lineCases) {
         const result = await client.callTool({
           name: "pty_run",
-          arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", code] }
+          arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", syncStdoutWriteCode(`${JSON.stringify(text[0])}.repeat(${text.length})+"\\n"`)] }
         });
         assert.equal(result.structuredContent?.state, "succeeded", `${label} must complete`);
         assert.equal(result.structuredContent?.truncated, false, `${label} must not be truncated`);
@@ -245,13 +254,15 @@ try {
       }
 
       const multiline = Array.from({ length: 135 }, () => "m".repeat(100)).join("\n") + "\n";
-      const multilineCode = `const fs=require("node:fs");const output=Buffer.from(Array.from({length:135},()=>"m".repeat(100)).join("\\n")+"\\n");let written=0;while(written<output.length)written+=fs.writeSync(1,output,written);fs.writeSync(2,Buffer.from("END:"+written+"\\n"))`;
+      const multilineCode = `const fs=require("node:fs");let written=0;for(let line=0;line<135;line++){const output=Buffer.from("m".repeat(100)+"\\n");let offset=0;while(offset<output.length){const count=fs.writeSync(1,output,offset,output.length-offset);if(count<=0)throw new Error("stdout write made no progress");offset+=count;written+=count}}fs.writeSync(2,Buffer.from("END:"+written+"\\n"))`;
       const multilineWithCompletion = `${multiline}END:${Buffer.byteLength(multiline)}\n`;
       for (let attempt = 0; attempt < 40; attempt += 1) {
         const multilineResult = await client.callTool({
           name: "pty_run",
           arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", multilineCode] }
         });
+        assert.equal(multilineResult.structuredContent?.state, "succeeded", `multiline producer must exit normally: ${JSON.stringify(multilineResult.structuredContent)}`);
+        assert.equal(multilineResult.structuredContent?.exit_code, 0, `multiline producer must exit 0: ${JSON.stringify(multilineResult.structuredContent)}`);
         assert.equal(multilineResult.structuredContent?.truncated, false, `multiline output attempt ${attempt + 1} must not be truncated`);
         assert.equal(multilineResult.structuredContent?.output_drain_incomplete, undefined, `multiline output attempt ${attempt + 1} must report a complete drain`);
         assert.equal(multilineResult.structuredContent?.raw_observed_bytes, Buffer.byteLength(multilineWithCompletion) + 136, `multiline output attempt ${attempt + 1} must observe every emitted byte including PTY newline expansion; actual=${multilineResult.structuredContent?.raw_observed_bytes}, text=${multilineResult.structuredContent?.transcript?.length}, suffix=${JSON.stringify(multilineResult.structuredContent?.transcript?.slice(-40))}`);
@@ -260,7 +271,7 @@ try {
       }
 
       const splitCredential = "API_TOKEN=chunk-cross-credential-value-9384756102";
-      const splitCredentialCode = `process.stdout.write(${JSON.stringify(splitCredential.slice(0, 13))});setTimeout(()=>process.stdout.write(${JSON.stringify(splitCredential.slice(13) + "\\n")}),100)`;
+      const splitCredentialCode = `const fs=require("node:fs");fs.writeSync(1,${JSON.stringify(splitCredential.slice(0, 13))});setTimeout(()=>{fs.writeSync(1,${JSON.stringify(splitCredential.slice(13) + "\\n")})},100)`;
       const splitCredentialResult = await client.callTool({
         name: "pty_run",
         arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", splitCredentialCode] }
@@ -270,7 +281,7 @@ try {
 
       const overBudgetResult = await client.callTool({
         name: "pty_run",
-        arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", `process.stdout.write("z".repeat(125000)+"\\n")`] }
+        arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", syncStdoutWriteCode(`"z".repeat(125000)+"\\n"`)] }
       });
       assert.equal(overBudgetResult.structuredContent?.truncated, true);
       assert.match(overBudgetResult.structuredContent?.transcript ?? "", /\[OUTPUT_SUPPRESSED: line exceeds configured retention limit\]/);

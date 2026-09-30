@@ -75,6 +75,7 @@ export const DEFAULT_UNSHARE_PATH = "/usr/bin/unshare";
 type TerminalReader = {
   closed?: boolean;
   once?: (event: string, listener: () => void) => unknown;
+  destroy?: () => void;
 };
 
 function terminalReaderForDrain(terminal: zigpty.Terminal): TerminalReader | undefined {
@@ -84,21 +85,95 @@ function terminalReaderForDrain(terminal: zigpty.Terminal): TerminalReader | und
   return (terminal as unknown as { _readable?: TerminalReader })._readable;
 }
 
-function waitForTerminalReaderDrain(reader: TerminalReader | undefined, timeoutMs: number): Promise<boolean> {
-  const once = reader?.once;
-  if (!reader || typeof once !== "function") return Promise.resolve(false);
-  if (reader.closed) return Promise.resolve(true);
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (drained: boolean) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(drained);
-    };
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    once.call(reader, "close", () => finish(true));
-  });
+function holdPtySlaveOpen(pid: number): number | undefined {
+  try {
+    const descriptorPath = `/proc/${pid}/fd/1`;
+    const terminalPath = fs.readlinkSync(descriptorPath);
+    if (!/^\/dev\/pts\/\d+$/.test(terminalPath)) return undefined;
+    return fs.openSync(descriptorPath, fs.constants.O_RDWR | fs.constants.O_NOCTTY);
+  } catch {
+    return undefined;
+  }
+}
+
+interface TerminalOutputDrain {
+  wait(): Promise<boolean>;
+  noteOutput(): void;
+  close(): boolean;
+}
+
+function createTerminalOutputDrain(
+  reader: TerminalReader | undefined,
+  slaveKeeperFd: number | undefined,
+  timeoutMs: number
+): TerminalOutputDrain {
+  let settled = false;
+  let started = false;
+  let keeperClosed = false;
+  let quietTimer: NodeJS.Timeout | undefined;
+  let closeTimer: NodeJS.Timeout | undefined;
+  let hardTimer: NodeJS.Timeout | undefined;
+  let resolveWait: ((drained: boolean) => void) | undefined;
+  let waitPromise: Promise<boolean> | undefined;
+  const closeKeeper = () => {
+    if (keeperClosed || slaveKeeperFd === undefined) return;
+    keeperClosed = true;
+    try { fs.closeSync(slaveKeeperFd); } catch {}
+  };
+  const finish = (drained: boolean) => {
+    if (settled) return;
+    settled = true;
+    if (hardTimer) clearTimeout(hardTimer);
+    if (quietTimer) clearTimeout(quietTimer);
+    if (closeTimer) clearTimeout(closeTimer);
+    closeKeeper();
+    resolveWait?.(drained);
+  };
+  const closeAfterQuiet = () => {
+    closeKeeper();
+    closeTimer = setTimeout(() => {
+      finish(false);
+      reader?.destroy?.();
+    }, 100);
+  };
+  const armQuietTimer = () => {
+    if (!started || settled || keeperClosed) return;
+    if (quietTimer) clearTimeout(quietTimer);
+    quietTimer = setTimeout(closeAfterQuiet, 50);
+  };
+  return {
+    wait() {
+      if (waitPromise) return waitPromise;
+      started = true;
+      const once = reader?.once;
+      if (!reader || typeof once !== "function") return Promise.resolve(false);
+      if (reader.closed) return Promise.resolve(true);
+      waitPromise = new Promise<boolean>((resolve) => {
+        resolveWait = resolve;
+        once.call(reader, "close", () => finish(true));
+        hardTimer = setTimeout(() => {
+          closeKeeper();
+          finish(false);
+          reader.destroy?.();
+        }, timeoutMs);
+        if (slaveKeeperFd !== undefined) armQuietTimer();
+        else {
+          closeTimer = setTimeout(() => {
+            finish(false);
+            reader.destroy?.();
+          }, timeoutMs);
+        }
+      });
+      return waitPromise;
+    },
+    noteOutput: armQuietTimer,
+    close() {
+      const incomplete = !settled;
+      closeKeeper();
+      if (incomplete) finish(false);
+      return incomplete;
+    }
+  };
 }
 
 /**
@@ -646,12 +721,16 @@ export class PtyRunManager {
       maxControlPayloadChars: this.maxControlPayloadChars
     });
     let terminalDataHandler: ((chunk: Uint8Array) => void) | undefined;
+    let terminalOutputDrain: TerminalOutputDrain | undefined;
     const terminal = this.useTerminalDataCallback
       ? new zigpty.Terminal({
           cols: PTY_LIMITS.fixedCols,
           rows: PTY_LIMITS.fixedRows,
           name: "xterm-256color",
-          data: (_terminal, chunk) => terminalDataHandler?.(chunk)
+          data: (_terminal, chunk) => {
+            terminalOutputDrain?.noteOutput();
+            terminalDataHandler?.(chunk);
+          }
         })
       : undefined;
 
@@ -686,6 +765,8 @@ export class PtyRunManager {
     const startTime = Date.now();
     const pid = pty.pid;
     const terminalReader = terminal ? terminalReaderForDrain(terminal) : undefined;
+    const slaveKeeperFd = terminal ? holdPtySlaveOpen(pid) : undefined;
+    terminalOutputDrain = terminal ? createTerminalOutputDrain(terminalReader, slaveKeeperFd, this.processKillWaitTimeoutMs) : undefined;
 
     const knownDescendants = new Set<number>();
     knownDescendants.add(pid);
@@ -772,6 +853,7 @@ export class PtyRunManager {
           try {
             pty.close();
           } catch {}
+          if (terminalOutputDrain?.close()) outputDrainIncomplete = true;
           try {
             terminal?.close();
           } catch {}
@@ -885,9 +967,10 @@ export class PtyRunManager {
           cleanupError = cleanErr;
         }
 
-        try {
-          pty.close();
-        } catch {}
+          try {
+            pty.close();
+          } catch {}
+          terminalOutputDrain?.close();
         try {
           terminal?.close();
         } catch {}
@@ -988,7 +1071,7 @@ export class PtyRunManager {
             const terminalState = exitCode === 0 && sigNum === null ? "succeeded" : "failed";
             void (async () => {
               if (terminal) {
-                outputDrainIncomplete = !(await waitForTerminalReaderDrain(terminalReader, this.processKillWaitTimeoutMs));
+                outputDrainIncomplete = slaveKeeperFd === undefined || !(await terminalOutputDrain?.wait());
               }
               if (!finalized) await finalize(terminalState);
             })().catch(() => {});
