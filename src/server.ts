@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { CodexProConfig } from "./config.js";
+import { CODEXPRO_BUILD_IDENTITY, CODEXPRO_PACKAGE_ROOT } from "./buildIdentity.js";
 import {
   WorkspaceManager,
   PathGuard,
@@ -46,7 +47,7 @@ export type { CodexProDiagnosticContext, DiagnosticContextOptions, DiagnosticTra
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 const RUNTIME_STATUS_FAILURE_DETAIL_MAX_BYTES = 2_048;
 const CODEXPRO_SERVER_NAME = "CodexPro";
-const CODEXPRO_SERVER_VERSION = "0.31.0";
+const CODEXPRO_SERVER_VERSION = CODEXPRO_BUILD_IDENTITY.package_version;
 // read_many owns a smaller aggregate response contract than the single-read
 // path. maxOutputBytes is not a universal read cap, but it remains the outer
 // configured ceiling when it is lower than this tool's own maximum.
@@ -2825,6 +2826,17 @@ function boundedRuntimeFailureDetail(value: unknown): string | null {
   return truncateUtf8(redacted, RUNTIME_STATUS_FAILURE_DETAIL_MAX_BYTES, `\n...[runtime failure detail truncated to ${RUNTIME_STATUS_FAILURE_DETAIL_MAX_BYTES} bytes]`);
 }
 
+function runtimeBuildIdentity() {
+  return {
+    package_name: CODEXPRO_BUILD_IDENTITY.package_name,
+    package_version: CODEXPRO_BUILD_IDENTITY.package_version,
+    source_commit: CODEXPRO_BUILD_IDENTITY.source_commit,
+    source_state: CODEXPRO_BUILD_IDENTITY.source_state,
+    package_root: CODEXPRO_PACKAGE_ROOT,
+    identity_status: CODEXPRO_BUILD_IDENTITY.source_commit && CODEXPRO_BUILD_IDENTITY.source_state === "clean" ? "exact" : "bounded"
+  };
+}
+
 function runtimeStatusPayload(config: CodexProConfig): Record<string, unknown> {
   let runtime: ReturnType<typeof readRuntimeConnection> = {};
   try {
@@ -2895,6 +2907,7 @@ function runtimeStatusPayload(config: CodexProConfig): Record<string, unknown> {
 
   return {
     health: "healthy",
+    build_identity: runtimeBuildIdentity(),
     runtime_source: isHttpChild ? "live_http_process" : "live_mcp_process",
     process: {
       role: isHttpChild ? "http_child" : "mcp_process",
@@ -3163,10 +3176,15 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     },
     async () => {
       const status = runtimeStatusPayload(config);
+      const buildIdentity = runtimeBuildIdentity();
       const text = [
         "# CodexPro Runtime Status",
         "",
         `Health: ${status.health}`,
+        `Version: ${buildIdentity.package_version}`,
+        `Build/source commit: ${buildIdentity.source_commit ?? "unavailable"}`,
+        `Package root: ${buildIdentity.package_root}`,
+        `Runtime source identity: ${buildIdentity.identity_status} (${buildIdentity.source_state})`,
         `HTTP child: ${JSON.stringify(status.http_child)}`,
         `Launcher: ${JSON.stringify(status.launcher)}`,
         `Tunnel: ${JSON.stringify(status.tunnel)}`,

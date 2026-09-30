@@ -11,7 +11,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(__dirname, "..");
+const repoRoot = path.resolve(process.env.CODEXPRO_TEST_PACKAGE_ROOT ?? path.resolve(__dirname, ".."));
 
 console.log("# RepoConnect M010 TASK-006: Public HTTP MCP Transport Smoke");
 
@@ -45,23 +45,19 @@ async function getFreePort() {
   });
 }
 
-function waitForListening(child) {
-  return new Promise((resolve, reject) => {
-    let stderr = "";
-    const timer = setTimeout(() => reject(new Error(`timeout waiting for HTTP server\n${stderr}`)), 15000);
-    timer.unref();
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
-      if (stderr.includes("HTTP MCP listening")) {
-        clearTimeout(timer);
-        resolve();
-      }
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      reject(new Error(`HTTP server exited before listening: ${code}\n${stderr}`));
-    });
-  });
+async function waitForListening(child, port) {
+  const deadline = Date.now() + 15_000;
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error(`CodexPro exited before HTTP health was ready: ${child.exitCode ?? child.signalCode}\n${stderr}`);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/healthz`);
+      if (response.ok) return;
+    } catch { /* startup is still in progress */ }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`timeout waiting for HTTP server health\n${stderr}`);
 }
 
 function waitForExit(child, timeoutMs = 7000) {
@@ -92,6 +88,7 @@ const fixtureRootB = await fs.mkdtemp(path.join(os.tmpdir(), "codexpro-pty-http-
 const realFixtureRootB = await fs.realpath(fixtureRootB);
 await fs.writeFile(path.join(realFixtureRootB, "package.json"), JSON.stringify({ name: "http-fixture-b" }, null, 2));
 await fs.mkdir(path.join(realFixtureRootB, ".git"), { recursive: true });
+const isolatedCodexProHome = await fs.mkdtemp(path.join(os.tmpdir(), "codexpro-pty-http-home-"));
 
 // Setup interactive CLI script in Workspace A
 const promptScriptPath = path.join(realFixtureRootA, "prompt_http_cli.mjs");
@@ -124,10 +121,12 @@ const serverEnv = {
   CODEXPRO_HOST: "127.0.0.1",
   CODEXPRO_PORT: String(port),
   CODEXPRO_HTTP_TOKEN: strongToken,
+  CODEXPRO_MAX_OUTPUT_BYTES: "120000",
   CODEXPRO_BASH_MODE: "full",
   CODEXPRO_WRITE_MODE: "workspace",
   CODEXPRO_TOOL_MODE: "full"
 };
+if (process.env.CODEXPRO_TEST_LAUNCHER) serverEnv.CODEXPRO_HOME = isolatedCodexProHome;
 
 let serverChild = null;
 
@@ -142,12 +141,15 @@ async function createHttpClient() {
 
 try {
   console.log(`Starting real HTTP server on port ${port}...`);
-  serverChild = spawn("node", ["dist/http.js"], {
+  const launchArgs = process.env.CODEXPRO_TEST_LAUNCHER
+    ? [process.env.CODEXPRO_TEST_LAUNCHER, "start", "--root", realFixtureRootA, "--allow-root", realFixtureRootB, "--tunnel", "none", "--port", String(port), "--headless", "--no-profile", "--no-auth", "--tool-mode", "full", "--bash", "full", "--write", "workspace"]
+    : [path.join(repoRoot, "dist/http.js")];
+  serverChild = spawn(process.execPath, launchArgs, {
     cwd: repoRoot,
     env: serverEnv,
     stdio: ["ignore", "pipe", "pipe"]
   });
-  await waitForListening(serverChild);
+  await waitForListening(serverChild, port);
   console.log("  ✓ HTTP server listening");
 
   // Step 1: Client A prompt/response round-trip + sent sentinel leak prevention
@@ -166,7 +168,7 @@ try {
         name: "pty_run",
         arguments: {
           workspace_id: wsIdA,
-          argv: ["node", promptScriptPath],
+          argv: [process.execPath, promptScriptPath],
           steps: [
             {
               wait_for: "Enter verification token: ",
@@ -202,7 +204,7 @@ try {
         name: "pty_run",
         arguments: {
           workspace_id: wsIdA,
-          argv: ["node", "-e", missionControlCode]
+          argv: [process.execPath, "-e", missionControlCode]
         }
       });
       assert.ok(!longJsonResult.isError, `long JSON pty_run over HTTP must succeed: ${JSON.stringify(longJsonResult)}`);
@@ -210,6 +212,63 @@ try {
       assert.equal(longJsonResult.structuredContent?.truncated, false);
       assert.equal(longJsonResult.structuredContent?.transcript, `${missionControlPayload}\n`);
       assert.doesNotMatch(longJsonResult.structuredContent?.transcript ?? "", /\[REDACTED_SECRET\]/);
+
+      const runtimeStatus = await client.callTool({ name: "runtime_status", arguments: {} });
+      assert.notEqual(runtimeStatus.isError, true);
+      assert.equal(runtimeStatus.structuredContent?.build_identity?.package_version, "0.31.0");
+      assert.equal(await fs.realpath(runtimeStatus.structuredContent?.build_identity?.package_root), await fs.realpath(repoRoot));
+      if (process.env.CODEXPRO_EXPECTED_SOURCE_COMMIT) {
+        assert.equal(runtimeStatus.structuredContent?.build_identity?.source_commit, process.env.CODEXPRO_EXPECTED_SOURCE_COMMIT);
+        assert.equal(runtimeStatus.structuredContent?.build_identity?.source_state, "clean");
+        assert.equal(runtimeStatus.structuredContent?.build_identity?.identity_status, "exact");
+      } else {
+        assert.match(runtimeStatus.structuredContent?.build_identity?.source_commit ?? "", /^[0-9a-f]{40}$/u);
+        assert.equal(runtimeStatus.structuredContent?.build_identity?.identity_status, "bounded");
+      }
+
+      const lineCases = [
+        { text: "s".repeat(3_000), code: `process.stdout.write("s".repeat(3000)+"\\n")`, label: "below the former boundary" },
+        { text: "x".repeat(5_000), code: `process.stdout.write("x".repeat(5000)+"\\n")`, label: "above the former boundary" },
+        { text: "b".repeat(5_000), code: `process.stdout.write("b".repeat(5000)+"\\n")`, label: "repeated benign character line" },
+        { text: "L".repeat(100_000), code: `process.stdout.write("L".repeat(100000)+"\\n")`, label: "large within-budget line" }
+      ];
+      for (const { text, code, label } of lineCases) {
+        const result = await client.callTool({
+          name: "pty_run",
+          arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", code] }
+        });
+        assert.equal(result.structuredContent?.state, "succeeded", `${label} must complete`);
+        assert.equal(result.structuredContent?.truncated, false, `${label} must not be truncated`);
+        assert.equal(result.structuredContent?.transcript?.length, text.length + 1, `${label} must preserve the full transcript length`);
+        assert.equal(result.structuredContent?.transcript, `${text}\n`, `${label} must be returned intact`);
+        assert.doesNotMatch(result.structuredContent?.transcript ?? "", /\[REDACTED_SECRET\]/);
+      }
+
+      const multiline = Array.from({ length: 135 }, () => "m".repeat(100)).join("\n") + "\n";
+      const multilineResult = await client.callTool({
+        name: "pty_run",
+        arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", `process.stdout.write(Array.from({length:135},()=>"m".repeat(100)).join("\\n")+"\\n")`] }
+      });
+      assert.equal(multilineResult.structuredContent?.truncated, false);
+      assert.equal(multilineResult.structuredContent?.transcript?.length, multiline.length, "multiline equivalent output length must survive intact");
+      assert.equal(multilineResult.structuredContent?.transcript, multiline, "multiline equivalent output must survive intact");
+
+      const splitCredential = "API_TOKEN=chunk-cross-credential-value-9384756102";
+      const splitCredentialCode = `process.stdout.write(${JSON.stringify(splitCredential.slice(0, 13))});setTimeout(()=>process.stdout.write(${JSON.stringify(splitCredential.slice(13) + "\\n")}),100)`;
+      const splitCredentialResult = await client.callTool({
+        name: "pty_run",
+        arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", splitCredentialCode] }
+      });
+      assert.doesNotMatch(splitCredentialResult.structuredContent?.transcript ?? "", /chunk-cross-credential-value-9384756102/);
+      assert.match(splitCredentialResult.structuredContent?.transcript ?? "", /\[REDACTED_SECRET\]/);
+
+      const overBudgetResult = await client.callTool({
+        name: "pty_run",
+        arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", `process.stdout.write("z".repeat(125000)+"\\n")`] }
+      });
+      assert.equal(overBudgetResult.structuredContent?.truncated, true);
+      assert.match(overBudgetResult.structuredContent?.transcript ?? "", /\[OUTPUT_SUPPRESSED: line exceeds configured retention limit\]/);
+      assert.doesNotMatch(overBudgetResult.structuredContent?.transcript ?? "", /\[REDACTED_SECRET\]/);
     } finally {
       await close();
     }
@@ -257,7 +316,7 @@ try {
         name: "pty_run",
         arguments: {
           workspace_id: wsIdA,
-          argv: ["node", "-e", `console.log("${sentinelA}"); setTimeout(() => {}, 800)`],
+          argv: [process.execPath, "-e", `console.log("${sentinelA}"); setTimeout(() => {}, 800)`],
           timeout_ms: 10000
         }
       });
@@ -267,7 +326,7 @@ try {
         name: "pty_run",
         arguments: {
           workspace_id: wsIdB,
-          argv: ["node", "-e", `console.log("${sentinelB}"); setTimeout(() => {}, 800)`],
+          argv: [process.execPath, "-e", `console.log("${sentinelB}"); setTimeout(() => {}, 800)`],
           timeout_ms: 10000
         }
       });
@@ -287,7 +346,7 @@ try {
         name: "pty_run",
         arguments: {
           workspace_id: wsIdA,
-          argv: ["node", "-e", `console.log("${sentinelC}")`]
+          argv: [process.execPath, "-e", `console.log("${sentinelC}")`]
         }
       });
 
@@ -325,14 +384,14 @@ try {
           name: "pty_run",
           arguments: {
             workspace_id: wsIdA,
-            argv: ["node", "-e", "console.log('CWD:' + process.cwd()); setTimeout(() => {}, 100);"]
+            argv: [process.execPath, "-e", "console.log('CWD:' + process.cwd()); setTimeout(() => {}, 100);"]
           }
         }),
         clientB.client.callTool({
           name: "pty_run",
           arguments: {
             workspace_id: wsIdB,
-            argv: ["node", "-e", "console.log('CWD:' + process.cwd()); setTimeout(() => {}, 100);"]
+            argv: [process.execPath, "-e", "console.log('CWD:' + process.cwd()); setTimeout(() => {}, 100);"]
           }
         })
       ]);
@@ -368,7 +427,7 @@ try {
         name: "pty_run",
         arguments: {
           workspace_id: wsIdA,
-          argv: ["node", "-e", `console.log("${shutdownSentinel}"); setInterval(() => {}, 1000)`],
+          argv: [process.execPath, "-e", `console.log("${shutdownSentinel}"); setInterval(() => {}, 1000)`],
           timeout_ms: 30000
         }
       });
@@ -411,6 +470,7 @@ try {
   }
   await Promise.allSettled([
     fs.rm(realFixtureRootA, { recursive: true, force: true }),
-    fs.rm(realFixtureRootB, { recursive: true, force: true })
+    fs.rm(realFixtureRootB, { recursive: true, force: true }),
+    fs.rm(isolatedCodexProHome, { recursive: true, force: true })
   ]);
 }
