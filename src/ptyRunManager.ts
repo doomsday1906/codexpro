@@ -82,6 +82,7 @@ type TerminalReader = {
 // the slave open through a bounded quiet window so delayed kernel/reader output
 // has time to reach the stream before EOF is allowed to finalize the transcript.
 const PTY_OUTPUT_DRAIN_QUIET_MS = 500;
+const PTY_OUTPUT_DRAIN_SETTLE_MS = 100;
 const PTY_OUTPUT_DRAIN_TIMEOUT_MS = 5_000;
 
 function terminalReaderForDrain(terminal: zigpty.Terminal): TerminalReader | undefined {
@@ -117,6 +118,7 @@ function createTerminalOutputDrain(
   let started = false;
   let keeperClosed = false;
   let quietTimer: NodeJS.Timeout | undefined;
+  let settleTimer: NodeJS.Timeout | undefined;
   let hardTimer: NodeJS.Timeout | undefined;
   let resolveWait: ((drained: boolean) => void) | undefined;
   let waitPromise: Promise<boolean> | undefined;
@@ -130,14 +132,22 @@ function createTerminalOutputDrain(
     settled = true;
     if (hardTimer) clearTimeout(hardTimer);
     if (quietTimer) clearTimeout(quietTimer);
+    if (settleTimer) clearTimeout(settleTimer);
     closeKeeper();
     resolveWait?.(drained);
   };
   const closeAfterQuiet = () => {
     closeKeeper();
+    keeperClosed = true;
+    settleTimer = setTimeout(() => finish(true), PTY_OUTPUT_DRAIN_SETTLE_MS);
   };
   const armQuietTimer = () => {
-    if (!started || settled || keeperClosed) return;
+    if (!started || settled) return;
+    if (keeperClosed) {
+      if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = setTimeout(() => finish(true), PTY_OUTPUT_DRAIN_SETTLE_MS);
+      return;
+    }
     if (quietTimer) clearTimeout(quietTimer);
     quietTimer = setTimeout(closeAfterQuiet, PTY_OUTPUT_DRAIN_QUIET_MS);
   };
@@ -156,7 +166,7 @@ function createTerminalOutputDrain(
           finish(false);
           reader.destroy?.();
         }, timeoutMs);
-        if (slaveKeeperFd !== undefined) armQuietTimer();
+        armQuietTimer();
       });
       return waitPromise;
     },
@@ -1065,7 +1075,7 @@ export class PtyRunManager {
             const terminalState = exitCode === 0 && sigNum === null ? "succeeded" : "failed";
             void (async () => {
               if (terminal) {
-                outputDrainIncomplete = slaveKeeperFd === undefined || !(await terminalOutputDrain?.wait());
+                outputDrainIncomplete = !(await terminalOutputDrain?.wait());
               }
               if (!finalized) await finalize(terminalState);
             })().catch(() => {});
