@@ -17,6 +17,7 @@ import {
 import { processIsAlive, readRuntimeConnection, readRuntimeFailure } from "./profileStore.js";
 import { repoTree, readPublicTextFile, readTextFile, writeTextFile, editTextFile, ensureAiBridge, withFileWriteLocks, type ReadFileResult } from "./fsOps.js";
 import { viewWorkspaceImage } from "./imageOps.js";
+import { ARTIFACT_HARD_MAX_BYTES, ARTIFACT_MIN_MAX_BYTES, readWorkspaceArtifact } from "./artifactOps.js";
 import { importAttachmentFile } from "./importOps.js";
 import { searchWorkspace } from "./searchOps.js";
 import { runBash } from "./bashOps.js";
@@ -1817,6 +1818,7 @@ const STANDARD_TOOL_NAMES = [
   "search",
   "load_skill",
   "view_image",
+  "read_artifact",
   "read_handoff",
   "wait_for_handoff",
   "export_pro_context",
@@ -1845,6 +1847,7 @@ const FULL_TOOL_NAMES = [
   "read",
   "read_many",
   "view_image",
+  "read_artifact",
   "write",
   "edit",
   "apply_patch",
@@ -4240,6 +4243,50 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
           mime_type: result.mimeType,
           width: result.width ?? null,
           height: result.height ?? null,
+          bytes: result.bytes,
+          sha256: result.sha256
+        })
+      };
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "read_artifact",
+    {
+      title: "Read Artifact",
+      description: "Retrieve a generic workspace file (video, audio, PDF, archive, or other binary) as native MCP embedded-resource content plus MIME type, byte count, and SHA-256. Returns the exact bytes; it does not render, play, or execute the file.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        path: z.string().describe("File path relative to workspace root."),
+        max_bytes: z.number().int().min(ARTIFACT_MIN_MAX_BYTES).max(ARTIFACT_HARD_MAX_BYTES).optional().describe("Maximum artifact bytes. Default: at least 1 MB, capped at 10 MB.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await readWorkspaceArtifact(config, guard, workspace, args.path, args.max_bytes);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Artifact: ${result.path}\nType: ${result.mimeType}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}`
+          },
+          {
+            type: "resource",
+            resource: {
+              uri: `workspace-artifact://${workspace.id}/${result.path}`,
+              mimeType: result.mimeType,
+              blob: result.data
+            }
+          }
+        ],
+        structuredContent: redactStructured({
+          workspace_id: workspace.id,
+          root: workspace.root,
+          path: result.path,
+          mime_type: result.mimeType,
           bytes: result.bytes,
           sha256: result.sha256
         })
