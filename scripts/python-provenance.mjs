@@ -32,6 +32,14 @@ function hasPythonErrorNode(nodes) {
   return nodes.some((node) => node.isError || node.type.startsWith(PYTHON_ERROR_NODE_PREFIX));
 }
 
+function hasUnexpectedTopLevelIndent(source, nodes) {
+  return nodes.some((node) => {
+    if (node.parent < 0 || nodes[node.parent]?.type !== 'Script' || node.type === 'Comment') return false;
+    const lineStart = Math.max(source.lastIndexOf('\n', node.from - 1), source.lastIndexOf('\r', node.from - 1)) + 1;
+    return /^[ \t]+$/u.test(source.slice(lineStart, node.from));
+  });
+}
+
 function collectTreeNodes(tree) {
   const nodes = [];
   const cursor = tree.cursor();
@@ -102,7 +110,7 @@ function assignmentRhs(nodes, assignment, typeDef) {
     .at(0);
 }
 
-function parsePythonSegment(source) {
+function parsePythonSegment(source, { completeSource = true } = {}) {
   const text = String(source ?? '');
   if (Buffer.byteLength(text, 'utf8') > PYTHON_PROVENANCE_MAX_BYTES) {
     return { valid: false, reason: 'over-limit', source: text };
@@ -116,17 +124,34 @@ function parsePythonSegment(source) {
   }
 
   const nodes = collectTreeNodes(tree);
-  if (hasPythonErrorNode(nodes)) {
+  // Lezer's Python grammar does not reject every CPython indentation error
+  // (for example, an indented statement at module scope), so do not let such
+  // a tree grant syntax ownership to a credential-looking field.
+  if (hasPythonErrorNode(nodes) || (completeSource && hasUnexpectedTopLevelIndent(text, nodes))) {
     return { valid: false, reason: 'parse-error', source: text };
   }
 
   const annotations = [];
   const aliases = [];
+  const functionReturnTypeNames = [];
 
   for (const node of nodes) {
     if (node.type === 'TypeDef') {
       const parent = nodes[node.parent];
       if (!parent) continue;
+
+      if (parent.type === 'FunctionDefinition') {
+        // A simple function return type is followed by the function suite
+        // colon. Credential-field matching can mistake that colon and the
+        // first token on the next line for a multiline credential field.
+        // Record only the exact parser-owned type name; parser errors and the
+        // complete-source indentation check return before this metadata exists.
+        const expression = firstAnnotationExpression(nodes, node);
+        if (expression?.type === 'VariableName') {
+          functionReturnTypeNames.push({ nameFrom: expression.from, nameTo: expression.to });
+        }
+        continue;
+      }
 
       let owner;
       if (parent.type === 'AssignStatement') {
@@ -183,7 +208,7 @@ function parsePythonSegment(source) {
     });
   }
 
-  return { valid: true, source: text, nodes, annotations, aliases };
+  return { valid: true, source: text, nodes, annotations, aliases, functionReturnTypeNames };
 }
 
 function splitPhysicalLines(source) {
@@ -508,7 +533,10 @@ function createDiffSide(source, lineRecords, side, language) {
     // Non-Python and absent/ambiguous sides deliberately never reach the
     // parser. Their offsets remain available so every mapped side must still
     // agree before a credential receives Python source fidelity.
-    parse: language === 'python' ? parsePythonSegment(chars.join('')) : undefined
+    // Unified-diff hunks are partial programs and may begin inside a nested
+    // body. The final resulting file is checked as complete source before a
+    // write, so module-scope indentation validation belongs to identity parses.
+    parse: language === 'python' ? parsePythonSegment(chars.join(''), { completeSource: false }) : undefined
   };
 }
 
@@ -656,6 +684,33 @@ function querySegment(segment, originalOffset, valueStart) {
       && offsetInRange(value, alias.rhsFrom, alias.rhsTo)) return true;
   }
   return false;
+}
+
+function queryFunctionReturnTypeName(segment, originalStart, originalEnd) {
+  const start = segment.originalToVirtual.get(originalStart);
+  const last = originalEnd > originalStart
+    ? segment.originalToVirtual.get(originalEnd - 1)
+    : undefined;
+  if (!Number.isInteger(start) || !Number.isInteger(last) || !segment.parse?.valid) return false;
+  const end = last + 1;
+  return (segment.parse.functionReturnTypeNames ?? []).some(
+    (name) => start === name.nameFrom && end === name.nameTo
+  );
+}
+
+export function isPythonFunctionReturnTypeName({ provenance, offset, end }) {
+  if (!provenance?.available || !Number.isInteger(offset) || !Number.isInteger(end) || end <= offset) return false;
+  const matches = [];
+  for (const segment of provenance.segments ?? []) {
+    for (const side of segment.sides ?? [segment]) {
+      if (side.originalToVirtual.has(offset) && side.originalToVirtual.has(end - 1)) {
+        matches.push(queryFunctionReturnTypeName(side, offset, end));
+      }
+    }
+  }
+  // Diff context shared by multiple sides grants this narrow syntax exception
+  // only when every mapped Python parse agrees on the same return type name.
+  return matches.length > 0 && matches.every(Boolean);
 }
 
 export function ownsPythonCredential({ provenance, offset, valueStart }) {
