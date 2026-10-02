@@ -1,6 +1,7 @@
 import {
   createPythonProvenance,
   extractDiffFileBlocks,
+  isPythonFunctionReturnTypeName,
   ownsPythonCredential
 } from './python-provenance.mjs';
 
@@ -364,6 +365,19 @@ function redactMalformedCredentialParentheses(text) {
 function credentialValueSpanEnd(text, valueEnd) {
   const genericTail = genericTailInfo(String(text ?? ''), valueEnd);
   return genericTail ? genericTail.end : valueEnd;
+}
+
+function pythonReturnTypeFieldColonEnd(match, syntax) {
+  if (!syntax?.pythonProvenance) return undefined;
+  const prefix = match[1] ?? '';
+  const colon = prefix.indexOf(':');
+  if (colon < 0) return undefined;
+  if (!isPythonFunctionReturnTypeName({
+    provenance: syntax.pythonProvenance,
+    offset: match.index,
+    end: match.index + colon
+  })) return undefined;
+  return match.index + colon + 1;
 }
 
 function hasTypedVariableAnnotationAnchor(code, syntax, offset, assignment = '', value = '') {
@@ -806,6 +820,16 @@ function collectCredentialMatches(text, pattern, context, syntax, priority) {
   const matches = [];
   let match;
   while ((match = pattern.exec(text)) !== null) {
+    const returnTypeColonEnd = pattern === CREDENTIAL_FIELD_PATTERN
+      ? pythonReturnTypeFieldColonEnd(match, syntax)
+      : undefined;
+    if (returnTypeColonEnd !== undefined) {
+      // The field regex may have consumed the next statement's label as the
+      // return annotation's value. Resume after the function-suite colon so
+      // that the same pass can inspect that next statement independently.
+      pattern.lastIndex = returnTypeColonEnd;
+      continue;
+    }
     const prefix = match[1] ?? '';
     const value = match[2] ?? '';
     const replacement = redactCredentialAssignment(match[0], prefix, value, text, match.index, context, syntax);
@@ -911,6 +935,13 @@ function hasUnsafeCredentialMatch(text, pattern, context, syntax = undefined) {
   pattern.lastIndex = 0;
   let match;
   while ((match = pattern.exec(text)) !== null) {
+    const returnTypeColonEnd = pattern === CREDENTIAL_FIELD_PATTERN
+      ? pythonReturnTypeFieldColonEnd(match, syntax)
+      : undefined;
+    if (returnTypeColonEnd !== undefined) {
+      pattern.lastIndex = returnTypeColonEnd;
+      continue;
+    }
     const prefix = match[1] ?? '';
     const value = match[2] ?? match[0].slice(prefix.length);
     if (!safeCredentialReference(value, text, match.index, context, prefix, syntax)) return true;

@@ -238,6 +238,15 @@ function assertPythonAstAccepted(source, label) {
   assert.equal(result.status, 0, `${label} was not accepted by ast.parse: ${result.stderr || result.stdout}`);
 }
 
+function assertPythonAstRejected(source, label) {
+  const result = spawnSync(
+    'python3',
+    ['-c', 'import ast, sys; ast.parse(sys.stdin.read(), filename="fixture.py", mode="exec")'],
+    { input: source, encoding: 'utf8' }
+  );
+  assert.notEqual(result.status, 0, `${label} unexpectedly parsed as valid Python`);
+}
+
 const sourceTs = [
   'const isCurrentTransition = (token: PlayerSessionTransitionToken): boolean => true;',
   'const { hasSecretValue: policyHasSecretValue, apiToken: configuredToken } = policy;',
@@ -496,6 +505,41 @@ const pythonProvenanceLawful = [
   ''
 ].join('\n');
 
+const pythonReturnAnnotationLawful = [
+  'def campaign_head() -> CampaignHeadToken:',
+  '    return CampaignHeadToken("harmless")',
+  ''
+].join('\n');
+
+const pythonReturnAnnotationCredentialField = [
+  'def campaign_head() -> CampaignHeadToken:',
+  '    API_TOKEN: "QZ7"',
+  '    return CampaignHeadToken("harmless")',
+  ''
+].join('\n');
+
+const pythonMultilineCredentialAssignment = [
+  'API_TOKEN = (',
+  '    "QZ7"',
+  ')',
+  ''
+].join('\n');
+
+const pythonMultilineCredentialField = [
+  'config = {',
+  '    API_TOKEN:',
+  '        "QZ7"',
+  '}',
+  ''
+].join('\n');
+
+const pythonMalformedReturnAnnotation = [
+  'def campaign_head() -> CampaignHeadToken:',
+  '    return CampaignHeadToken("harmless")',
+  '  unexpected_indent = 1',
+  ''
+].join('\n');
+
 const pythonProvenanceHostile = [
   'class EarlierLawful:',
   '    token: Token[str]',
@@ -542,6 +586,34 @@ const pythonProvenanceHostileRedacted = [
 
 assertPythonParserAccepted(pythonProvenanceLawful, 'Python provenance lawful fixture');
 assertPythonParserAccepted(pythonProvenanceHostile, 'Python provenance hostile fixture');
+assertPythonAstAccepted(pythonReturnAnnotationLawful, 'Python function return annotation fixture');
+assertPythonParserAccepted(pythonReturnAnnotationLawful, 'Python function return annotation fixture');
+assert.equal(redactSensitiveText(pythonReturnAnnotationLawful, pythonPolicy), pythonReturnAnnotationLawful, 'Python function return annotation changed source bytes');
+assert.equal(hasSecretValue(pythonReturnAnnotationLawful, pythonPolicy), false, 'Python function return annotation was classified as hostile');
+
+assertPythonAstAccepted(pythonReturnAnnotationCredentialField, 'Python return annotation credential-field fixture');
+assert.equal(hasSecretValue(pythonReturnAnnotationCredentialField, pythonPolicy), true, 'credential field after Python return annotation escaped detection');
+const pythonReturnAnnotationCredentialFieldRedacted = redactSensitiveText(pythonReturnAnnotationCredentialField, pythonPolicy);
+assert.equal(pythonReturnAnnotationCredentialFieldRedacted.includes('QZ7'), false, 'credential field after Python return annotation leaked its synthetic value');
+assert.equal(pythonReturnAnnotationCredentialFieldRedacted.includes('[REDACTED_SECRET]'), true, 'credential field after Python return annotation omitted the redaction marker');
+
+for (const [label, source] of [
+  ['multiline assignment', pythonMultilineCredentialAssignment],
+  ['multiline field', pythonMultilineCredentialField]
+]) {
+  assertPythonAstAccepted(source, `Python ${label} credential fixture`);
+  assertPythonParserAccepted(source, `Python ${label} credential fixture`);
+  const redacted = redactSensitiveText(source, pythonPolicy);
+  assert.equal(hasSecretValue(source, pythonPolicy), true, `Python ${label} credential was not classified as hostile`);
+  assert.equal(redacted.includes('QZ7'), false, `Python ${label} credential leaked its synthetic value`);
+  assert.equal(redacted.includes('[REDACTED_SECRET]'), true, `Python ${label} credential omitted the redaction marker`);
+}
+
+assert.equal(hasSecretValue(pythonMalformedReturnAnnotation, pythonPolicy), true, 'malformed Python return annotation received syntax ownership');
+const pythonMalformedReturnAnnotationRedacted = redactSensitiveText(pythonMalformedReturnAnnotation, pythonPolicy);
+assert.notEqual(pythonMalformedReturnAnnotationRedacted, pythonMalformedReturnAnnotation, 'malformed Python return annotation bypassed fail-closed redaction');
+assert.equal(pythonMalformedReturnAnnotationRedacted.includes('[REDACTED_SECRET]'), true, 'malformed Python return annotation omitted the fail-closed marker');
+assertPythonAstRejected(pythonMalformedReturnAnnotation, 'malformed Python return annotation fixture');
 
 const python312Lawful = [
   'type password = PasswordType',
@@ -1743,6 +1815,25 @@ const applyRenameHostileLiterals = [
   'APPLY_RENAME_OLD_LITERAL',
   'APPLY_RENAME_NEW_LITERAL'
 ];
+const pythonReturnAnnotationEditPath = 'python-return-annotation-edit.py';
+const pythonReturnAnnotationEditAfter = pythonReturnAnnotationLawful.replace(
+  'return CampaignHeadToken("harmless")',
+  'return CampaignHeadToken("still_harmless")'
+);
+const pythonReturnAnnotationCredentialFieldEditPath = 'python-return-annotation-credential-field-edit.py';
+const pythonMultilineAssignmentEditPath = 'python-multiline-assignment-edit.py';
+const pythonMultilineAssignmentEditBefore = [
+  '# marker: before',
+  ...pythonMultilineCredentialAssignment.trimEnd().split('\n'),
+  ''
+].join('\n');
+const pythonMultilineFieldEditPath = 'python-multiline-field-edit.py';
+const pythonMultilineFieldEditBefore = [
+  '# marker: before',
+  ...pythonMultilineCredentialField.trimEnd().split('\n'),
+  ''
+].join('\n');
+const pythonMalformedAnnotationEditPath = 'python-malformed-annotation-edit.py';
 
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-source-redaction-'));
 const rawArtifactDir = process.env.SOURCE_REDACTION_RAW_ARTIFACT_DIR;
@@ -1754,6 +1845,11 @@ try {
   for (const [relativePath, source] of Object.entries(looksPythonHostileFixtures)) await writeFixture(tmp, relativePath, source);
   await writeFixture(tmp, 'python-provenance-lawful.py', pythonProvenanceLawful);
   await writeFixture(tmp, 'python-provenance-hostile.py', pythonProvenanceHostile);
+  await writeFixture(tmp, pythonReturnAnnotationEditPath, pythonReturnAnnotationLawful);
+  await writeFixture(tmp, pythonReturnAnnotationCredentialFieldEditPath, pythonReturnAnnotationCredentialField);
+  await writeFixture(tmp, pythonMultilineAssignmentEditPath, pythonMultilineAssignmentEditBefore);
+  await writeFixture(tmp, pythonMultilineFieldEditPath, pythonMultilineFieldEditBefore);
+  await writeFixture(tmp, pythonMalformedAnnotationEditPath, pythonMalformedReturnAnnotation);
   await writeFixture(tmp, 'python-312-lawful.py', python312Lawful);
   await writeFixture(tmp, 'python-312-hostile.py', python312Hostile);
   await writeFixture(tmp, 'python-mixed-provenance.py', pythonMixedProvenance);
@@ -3805,6 +3901,82 @@ try {
     const current = await fs.readFile(path.join(tmp, relativePath), 'utf8');
     assert.equal(current.includes(newText), true, `source edit changed ${relativePath} unexpectedly`);
   }
+
+  const returnAnnotationEdited = assertToolSuccess(await client.request('tools/call', {
+    name: 'edit',
+    arguments: {
+      workspace_id: workspaceId,
+      path: pythonReturnAnnotationEditPath,
+      old_text: 'return CampaignHeadToken("harmless")',
+      new_text: 'return CampaignHeadToken("still_harmless")',
+      expected_replacements: 1
+    }
+  }), 'Python function return annotation edit');
+  assert.ok(returnAnnotationEdited.structuredContent, 'Python function return annotation edit omitted structured output');
+  assert.equal(
+    await fs.readFile(path.join(tmp, pythonReturnAnnotationEditPath), 'utf8'),
+    pythonReturnAnnotationEditAfter,
+    'Python function return annotation edit changed more than the harmless body value'
+  );
+
+  const pythonReturnAnnotationCredentialFieldBefore = await fs.readFile(
+    path.join(tmp, pythonReturnAnnotationCredentialFieldEditPath),
+    'utf8'
+  );
+  const blockedReturnAnnotationCredentialField = assertToolError(await client.request('tools/call', {
+    name: 'edit',
+    arguments: {
+      workspace_id: workspaceId,
+      path: pythonReturnAnnotationCredentialFieldEditPath,
+      old_text: 'return CampaignHeadToken("harmless")',
+      new_text: 'return CampaignHeadToken("still_harmless")',
+      expected_replacements: 1
+    }
+  }), 'credential field after Python return annotation edit');
+  assert.match(resultText(blockedReturnAnnotationCredentialField), /Secret-looking content is blocked from edit/);
+  assert.equal(resultText(blockedReturnAnnotationCredentialField).includes('QZ7'), false, 'blocked composite edit leaked its synthetic value');
+  assert.equal(
+    await fs.readFile(path.join(tmp, pythonReturnAnnotationCredentialFieldEditPath), 'utf8'),
+    pythonReturnAnnotationCredentialFieldBefore,
+    'credential field after Python return annotation edit mutated the source'
+  );
+
+  for (const [label, pathName, before] of [
+    ['multiline assignment', pythonMultilineAssignmentEditPath, pythonMultilineAssignmentEditBefore],
+    ['multiline field', pythonMultilineFieldEditPath, pythonMultilineFieldEditBefore]
+  ]) {
+    const blocked = assertToolError(await client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: workspaceId,
+        path: pathName,
+        old_text: '# marker: before',
+        new_text: '# marker: after',
+        expected_replacements: 1
+      }
+    }), `Python ${label} credential edit`);
+    assert.match(resultText(blocked), /Secret-looking content is blocked from edit/);
+    assert.equal(resultText(blocked).includes('QZ7'), false, `Python ${label} edit leaked its synthetic value`);
+    assert.equal(await fs.readFile(path.join(tmp, pathName), 'utf8'), before, `Python ${label} edit mutated the source`);
+  }
+
+  const malformedAnnotationBefore = await fs.readFile(path.join(tmp, pythonMalformedAnnotationEditPath), 'utf8');
+  const blockedMalformedAnnotation = assertToolError(await client.request('tools/call', {
+    name: 'edit',
+    arguments: {
+      workspace_id: workspaceId,
+      path: pythonMalformedAnnotationEditPath,
+      old_text: 'return CampaignHeadToken("harmless")',
+      new_text: 'return CampaignHeadToken("still_harmless")',
+      expected_replacements: 1
+    }
+  }), 'malformed Python return annotation edit');
+  assert.match(resultText(blockedMalformedAnnotation), /Secret-looking content is blocked from edit/);
+  assert.equal(
+    await fs.readFile(path.join(tmp, pythonMalformedAnnotationEditPath), 'utf8'),
+    malformedAnnotationBefore,
+    'malformed Python return annotation edit mutated the source'
+  );
 
   const patch = [
     'diff --git a/compat.rb b/compat.rb',
