@@ -110,6 +110,90 @@ function assignmentRhs(nodes, assignment, typeDef) {
     .at(0);
 }
 
+function isCallKeywordReference(nodes, node, source) {
+  if (!node) return false;
+  if (node.type === 'VariableName') {
+    // Existing hostile fixtures use opaque uppercase/digit identifiers as
+    // literal credentials. Do not grant them a new call-reference exception.
+    return !/^(?=.*\d)[A-Z0-9_]+$/u.test(source.slice(node.from, node.to));
+  }
+  if (node.type !== 'MemberExpression') return false;
+  const children = directChildren(nodes, node.index);
+  return children.length === 3
+    && children[1].type === '.'
+    && children[2].type === 'PropertyName'
+    && isCallKeywordReference(nodes, children[0], source);
+}
+
+function collectCallKeywordReferences(nodes, source) {
+  const references = [];
+  for (const list of nodes) {
+    if (list.type !== 'ArgList' || !hasParentType(nodes, list.index, 'CallExpression')) continue;
+    const children = directChildren(nodes, list.index)
+      .filter((node) => !['(', ')', 'Comment'].includes(node.type));
+    for (let index = 0; index < children.length; index += 1) {
+      const [name, operator, rhs, next] = children.slice(index, index + 4);
+      if (index > 0 && children[index - 1].type !== ',') continue;
+      if (name.type !== 'VariableName' || operator?.type !== 'AssignOp') continue;
+      if (source.slice(operator.from, operator.to) !== '=') continue;
+      if (next && next.type !== ',') continue;
+      if (!isCallKeywordReference(nodes, rhs, source)) continue;
+      references.push({ nameFrom: name.from, nameTo: name.to, rhsFrom: rhs.from, rhsTo: rhs.to });
+    }
+  }
+  return references;
+}
+
+function collectSourceFieldSyntax(nodes, source) {
+  const suiteConditionNames = [];
+  const authorizationAnnotations = [];
+  const typeNodes = new Set(['VariableName', 'PropertyName', 'MemberExpression',
+    'BinaryExpression', 'BitOp', 'None', 'ParenthesizedExpression', '.', '[', ']', '(', ')', ',']);
+  for (const node of nodes) {
+    if (node.type === 'Body') {
+      const colon = directChildren(nodes, node.index)[0];
+      const parent = nodes[node.parent];
+      if (colon?.type !== ':' || !['IfStatement', 'WhileStatement', 'ForStatement', 'WithStatement'].includes(parent?.type)) continue;
+      const condition = directChildren(nodes, parent.index).filter((child) => child.to <= colon.from).at(-1);
+      let tail = condition;
+      while (tail?.children.length) tail = directChildren(nodes, tail.index).at(-1);
+      if (tail?.type === 'VariableName' && tail.to === condition.to) {
+        suiteConditionNames.push({ nameFrom: tail.from, nameTo: tail.to });
+      }
+      continue;
+    }
+    if (node.type !== 'TypeDef') continue;
+    const parent = nodes[node.parent];
+    const parameter = parent?.type === 'ParamList' && hasParentType(nodes, parent.index, 'FunctionDefinition');
+    const target = parent?.type === 'AssignStatement' ? meaningfulChildren(nodes, parent.index)[0] : undefined;
+    if (!parameter && target?.type !== 'VariableName') continue;
+    const name = directVariableBefore(nodes, parent.index, node.from);
+    const expression = firstAnnotationExpression(nodes, node);
+    if (!name || !expression || source.slice(name.from, name.to).toLowerCase() !== 'authorization') continue;
+    const pending = [expression];
+    let safeType = true;
+    while (pending.length > 0) {
+      const current = pending.pop();
+      if (!typeNodes.has(current.type) || (current.type === 'BitOp' && source.slice(current.from, current.to) !== '|')) {
+        safeType = false;
+        break;
+      }
+      pending.push(...directChildren(nodes, current.index));
+    }
+    if (!safeType) continue;
+    const children = directChildren(nodes, parent.index);
+    const typeIndex = children.findIndex((child) => child.index === node.index);
+    const operator = children[typeIndex + 1];
+    const rhs = operator?.type === 'AssignOp' ? children[typeIndex + 2] : undefined;
+    if (operator?.type === 'AssignOp'
+      && (source.slice(operator.from, operator.to) !== '=' || !rhs
+        || (rhs.type !== 'None' && !isCallKeywordReference(nodes, rhs, source)))) continue;
+    authorizationAnnotations.push({ nameFrom: name.from, nameTo: name.to,
+      valueFrom: expression.from, safeTo: rhs?.to ?? node.to });
+  }
+  return { suiteConditionNames, authorizationAnnotations };
+}
+
 function parsePythonSegment(source, { completeSource = true } = {}) {
   const text = String(source ?? '');
   if (Buffer.byteLength(text, 'utf8') > PYTHON_PROVENANCE_MAX_BYTES) {
@@ -208,7 +292,11 @@ function parsePythonSegment(source, { completeSource = true } = {}) {
     });
   }
 
-  return { valid: true, source: text, nodes, annotations, aliases, functionReturnTypeNames };
+  return {
+    valid: true, source: text, nodes, annotations, aliases, functionReturnTypeNames,
+    callKeywordReferences: collectCallKeywordReferences(nodes, text),
+    ...collectSourceFieldSyntax(nodes, text)
+  };
 }
 
 function splitPhysicalLines(source) {
@@ -727,4 +815,62 @@ export function ownsPythonCredential({ provenance, offset, valueStart }) {
   // must agree before provenance is granted to avoid a recovery side donating
   // authority to a lawful-looking candidate.
   return matches.length > 0 && matches.every(Boolean);
+}
+
+export function ownsPythonCallKeywordReference({ provenance, nameStart, nameEnd, valueStart, valueEnd }) {
+  if (!provenance?.available
+    || ![nameStart, nameEnd, valueStart, valueEnd].every(Number.isInteger)
+    || nameEnd <= nameStart || valueEnd <= valueStart) return false;
+  const matches = [];
+  for (const segment of provenance.segments ?? []) {
+    for (const side of segment.sides ?? [segment]) {
+      if (!side.originalToVirtual.has(nameStart)) continue;
+      const start = side.originalToVirtual.get(nameStart);
+      const nameLast = side.originalToVirtual.get(nameEnd - 1);
+      const rhsStart = side.originalToVirtual.get(valueStart);
+      const rhsLast = side.originalToVirtual.get(valueEnd - 1);
+      matches.push(Boolean(side.parse?.valid
+        && Number.isInteger(nameLast) && Number.isInteger(rhsStart) && Number.isInteger(rhsLast)
+        && (side.parse.callKeywordReferences ?? []).some((reference) =>
+          start === reference.nameFrom && nameLast + 1 === reference.nameTo
+          && rhsStart === reference.rhsFrom && rhsLast + 1 === reference.rhsTo)));
+    }
+  }
+  // Missing endpoints and invalid/non-Python mapped sides veto this exception.
+  return matches.length > 0 && matches.every(Boolean);
+}
+
+export function isPythonSuiteConditionName({ provenance, offset, end }) {
+  if (!provenance?.available || !Number.isInteger(offset) || !Number.isInteger(end) || end <= offset) return false;
+  const matches = [];
+  for (const segment of provenance.segments ?? []) {
+    for (const side of segment.sides ?? [segment]) {
+      if (!side.originalToVirtual.has(offset)) continue;
+      const start = side.originalToVirtual.get(offset);
+      const last = side.originalToVirtual.get(end - 1);
+      matches.push(Boolean(side.parse?.valid && Number.isInteger(last)
+        && (side.parse.suiteConditionNames ?? []).some((name) => start === name.nameFrom && last + 1 === name.nameTo)));
+    }
+  }
+  return matches.length > 0 && matches.every(Boolean);
+}
+
+export function pythonAuthorizationAnnotationEnd({ provenance, nameStart, nameEnd, valueStart }) {
+  if (!provenance?.available || ![nameStart, nameEnd, valueStart].every(Number.isInteger) || nameEnd <= nameStart) return undefined;
+  const ends = [];
+  for (const segment of provenance.segments ?? []) {
+    for (const side of segment.sides ?? [segment]) {
+      if (!side.originalToVirtual.has(nameStart)) continue;
+      const start = side.originalToVirtual.get(nameStart);
+      const nameLast = side.originalToVirtual.get(nameEnd - 1);
+      const value = side.originalToVirtual.get(valueStart);
+      const owner = side.parse?.valid && Number.isInteger(nameLast) && Number.isInteger(value)
+        ? (side.parse.authorizationAnnotations ?? []).find((entry) =>
+          start === entry.nameFrom && nameLast + 1 === entry.nameTo && value === entry.valueFrom)
+        : undefined;
+      const last = owner ? side.originalOffsets[owner.safeTo - 1] : undefined;
+      ends.push(Number.isInteger(last) && last >= 0 ? last + 1 : undefined);
+    }
+  }
+  return ends.length > 0 && Number.isInteger(ends[0]) && ends.every((end) => end === ends[0]) ? ends[0] : undefined;
 }

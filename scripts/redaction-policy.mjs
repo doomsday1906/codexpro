@@ -2,7 +2,10 @@ import {
   createPythonProvenance,
   extractDiffFileBlocks,
   isPythonFunctionReturnTypeName,
-  ownsPythonCredential
+  isPythonSuiteConditionName,
+  ownsPythonCallKeywordReference,
+  ownsPythonCredential,
+  pythonAuthorizationAnnotationEnd
 } from './python-provenance.mjs';
 
 export { extractDiffFileBlocks };
@@ -372,11 +375,12 @@ function pythonReturnTypeFieldColonEnd(match, syntax) {
   const prefix = match[1] ?? '';
   const colon = prefix.indexOf(':');
   if (colon < 0) return undefined;
-  if (!isPythonFunctionReturnTypeName({
+  const name = {
     provenance: syntax.pythonProvenance,
     offset: match.index,
     end: match.index + colon
-  })) return undefined;
+  };
+  if (!isPythonFunctionReturnTypeName(name) && !isPythonSuiteConditionName(name)) return undefined;
   return match.index + colon + 1;
 }
 
@@ -517,6 +521,14 @@ function isCredibleSourceReference(value, text, offset, assignment = '', syntax 
     // literal/value-shaped occurrences continue through the generic checks and
     // therefore remain fail-closed.
     if (ownsPythonCredential({ provenance: syntax.pythonProvenance, offset, valueStart })) return true;
+    const keyword = assignment.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*$/u);
+    if (keyword && ownsPythonCallKeywordReference({
+      provenance: syntax.pythonProvenance,
+      nameStart: offset,
+      nameEnd: offset + keyword[1].length,
+      valueStart,
+      valueEnd
+    })) return true;
   }
   // Only the matched occurrence's code boundary must survive trivia masking.
   // Calls such as os.getenv("TOKEN") legitimately contain masked string bytes
@@ -580,7 +592,10 @@ function isPythonLikeTypedAssignment(assignment) {
 }
 
 function safeCredentialReference(value, text, offset, context, assignment = '', syntax = undefined) {
-  if (isExactPlaceholder(value)) return true;
+  if (isExactPlaceholder(value) && !(context === 'source' && syntax?.pythonProvenance
+    && !EXACT_PLACEHOLDERS.has(normalizeCredentialValue(value)))) return true;
+  // Python environment expressions require complete syntax ownership too;
+  // the generic placeholder compatibility must not donate a safe RHS prefix.
   // Source member/call expressions are safe only through the masked-syntax
   // envelope. Do not let a source string/comment/config record inherit the
   // diagnostic member compatibility fallback.
@@ -868,8 +883,35 @@ function applyCredentialPatterns(text, context, languageOptions) {
   return output + text.slice(cursor);
 }
 
-function applyDirectPatterns(text) {
-  let output = text.replace(AUTHORIZATION_PATTERN, (match, prefix, value) => isExactPlaceholder(authorizationValue(value)) ? match : `${prefix}${REDACTED_SECRET}`);
+function sourceAuthorizationEnd(match, syntax) {
+  if (!syntax?.pythonProvenance) return undefined;
+  const prefix = match[1];
+  const name = prefix.slice(0, prefix.indexOf(':')).trimEnd();
+  return pythonAuthorizationAnnotationEnd({ provenance: syntax.pythonProvenance,
+    nameStart: match.index, nameEnd: match.index + name.length,
+    valueStart: match.index + prefix.length });
+}
+
+function applyDirectPatterns(text, options) {
+  let syntax;
+  let output = '';
+  let cursor = 0;
+  AUTHORIZATION_PATTERN.lastIndex = 0;
+  let match;
+  while ((match = AUTHORIZATION_PATTERN.exec(text)) !== null) {
+    if (options.context === 'source' && syntax === undefined) syntax = createSourceSyntax(text, options);
+    const sourceEnd = sourceAuthorizationEnd(match, syntax);
+    if (sourceEnd !== undefined) {
+      // Resume at the exact owned syntax end, so a following real header on
+      // the same line is still inspected by this independent pattern pass.
+      AUTHORIZATION_PATTERN.lastIndex = sourceEnd;
+      continue;
+    }
+    if (isExactPlaceholder(authorizationValue(match[2]))) continue;
+    output += text.slice(cursor, match.index) + match[1] + REDACTED_SECRET;
+    cursor = match.index + match[0].length;
+  }
+  output += text.slice(cursor);
   output = output.replace(CLI_TOKEN_PATTERN, (match, prefix, value) => isExactPlaceholder(value) ? match : `${prefix}${REDACTED_SECRET}`);
   output = output.replace(QUERY_TOKEN_PATTERN, (match, prefix, value) => isExactPlaceholder(value) ? match : `${prefix}${REDACTED_SECRET}`);
   output = output.replace(CREDENTIAL_URL_PATTERN, (match, prefix, value) => isExactPlaceholder(value) ? match : `${prefix}${REDACTED_SECRET}@`);
@@ -886,7 +928,7 @@ export function redactSensitiveText(text, options = {}) {
   // Protect transport-shaped credentials before generic assignment handling;
   // otherwise `?codexpro_token=value` becomes `?codexpro_token= [REDACTED_SECRET]`
   // and the displayed URL no longer retains a valid query shape.
-  const directSafe = applyDirectPatterns(privateSafe);
+  const directSafe = applyDirectPatterns(privateSafe, normalized);
   return redactMalformedCredentialParentheses(applyCredentialPatterns(directSafe, context, normalized));
 }
 
@@ -967,6 +1009,11 @@ export function hasSecretValue(text, options = {}) {
   AUTHORIZATION_PATTERN.lastIndex = 0;
   let match;
   while ((match = AUTHORIZATION_PATTERN.exec(source)) !== null) {
+    const sourceEnd = sourceAuthorizationEnd(match, syntax);
+    if (sourceEnd !== undefined) {
+      AUTHORIZATION_PATTERN.lastIndex = sourceEnd;
+      continue;
+    }
     if (!isExactPlaceholder(authorizationValue(match[2]))) return true;
   }
   for (const pattern of [CLI_TOKEN_PATTERN, QUERY_TOKEN_PATTERN, CREDENTIAL_URL_PATTERN]) {
