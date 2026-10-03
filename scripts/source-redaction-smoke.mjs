@@ -757,19 +757,51 @@ const pythonCallKeywordReturnComposition = [
   '    send(token=token_ref, work_token=client.session.state)',
   ''
 ].join('\n');
+const pythonCallKeywordTypedReference = [
+  '# marker: before',
+  'def run(authorization: Mapping[str, Any] | None = None):',
+  '    if invalid or pending_status is not None or token:',
+  '        raise LaneOperationError("not ready")',
+  '    authorization: Mapping[str, Any] | None = None',
+  '    send(token=authorization, work_token=authorization)',
+  ''
+].join('\n');
 const pythonCallKeywordSyntheticCredential = ['ghp_', 'A'.repeat(24)].join('');
+const pythonCallKeywordMalformedAnnotationSource = [
+  'send(token=reference)',
+  'def run(authorization: Mapping[str, Any] | None ='
+].join('\n');
+const pythonCallKeywordMalformedControlSource = [
+  'send(token=reference)',
+  'if invalid or pending_status is not None or token',
+  '    raise LaneOperationError("not ready")'
+].join('\n');
+const pythonCallKeywordTypedHostileSource = [
+  '# marker: before',
+  'def run(authorization: Mapping[str, Any] | None = None):',
+  '    if invalid or pending_status is not None or token:',
+  '        raise LaneOperationError("not ready")',
+  `    headers = {"Authorization": "Bearer ${pythonCallKeywordSyntheticCredential}"}`,
+  '    send(token=authorization)',
+  ''
+].join('\n');
 const pythonCallKeywordMarker = 'QZ7';
 const pythonCallKeywordPositiveCases = [
   ['noncredential helper keyword', 'helper(timeout=timeout_value)\n'],
   ['variable and dotted references', pythonCallKeywordReference],
   ['multiline LF references', pythonCallKeywordMultilineLf],
   ['multiline CRLF references', pythonCallKeywordMultilineCrlf],
-  ['return annotation composition', pythonCallKeywordReturnComposition]
+  ['return annotation composition', pythonCallKeywordReturnComposition],
+  ['mapping annotations with None and reference values', pythonCallKeywordTypedReference]
 ];
 for (const [label, source] of pythonCallKeywordPositiveCases) {
   checkPythonCallKeyword(label, () => assertPythonCallKeywordAllowed(label, source));
 }
 const pythonCallKeywordHostileCases = [
+  ['None keyword value is not a reference', 'send(token=None)\n'],
+  ['string keyword value is not a reference', 'send(token="safe")\n'],
+  ['generic-root attribute concatenation', 'send(token=config.token + suffix)\n'],
+  ['environment attribute concatenation', 'send(token=os.environ.token + suffix)\n'],
   ['concatenated reference', 'send(token=client.session.token_ref + suffix)\n'],
   ['indexed reference', 'send(token=client.session.token_refs[0])\n'],
   ['called reference', 'send(token=client.get_token())\n'],
@@ -788,6 +820,24 @@ const pythonCallKeywordHostileCases = [
 for (const [label, source, marker = pythonCallKeywordMarker] of pythonCallKeywordHostileCases) {
   checkPythonCallKeyword(label, () => assertPythonCallKeywordDenied(label, source, marker));
 }
+for (const [label, source] of [
+  ['credential-shaped type identifier', `def run(value: Mapping[${pythonCallKeywordSyntheticCredential}, str] | None = None):\n    pass\n`],
+  ['credential-bearing authorization header after safe call', `send(token=reference)\nheaders = {"Authorization": "Bearer ${pythonCallKeywordSyntheticCredential}"}\n`],
+  ['credential-bearing authorization default', `def run(headers={"Authorization": "Bearer ${pythonCallKeywordSyntheticCredential}"}):\n    pass\n`],
+  ['credential-bearing nested dictionary call', `send(token=provider.forward({"Authorization": "Bearer ${pythonCallKeywordSyntheticCredential}"}))\n`],
+  ['credential field after token guard suite', `if invalid or pending_status is not None or token:\n    raise LaneOperationError("not ready")\ncredentials = {"token": "${pythonCallKeywordSyntheticCredential}"}\n`]
+]) {
+  checkPythonCallKeyword(label, () => assertPythonCallKeywordDenied(label, source, pythonCallKeywordSyntheticCredential));
+}
+checkPythonCallKeyword('malformed mapping annotation remains refused', () => {
+  const source = pythonCallKeywordMalformedAnnotationSource;
+  assertPythonAstRejected(source, 'malformed mapping annotation with safe keyword candidate');
+  assertPythonCallKeywordDenied('malformed mapping annotation with safe keyword candidate', source, undefined, false);
+});
+checkPythonCallKeyword('malformed control syntax with safe keyword candidate remains refused', () => {
+  assertPythonAstRejected(pythonCallKeywordMalformedControlSource, 'malformed control syntax with safe keyword candidate');
+  assertPythonCallKeywordDenied('malformed control syntax with safe keyword candidate', pythonCallKeywordMalformedControlSource, undefined, false);
+});
 for (const [label, source] of [
   ['malformed LF call', 'send(token=token_ref, password=)\n'],
   ['malformed CRLF call', 'send(token=token_ref, password=)\r\n']
@@ -1959,6 +2009,10 @@ const pythonCallKeywordHostileSource = [
   `    send(token=token_ref, password="${pythonCallKeywordMarker}")`,
   ''
 ].join('\n');
+const pythonCallKeywordTypedPath = 'python-call-keyword-typed.py';
+const pythonCallKeywordTypedEditAfter = pythonCallKeywordTypedReference.replace('# marker: before', '# marker: after');
+const pythonCallKeywordTypedHostilePath = 'python-call-keyword-typed-hostile.py';
+const pythonCallKeywordMalformedAnnotationPath = 'python-call-keyword-malformed-annotation.py';
 const pythonCallKeywordMalformedWritePath = 'python-call-keyword-malformed.py';
 const pythonCallKeywordMalformedSource = 'send(token=token_ref, password=)\n';
 
@@ -1977,6 +2031,7 @@ try {
   await writeFixture(tmp, pythonCallKeywordReadPath, pythonCallKeywordReadSource);
   await writeFixture(tmp, pythonCallKeywordEditPath, pythonCallKeywordEditBefore);
   await writeFixture(tmp, pythonCallKeywordHostilePath, pythonCallKeywordHostileSource);
+  await writeFixture(tmp, pythonCallKeywordTypedHostilePath, pythonCallKeywordTypedHostileSource);
   await writeFixture(tmp, pythonMultilineAssignmentEditPath, pythonMultilineAssignmentEditBefore);
   await writeFixture(tmp, pythonMultilineFieldEditPath, pythonMultilineFieldEditBefore);
   await writeFixture(tmp, pythonMalformedAnnotationEditPath, pythonMalformedReturnAnnotation);
@@ -2191,6 +2246,68 @@ try {
     assert.equal(edited.structuredContent.sha256, sha256(pythonCallKeywordEditAfter), 'Python call-keyword edit returned a different source hash');
   });
 
+  await checkPythonCallKeywordAsync('ordinary MCP typed-reference write/read/edit accepts safe annotations and token guard', async () => {
+    const written = assertToolSuccess(await client.request('tools/call', {
+      name: 'write',
+      arguments: { workspace_id: workspaceId, path: pythonCallKeywordTypedPath, content: pythonCallKeywordTypedReference }
+    }), 'Python typed-reference write');
+    assert.equal(await fs.readFile(path.join(tmp, pythonCallKeywordTypedPath), 'utf8'), pythonCallKeywordTypedReference, 'typed-reference write changed exact bytes');
+    assert.equal(written.structuredContent.sha256, sha256(pythonCallKeywordTypedReference), 'typed-reference write returned a different source hash');
+    const read = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: pythonCallKeywordTypedPath }
+    }), 'Python typed-reference read');
+    assertReadMetadata(read, pythonCallKeywordTypedReference, 1, undefined, 'Python typed-reference read');
+    assert.equal(read.structuredContent.text, numbered(pythonCallKeywordTypedReference), 'typed-reference read changed exact source projection');
+    const edited = assertToolSuccess(await client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: workspaceId,
+        path: pythonCallKeywordTypedPath,
+        old_text: '# marker: before',
+        new_text: '# marker: after',
+        expected_replacements: 1
+      }
+    }), 'Python typed-reference edit');
+    assert.equal(await fs.readFile(path.join(tmp, pythonCallKeywordTypedPath), 'utf8'), pythonCallKeywordTypedEditAfter, 'typed-reference edit changed unexpected bytes');
+    assert.equal(edited.structuredContent.sha256, sha256(pythonCallKeywordTypedEditAfter), 'typed-reference edit returned a different source hash');
+  });
+
+  await checkPythonCallKeywordAsync('ordinary MCP typed credential refusal preserves file identity', async () => {
+    const target = path.join(tmp, pythonCallKeywordTypedHostilePath);
+    const before = await fs.readFile(target);
+    const beforeStat = await fs.stat(target, { bigint: true });
+    const refused = assertToolError(await client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: workspaceId,
+        path: pythonCallKeywordTypedHostilePath,
+        old_text: '# marker: before',
+        new_text: '# marker: after',
+        expected_replacements: 1
+      }
+    }), 'Python typed credential edit');
+    assert.match(resultText(refused), /Secret-looking content is blocked/);
+    expectNoHostileResponseFields(refused, [pythonCallKeywordSyntheticCredential], 'Python typed credential edit refusal');
+    const after = await fs.readFile(target);
+    const afterStat = await fs.stat(target, { bigint: true });
+    assert.deepEqual({
+      bytes: after.toString('utf8'),
+      hash: sha256(after),
+      dev: afterStat.dev.toString(),
+      ino: afterStat.ino.toString(),
+      size: afterStat.size.toString(),
+      mtimeNs: afterStat.mtimeNs.toString()
+    }, {
+      bytes: before.toString('utf8'),
+      hash: sha256(before),
+      dev: beforeStat.dev.toString(),
+      ino: beforeStat.ino.toString(),
+      size: beforeStat.size.toString(),
+      mtimeNs: beforeStat.mtimeNs.toString()
+    }, 'typed credential edit refusal changed bytes or file identity');
+  });
+
   await checkPythonCallKeywordAsync('ordinary MCP malformed-source write refuses without creating a file', async () => {
     const refused = assertToolError(await client.request('tools/call', {
       name: 'write',
@@ -2211,6 +2328,15 @@ try {
     size: pythonCallKeywordHostileStat.size.toString(),
     mtimeNs: pythonCallKeywordHostileStat.mtimeNs.toString()
   };
+
+  await checkPythonCallKeywordAsync('ordinary MCP malformed annotation write refuses without creating a file', async () => {
+    const refused = assertToolError(await client.request('tools/call', {
+      name: 'write',
+      arguments: { workspace_id: workspaceId, path: pythonCallKeywordMalformedAnnotationPath, content: pythonCallKeywordMalformedAnnotationSource }
+    }), 'Python malformed annotation write');
+    assert.match(resultText(refused), /Secret-looking content is blocked/);
+    await assert.rejects(fs.access(path.join(tmp, pythonCallKeywordMalformedAnnotationPath)), (error) => error?.code === 'ENOENT');
+  });
 
   await checkPythonCallKeywordAsync('ordinary MCP read redacts a hostile sibling in the same call', async () => {
     const read = assertToolSuccess(await client.request('tools/call', {
