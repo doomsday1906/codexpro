@@ -57,6 +57,7 @@ Usage:
   codexpro start --root /path/to/repo
   codexpro settings
   codexpro doctor
+  codexpro approve-source /absolute/path/test.py --expected-sha <sha256> --keywords token,work_token
   codexpro connection-test --root /path/to/repo
   codexpro inspect --root /path/to/repo [--json]
   codexpro review --root /path/to/repo [--staged] [--path src/file.ts] [--json]
@@ -4487,6 +4488,11 @@ function holdRuntime(runtime, details, shutdown, headless) {
 
 async function main() {
   let argv = process.argv.slice(2);
+  if (argv[0] === 'approve-source') {
+    process.argv.splice(2, 1);
+    await import('./approve-source.mjs');
+    return;
+  }
   let connectionTest = false;
   if (argv[0] === '--version' || argv[0] === '-v' || argv[0] === 'version') {
     console.log(packageVersion());

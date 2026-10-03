@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 
 const require = createRequire(import.meta.url);
 let pythonParser;
@@ -142,6 +143,39 @@ function collectCallKeywordReferences(nodes, source) {
     }
   }
   return references;
+}
+
+const approvalDigest = (value) => createHash('sha256').update(value).digest('hex');
+
+function collectCallKeywordLiterals(nodes, source) {
+  const literals = [];
+  for (const list of nodes) {
+    if (list.type !== 'ArgList' || !hasParentType(nodes, list.index, 'CallExpression')) continue;
+    const callee = directChildren(nodes, nodes[list.parent].index)[0];
+    if (!isCallKeywordReference(nodes, callee, source)) continue;
+    const children = directChildren(nodes, list.index).filter((node) => !['(', ')', 'Comment'].includes(node.type));
+    for (let index = 0; index < children.length; index += 1) {
+      const [name, operator, rhs, next] = children.slice(index, index + 4);
+      if (index > 0 && children[index - 1].type !== ',') continue;
+      if (name.type !== 'VariableName' || operator?.type !== 'AssignOp' || !rhs) continue;
+      if (source.slice(operator.from, operator.to) !== '=' || (next && next.type !== ',')) continue;
+      if (rhs.type !== 'None' && !(rhs.type === 'String' && rhs.children.length === 0
+        && /^["']/u.test(source.slice(rhs.from, rhs.to)))) continue;
+      literals.push({ nameFrom: name.from, nameTo: name.to, rhsFrom: rhs.from, rhsTo: rhs.to,
+        entry: { keyword_sha256: approvalDigest(source.slice(name.from, name.to)),
+          callee_sha256: approvalDigest(source.slice(callee.from, callee.to)),
+          value_sha256: approvalDigest(source.slice(rhs.from, rhs.to)) } });
+    }
+  }
+  return literals;
+}
+
+export function collectPythonCallKeywordApprovals(source, keywords) {
+  const parsed = parsePythonSegment(source);
+  if (!parsed.valid) throw new Error('Approval requires complete valid Python source within the parser limit.');
+  const allowed = new Set(keywords.map(approvalDigest));
+  return [...new Map(parsed.callKeywordLiterals.filter((literal) => allowed.has(literal.entry.keyword_sha256))
+    .map((literal) => [JSON.stringify(literal.entry), literal.entry])).values()];
 }
 
 function collectSourceFieldSyntax(nodes, source) {
@@ -295,6 +329,7 @@ function parsePythonSegment(source, { completeSource = true } = {}) {
   return {
     valid: true, source: text, nodes, annotations, aliases, functionReturnTypeNames,
     callKeywordReferences: collectCallKeywordReferences(nodes, text),
+    callKeywordLiterals: collectCallKeywordLiterals(nodes, text),
     ...collectSourceFieldSyntax(nodes, text)
   };
 }
@@ -837,6 +872,27 @@ export function ownsPythonCallKeywordReference({ provenance, nameStart, nameEnd,
     }
   }
   // Missing endpoints and invalid/non-Python mapped sides veto this exception.
+  return matches.length > 0 && matches.every(Boolean);
+}
+
+export function ownsApprovedPythonCallKeyword({ provenance, entries, nameStart, nameEnd, valueStart, valueEnd }) {
+  if (!provenance?.available || !Array.isArray(entries) || entries.length === 0
+    || ![nameStart, nameEnd, valueStart, valueEnd].every(Number.isInteger)
+    || nameEnd <= nameStart || valueEnd <= valueStart) return false;
+  const matches = [];
+  for (const segment of provenance.segments ?? []) {
+    for (const side of segment.sides ?? [segment]) {
+      if (!side.originalToVirtual.has(nameStart)) continue;
+      const start = side.originalToVirtual.get(nameStart), nameLast = side.originalToVirtual.get(nameEnd - 1);
+      const rhsStart = side.originalToVirtual.get(valueStart), rhsLast = side.originalToVirtual.get(valueEnd - 1);
+      matches.push(Boolean(side.parse?.valid && Number.isInteger(nameLast) && Number.isInteger(rhsStart) && Number.isInteger(rhsLast)
+        && (side.parse.callKeywordLiterals ?? []).some((literal) =>
+          start === literal.nameFrom && nameLast + 1 === literal.nameTo
+          && rhsStart === literal.rhsFrom && rhsLast + 1 === literal.rhsTo
+          && entries.some((entry) => entry.keyword_sha256 === literal.entry.keyword_sha256
+            && entry.callee_sha256 === literal.entry.callee_sha256 && entry.value_sha256 === literal.entry.value_sha256))));
+    }
+  }
   return matches.length > 0 && matches.every(Boolean);
 }
 

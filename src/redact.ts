@@ -29,7 +29,7 @@ export function createPrivateKeyScanner(): PrivateKeyScanner {
 
 export type RedactionContext = "source" | "diagnostic";
 export type SourceLanguage = "python";
-export type RedactionOptions = { context?: RedactionContext; language?: SourceLanguage };
+export type RedactionOptions = { context?: RedactionContext; language?: SourceLanguage; sourcePath?: string };
 
 export type DiffFileBlock = {
   readonly source: string;
@@ -62,9 +62,10 @@ export function hasSecretValue(text: string, options: RedactionOptions | Redacti
 
 export function hasSecretValueInUnifiedDiff(
   text: string,
-  languageForPath?: (path: string | undefined) => SourceLanguage | undefined
+  languageForPath?: (path: string | undefined) => SourceLanguage | undefined,
+  sourcePathForPath?: (path: string | undefined) => string | undefined
 ): boolean {
-  return policyHasSecretValueInUnifiedDiff(text, { languageForPath });
+  return policyHasSecretValueInUnifiedDiff(text, { languageForPath, sourcePathForPath });
 }
 
 export function redactSensitiveText(text: string, options: RedactionOptions | RedactionContext = {}): string {
@@ -77,9 +78,10 @@ export function redactSensitiveTextPreservingLines(text: string, options: Redact
 
 export function redactUnifiedDiff(
   text: string,
-  languageForPath?: (path: string | undefined) => SourceLanguage | undefined
+  languageForPath?: (path: string | undefined) => SourceLanguage | undefined,
+  sourcePathForPath?: (path: string | undefined) => string | undefined
 ): string {
-  return policyRedactUnifiedDiff(text, { languageForPath });
+  return policyRedactUnifiedDiff(text, { languageForPath, sourcePathForPath });
 }
 
 /** Redact a unified diff while preserving hunk line cardinality. */

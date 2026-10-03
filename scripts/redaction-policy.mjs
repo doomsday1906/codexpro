@@ -4,9 +4,11 @@ import {
   isPythonFunctionReturnTypeName,
   isPythonSuiteConditionName,
   ownsPythonCallKeywordReference,
+  ownsApprovedPythonCallKeyword,
   ownsPythonCredential,
   pythonAuthorizationAnnotationEnd
 } from './python-provenance.mjs';
+import { loadCallKeywordApprovals } from './source-approvals.mjs';
 
 export { extractDiffFileBlocks };
 
@@ -35,7 +37,10 @@ function normalizeOptions(options, defaultContext = 'source') {
   const languageForPath = context === 'source' && typeof options?.languageForPath === 'function'
     ? options.languageForPath
     : undefined;
-  return { context, language, oldLanguage, newLanguage, languageForPath };
+  const approvedCallKeywordValues = context === 'source'
+    ? (Array.isArray(options?.approvedCallKeywordValues) ? options.approvedCallKeywordValues : loadCallKeywordApprovals(options?.sourcePath))
+    : [];
+  return { context, language, oldLanguage, newLanguage, languageForPath, approvedCallKeywordValues };
 }
 
 const PRIVATE_KEY_LABELS = [
@@ -494,6 +499,7 @@ function createSourceSyntax(text, options = {}) {
     code,
     pairs: buildDelimiterPairs(code),
     language,
+    approvedCallKeywordValues: normalizeOptions(options).approvedCallKeywordValues,
     // Parser authority is opt-in from a trusted path-derived language hint.
     // Diagnostics, URLs, config, and generic text deliberately carry no
     // provenance object, even when their bytes resemble Python.
@@ -522,13 +528,15 @@ function isCredibleSourceReference(value, text, offset, assignment = '', syntax 
     // therefore remain fail-closed.
     if (ownsPythonCredential({ provenance: syntax.pythonProvenance, offset, valueStart })) return true;
     const keyword = assignment.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*$/u);
-    if (keyword && ownsPythonCallKeywordReference({
+    const query = keyword && {
       provenance: syntax.pythonProvenance,
       nameStart: offset,
       nameEnd: offset + keyword[1].length,
       valueStart,
       valueEnd
-    })) return true;
+    };
+    if (query && (ownsPythonCallKeywordReference(query)
+      || ownsApprovedPythonCallKeyword({ ...query, entries: syntax.approvedCallKeywordValues }))) return true;
   }
   // Only the matched occurrence's code boundary must survive trivia masking.
   // Calls such as os.getenv("TOKEN") legitimately contain masked string bytes
@@ -1052,6 +1060,17 @@ function trustedDiffLanguage(languageForPath, path, present, pathDiscoveryValid)
 // first pass the canonical pathDiscoveryValid authority: invalid metadata or
 // hunks disable both sides, while valid blocks retain independent old/new path
 // language routing.
+function diffCallKeywordApprovals(block, options) {
+  if (!block.pathDiscoveryValid || typeof options.sourcePathForPath !== 'function') return [];
+  const paths = [block.oldPresent && block.oldPath, block.newPresent && block.newPath].filter(Boolean);
+  try {
+    const lists = paths.map((filePath) => loadCallKeywordApprovals(options.sourcePathForPath(filePath)));
+    return lists.length ? lists[0].filter((entry) => lists.every((list) => list.some((other) =>
+      entry.keyword_sha256 === other.keyword_sha256 && entry.callee_sha256 === other.callee_sha256
+      && entry.value_sha256 === other.value_sha256))) : [];
+  } catch { return []; }
+}
+
 export function redactUnifiedDiff(text, options = {}) {
   const languageForPath = typeof options?.languageForPath === 'function'
     ? options.languageForPath
@@ -1059,7 +1078,8 @@ export function redactUnifiedDiff(text, options = {}) {
   return extractDiffFileBlocks(text).map((block) => {
     const oldLanguage = trustedDiffLanguage(languageForPath, block.oldPath, block.oldPresent, block.pathDiscoveryValid);
     const newLanguage = trustedDiffLanguage(languageForPath, block.newPath, block.newPresent, block.pathDiscoveryValid);
-    return redactSensitiveText(block.source, { context: 'source', oldLanguage, newLanguage });
+    return redactSensitiveText(block.source, { context: 'source', oldLanguage, newLanguage,
+      approvedCallKeywordValues: diffCallKeywordApprovals(block, options) });
   }).join('');
 }
 
@@ -1070,7 +1090,8 @@ export function hasSecretValueInUnifiedDiff(text, options = {}) {
   return extractDiffFileBlocks(text).some((block) => {
     const oldLanguage = trustedDiffLanguage(languageForPath, block.oldPath, block.oldPresent, block.pathDiscoveryValid);
     const newLanguage = trustedDiffLanguage(languageForPath, block.newPath, block.newPresent, block.pathDiscoveryValid);
-    return hasSecretValue(block.source, { context: 'source', oldLanguage, newLanguage });
+    return hasSecretValue(block.source, { context: 'source', oldLanguage, newLanguage,
+      approvedCallKeywordValues: diffCallKeywordApprovals(block, options) });
   });
 }
 

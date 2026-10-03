@@ -882,7 +882,7 @@ async function readPublicSnapshotFile(
   const text = buffer.toString("utf8");
   const digest = sha256(text);
   const language = sourceLanguageForPath(resolved.relPath);
-  const redacted = redactSensitiveTextPreservingLines(text, { context: "source", language });
+  const redacted = redactSensitiveTextPreservingLines(text, { context: "source", language, sourcePath: resolved.absPath });
   const rawLines = splitLines(text);
   const redactedLines = splitLines(redacted);
   if (redactedLines.length !== rawLines.length) {
@@ -1009,7 +1009,7 @@ export async function writeTextFile(
   if (contentBytes > config.maxWriteBytes) {
     throw new CodexProError(`Write content is too large (${contentBytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
   }
-  if (hasSecretValue(content, { context: "source", language: sourceLanguageForPath(resolved.relPath) })) {
+  if (hasSecretValue(content, { context: "source", language: sourceLanguageForPath(resolved.relPath), sourcePath: resolved.absPath })) {
     throw new CodexProError("Secret-looking content is blocked from write. Use placeholders such as [REDACTED_SECRET] in handoff files.");
   }
 
@@ -1087,7 +1087,7 @@ export async function editTextFile(
     if (afterBytes > config.maxWriteBytes) {
       throw new CodexProError(`Edited file would be too large (${afterBytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
     }
-    if (hasSecretValue(after, { context: "source", language: sourceLanguageForPath(resolved.relPath) })) {
+    if (hasSecretValue(after, { context: "source", language: sourceLanguageForPath(resolved.relPath), sourcePath: resolved.absPath })) {
       throw new CodexProError("Secret-looking content is blocked from edit. Use placeholders such as [REDACTED_SECRET] in handoff files.");
     }
 

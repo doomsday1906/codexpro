@@ -2536,11 +2536,16 @@ async function simulateWorkspacePatch(config: CodexProConfig, records: Validated
 
 function validateSimulatedSource(simulated: SimulatedPatch, records: ValidatedPatchPath[]): ValidatedSimulation {
   const languageForPath = languageForValidatedPaths(records);
+  const sourcePathForPath = (pathHint: string | undefined): string | undefined => {
+    if (typeof pathHint !== "string") return undefined;
+    const matches = records.filter((record) => policyPathMatches(record.gitPath, pathHint) || policyPathMatches(record.relPath, pathHint));
+    return matches.length === 1 ? matches[0].absPath : undefined;
+  };
   try {
-    if (hasSecretValueInUnifiedDiff(simulated.rawDiff, languageForPath)) {
+    if (hasSecretValueInUnifiedDiff(simulated.rawDiff, languageForPath, sourcePathForPath)) {
       throw new CodexProError("Secret-looking content is blocked from apply_patch. Use placeholders such as [REDACTED_SECRET].");
     }
-    return { ...simulated, diff: redactUnifiedDiff(simulated.rawDiff, languageForPath) };
+    return { ...simulated, diff: redactUnifiedDiff(simulated.rawDiff, languageForPath, sourcePathForPath) };
   } catch (error) {
     if (error instanceof CodexProError) throw error;
     throw new CodexProError("Canonical Git diff source validation failed.");
