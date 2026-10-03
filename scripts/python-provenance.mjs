@@ -147,6 +147,20 @@ function collectCallKeywordReferences(nodes, source) {
 
 const approvalDigest = (value) => createHash('sha256').update(value).digest('hex');
 
+function isApprovalString(nodes, node, source) {
+  if (node.type === 'String') return node.children.length === 0 && /^["']/u.test(source.slice(node.from, node.to));
+  if (node.type !== 'FormatString') return false;
+  return directChildren(nodes, node.index).every((replacement) => {
+    if (replacement.type !== 'FormatReplacement') return false;
+    const children = directChildren(nodes, replacement.index).filter((child) => !['{', '}'].includes(child.type));
+    const reference = children[0];
+    const format = children[1];
+    return isCallKeywordReference(nodes, reference, source)
+      && (children.length === 1 || (children.length === 2 && format.type === 'FormatSpec'
+        && directChildren(nodes, format.index).every((child) => child.type === ':')));
+  });
+}
+
 function collectCallKeywordLiterals(nodes, source) {
   const literals = [];
   for (const list of nodes) {
@@ -159,8 +173,7 @@ function collectCallKeywordLiterals(nodes, source) {
       if (index > 0 && children[index - 1].type !== ',') continue;
       if (name.type !== 'VariableName' || operator?.type !== 'AssignOp' || !rhs) continue;
       if (source.slice(operator.from, operator.to) !== '=' || (next && next.type !== ',')) continue;
-      if (rhs.type !== 'None' && !(rhs.type === 'String' && rhs.children.length === 0
-        && /^["']/u.test(source.slice(rhs.from, rhs.to)))) continue;
+      if (rhs.type !== 'None' && !isApprovalString(nodes, rhs, source)) continue;
       literals.push({ nameFrom: name.from, nameTo: name.to, rhsFrom: rhs.from, rhsTo: rhs.to,
         entry: { keyword_sha256: approvalDigest(source.slice(name.from, name.to)),
           callee_sha256: approvalDigest(source.slice(callee.from, callee.to)),
@@ -894,6 +907,29 @@ export function ownsApprovedPythonCallKeyword({ provenance, entries, nameStart, 
     }
   }
   return matches.length > 0 && matches.every(Boolean);
+}
+
+export function approvedPythonCallKeywordEnd({ provenance, entries, nameStart, nameEnd, valueStart }) {
+  if (!provenance?.available || !Array.isArray(entries) || entries.length === 0
+    || ![nameStart, nameEnd, valueStart].every(Number.isInteger) || nameEnd <= nameStart) return undefined;
+  const ends = [];
+  for (const segment of provenance.segments ?? []) {
+    for (const side of segment.sides ?? [segment]) {
+      if (!side.originalToVirtual.has(nameStart)) continue;
+      const start = side.originalToVirtual.get(nameStart), nameLast = side.originalToVirtual.get(nameEnd - 1);
+      const rhsStart = side.originalToVirtual.get(valueStart);
+      const literal = side.parse?.valid && Number.isInteger(nameLast) && Number.isInteger(rhsStart)
+        ? (side.parse.callKeywordLiterals ?? []).find((item) => start === item.nameFrom
+          && nameLast + 1 === item.nameTo && rhsStart === item.rhsFrom)
+        : undefined;
+      const last = literal && side.originalOffsets[literal.rhsTo - 1];
+      ends.push(Number.isInteger(last) && last >= 0 ? last + 1 : undefined);
+    }
+  }
+  const valueEnd = ends[0];
+  if (!Number.isInteger(valueEnd) || !ends.every((end) => end === valueEnd)) return undefined;
+  return ownsApprovedPythonCallKeyword({ provenance, entries, nameStart, nameEnd, valueStart, valueEnd })
+    ? valueEnd : undefined;
 }
 
 export function isPythonSuiteConditionName({ provenance, offset, end }) {

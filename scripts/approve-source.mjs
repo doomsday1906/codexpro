@@ -8,7 +8,7 @@ import { enrollSourceApproval, approvalRegistryPath } from './source-approvals.m
 const usage = 'node scripts/approve-source.mjs <absolute .py file> --expected-sha <sha256> --keywords token,work_token [--registry <file>]';
 function main(args) {
   if (args.length === 1 && args[0] === '--help') {
-    console.log(usage + '\nOwner-only enrollment: allows unchanged exact plain-string/None call values; never rewrites source or exempts definite credentials.');
+    console.log(usage + '\nOwner-only enrollment: allows unchanged exact string/None call values, including f-strings with reference interpolations and static format specs; never rewrites source or exempts definite credentials.');
     return;
   }
   const [sourcePath, ...flags] = args;
@@ -45,7 +45,7 @@ function main(args) {
   const source = buffer.toString('utf8');
   if (buffer.includes(0) || !Buffer.from(source).equals(buffer)) throw new Error('Approval requires UTF-8 text.');
   const entries = collectPythonCallKeywordApprovals(source, keywords);
-  if (!entries.length) throw new Error('No eligible plain-string/None call keyword values.');
+  if (!entries.length) throw new Error('No eligible string/None call keyword values.');
   if (hasSecretValue(source, { context: 'source', language: 'python', approvedCallKeywordValues: entries })) {
     throw new Error('Independent credential or unapproved source candidate remains; approval refused.');
   }
@@ -59,4 +59,3 @@ try { main(process.argv.slice(2)); } catch (error) {
   console.error(error instanceof Error ? error.message : 'Source approval failed.');
   process.exitCode = 1;
 }
-

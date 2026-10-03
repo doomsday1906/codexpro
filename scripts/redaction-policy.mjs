@@ -4,7 +4,7 @@ import {
   isPythonFunctionReturnTypeName,
   isPythonSuiteConditionName,
   ownsPythonCallKeywordReference,
-  ownsApprovedPythonCallKeyword,
+  approvedPythonCallKeywordEnd,
   ownsPythonCredential,
   pythonAuthorizationAnnotationEnd
 } from './python-provenance.mjs';
@@ -535,8 +535,14 @@ function isCredibleSourceReference(value, text, offset, assignment = '', syntax 
       valueStart,
       valueEnd
     };
-    if (query && (ownsPythonCallKeywordReference(query)
-      || ownsApprovedPythonCallKeyword({ ...query, entries: syntax.approvedCallKeywordValues }))) return true;
+    if (query) {
+      if (ownsPythonCallKeywordReference(query)) return true;
+      // Regexes may see only an f-string prefix. Approval still owns the exact
+      // complete parser RHS on every side, never that prefix or its wrapper.
+      // Keep regex cursors unchanged so the remaining bytes are also scanned.
+      const approvedEnd = approvedPythonCallKeywordEnd({ ...query, entries: syntax.approvedCallKeywordValues });
+      if (Number.isInteger(approvedEnd) && valueEnd <= approvedEnd) return true;
+    }
   }
   // Only the matched occurrence's code boundary must survive trivia masking.
   // Calls such as os.getenv("TOKEN") legitimately contain masked string bytes

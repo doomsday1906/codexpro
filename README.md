@@ -39,7 +39,7 @@ codexpro setup
 
 ## Approve nonsecret Python test values
 
-Python call keywords accept complete variable or dotted-attribute references. For a known nonsecret plain string or `None` in a credential-named test keyword, the local owner can enroll the existing file:
+Python call keywords accept complete variable or dotted-attribute references. For a known nonsecret string or `None` in a credential-named test keyword, the local owner can enroll the existing file. Formatted strings require variable or dotted-attribute interpolations with optional static format specifications:
 
 ```bash
 codexpro approve-source /absolute/path/test.py --expected-sha CURRENT_SHA256 --keywords token,work_token
