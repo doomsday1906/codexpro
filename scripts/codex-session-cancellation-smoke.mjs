@@ -406,7 +406,7 @@ try {
     ]);
     assert.equal(result.structuredContent.cursor, sourceSize);
     assert.equal(result.structuredContent.resume_cursor, targetStart);
-    assert.equal(result.structuredContent.next_cursor, undefined);
+    assert.equal(result.structuredContent.next_cursor, null);
     assert.equal(result.structuredContent.has_more, false);
     assert.equal(result.structuredContent.source_size_bytes, sourceSize);
     const outcome = await client.waitForLog(logStart,
