@@ -68,7 +68,7 @@ while (alignedTailBlockBytes - Buffer.byteLength(alignedTailSuffix, "utf8") >
 }
 const alignmentNoteBytes = alignedTailBlockBytes -
   Buffer.byteLength(alignedTailSuffix, "utf8") -
-  Buffer.byteLength(alignmentBaseEvent, "utf8") - 2;
+  Buffer.byteLength(alignmentBaseEvent, "utf8") - 1;
 const alignmentFiller = alignmentEvent(999_999, "x".repeat(alignmentNoteBytes));
 alignedRows.unshift(alignmentFiller);
 alignedTailSuffix = "\n" + alignedRows.join("\n");
