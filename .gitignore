@@ -15,3 +15,6 @@ CODEXPRO_MCP_REPORT.md
 *.log
 SOCIAL_POSTS.md
 LAUNCH_COPY.md
+# AgentWorkspace Mission Control runtime identity and transient lock.
+/.mission-control/planning.owner-origin.json
+/.mission-control/portfolio.planning.lock
