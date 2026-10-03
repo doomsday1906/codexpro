@@ -4885,6 +4885,374 @@ try {
   assert.match(resultText(privateWrite), /Secret-looking content is blocked/);
   await assert.rejects(fs.access(path.join(tmp, 'blocked-private-key.txt')), (error) => error?.code === 'ENOENT');
 
+  {
+  const approvalRegistryPath = path.join(tmp, 'source-approvals.json');
+  const approvalClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--bash', 'off', '--write', 'workspace', '--tool-mode', 'full'], {
+    cwd: path.resolve('.'),
+    env: {
+      ...process.env,
+      CODEXPRO_ROOT: tmp,
+      CODEXPRO_ALLOWED_ROOTS: tmp,
+      CODEXPRO_BASH_MODE: 'off',
+      CODEXPRO_WRITE_MODE: 'workspace',
+      CODEXPRO_TOOL_MODE: 'full',
+      CODEXPRO_TOOL_CARDS: '0',
+      CODEXPRO_ANALYSIS: '1',
+      CODEXPRO_SOURCE_APPROVALS_FILE: approvalRegistryPath
+    }
+  });
+  try {
+  await approvalClient.request('initialize', {
+    protocolVersion: '2024-11-05',
+    capabilities: {},
+    clientInfo: { name: 'codexpro-source-approval-smoke', version: '0.1.0' }
+  });
+  approvalClient.notify('notifications/initialized');
+  const approvalOpened = assertToolSuccess(await approvalClient.request('tools/call', {
+    name: 'open_current_workspace', arguments: { include_tree: false }
+  }), 'approval open_current_workspace');
+  const client = approvalClient;
+  const workspaceId = approvalOpened.structuredContent.workspace_id;
+  assert.ok(workspaceId, 'approval workspace omitted its id');
+
+  // Owner approvals are a native command and bind only exact parser-owned
+  // keyword/callee/value triples to the canonical file path. The registry
+  // contains digests, never source literals; MCP receives no approval writer.
+  const approvalRelativePath = 'source-approval-fixture.py';
+  const approvalAbsolutePath = path.join(tmp, approvalRelativePath);
+  const approvalSource = [
+    '# approval marker: before',
+    'def run():',
+    '    send(token="APPROVED_OWNER_ALPHA", work_token=None)',
+    '    client.session.send(token="APPROVED_OWNER_BETA", work_token="APPROVED_OWNER_GAMMA")',
+    ''
+  ].join('\n');
+  const approvalAfterMarker = approvalSource.replace('# approval marker: before', '# approval marker: after');
+  const approvalLiterals = ['APPROVED_OWNER_ALPHA', 'APPROVED_OWNER_BETA', 'APPROVED_OWNER_GAMMA'];
+  const approvalSnapshot = async (absolutePath) => {
+    const bytes = await fs.readFile(absolutePath);
+    const stat = await fs.stat(absolutePath, { bigint: true });
+    return {
+      bytes: bytes.toString('base64'),
+      sha256: sha256(bytes.toString('utf8')),
+      dev: stat.dev.toString(),
+      ino: stat.ino.toString(),
+      size: stat.size.toString(),
+      mtimeNs: stat.mtimeNs.toString()
+    };
+  };
+  const approvalCommand = path.resolve('scripts/codexpro.mjs');
+  const runApprovalCommand = (sourcePath, expectedSha) => spawnSync(process.execPath, [
+    approvalCommand,
+    'approve-source',
+    sourcePath,
+    '--expected-sha', expectedSha,
+    '--keywords', 'token,work_token',
+    '--registry', approvalRegistryPath
+  ], { cwd: path.resolve('.'), encoding: 'utf8', timeout: 20000, maxBuffer: 128 * 1024 });
+  await fs.writeFile(approvalAbsolutePath, approvalSource, { encoding: 'utf8', flag: 'wx' });
+  const approvalBeforeEnrollment = await approvalSnapshot(approvalAbsolutePath);
+  const enrollmentResult = runApprovalCommand(approvalAbsolutePath, sha256(approvalSource));
+  assert.equal(enrollmentResult.error?.code ?? null, null, 'codexpro approve-source could not start');
+  assert.equal(enrollmentResult.status, 0, `codexpro approve-source failed: ${enrollmentResult.stderr || enrollmentResult.stdout}`);
+  expectNoHostileResponseFields({ stdout: enrollmentResult.stdout, stderr: enrollmentResult.stderr }, approvalLiterals, 'owner approval command');
+  const enrolledRegistryBytes = await fs.readFile(approvalRegistryPath);
+  const enrolledRegistry = JSON.parse(enrolledRegistryBytes.toString('utf8'));
+  assert.equal(enrolledRegistry.version, 1, 'approval registry schema version changed');
+  assert.equal(enrolledRegistry.files.length, 1, 'owner command enrolled an unexpected file count');
+  assert.equal(enrolledRegistry.files[0].path, path.resolve(approvalAbsolutePath), 'owner command did not bind the canonical exact path');
+  assert.equal(enrolledRegistry.files[0].source_sha256, sha256(approvalSource), 'owner command omitted the enrollment source hash');
+  const expectedApprovalRows = [
+    ['token', 'send', '"APPROVED_OWNER_ALPHA"'],
+    ['work_token', 'send', 'None'],
+    ['token', 'client.session.send', '"APPROVED_OWNER_BETA"'],
+    ['work_token', 'client.session.send', '"APPROVED_OWNER_GAMMA"']
+  ].map((row) => row.map(sha256).join(':')).sort();
+  const actualApprovalRows = enrolledRegistry.files[0].entries.map((row) => [
+    row.keyword_sha256,
+    row.callee_sha256,
+    row.value_sha256
+  ].join(':')).sort();
+  assert.deepEqual(actualApprovalRows, expectedApprovalRows, 'owner command enrolled a different keyword/callee/value triple set');
+  expectNoHostileResponseFields(enrolledRegistry, [...approvalLiterals, 'None'], 'hash-only approval registry');
+  assert.deepEqual(await approvalSnapshot(approvalAbsolutePath), approvalBeforeEnrollment, 'owner command changed source bytes or metadata');
+
+  const toolsListResult = assertToolSuccess(await client.request('tools/list', {}), 'approval tools/list');
+  const listedTools = toolsListResult.structuredContent?.tools ?? toolsListResult.tools;
+  assert.ok(Array.isArray(listedTools) && listedTools.length > 0, 'approval tools/list omitted its tool catalog');
+  assert.equal(listedTools.some((tool) => /approve.*source|source.*approve/i.test(String(tool.name))), false, 'MCP exposed an owner approval command');
+  for (const toolName of ['write', 'edit']) {
+    const schema = listedTools.find((tool) => tool.name === toolName)?.inputSchema?.properties ?? {};
+    assert.equal(Object.keys(schema).some((name) => /approval/i.test(name)), false, `${toolName} exposed an approval-writing parameter`);
+  }
+  const approvedRead = assertToolSuccess(await client.request('tools/call', {
+    name: 'read', arguments: { workspace_id: workspaceId, path: approvalRelativePath }
+  }), 'approved source read');
+  assert.equal(approvedRead.structuredContent.text, numbered(approvalSource), 'approved read changed exact source bytes');
+  for (const literal of approvalLiterals) assert.equal(JSON.stringify(approvedRead).includes(literal), true, 'approved read omitted an enrolled literal');
+  const approvedWrite = assertToolSuccess(await client.request('tools/call', {
+    name: 'write', arguments: { workspace_id: workspaceId, path: approvalRelativePath, content: approvalSource }
+  }), 'approved ordinary MCP write');
+  assert.equal(await fs.readFile(approvalAbsolutePath, 'utf8'), approvalSource, 'approved write changed exact fixture bytes');
+  assert.equal(approvedWrite.structuredContent.sha256, sha256(approvalSource), 'approved write returned a different hash');
+  const approvedEdit = assertToolSuccess(await client.request('tools/call', {
+    name: 'edit', arguments: {
+      workspace_id: workspaceId,
+      path: approvalRelativePath,
+      old_text: '# approval marker: before',
+      new_text: '# approval marker: after',
+      expected_replacements: 1
+    }
+  }), 'approved unrelated ordinary MCP edit');
+  assert.equal(await fs.readFile(approvalAbsolutePath, 'utf8'), approvalAfterMarker, 'unrelated approved edit changed additional source bytes');
+  assert.equal(approvedEdit.structuredContent.sha256, sha256(approvalAfterMarker), 'approved edit returned a different resulting hash');
+  const approvedReread = assertToolSuccess(await client.request('tools/call', {
+    name: 'read', arguments: { workspace_id: workspaceId, path: approvalRelativePath }
+  }), 'approved source reread');
+  assert.equal(approvedReread.structuredContent.text, numbered(approvalAfterMarker), 'unrelated edit invalidated unchanged approved triples');
+  assert.deepEqual(await fs.readFile(approvalRegistryPath), enrolledRegistryBytes, 'unrelated edit rewrote enrollment metadata');
+
+  const syntheticProviderIdentifier = ['gh', 'p_', 'A'.repeat(28)].join('');
+  const syntheticJwtValue = [
+    ['eyJ', 'hbGciOiJub25lIn0'].join(''),
+    ['eyJ', 'zdWIiOiJzeW50aGV0aWMifQ'].join(''),
+    'S'.repeat(32)
+  ].join('.');
+  const syntheticPrivateKeyValue = [
+    '-----BEGIN PRIVATE KEY-----',
+    'SYNTHETIC_TEST_MATERIAL_ONLY',
+    '-----END PRIVATE KEY-----'
+  ].join('\n');
+  const hostileOpaqueValue = 'Authorization: Bearer OPAQUE_LITERAL';
+  const protectedSyntheticValues = [syntheticProviderIdentifier, syntheticJwtValue, syntheticPrivateKeyValue, hostileOpaqueValue, 'OPAQUE_LITERAL'];
+  const refusalCases = [
+    ['changed credential key', '    send(api_token="APPROVED_OWNER_ALPHA")'],
+    ['changed approved value', '    send(token="APPROVED_OWNER_CHANGED")'],
+    ['changed approved callee', '    client.session.forward(token="APPROVED_OWNER_ALPHA")'],
+    ['approved prefix concatenation', '    send(token="APPROVED_OWNER_ALPHA" + suffix)'],
+    ['new unapproved literal sibling', '    send(token="APPROVED_OWNER_UNENROLLED")'],
+    ['generic-root concatenated attribute', '    send(token=config.token + suffix)'],
+    ['environment-root indexed attribute', '    send(token=os.environ.token[0])'],
+    ['generic-root called attribute', '    send(token=config.token())'],
+    ['generic-root parenthesized attribute', '    send(token=(config.token))'],
+    ['safe argument with hostile sibling', '    send(token=token_ref, password="OPAQUE_LITERAL")'],
+    ['credential-shaped identifier root', `    send(token=${syntheticProviderIdentifier})`],
+    ['credential-shaped attribute', `    send(token=provider.${syntheticProviderIdentifier})`],
+    ['safe annotation followed by opaque same-line header', 'def run(authorization: Mapping[str, str] | None = None, note="Authorization: Bearer OPAQUE_LITERAL"):\n    pass'],
+    ['token suite followed by opaque password', 'if token:\n    password="OPAQUE_LITERAL"'],
+    ['malformed approved Python edit', '    send(token="APPROVED_OWNER_ALPHA"']
+  ];
+  async function refuseApprovedEdit(label, insertedSource) {
+    const before = await approvalSnapshot(approvalAbsolutePath);
+    const topLevelCandidate = label.startsWith('safe annotation') || label.startsWith('token suite');
+    const targetText = topLevelCandidate
+      ? '# approval marker: after'
+      : '    send(token="APPROVED_OWNER_ALPHA", work_token=None)';
+    const replacementText = topLevelCandidate
+      ? '# approval marker: after\n' + insertedSource
+      : insertedSource;
+    const candidateSource = approvalAfterMarker.replace(targetText, replacementText);
+    const syntaxCheck = spawnSync('python3', ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'], {
+      input: candidateSource, encoding: 'utf8', timeout: 10000
+    });
+    if (label === 'malformed approved Python edit') {
+      assert.notEqual(syntaxCheck.status, 0, 'malformed edit fixture unexpectedly parsed');
+    } else {
+      assert.equal(syntaxCheck.status, 0, `${label} was malformed before policy evaluation: ${syntaxCheck.stderr || syntaxCheck.stdout}`);
+    }
+    const result = assertToolError(await client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: workspaceId,
+        path: approvalRelativePath,
+        old_text: targetText,
+        new_text: replacementText,
+        expected_replacements: 1
+      }
+    }), label);
+    assert.match(resultText(result), /Secret-looking content is blocked/);
+    expectNoHostileResponseFields(result, [...approvalLiterals, ...protectedSyntheticValues], label);
+    assert.deepEqual(await approvalSnapshot(approvalAbsolutePath), before, `${label} changed bytes, hash, inode, size, or mtime`);
+  }
+  for (const [label, source] of refusalCases) await refuseApprovedEdit(label, source);
+  for (const [label, source] of [
+    ['complete generic-root dotted reference', 'send(token=config.token)'],
+    ['complete environment-root dotted reference', 'send(token=os.environ.token)']
+  ]) {
+    const before = await fs.readFile(approvalAbsolutePath, 'utf8');
+    const after = before.replace('# approval marker: after', '# approval marker: after\n' + source);
+    assert.notEqual(after, before, `${label} insertion anchor was missing`);
+    assertPythonAstAccepted(after, label);
+    const allowed = assertToolSuccess(await client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: workspaceId,
+        path: approvalRelativePath,
+        old_text: '# approval marker: after',
+        new_text: '# approval marker: after\n' + source,
+        expected_replacements: 1
+      }
+    }), label);
+    assert.equal(await fs.readFile(approvalAbsolutePath, 'utf8'), after, `${label} edit changed unexpected bytes`);
+    assert.equal(allowed.structuredContent.sha256, sha256(after), `${label} edit returned an incorrect source hash`);
+  }
+  assert.deepEqual(await fs.readFile(approvalRegistryPath), enrolledRegistryBytes, 'complete dotted references changed owner approval metadata');
+  for (const [label, value] of [
+    ['provider-shaped approved literal', syntheticProviderIdentifier],
+    ['JWT-shaped approved literal', syntheticJwtValue],
+    ['private-key approved literal', syntheticPrivateKeyValue],
+    ['Authorization-header approved literal', hostileOpaqueValue]
+  ]) {
+    const source = `send(token=${JSON.stringify(value)})\n`;
+    const file = path.join(tmp, `approval-refusal-${label.replaceAll(/[^a-z0-9]+/giu, '-')}.py`);
+    await fs.writeFile(file, source, { encoding: 'utf8', flag: 'wx' });
+    const sourceBefore = await approvalSnapshot(file);
+    const registryBefore = await fs.readFile(approvalRegistryPath);
+    const rejected = runApprovalCommand(file, sha256(source));
+    assert.equal(rejected.error?.code ?? null, null, `${label} enrollment command could not start`);
+    assert.notEqual(rejected.status, 0, `${label} enrollment unexpectedly succeeded`);
+    expectNoHostileResponseFields({ stdout: rejected.stdout, stderr: rejected.stderr }, protectedSyntheticValues, `${label} enrollment refusal`);
+    assert.deepEqual(await approvalSnapshot(file), sourceBefore, `${label} enrollment changed source bytes or metadata`);
+    assert.deepEqual(await fs.readFile(approvalRegistryPath), registryBefore, `${label} enrollment changed the registry`);
+  }
+
+  const sourceBeforeStaleApproval = await approvalSnapshot(approvalAbsolutePath);
+  const staleRegistryBeforeAttempt = await fs.readFile(approvalRegistryPath);
+  const staleApproval = runApprovalCommand(approvalAbsolutePath, '0'.repeat(64));
+  assert.notEqual(staleApproval.status, 0, 'stale expected source SHA was accepted');
+  assert.deepEqual(await approvalSnapshot(approvalAbsolutePath), sourceBeforeStaleApproval, 'stale SHA changed source identity');
+  assert.deepEqual(await fs.readFile(approvalRegistryPath), staleRegistryBeforeAttempt, 'stale expected source SHA changed the registry');
+  const malformedApprovalPath = path.join(tmp, 'approval-malformed.py');
+  const malformedApprovalSource = 'send(token="APPROVED_OWNER_SAFE")\ndef broken(:\n';
+  await fs.writeFile(malformedApprovalPath, malformedApprovalSource, { encoding: 'utf8', flag: 'wx' });
+  const malformedApprovalBefore = await approvalSnapshot(malformedApprovalPath);
+  const registryBeforeMalformedEnrollment = await fs.readFile(approvalRegistryPath);
+  const malformedEnrollment = runApprovalCommand(malformedApprovalPath, sha256(malformedApprovalSource));
+  assert.notEqual(malformedEnrollment.status, 0, 'malformed source enrollment unexpectedly succeeded');
+  assert.deepEqual(await approvalSnapshot(malformedApprovalPath), malformedApprovalBefore, 'malformed enrollment changed source bytes or metadata');
+  assert.deepEqual(await fs.readFile(approvalRegistryPath), registryBeforeMalformedEnrollment, 'malformed enrollment changed the registry');
+
+  const approvalDiffPath = 'source-approval-diff.py';
+  const unapprovedDiffPath = 'source-approval-unapproved-diff.py';
+  const approvalDiffSource = '# diff marker: before\ndef run():\n    send(token="APPROVED_DIFF_VALUE")\n';
+  const approvalDiffAfter = approvalDiffSource.replace('# diff marker: before', '# diff marker: after');
+  await fs.writeFile(path.join(tmp, approvalDiffPath), approvalDiffSource, { encoding: 'utf8', flag: 'wx' });
+  await fs.writeFile(path.join(tmp, unapprovedDiffPath), approvalDiffSource, { encoding: 'utf8', flag: 'wx' });
+  const stageApprovalDiffFixtures = spawnSync('git', ['add', '--', approvalDiffPath, unapprovedDiffPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(stageApprovalDiffFixtures.status, 0, `approval diff fixture staging failed: ${stageApprovalDiffFixtures.stderr || stageApprovalDiffFixtures.stdout}`);
+  const commitApprovalDiffFixtures = spawnSync('git', ['-c', 'user.email=source-redaction-smoke@example.com', '-c', 'user.name=Source Redaction Smoke', 'commit', '-m', 'approval diff fixture'], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(commitApprovalDiffFixtures.status, 0, `approval diff fixture commit failed: ${commitApprovalDiffFixtures.stderr || commitApprovalDiffFixtures.stdout}`);
+  const diffApprovalFile = path.join(tmp, approvalDiffPath);
+  const diffApprovalResult = runApprovalCommand(diffApprovalFile, sha256(approvalDiffSource));
+  assert.equal(diffApprovalResult.status, 0, `approved diff-side enrollment failed: ${diffApprovalResult.stderr || diffApprovalResult.stdout}`);
+  await fs.writeFile(diffApprovalFile, approvalDiffAfter, 'utf8');
+  const approvedGitDiff = spawnSync('git', ['diff', '--no-ext-diff', '--unified=3', '--', approvalDiffPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(approvedGitDiff.status, 0, `approved-side Git diff failed: ${approvedGitDiff.stderr || approvedGitDiff.stdout}`);
+  assert.equal(approvedGitDiff.stdout.includes(`a/${approvalDiffPath}`) && approvedGitDiff.stdout.includes(`b/${approvalDiffPath}`), true, 'approved-side patch omitted its exact old/new path');
+  await fs.writeFile(diffApprovalFile, approvalDiffSource, 'utf8');
+  const approvedDiffApply = assertToolSuccess(await client.request('tools/call', {
+    name: 'apply_patch', arguments: { workspace_id: workspaceId, patch: approvedGitDiff.stdout }
+  }), 'Git-produced approved-side apply_patch');
+  assert.deepEqual(approvedDiffApply.structuredContent.paths, [approvalDiffPath], 'approved-side apply_patch changed an unexpected path');
+  assert.equal(await fs.readFile(diffApprovalFile, 'utf8'), approvalDiffAfter, 'approved-side apply_patch changed unexpected bytes');
+
+  const approvalDiffAfterCommit = spawnSync('git', ['add', '--', approvalDiffPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(approvalDiffAfterCommit.status, 0, `approved-side diff commit staging failed: ${approvalDiffAfterCommit.stderr || approvalDiffAfterCommit.stdout}`);
+  const approvalDiffCommit = spawnSync('git', ['-c', 'user.email=source-redaction-smoke@example.com', '-c', 'user.name=Source Redaction Smoke', 'commit', '-m', 'approved-side diff baseline'], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(approvalDiffCommit.status, 0, `approved-side diff baseline commit failed: ${approvalDiffCommit.stderr || approvalDiffCommit.stdout}`);
+  const approvalDiffFinal = approvalDiffAfter.replace('# diff marker: after', '# diff marker: final');
+  await fs.writeFile(diffApprovalFile, approvalDiffFinal, 'utf8');
+  await fs.writeFile(path.join(tmp, unapprovedDiffPath), approvalDiffAfter, 'utf8');
+  const mixedApprovalDiff = spawnSync('git', ['diff', '--no-ext-diff', '--unified=3', '--', approvalDiffPath, unapprovedDiffPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(mixedApprovalDiff.status, 0, `mixed approval-side Git diff failed: ${mixedApprovalDiff.stderr || mixedApprovalDiff.stdout}`);
+  await fs.writeFile(diffApprovalFile, approvalDiffAfter, 'utf8');
+  await fs.writeFile(path.join(tmp, unapprovedDiffPath), approvalDiffSource, 'utf8');
+  const approvedDiffBeforeRefusal = await approvalSnapshot(diffApprovalFile);
+  const unapprovedDiffBeforeRefusal = await approvalSnapshot(path.join(tmp, unapprovedDiffPath));
+  const mixedApprovalRefusal = assertToolError(await client.request('tools/call', {
+    name: 'apply_patch', arguments: { workspace_id: workspaceId, patch: mixedApprovalDiff.stdout }
+  }), 'Git-produced approved plus unapproved diff-side agreement');
+  assert.match(resultText(mixedApprovalRefusal), /Secret-looking content is blocked/);
+  expectNoHostileResponseFields(mixedApprovalRefusal, ['APPROVED_DIFF_VALUE'], 'mixed approval-side refusal');
+  assert.deepEqual(await approvalSnapshot(diffApprovalFile), approvedDiffBeforeRefusal, 'mixed approval-side refusal changed approved file bytes or metadata');
+  assert.deepEqual(await approvalSnapshot(path.join(tmp, unapprovedDiffPath)), unapprovedDiffBeforeRefusal, 'mixed approval-side refusal changed unapproved sibling bytes or metadata');
+
+  async function prepareRenameDiff(oldPath, newPath, approveNewSide) {
+    const oldSource = '# rename marker: before\ndef run():\n    send(token="APPROVED_RENAME_VALUE")\n';
+    const newSource = oldSource.replace('# rename marker: before', '# rename marker: after');
+    const oldAbsolute = path.join(tmp, oldPath);
+    const newAbsolute = path.join(tmp, newPath);
+    await fs.writeFile(oldAbsolute, oldSource, { encoding: 'utf8', flag: 'wx' });
+    const stageOld = spawnSync('git', ['add', '--', oldPath], { cwd: tmp, encoding: 'utf8' });
+    assert.equal(stageOld.status, 0, `rename source staging failed: ${stageOld.stderr || stageOld.stdout}`);
+    const commitOld = spawnSync('git', ['-c', 'user.email=source-redaction-smoke@example.com', '-c', 'user.name=Source Redaction Smoke', 'commit', '-m', `rename source ${oldPath}`], { cwd: tmp, encoding: 'utf8' });
+    assert.equal(commitOld.status, 0, `rename source commit failed: ${commitOld.stderr || commitOld.stdout}`);
+    const approveOld = runApprovalCommand(oldAbsolute, sha256(oldSource));
+    assert.equal(approveOld.status, 0, `rename old-side approval failed: ${approveOld.stderr || approveOld.stdout}`);
+    if (approveNewSide) {
+      await fs.writeFile(newAbsolute, newSource, { encoding: 'utf8', flag: 'wx' });
+      const approveNew = runApprovalCommand(newAbsolute, sha256(newSource));
+      assert.equal(approveNew.status, 0, `rename new-side approval failed: ${approveNew.stderr || approveNew.stdout}`);
+      await fs.rm(newAbsolute);
+    }
+    await fs.writeFile(newAbsolute, newSource, { encoding: 'utf8', flag: 'wx' });
+    await fs.rm(oldAbsolute);
+    const stageRename = spawnSync('git', ['add', '-A', '--', oldPath, newPath], { cwd: tmp, encoding: 'utf8' });
+    assert.equal(stageRename.status, 0, `rename candidate staging failed: ${stageRename.stderr || stageRename.stdout}`);
+    const renameDiff = spawnSync('git', ['diff', '--cached', '--find-renames', '--no-ext-diff', '--unified=3', '--', oldPath, newPath], { cwd: tmp, encoding: 'utf8' });
+    assert.equal(renameDiff.status, 0, `rename-side Git diff failed: ${renameDiff.stderr || renameDiff.stdout}`);
+    assert.equal(renameDiff.stdout.includes(`rename from ${oldPath}`) && renameDiff.stdout.includes(`rename to ${newPath}`), true, 'Git did not produce the expected two-sided rename patch');
+    const resetRename = spawnSync('git', ['reset', '--hard', 'HEAD'], { cwd: tmp, encoding: 'utf8' });
+    assert.equal(resetRename.status, 0, `rename fixture reset failed: ${resetRename.stderr || resetRename.stdout}`);
+    assert.equal(await fs.readFile(oldAbsolute, 'utf8'), oldSource, 'rename patch setup did not restore the old-side source');
+    await assert.rejects(fs.access(newAbsolute), (error) => error?.code === 'ENOENT');
+    return { oldSource, newSource, diff: renameDiff.stdout, oldAbsolute, newAbsolute };
+  }
+
+  const approvedRename = await prepareRenameDiff('source-approval-rename-old.py', 'source-approval-rename-new.py', true);
+  assertToolSuccess(await client.request('tools/call', {
+    name: 'apply_patch', arguments: { workspace_id: workspaceId, patch: approvedRename.diff }
+  }), 'Git-produced rename with both source sides approved');
+  await assert.rejects(fs.access(approvedRename.oldAbsolute), (error) => error?.code === 'ENOENT');
+  assert.equal(await fs.readFile(approvedRename.newAbsolute, 'utf8'), approvedRename.newSource, 'approved two-sided rename changed resulting bytes');
+
+  const oneSidedRename = await prepareRenameDiff('source-approval-one-sided-old.py', 'source-approval-one-sided-new.py', false);
+  const oneSidedOldBefore = await approvalSnapshot(oneSidedRename.oldAbsolute);
+  const oneSidedNewBefore = await fs.access(oneSidedRename.newAbsolute).then(() => 'present').catch((error) => {
+    if (error?.code === 'ENOENT') return 'absent';
+    throw error;
+  });
+  const oneSidedRenameRefusal = assertToolError(await client.request('tools/call', {
+    name: 'apply_patch', arguments: { workspace_id: workspaceId, patch: oneSidedRename.diff }
+  }), 'Git-produced rename with only old source side approved');
+  assert.match(resultText(oneSidedRenameRefusal), /Secret-looking content is blocked/);
+  expectNoHostileResponseFields(oneSidedRenameRefusal, ['APPROVED_RENAME_VALUE'], 'one-sided rename refusal');
+  assert.deepEqual(await approvalSnapshot(oneSidedRename.oldAbsolute), oneSidedOldBefore, 'one-sided rename refusal changed old-side bytes or metadata');
+  const oneSidedNewAfter = await fs.access(oneSidedRename.newAbsolute).then(() => 'present').catch((error) => {
+    if (error?.code === 'ENOENT') return 'absent';
+    throw error;
+  });
+  assert.equal(oneSidedNewAfter, oneSidedNewBefore, 'one-sided rename refusal changed new-side presence');
+  console.log('SOURCE_APPROVAL_MATRIX: owner CLI hash-only enrollment; ordinary MCP approval/read/write/edit/refusal; registry non-mutation; exact Git diff path-side agreement');
+  } finally {
+    let closeTimer;
+    const childExit = approvalClient.child.exitCode !== null || approvalClient.child.signalCode !== null
+      ? Promise.resolve()
+      : new Promise((resolve) => approvalClient.child.once('exit', resolve));
+    approvalClient.child.stdin.end();
+    try {
+      await Promise.race([
+        childExit,
+        new Promise((_, reject) => {
+          closeTimer = setTimeout(() => reject(new Error('approval stdio server did not exit after stdin close')), 10000);
+        })
+      ]);
+    } finally {
+      clearTimeout(closeTimer);
+    }
+  }
+  }
+
   console.log(`source-redaction-smoke: PASS (real MCP read/search/read_many; ranged lawful/hostile/private and byte-limit coverage; ${negativePaths.length} negative fixtures; write/edit/apply_patch compatibility)`);
 } finally {
   client?.close();
