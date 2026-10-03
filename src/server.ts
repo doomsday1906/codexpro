@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { CodexProConfig } from "./config.js";
+import { CODEXPRO_BUILD_IDENTITY, CODEXPRO_PACKAGE_ROOT } from "./buildIdentity.js";
 import {
   WorkspaceManager,
   PathGuard,
@@ -16,6 +17,7 @@ import {
 import { processIsAlive, readRuntimeConnection, readRuntimeFailure } from "./profileStore.js";
 import { repoTree, readPublicTextFile, readTextFile, writeTextFile, editTextFile, ensureAiBridge, withFileWriteLocks, type ReadFileResult } from "./fsOps.js";
 import { viewWorkspaceImage } from "./imageOps.js";
+import { ARTIFACT_HARD_MAX_BYTES, ARTIFACT_MIN_MAX_BYTES, readWorkspaceArtifact } from "./artifactOps.js";
 import { importAttachmentFile } from "./importOps.js";
 import { searchWorkspace } from "./searchOps.js";
 import { runBash } from "./bashOps.js";
@@ -46,7 +48,7 @@ export type { CodexProDiagnosticContext, DiagnosticContextOptions, DiagnosticTra
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 const RUNTIME_STATUS_FAILURE_DETAIL_MAX_BYTES = 2_048;
 const CODEXPRO_SERVER_NAME = "CodexPro";
-const CODEXPRO_SERVER_VERSION = "0.31.0";
+const CODEXPRO_SERVER_VERSION = CODEXPRO_BUILD_IDENTITY.package_version;
 // read_many owns a smaller aggregate response contract than the single-read
 // path. maxOutputBytes is not a universal read cap, but it remains the outer
 // configured ceiling when it is lower than this tool's own maximum.
@@ -1816,6 +1818,7 @@ const STANDARD_TOOL_NAMES = [
   "search",
   "load_skill",
   "view_image",
+  "read_artifact",
   "read_handoff",
   "wait_for_handoff",
   "export_pro_context",
@@ -1844,6 +1847,7 @@ const FULL_TOOL_NAMES = [
   "read",
   "read_many",
   "view_image",
+  "read_artifact",
   "write",
   "edit",
   "apply_patch",
@@ -2825,6 +2829,17 @@ function boundedRuntimeFailureDetail(value: unknown): string | null {
   return truncateUtf8(redacted, RUNTIME_STATUS_FAILURE_DETAIL_MAX_BYTES, `\n...[runtime failure detail truncated to ${RUNTIME_STATUS_FAILURE_DETAIL_MAX_BYTES} bytes]`);
 }
 
+function runtimeBuildIdentity() {
+  return {
+    package_name: CODEXPRO_BUILD_IDENTITY.package_name,
+    package_version: CODEXPRO_BUILD_IDENTITY.package_version,
+    source_commit: CODEXPRO_BUILD_IDENTITY.source_commit,
+    source_state: CODEXPRO_BUILD_IDENTITY.source_state,
+    package_root: CODEXPRO_PACKAGE_ROOT,
+    identity_status: CODEXPRO_BUILD_IDENTITY.source_commit && CODEXPRO_BUILD_IDENTITY.source_state === "clean" ? "exact" : "bounded"
+  };
+}
+
 function runtimeStatusPayload(config: CodexProConfig): Record<string, unknown> {
   let runtime: ReturnType<typeof readRuntimeConnection> = {};
   try {
@@ -2895,6 +2910,7 @@ function runtimeStatusPayload(config: CodexProConfig): Record<string, unknown> {
 
   return {
     health: "healthy",
+    build_identity: runtimeBuildIdentity(),
     runtime_source: isHttpChild ? "live_http_process" : "live_mcp_process",
     process: {
       role: isHttpChild ? "http_child" : "mcp_process",
@@ -3163,10 +3179,15 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     },
     async () => {
       const status = runtimeStatusPayload(config);
+      const buildIdentity = runtimeBuildIdentity();
       const text = [
         "# CodexPro Runtime Status",
         "",
         `Health: ${status.health}`,
+        `Version: ${buildIdentity.package_version}`,
+        `Build/source commit: ${buildIdentity.source_commit ?? "unavailable"}`,
+        `Package root: ${buildIdentity.package_root}`,
+        `Runtime source identity: ${buildIdentity.identity_status} (${buildIdentity.source_state})`,
         `HTTP child: ${JSON.stringify(status.http_child)}`,
         `Launcher: ${JSON.stringify(status.launcher)}`,
         `Tunnel: ${JSON.stringify(status.tunnel)}`,
@@ -4222,6 +4243,50 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
           mime_type: result.mimeType,
           width: result.width ?? null,
           height: result.height ?? null,
+          bytes: result.bytes,
+          sha256: result.sha256
+        })
+      };
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "read_artifact",
+    {
+      title: "Read Artifact",
+      description: "Retrieve a generic workspace file (video, audio, PDF, archive, or other binary) as native MCP embedded-resource content plus MIME type, byte count, and SHA-256. Returns the exact bytes; it does not render, play, or execute the file.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        path: z.string().describe("File path relative to workspace root."),
+        max_bytes: z.number().int().min(ARTIFACT_MIN_MAX_BYTES).max(ARTIFACT_HARD_MAX_BYTES).optional().describe("Maximum artifact bytes. Default: at least 1 MB, capped at 10 MB.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await readWorkspaceArtifact(config, guard, workspace, args.path, args.max_bytes);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Artifact: ${result.path}\nType: ${result.mimeType}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}`
+          },
+          {
+            type: "resource",
+            resource: {
+              uri: `workspace-artifact://${workspace.id}/${result.path}`,
+              mimeType: result.mimeType,
+              blob: result.data
+            }
+          }
+        ],
+        structuredContent: redactStructured({
+          workspace_id: workspace.id,
+          root: workspace.root,
+          path: result.path,
+          mime_type: result.mimeType,
           bytes: result.bytes,
           sha256: result.sha256
         })

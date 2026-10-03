@@ -177,6 +177,28 @@ npm run stress
 npm run release:check
 ```
 
+The source checkout and the installed runtime are separate. `npm run build` only
+updates this checkout's `dist/`; `codexpro start` runs the package reached by the
+`codexpro` executable on `PATH`. Do not permanently `npm link` the active source
+checkout into that command. After an exact candidate is accepted and committed,
+deploy it with the full commit SHA:
+
+```bash
+npm run deploy:local -- <full-40-character-commit-sha>
+```
+
+The command refuses a dirty or mismatched checkout, resolves and verifies the
+ordinary executable's package root and npm global target, builds and installs the
+exact package, and reads back its embedded commit identity and package contents.
+It changes package code only: saved profiles and state under `~/.codexpro` remain
+in place, and the service is not restarted. After `DEPLOYED / READY FOR RESTART`,
+Andrew restarts normally with `codexpro start`; Hestia can then confirm the live
+`runtime_status` reports the deployed source commit and installed package root.
+The runtime identity is embedded in the built package, so later changes to a
+development checkout's Git HEAD cannot change an already-installed runtime's
+reported identity. Builds without usable local Git metadata report source
+identity as unavailable instead of inventing a commit.
+
 Publish only from the CodexPro root:
 
 ```bash

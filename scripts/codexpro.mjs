@@ -17,6 +17,12 @@ import {
   verifyCloudflaredAsset
 } from './cloudflared-release.mjs';
 import {
+  descendantProcessIds,
+  parseProcessTable,
+  processTableInvocation,
+  processTreeTerminationInvocation
+} from './launcher-process-tree.mjs';
+import {
   createPrivateKeyScanner,
   redactDiagnosticText,
   truncateUtf8
@@ -1275,16 +1281,37 @@ async function assertPortAvailable(host, port) {
 
 const spawnedChildren = new Set();
 const SPAWN_LOG_PENDING_MAX_BYTES = 8_192;
+const CHILD_SHUTDOWN_GRACE_MS = 1_500;
+const HTTP_CHILD_SHUTDOWN_GRACE_MS = 6_500;
+const CHILD_FORCE_EXIT_TIMEOUT_MS = 5_000;
+const CHILD_PROCESS_POLL_INTERVAL_MS = 100;
+const PROCESS_TABLE_TIMEOUT_MS = 1_000;
+let childCleanupStarted = false;
+let childCleanupPromise = null;
 
 function spawnLogged(name, command, args, options = {}) {
-  const { verbose = false, ...spawnOptions } = options;
+  if (childCleanupStarted) {
+    throw new Error('Cannot spawn a managed child after launcher shutdown has started.');
+  }
+  const {
+    verbose = false,
+    shutdownGraceMs = CHILD_SHUTDOWN_GRACE_MS,
+    ...spawnOptions
+  } = options;
   const invocation = processInvocation(command, args);
   const child = spawn(invocation.command, invocation.args, {
     ...spawnOptions,
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsVerbatimArguments: invocation.windowsVerbatimArguments
   });
-  child.codexproKillTree = Boolean(invocation.killTree);
+  child.codexproShutdownGraceMs = Number.isFinite(shutdownGraceMs)
+    ? Math.max(0, Math.min(30_000, Math.floor(shutdownGraceMs)))
+    : CHILD_SHUTDOWN_GRACE_MS;
+  child.codexproSpawned = false;
+  child.codexproExited = false;
+  child.codexproClosed = false;
+  child.once('spawn', () => { child.codexproSpawned = true; });
+  child.once('exit', () => { child.codexproExited = true; });
   const logLines = [];
   const streamState = new Map([
     ['stdout', { decoder: new StringDecoder('utf8'), scanner: createPrivateKeyScanner(), pending: '', pendingBytes: 0, overflowing: false }],
@@ -1379,8 +1406,8 @@ function spawnLogged(name, command, args, options = {}) {
   child.stdout.on('data', (chunk) => record('stdout', process.stdout, chunk));
   child.stderr.on('data', (chunk) => record('stderr', process.stderr, chunk));
   child.on('close', (code, signal) => {
+    child.codexproClosed = true;
     flushPending();
-    spawnedChildren.delete(child);
     if (verbose) console.error('[' + name + '] exited code=' + code + ' signal=' + signal);
   });
   return child;
@@ -1502,25 +1529,298 @@ function writeQuickTunnelCredentials(tunnel) {
   return { tmpRoot, credentialsPath };
 }
 
-function killProcess(child) {
-  if (!child || child.killed) return;
-  if (child.codexproKillTree && child.pid) {
-    const result = spawnSync('taskkill.exe', ['/pid', String(child.pid), '/t', '/f'], {
-      stdio: 'ignore',
-      windowsHide: true
-    });
-    if (!result.error && result.status === 0) return;
+function childHasExited(child) {
+  return Boolean(
+    child && (
+      child.codexproExited
+      || child.codexproClosed
+      || (child.exitCode !== null && child.exitCode !== undefined)
+      || (child.signalCode !== null && child.signalCode !== undefined)
+    )
+  );
+}
+
+function waitForChildSpawn(child, timeoutMs) {
+  if (child.codexproSpawned) return Promise.resolve('spawned');
+  if (child.codexproClosed) return Promise.resolve('closed');
+  return new Promise((resolve) => {
+    let timer;
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off('spawn', onSpawn);
+      child.off('close', onClose);
+      resolve(result);
+    };
+    const onSpawn = () => finish('spawned');
+    const onClose = () => finish('closed');
+    child.once('spawn', onSpawn);
+    child.once('close', onClose);
+    timer = setTimeout(() => finish('timeout'), timeoutMs);
+    if (child.codexproSpawned) finish('spawned');
+    else if (child.codexproClosed) finish('closed');
+  });
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (childHasExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let timer;
+    let settled = false;
+    const finish = (exited) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off('exit', onExit);
+      child.off('close', onClose);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const onClose = () => finish(true);
+    child.once('exit', onExit);
+    child.once('close', onClose);
+    timer = setTimeout(() => finish(false), Math.max(0, timeoutMs));
+    if (childHasExited(child)) finish(true);
+  });
+}
+
+function readManagedProcessTable() {
+  const invocation = processTableInvocation();
+  const result = spawnSync(invocation.command, invocation.args, {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: PROCESS_TABLE_TIMEOUT_MS,
+    maxBuffer: 4 * 1024 * 1024
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error('Could not inspect the managed child process tree.');
   }
-  try { child.kill('SIGTERM'); } catch {}
-  setTimeout(() => {
-    if (!child.killed) {
-      try { child.kill('SIGKILL'); } catch {}
+  return parseProcessTable(result.stdout);
+}
+
+function addObservedDescendants(processes, rootPid, knownPids) {
+  if (!Number.isSafeInteger(rootPid) || rootPid <= 0) return;
+  for (const pid of descendantProcessIds(processes, rootPid)) knownPids.add(pid);
+}
+
+function addObservedDescendantsOfKnownProcesses(processes, knownPids) {
+  const parents = [...knownPids];
+  for (const pid of parents) addObservedDescendants(processes, pid, knownPids);
+}
+
+function liveManagedPids(processes, rootPid, knownPids) {
+  const present = new Set(processes.map(({ pid }) => pid));
+  return [...new Set([...(rootPid ? [rootPid] : []), ...knownPids])].filter((pid) => pid && present.has(pid));
+}
+
+function pauseForProcessPoll(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function signalManagedPosixPid(pid, signal, child) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    if (pid === child.pid) return child.kill(signal);
+    process.kill(pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForManagedPosixTree(child, knownPids, deadline, signal) {
+  let latest = [];
+  while (Date.now() <= deadline) {
+    latest = readManagedProcessTable();
+    if (!childHasExited(child)) addObservedDescendants(latest, child.pid, knownPids);
+    addObservedDescendantsOfKnownProcesses(latest, knownPids);
+    const alive = liveManagedPids(latest, childHasExited(child) ? null : child.pid, knownPids);
+    if (childHasExited(child) && alive.length === 0) return { exited: true, processes: latest };
+
+    if (signal) {
+      const descendantPids = [...knownPids].filter((pid) => pid !== child.pid);
+      for (const pid of descendantPids.reverse()) {
+        if (latest.some((entry) => entry.pid === pid)) signalManagedPosixPid(pid, signal, child);
+      }
+      if (!childHasExited(child) && latest.some((entry) => entry.pid === child.pid)) {
+        signalManagedPosixPid(child.pid, signal, child);
+      }
     }
-  }, 1500).unref();
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await pauseForProcessPoll(Math.min(CHILD_PROCESS_POLL_INTERVAL_MS, remaining));
+  }
+  latest = readManagedProcessTable();
+  if (!childHasExited(child)) addObservedDescendants(latest, child.pid, knownPids);
+  addObservedDescendantsOfKnownProcesses(latest, knownPids);
+  return {
+    exited: childHasExited(child) && liveManagedPids(latest, null, knownPids).length === 0,
+    processes: latest
+  };
+}
+
+async function killPosixProcessTree(child) {
+  const pid = child.pid;
+  const knownPids = new Set();
+  let processes = [];
+  let tableError = null;
+  try {
+    processes = readManagedProcessTable();
+    if (!childHasExited(child) && !processes.some((entry) => entry.pid === pid)) {
+      throw new Error('managed process was missing from the process table');
+    }
+    if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids);
+    addObservedDescendantsOfKnownProcesses(processes, knownPids);
+  } catch {
+    tableError = true;
+  }
+
+  let termSignalSent = false;
+  if (!childHasExited(child)) termSignalSent = signalManagedPosixPid(pid, 'SIGTERM', child);
+
+  const graceMs = child.codexproShutdownGraceMs ?? CHILD_SHUTDOWN_GRACE_MS;
+  if (tableError) {
+    if (!await waitForChildExit(child, graceMs)) {
+      signalManagedPosixPid(pid, 'SIGKILL', child);
+      await waitForChildExit(child, CHILD_FORCE_EXIT_TIMEOUT_MS);
+    }
+    throw new Error(`Could not verify the process tree for managed child ${pid ?? 'with unknown pid'} after shutdown.`);
+  }
+
+  const graceful = await waitForManagedPosixTree(child, knownPids, Date.now() + graceMs, null);
+  if (graceful.exited) return;
+
+  processes = graceful.processes;
+  if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids);
+  addObservedDescendantsOfKnownProcesses(processes, knownPids);
+  const forceDeadline = Date.now() + CHILD_FORCE_EXIT_TIMEOUT_MS;
+  const forced = await waitForManagedPosixTree(child, knownPids, forceDeadline, 'SIGKILL');
+  if (forced.exited) return;
+
+  throw new Error(
+    `Could not confirm managed child ${pid ?? 'with unknown pid'} and its process tree exited after forceful termination `
+    + `(SIGTERM sent=${termSignalSent}).`
+  );
+}
+
+function taskkillProcessTree(pid, timeoutMs) {
+  const invocation = processTreeTerminationInvocation('win32', pid);
+  if (!invocation) return false;
+  const result = spawnSync(invocation.command, invocation.args, {
+    stdio: 'ignore',
+    windowsHide: true,
+    timeout: Math.max(1, timeoutMs)
+  });
+  return !result.error && result.status === 0;
+}
+
+async function killWindowsProcessTree(child) {
+  const pid = child.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    if (childHasExited(child)) return;
+    throw new Error('Could not confirm a process ID for a managed Windows child.');
+  }
+
+  const knownPids = new Set();
+  let processes;
+  let tableError = null;
+  try {
+    processes = readManagedProcessTable();
+    if (!childHasExited(child) && !processes.some((entry) => entry.pid === pid)) {
+      throw new Error('managed process was missing from the process table');
+    }
+    if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids);
+    addObservedDescendantsOfKnownProcesses(processes, knownPids);
+  } catch {
+    processes = [];
+    tableError = new Error(`Could not inspect the process tree for managed Windows child ${pid}.`);
+  }
+
+  // Windows child_process signals do not provide POSIX graceful-shutdown semantics.
+  // Use taskkill's native tree operation for direct executables and batch wrappers alike.
+  const treeKillSucceeded = taskkillProcessTree(pid, CHILD_FORCE_EXIT_TIMEOUT_MS);
+  const forceDeadline = Date.now() + CHILD_FORCE_EXIT_TIMEOUT_MS;
+
+  while (Date.now() <= forceDeadline) {
+    try {
+      processes = readManagedProcessTable();
+    } catch {
+      tableError ??= new Error(`Could not inspect the process tree for managed Windows child ${pid}.`);
+      break;
+    }
+    if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids);
+    addObservedDescendantsOfKnownProcesses(processes, knownPids);
+    const alive = liveManagedPids(processes, childHasExited(child) ? null : pid, knownPids);
+    if (childHasExited(child) && alive.length === 0 && (!tableError || treeKillSucceeded)) return;
+
+    // If the direct process disappeared while a previously observed descendant
+    // remained, taskkill can still reap that child's current subtree by PID.
+    for (const descendantPid of alive.filter((entry) => entry !== pid)) {
+      const remaining = forceDeadline - Date.now();
+      if (remaining <= 0) break;
+      taskkillProcessTree(descendantPid, Math.min(1_000, remaining));
+    }
+    const pause = forceDeadline - Date.now();
+    if (pause > 0) await pauseForProcessPoll(Math.min(CHILD_PROCESS_POLL_INTERVAL_MS, pause));
+  }
+
+  if (!tableError) {
+    try {
+      processes = readManagedProcessTable();
+      if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids);
+      addObservedDescendantsOfKnownProcesses(processes, knownPids);
+      const alive = liveManagedPids(processes, childHasExited(child) ? null : pid, knownPids);
+      if (!childHasExited(child) && !alive.includes(pid)) await waitForChildExit(child, 250);
+      if (childHasExited(child) && alive.length === 0) return;
+    } catch {
+      tableError = new Error(`Could not inspect the process tree for managed Windows child ${pid}.`);
+    }
+  }
+  if (tableError) throw tableError;
+  throw new Error(
+    `Could not confirm managed Windows child ${pid} and its process tree exited after taskkill.`
+  );
+}
+
+async function killProcess(child) {
+  if (!child) return;
+  if (!child.codexproSpawned) {
+    const spawnState = await waitForChildSpawn(child, CHILD_FORCE_EXIT_TIMEOUT_MS);
+    if (spawnState === 'closed' && !child.pid) return;
+    if (spawnState !== 'spawned' && !child.pid) {
+      throw new Error(`Could not confirm managed child ${child.pid ?? 'with unknown pid'} spawned or closed.`);
+    }
+  }
+  if (process.platform === 'win32') return killWindowsProcessTree(child);
+  return killPosixProcessTree(child);
 }
 
 function cleanupChildren() {
-  for (const child of spawnedChildren) killProcess(child);
+  childCleanupStarted = true;
+  if (childCleanupPromise) return childCleanupPromise;
+  const children = [...spawnedChildren];
+  childCleanupPromise = (async () => {
+    const failures = [];
+    await Promise.all(children.map(async (child) => {
+      try {
+        await killProcess(child);
+      } catch (error) {
+        failures.push({ child, message: error instanceof Error ? error.message : String(error) });
+      }
+    }));
+    const alive = children.filter((child) => !childHasExited(child));
+    if (alive.length || failures.length) {
+      throw new Error([
+        ...failures.map(({ message }) => message),
+        ...(alive.length ? [`${alive.length} managed child process(es) remain alive`] : [])
+      ].join('; '));
+    }
+    for (const child of children) spawnedChildren.delete(child);
+  })();
+  return childCleanupPromise;
 }
 
 function endpointWithToken(endpoint, token) {
@@ -1864,8 +2164,7 @@ function processInvocation(command, args) {
   return {
     command: process.env.ComSpec || 'cmd.exe',
     args: ['/d', '/q', '/v:off', '/s', '/c', commandLine],
-    windowsVerbatimArguments: true,
-    killTree: true
+    windowsVerbatimArguments: true
   };
 }
 
@@ -3984,7 +4283,7 @@ function writeControlPrompt() {
   process.stdout.write('codexpro> ');
 }
 
-function runControlPanel(details, cleanup = cleanupChildren) {
+function runControlPanel(details, shutdown = (exitCode) => requestLauncherShutdown(exitCode)) {
   if (!process.stdin.isTTY) {
     process.stdin.setEncoding('utf8');
     process.stdin.resume();
@@ -3992,8 +4291,7 @@ function runControlPanel(details, cleanup = cleanupChildren) {
       process.stdin.on('data', (input) => {
         const normalized = String(input).trim().toLowerCase();
         if (normalized === 'q') {
-          cleanup();
-          process.exit(0);
+          void shutdown(0);
         }
       });
     });
@@ -4009,8 +4307,7 @@ function runControlPanel(details, cleanup = cleanupChildren) {
     process.stdin.on('data', (key) => {
       if (key === '\u0003') {
         console.log('\nStopping CodexPro...');
-        cleanup();
-        process.exit(130);
+        void shutdown(130);
       }
       const normalized = key.toLowerCase();
       if (key === '\r' || key === '\n') {
@@ -4046,18 +4343,43 @@ function runControlPanel(details, cleanup = cleanupChildren) {
         writeControlPrompt();
       } else if (normalized === 'q') {
         console.log('\nStopping CodexPro...');
-        cleanup();
-        process.exit(0);
+        void shutdown(0);
       }
     });
   });
 }
 
 let activeRuntimeContext = null;
+let launcherShutdownPromise = null;
+
+function requestLauncherShutdown(exitCode = 0, error = null) {
+  if (launcherShutdownPromise) return launcherShutdownPromise;
+  const runtime = activeRuntimeContext;
+  if (error) {
+    if (runtime && !runtime.hasFailure()) runtime.recordLauncherFailure(error);
+    const message = redactForLog(error instanceof Error ? error.message : String(error));
+    console.error(`Error: ${message}`);
+    if (process.env.CODEXPRO_DEBUG === '1' && error instanceof Error && error.stack) {
+      console.error(redactForLog(error.stack));
+    }
+  }
+
+  launcherShutdownPromise = (async () => {
+    if (runtime) await runtime.cleanup();
+    else await cleanupChildren();
+  })().then(() => {
+    process.exit(exitCode);
+  }).catch((cleanupError) => {
+    const message = redactForLog(cleanupError instanceof Error ? cleanupError.message : String(cleanupError));
+    console.error(`[codexpro] Cleanup incomplete; an owned child may still be alive: ${message}`);
+    process.exitCode = 1;
+  });
+  return launcherShutdownPromise;
+}
 
 function createRuntimeLifecycle(root, metadata = {}) {
   let cleanupFn = () => {};
-  let cleaned = false;
+  let cleanupPromise = null;
   let intentionalShutdown = false;
   let failureRecord = null;
   let rejectFailure;
@@ -4085,9 +4407,9 @@ function createRuntimeLifecycle(root, metadata = {}) {
     },
     cleanup() {
       intentionalShutdown = true;
-      if (cleaned) return;
-      cleaned = true;
-      cleanupFn();
+      if (cleanupPromise) return cleanupPromise;
+      cleanupPromise = Promise.resolve().then(() => cleanupFn());
+      return cleanupPromise;
     },
     hasFailure() {
       return Boolean(failureRecord);
@@ -4158,9 +4480,9 @@ function createRuntimeLifecycle(root, metadata = {}) {
   return context;
 }
 
-function holdRuntime(runtime, details, cleanup, headless) {
+function holdRuntime(runtime, details, shutdown, headless) {
   if (headless) return runtime.wait();
-  return Promise.race([runControlPanel(details, cleanup), runtime.wait()]);
+  return Promise.race([runControlPanel(details, shutdown), runtime.wait()]);
 }
 
 async function main() {
@@ -4405,19 +4727,26 @@ async function main() {
   });
   activeRuntimeContext = runtime;
   statusLine('wait', 'Starting local MCP server');
-  const server = spawnLogged('codexpro', process.execPath, [httpPath], { cwd: projectRoot, env: serverEnv, verbose: verboseLogs });
-  runtime.attach(server, 'http_child');
   let cloudflared;
   let cleanupTunnelCredentials = () => {};
-  const performCleanup = () => {
+  const performCleanup = async () => {
+    await cleanupChildren();
     cleanupTunnelCredentials();
-    cleanupChildren();
     clearRuntimeConnection(root);
   };
   runtime.setCleanup(performCleanup);
-  const cleanup = () => runtime.cleanup();
-  process.on('SIGINT', () => { cleanup(); process.exit(130); });
-  process.on('SIGTERM', () => { cleanup(); process.exit(143); });
+  const shutdown = (exitCode = 0) => requestLauncherShutdown(exitCode);
+  process.on('SIGINT', () => { void shutdown(130); });
+  process.on('SIGTERM', () => { void shutdown(143); });
+  if (process.platform !== 'win32') process.on('SIGHUP', () => { void shutdown(129); });
+
+  const server = spawnLogged('codexpro', process.execPath, [httpPath], {
+    cwd: projectRoot,
+    env: serverEnv,
+    verbose: verboseLogs,
+    shutdownGraceMs: HTTP_CHILD_SHUTDOWN_GRACE_MS
+  });
+  runtime.attach(server, 'http_child');
 
   const localBase = `http://${host}:${port}`;
   runtime.setPhase('http_startup');
@@ -4468,7 +4797,7 @@ async function main() {
     });
     runtime.setPhase('running');
     saveRuntimeConnection(root, details, runtimeOptions);
-    await holdRuntime(runtime, details, cleanup, headless);
+    await holdRuntime(runtime, details, shutdown, headless);
     return;
   }
 
@@ -4518,7 +4847,7 @@ async function main() {
       connectionTest
     });
     saveRuntimeConnection(root, details, runtimeOptions);
-    await holdRuntime(runtime, details, cleanup, headless);
+    await holdRuntime(runtime, details, shutdown, headless);
     return;
   }
 
@@ -4569,7 +4898,7 @@ async function main() {
       connectionTest
     });
     saveRuntimeConnection(root, details, runtimeOptions);
-    await holdRuntime(runtime, details, cleanup, headless);
+    await holdRuntime(runtime, details, shutdown, headless);
     return;
   }
 
@@ -4597,7 +4926,7 @@ async function main() {
       connectionTest
     });
     saveRuntimeConnection(root, details, runtimeOptions);
-    await holdRuntime(runtime, details, cleanup, headless);
+    await holdRuntime(runtime, details, shutdown, headless);
     return;
   }
 
@@ -4647,7 +4976,7 @@ async function main() {
       connectionTest
     });
     saveRuntimeConnection(root, details, runtimeOptions);
-    await holdRuntime(runtime, details, cleanup, headless);
+    await holdRuntime(runtime, details, shutdown, headless);
     return;
   }
 
@@ -4722,20 +5051,9 @@ async function main() {
     connectionTest
   });
   saveRuntimeConnection(root, details, runtimeOptions);
-  await holdRuntime(runtime, details, cleanup, headless);
+  await holdRuntime(runtime, details, shutdown, headless);
 }
 
 main().catch((error) => {
-  if (activeRuntimeContext) {
-    if (!activeRuntimeContext.hasFailure()) activeRuntimeContext.recordLauncherFailure(error);
-    activeRuntimeContext.cleanup();
-  } else {
-    cleanupChildren();
-  }
-  const message = redactForLog(error instanceof Error ? error.message : String(error));
-  console.error(`Error: ${message}`);
-  if (process.env.CODEXPRO_DEBUG === '1' && error instanceof Error && error.stack) {
-    console.error(redactForLog(error.stack));
-  }
-  process.exit(1);
+  void requestLauncherShutdown(1, error);
 });

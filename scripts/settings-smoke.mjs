@@ -11,6 +11,35 @@ import {
   readCloudflaredAssetResponse,
   verifyCloudflaredAsset
 } from './cloudflared-release.mjs';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import {
+  descendantProcessIds,
+  parseProcessTable,
+  processTableInvocation,
+  processTreeTerminationInvocation
+} from './launcher-process-tree.mjs';
+
+const portableMacProcessList = processTableInvocation('darwin');
+if (portableMacProcessList.command !== 'ps' || portableMacProcessList.args.join(' ') !== '-A -o pid=,ppid=') {
+  throw new Error(`macOS process discovery must use portable ps columns; got ${JSON.stringify(portableMacProcessList)}`);
+}
+const portableLinuxProcessList = processTableInvocation('linux');
+if (portableLinuxProcessList.command !== 'ps' || portableLinuxProcessList.args.join(' ') !== '-A -o pid=,ppid=') {
+  throw new Error(`Linux process discovery must use portable ps columns; got ${JSON.stringify(portableLinuxProcessList)}`);
+}
+const portableRows = parseProcessTable('41 7\n42 41\n43 42\nnot-a-process-row');
+if (JSON.stringify(descendantProcessIds(portableRows, 41).sort((a, b) => a - b)) !== JSON.stringify([42, 43])) {
+  throw new Error('portable process-table parser did not find transitive descendants');
+}
+const windowsTreeKill = processTreeTerminationInvocation('win32', 4242);
+if (
+  windowsTreeKill?.command !== 'taskkill.exe'
+  || windowsTreeKill.args.join(' ') !== '/PID 4242 /T /F'
+  || processTreeTerminationInvocation('linux', 4242) !== null
+) {
+  throw new Error(`Windows managed children must select recursive taskkill independently of wrapper type; got ${JSON.stringify(windowsTreeKill)}`);
+}
 
 const pinnedCloudflared = cloudflaredReleaseAsset('darwin', 'arm64');
 if (
@@ -79,6 +108,12 @@ async function runtimeStatusPath(root, home) {
   return path.join(home, 'runtime', `${id}.json`);
 }
 
+async function runtimeFailurePath(root, home) {
+  const realRoot = await fs.realpath(root);
+  const id = createHash('sha256').update(realRoot).digest('hex').slice(0, 24);
+  return path.join(home, 'runtime', `${id}.last-failure.json`);
+}
+
 async function writeNodeExecutable(filePath, lines, windowsCommandPath) {
   await fs.writeFile(filePath, lines.join('\n'), { mode: 0o700 });
   if (process.platform !== 'win32') return filePath;
@@ -117,6 +152,21 @@ async function waitForJson(filePath, predicate, label) {
   throw new Error(`timed out waiting for ${label}: ${lastError?.message ?? 'predicate not met'}`);
 }
 
+async function waitForFileText(filePath, label) {
+  const deadline = Date.now() + 10_000;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const value = (await fs.readFile(filePath, 'utf8')).trim();
+      if (value) return value;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`timed out waiting for ${label}: ${lastError?.message ?? 'file remained empty'}`);
+}
+
 async function waitForProcessExit(pid, label) {
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
@@ -129,6 +179,144 @@ async function waitForProcessExit(pid, label) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`timed out waiting for ${label} process ${pid} to exit`);
+}
+
+async function waitForLauncherClose(child, label, timeoutMs = 15_000) {
+  let timer;
+  try {
+    return await Promise.race([
+      new Promise((resolve) => child.once('close', (code, signal) => resolve({ code, signal }))),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} did not exit within ${timeoutMs}ms`)), timeoutMs); })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function processExists(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
+function directChildPids(pid) {
+  const invocation = processTableInvocation();
+  const result = spawnSync(invocation.command, invocation.args, { encoding: 'utf8', windowsHide: true, timeout: 5_000 });
+  if (result.error || result.status !== 0) {
+    throw new Error(`could not inspect launcher child processes: ${result.error?.message ?? result.stderr}`);
+  }
+  return parseProcessTable(result.stdout)
+    .filter((row) => row.parentPid === pid)
+    .map((row) => row.pid);
+}
+
+function processSnapshot() {
+  const invocation = processTableInvocation();
+  const result = spawnSync(invocation.command, invocation.args, { encoding: 'utf8', windowsHide: true, timeout: 5_000 });
+  if (result.error || result.status !== 0) {
+    throw new Error(`could not inspect managed process tree: ${result.error?.message ?? result.stderr}`);
+  }
+  return parseProcessTable(result.stdout);
+}
+
+async function reapProcess(pid, label) {
+  if (!await processExists(pid)) return;
+  try { process.kill(pid, 'SIGTERM'); } catch {}
+  const gracefulDeadline = Date.now() + 2_000;
+  while (Date.now() < gracefulDeadline && await processExists(pid)) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  if (await processExists(pid)) {
+    try { process.kill(pid, 'SIGKILL'); } catch {}
+  }
+  const killDeadline = Date.now() + 2_000;
+  while (Date.now() < killDeadline && await processExists(pid)) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  if (await processExists(pid)) throw new Error(`could not reap ${label} process ${pid}`);
+}
+
+async function assertPortReusable(port, label) {
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', resolve);
+  });
+  await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+}
+
+async function assertPathMissing(filePath, label) {
+  try {
+    await fs.access(filePath);
+    throw new Error(`${label} unexpectedly remains: ${filePath}`);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+}
+
+async function startObservedLauncher(args, env, root, label) {
+  const child = spawn(process.execPath, ['scripts/codexpro.mjs', 'start', ...args], {
+    cwd: path.resolve('.'),
+    env,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+  const closed = new Promise((resolve) => child.once('close', (code, signal) => resolve({ code, signal })));
+  const runtimePath = await runtimeStatusPath(root, env.CODEXPRO_HOME);
+  try {
+    const runtime = await waitForJson(runtimePath, (value) => Number.isInteger(value.pid) && Number.isInteger(value.runtimePid), `${label} runtime status`);
+    return { child, closed, runtime, runtimePath, failurePath: await runtimeFailurePath(root, env.CODEXPRO_HOME), output: () => output };
+  } catch (error) {
+    try { child.kill('SIGTERM'); } catch {}
+    await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    if (child.exitCode === null && child.signalCode === null) {
+      try { child.kill('SIGKILL'); } catch {}
+    }
+    throw new Error(`${error.message}\n${label} output:\n${output}`);
+  }
+}
+
+async function createLauncherMcpClient(port) {
+  const client = new Client({ name: 'launcher-supervision-smoke', version: '1.0.0' });
+  const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
+  await client.connect(transport);
+  return { client, close: () => client.close() };
+}
+
+async function startLauncherBeforeTunnelReady(args, env, tunnelPidPath, label) {
+  const child = spawn(process.execPath, ['scripts/codexpro.mjs', 'start', ...args], {
+    cwd: path.resolve('.'),
+    env,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+  const closed = new Promise((resolve) => child.once('close', (code, signal) => resolve({ code, signal })));
+  try {
+    const tunnelPid = Number(await waitForFileText(tunnelPidPath, `${label} fake tunnel PID`));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const childPids = directChildPids(child.pid);
+    const httpPid = childPids.find((pid) => pid !== tunnelPid);
+    if (!Number.isInteger(httpPid)) {
+      throw new Error(`launcher child list did not contain HTTP child PID; launcherPid=${child.pid}; childPids=${JSON.stringify(childPids)}; tunnelPid=${tunnelPid}`);
+    }
+    return { child, closed, tunnelPid, httpPid, output: () => output };
+  } catch (error) {
+    try { child.kill('SIGTERM'); } catch {}
+    await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    if (child.exitCode === null && child.signalCode === null) {
+      try { child.kill('SIGKILL'); } catch {}
+    }
+    throw new Error(`${error.message}\n${label} output:\n${output}`);
+  }
 }
 
 async function withStartedCodexPro(args, env, fn, options = {}) {
@@ -173,7 +361,8 @@ function runInteractiveQuit(args, env) {
   const payload = JSON.stringify({
     cmd: process.execPath,
     args: ['scripts/codexpro.mjs', 'start', ...args],
-    cwd: path.resolve('.')
+    cwd: path.resolve('.'),
+    runtimePath: args[args.indexOf('--root') + 1]
   });
   const code = `
 import json, os, pty, select, subprocess, sys, time
@@ -198,6 +387,15 @@ while time.time() < deadline:
         break
     out.extend(chunk)
     if not sent and b"codexpro> " in out:
+        runtime_path = payload["runtimePath"]
+        runtime_dir = os.environ.get("CODEXPRO_HOME", os.path.expanduser("~/.codexpro"))
+        runtime_id = __import__("hashlib").sha256(os.path.realpath(runtime_path).encode()).hexdigest()[:24]
+        status_path = os.path.join(runtime_dir, "runtime", runtime_id + ".json")
+        try:
+            with open(status_path, encoding="utf-8") as status_file:
+                runtime_snapshot = json.load(status_file)
+        except (OSError, ValueError):
+            runtime_snapshot = {}
         os.write(master, b"q")
         sent = True
 if proc.poll() is None:
@@ -230,6 +428,7 @@ sys.stdout.write(out.decode(errors="replace"))
 if not sent:
     sys.stderr.write("control prompt was not reached\\n")
     raise SystemExit(125)
+sys.stdout.write("\\nCODEXPRO_RUNTIME_SNAPSHOT:" + json.dumps(runtime_snapshot) + "\\n")
 raise SystemExit(proc.returncode or 0)
 `;
   const result = spawnSync(python, ['-c', code, payload], {
@@ -241,7 +440,9 @@ raise SystemExit(proc.returncode or 0)
   if (result.status !== 0) {
     throw new Error(`interactive quit failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
   }
-  return true;
+  const snapshotLine = result.stdout.split(/\r?\n/).find((line) => line.startsWith('CODEXPRO_RUNTIME_SNAPSHOT:'));
+  const runtime = snapshotLine ? JSON.parse(snapshotLine.slice('CODEXPRO_RUNTIME_SNAPSHOT:'.length)) : {};
+  return { runtime, output: result.stdout };
 }
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-settings-root-'));
@@ -610,7 +811,8 @@ try {
 const quitRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-settings-quit-'));
 const quitPort = await getFreePort();
 const quitRuntimePath = await runtimeStatusPath(quitRoot, home);
-if (runInteractiveQuit([
+const quitFailurePath = await runtimeFailurePath(quitRoot, home);
+const quitResult = runInteractiveQuit([
   '--root',
   quitRoot,
   '--tunnel',
@@ -618,13 +820,248 @@ if (runInteractiveQuit([
   '--port',
   String(quitPort),
   '--no-copy-url'
-], env)) {
-  try {
-    await fs.access(quitRuntimePath);
-    throw new Error('runtime status was not cleared after interactive q exit');
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
+], env);
+if (quitResult) {
+  if (!Number.isInteger(quitResult.runtime.runtimePid)) {
+    throw new Error(`interactive q did not expose the running HTTP child PID; port=${quitPort}\n${quitResult.output}`);
   }
+  await waitForProcessExit(quitResult.runtime.runtimePid, 'HTTP child after interactive q');
+  await assertPortReusable(quitPort, 'interactive q');
+  await assertPathMissing(quitRuntimePath, 'runtime status after interactive q');
+  await assertPathMissing(quitFailurePath, 'last-failure record after interactive q');
+}
+
+const shutdownCaseFailures = [];
+async function recordShutdownCase(name, runCase) {
+  try {
+    await runCase();
+  } catch (error) {
+    shutdownCaseFailures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function runIntentionalSignalCase(name, signal) {
+  const signalRoot = await fs.mkdtemp(path.join(os.tmpdir(), `codexpro-settings-${name}-`));
+  const signalPort = await getFreePort();
+  const launch = await startObservedLauncher([
+    '--root', signalRoot,
+    '--tunnel', 'none',
+    '--port', String(signalPort),
+    '--headless',
+    '--no-auth'
+  ], env, signalRoot, name);
+  try {
+    const startedAt = Date.now();
+    launch.child.kill(signal);
+    const closed = await waitForLauncherClose(launch.child, name);
+    const expectedExitCode = signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 129;
+    if (closed.code !== expectedExitCode) {
+      throw new Error(`${name} exited with code=${closed.code} signal=${closed.signal}; expected exit code ${expectedExitCode}`);
+    }
+    await waitForProcessExit(launch.runtime.runtimePid, `HTTP child after ${name}`);
+    await assertPortReusable(signalPort, name);
+    await assertPathMissing(launch.runtimePath, `runtime status after ${name}`);
+    await assertPathMissing(launch.failurePath, `last-failure record after ${name}`);
+    return { elapsedMs: Date.now() - startedAt, closed, pid: launch.child.pid, httpPid: launch.runtime.runtimePid, port: signalPort };
+  } catch (error) {
+    throw new Error(`${error.message}; launcherPid=${launch.child.pid}; httpPid=${launch.runtime.runtimePid}; port=${signalPort}; output=${launch.output()}`);
+  } finally {
+    await reapProcess(launch.runtime.runtimePid, `${name} HTTP child`);
+    await reapProcess(launch.child.pid, `${name} launcher`);
+  }
+}
+
+await recordShutdownCase('SIGTERM shutdown', async () => {
+  await runIntentionalSignalCase('sigterm', 'SIGTERM');
+});
+await recordShutdownCase('SIGINT shutdown', async () => {
+  await runIntentionalSignalCase('sigint', 'SIGINT');
+});
+if (process.platform !== 'win32') {
+  await recordShutdownCase('POSIX SIGHUP shutdown', async () => {
+    await runIntentionalSignalCase('sighup', 'SIGHUP');
+  });
+}
+
+await recordShutdownCase('stubborn fake tunnel shutdown', async () => {
+  const stubbornRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-settings-stubborn-tunnel-'));
+  const stubbornPort = await getFreePort();
+  const termMarker = path.join(home, 'fake-stubborn-tunnel-sigterm');
+  const tunnelPidPath = path.join(home, 'fake-stubborn-tunnel.pid');
+  const stubbornRuntimePath = await runtimeStatusPath(stubbornRoot, home);
+  const stubbornFailurePath = await runtimeFailurePath(stubbornRoot, home);
+  const fakeTunnel = await writeNodeExecutable(path.join(home, 'fake-stubborn-cloudflared.mjs'), [
+    '#!/usr/bin/env node',
+    "import fs from 'node:fs';",
+    "if (process.argv.includes('--version')) { console.log('cloudflared version 2026.6.0'); process.exit(0); }",
+    "fs.writeFileSync(process.env.CODEXPRO_STUBBORN_TUNNEL_PID, String(process.pid));",
+    "process.on('SIGTERM', () => fs.appendFileSync(process.env.CODEXPRO_STUBBORN_TUNNEL_TERM, 'SIGTERM\\n'));",
+    'setInterval(() => {}, 1000);',
+    ''
+  ]);
+  let launch;
+  try {
+    launch = await startLauncherBeforeTunnelReady([
+      '--root', stubbornRoot,
+      '--tunnel', 'cloudflare',
+      '--cloudflared', fakeTunnel,
+      '--port', String(stubbornPort),
+      '--headless',
+      '--no-copy-url'
+    ], {
+      ...env,
+      CODEXPRO_STUBBORN_TUNNEL_PID: tunnelPidPath,
+      CODEXPRO_STUBBORN_TUNNEL_TERM: termMarker
+    }, tunnelPidPath, 'stubborn fake tunnel');
+    const startedAt = Date.now();
+    launch.child.kill('SIGTERM');
+    const closed = await waitForLauncherClose(launch.child, 'stubborn fake tunnel launcher');
+    const elapsedMs = Date.now() - startedAt;
+    const evidenceFailures = [];
+    const observe = async (name, assertion) => {
+      try { await assertion(); }
+      catch (error) { evidenceFailures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`); }
+    };
+    await observe('launcher exit code', async () => {
+      if (closed.code !== 143) throw new Error(`observed code=${closed.code} signal=${closed.signal}; expected 143`);
+    });
+    await observe('grace elapsed', async () => {
+      if (elapsedMs < 1_000) throw new Error(`observed ${elapsedMs}ms; expected at least 1000ms`);
+    });
+    await observe('graceful tunnel signal', async () => {
+      const signals = await fs.readFile(termMarker, 'utf8');
+      if (!signals.includes('SIGTERM')) throw new Error(`marker did not record SIGTERM: ${signals}`);
+    });
+    await observe('tunnel process exit', () => waitForProcessExit(launch.tunnelPid, 'stubborn fake tunnel after escalation'));
+    await observe('HTTP child exit', () => waitForProcessExit(launch.httpPid, 'HTTP child after stubborn tunnel shutdown'));
+    await observe('port bindability', () => assertPortReusable(stubbornPort, 'stubborn fake tunnel shutdown'));
+    await observe('runtime-current removal', () => assertPathMissing(stubbornRuntimePath, 'runtime status after stubborn tunnel shutdown'));
+    await observe('failure-record absence', () => assertPathMissing(stubbornFailurePath, 'last-failure record after stubborn tunnel shutdown'));
+    if (evidenceFailures.length) {
+      throw new Error(`${evidenceFailures.join('; ')}; launcherPid=${launch.child.pid}; tunnelPid=${launch.tunnelPid}; httpPid=${launch.httpPid}; port=${stubbornPort}`);
+    }
+  } catch (error) {
+    const detail = launch
+      ? `${error.message}; launcherPid=${launch.child.pid}; tunnelPid=${launch.tunnelPid}; httpPid=${launch.httpPid}; port=${stubbornPort}; output=${launch.output()}`
+      : `${error.message}; port=${stubbornPort}`;
+    throw new Error(detail);
+  } finally {
+    if (launch) {
+      await reapProcess(launch.tunnelPid, 'stubborn fake tunnel');
+      await reapProcess(launch.httpPid, 'stubborn tunnel HTTP child');
+      await reapProcess(launch.child.pid, 'stubborn tunnel launcher');
+    }
+  }
+});
+
+if (process.platform !== 'win32') {
+  await recordShutdownCase('active managed verification descendant shutdown', async () => {
+    const activeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-settings-active-verification-'));
+    const activePort = await getFreePort();
+    const descendantPidPath = path.join(home, 'active-verification-descendant.pid');
+    const descendantTermPath = path.join(home, 'active-verification-descendant.term');
+    const fixturePath = path.resolve('scripts/launcher-supervision-stubborn-child.mjs');
+    const quoteScriptArg = (value) => `"${String(value).replaceAll('"', '""')}"`;
+    await fs.writeFile(path.join(activeRoot, 'package.json'), JSON.stringify({
+      name: 'codexpro-launcher-supervision-fixture',
+      version: '1.0.0',
+      scripts: {
+        supervision_probe: [process.execPath, fixturePath, descendantPidPath, descendantTermPath]
+          .map(quoteScriptArg)
+          .join(' ')
+      }
+    }, null, 2));
+
+    let launch;
+    let client;
+    let descendantPid;
+    try {
+      launch = await startObservedLauncher([
+        '--root', activeRoot,
+        '--tunnel', 'none',
+        '--port', String(activePort),
+        '--headless',
+        '--no-auth',
+        '--bash', 'full',
+        '--tool-mode', 'full'
+      ], withoutProxyEnv(env), activeRoot, 'active managed verification descendant');
+      const opened = await createLauncherMcpClient(activePort);
+      client = opened.client;
+      const workspace = await client.callTool({ name: 'open_current_workspace', arguments: {} });
+      if (workspace.isError) throw new Error(`could not open disposable workspace: ${JSON.stringify(workspace)}`);
+      const workspaceId = workspace.structuredContent?.workspace_id;
+      if (typeof workspaceId !== 'string' || !workspaceId) {
+        throw new Error(`open_current_workspace did not return a workspace ID: ${JSON.stringify(workspace)}`);
+      }
+      const started = await client.callTool({
+        name: 'start_verification',
+        arguments: {
+          workspace_id: workspaceId,
+          runner: 'package_script',
+          package_manager: 'npm',
+          script: 'supervision_probe',
+          lifetime_ms: 60_000
+        }
+      });
+      if (started.isError) throw new Error(`managed verification fixture did not start: ${JSON.stringify(started)}`);
+      descendantPid = Number(await waitForFileText(descendantPidPath, 'managed verification descendant PID'));
+      if (!Number.isInteger(descendantPid) || descendantPid <= 0 || !await processExists(descendantPid)) {
+        throw new Error(`managed verification descendant is not alive at shutdown setup: ${descendantPid}`);
+      }
+      const descendants = descendantProcessIds(processSnapshot(), launch.runtime.runtimePid);
+      if (!descendants.includes(descendantPid)) {
+        throw new Error(`fixture PID ${descendantPid} is not below HTTP child ${launch.runtime.runtimePid}; descendants=${JSON.stringify(descendants)}`);
+      }
+      await opened.close();
+      client = undefined;
+
+      const startedAt = Date.now();
+      launch.child.kill('SIGTERM');
+      const closed = await waitForLauncherClose(launch.child, 'active managed verification launcher', 15_000);
+      const descendantAliveAtLauncherClose = await processExists(descendantPid);
+      if (descendantAliveAtLauncherClose) {
+        throw new Error(`managed verification descendant PID ${descendantPid} was still alive when launcher close was observed`);
+      }
+      const termText = await fs.readFile(descendantTermPath, 'utf8');
+      const termMatch = termText.match(/^(\d+) SIGTERM$/m);
+      if (!termMatch) throw new Error(`managed descendant did not record SIGTERM: ${termText}`);
+      const elapsedSinceTermMs = Date.now() - Number(termMatch[1]);
+      if (elapsedSinceTermMs < 1_200) {
+        throw new Error(`SIGTERM-resistant managed child ended after ${elapsedSinceTermMs}ms; expected internal escalation after its grace`);
+      }
+      if (closed.code !== 143) {
+        throw new Error(`launcher exited code=${closed.code} signal=${closed.signal}; expected intentional SIGTERM code 143`);
+      }
+      await waitForProcessExit(descendantPid, 'managed verification descendant after launcher shutdown');
+      await waitForProcessExit(launch.runtime.runtimePid, 'HTTP child after active verification shutdown');
+      await assertPortReusable(activePort, 'active managed verification shutdown');
+      await assertPathMissing(launch.runtimePath, 'runtime status after active verification shutdown');
+      await assertPathMissing(launch.failurePath, 'last-failure after active verification shutdown');
+      console.log(
+        `PASS active managed verification shutdown: launcherPid=${launch.child.pid} httpPid=${launch.runtime.runtimePid} descendantPid=${descendantPid} port=${activePort} exitCode=${closed.code} termToCloseMs=${elapsedSinceTermMs} portRebound=true runtimeCurrentRemoved=true lastFailureAbsent=true`
+      );
+      return {
+        elapsedMs: Date.now() - startedAt,
+        elapsedSinceTermMs,
+        launcherPid: launch.child.pid,
+        httpPid: launch.runtime.runtimePid,
+        descendantPid,
+        port: activePort
+      };
+    } catch (error) {
+      throw new Error(`${error.message}; launcherPid=${launch?.child.pid ?? 'unknown'}; httpPid=${launch?.runtime.runtimePid ?? 'unknown'}; descendantPid=${descendantPid ?? 'unknown'}; port=${activePort}; output=${launch?.output() ?? ''}`);
+    } finally {
+      if (client) await client.close().catch(() => {});
+      if (descendantPid) await reapProcess(descendantPid, 'active managed verification descendant');
+      if (launch) {
+        await reapProcess(launch.runtime.runtimePid, 'active verification HTTP child');
+        await reapProcess(launch.child.pid, 'active verification launcher');
+      }
+    }
+  });
+}
+if (shutdownCaseFailures.length) {
+  throw new Error(`launcher shutdown regression cases failed:\n${shutdownCaseFailures.join('\n')}`);
 }
 
 const cloudflareRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-settings-cloudflare-'));

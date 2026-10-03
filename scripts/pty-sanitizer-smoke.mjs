@@ -918,6 +918,50 @@ await test("accepted M009 long-gap/quoted/private-key/UTF-8 regressions remain P
 });
 
 // --------------------------------------------------------------------------
+// Test 20b: Long-line redaction remains content-based and budget-bounded
+// --------------------------------------------------------------------------
+await test("benign long lines survive while genuine secrets and bounded suppression stay distinct", () => {
+  const belowFailureRegion = "x".repeat(3000);
+  const aboveFailureRegion = "x".repeat(5000);
+  const substantiallyLarger = "x".repeat(100_000);
+  const maxOutputBytes = 120_000;
+
+  for (const line of [belowFailureRegion, aboveFailureRegion, substantiallyLarger]) {
+    const result = sanitizeAndRedactTerminalOutput(line, { maxOutputBytes });
+    assert.equal(result.transcript, line);
+    assert.equal(result.truncated, false);
+    assert.doesNotMatch(result.transcript, /\[REDACTED_SECRET\]/);
+  }
+
+  const splitLines = ["x".repeat(901), ...Array.from({ length: 99 }, () => "x".repeat(1000))].join("\n");
+  const splitResult = sanitizeAndRedactTerminalOutput(splitLines, { maxOutputBytes });
+  assert.equal(splitResult.transcript, splitLines);
+  assert.equal(splitResult.truncated, false);
+  assert.equal(Buffer.byteLength(splitResult.transcript, "utf8"), Buffer.byteLength(substantiallyLarger, "utf8"));
+
+  const credential = "Authorization: Bearer ghp_123456789012345678901234567890123456\n";
+  const credentialResult = sanitizeAndRedactTerminalOutput(credential, { maxOutputBytes });
+  assert.match(credentialResult.transcript, /\[REDACTED_SECRET\]/);
+  assert.doesNotMatch(credentialResult.transcript, /ghp_123456789012345678901234567890123456/);
+
+  const chunked = new PtyTranscriptPipeline({ maxOutputBytes });
+  chunked.push(Buffer.from("Authorization: Bearer ghp_1234567"));
+  chunked.push(Buffer.from("89012345678901234567890123456\n"));
+  const chunkedResult = chunked.finish();
+  assert.match(chunkedResult.transcript, /\[REDACTED_SECRET\]/);
+  assert.doesNotMatch(chunkedResult.transcript, /ghp_123456789012345678901234567890123456/);
+  assert.equal(chunkedResult.truncated, false);
+
+  const overBudget = sanitizeAndRedactTerminalOutput("x".repeat(5000), {
+    maxOutputBytes: 4096,
+    hardOutputCeilingBytes: 4096
+  });
+  assert.equal(overBudget.truncated, true);
+  assert.match(overBudget.transcript, /\[OUTPUT_SUPPRESSED: line exceeds configured retention limit\]/);
+  assert.doesNotMatch(overBudget.transcript, /\[REDACTED_SECRET\]/);
+});
+
+// --------------------------------------------------------------------------
 // Test 21: Final retained output respects byte bound
 // --------------------------------------------------------------------------
 await test("final retained transcript respects maxOutputBytes bound", () => {
@@ -989,11 +1033,11 @@ await test("truncation never splits multi-byte UTF-8 code points", () => {
 
   // In pipeline:
   const pipeline = new PtyTranscriptPipeline({ maxOutputBytes: 8 });
-  pipeline.push(Buffer.from("Hello 🚀 World"));
+  pipeline.push(Buffer.from("Café 🚀"));
   const res = pipeline.finish();
 
   assert.equal(res.truncated, true);
-  assert.equal(res.transcript, "Hello "); // cleanly drops 🚀 rather than corrupting it
+  assert.equal(res.transcript, "Café "); // cleanly drops 🚀 rather than corrupting it
   assert.equal(Buffer.byteLength(res.transcript, "utf8"), 6);
   // Verify valid UTF-8
   assert.doesNotMatch(res.transcript, /\uFFFD/);

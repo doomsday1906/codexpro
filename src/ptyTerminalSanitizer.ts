@@ -535,7 +535,10 @@ export class PtyTranscriptPipeline {
     this.maxOutputBytes = Math.floor(options.maxOutputBytes);
     this.hardOutputCeilingBytes = options.hardOutputCeilingBytes ?? PTY_LIMITS.hardOutputCeilingBytes;
     this.sanitizer = new TerminalSanitizer({ maxControlPayloadChars: options.maxControlPayloadChars });
-    this.redactor = new StreamingRedactor();
+    // Keep the shared line-based redaction window large enough for any single
+    // line the active output budget can retain. Over-budget lines are bounded
+    // by that same window and reported as output suppression, never as secrets.
+    this.redactor = new StreamingRedactor({ maxPendingLineChars: this.maxOutputBytes });
     this.collector = new BoundedTranscriptCollector(this.maxOutputBytes);
   }
 

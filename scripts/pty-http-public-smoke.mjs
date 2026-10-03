@@ -11,9 +11,26 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(__dirname, "..");
+const repoRoot = path.resolve(process.env.CODEXPRO_TEST_PACKAGE_ROOT ?? path.resolve(__dirname, ".."));
 
 console.log("# RepoConnect M010 TASK-006: Public HTTP MCP Transport Smoke");
+
+function syncStdoutWriteCode(expression) {
+  return `const fs=require("node:fs");const output=Buffer.from(${expression});let written=0;while(written<output.length){const count=fs.writeSync(1,output,written,output.length-written);if(count<=0)throw new Error("stdout write made no progress");written+=count}`;
+}
+
+function ptyResultSummary(result) {
+  const value = result.structuredContent ?? {};
+  const transcript = value.transcript ?? "";
+  return JSON.stringify({
+    state: value.state,
+    truncated: value.truncated,
+    output_drain_incomplete: value.output_drain_incomplete,
+    raw_observed_bytes: value.raw_observed_bytes,
+    transcript_chars: transcript.length,
+    transcript_suffix: transcript.slice(-40)
+  });
+}
 
 function findHostProcessesWithToken(token) {
   const survivors = [];
@@ -45,23 +62,21 @@ async function getFreePort() {
   });
 }
 
-function waitForListening(child) {
-  return new Promise((resolve, reject) => {
-    let stderr = "";
-    const timer = setTimeout(() => reject(new Error(`timeout waiting for HTTP server\n${stderr}`)), 15000);
-    timer.unref();
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
-      if (stderr.includes("HTTP MCP listening")) {
-        clearTimeout(timer);
-        resolve();
-      }
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      reject(new Error(`HTTP server exited before listening: ${code}\n${stderr}`));
-    });
+async function waitForListening(child, port) {
+  const deadline = Date.now() + 15_000;
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr += String(chunk);
   });
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error(`CodexPro exited before HTTP health was ready: ${child.exitCode ?? child.signalCode}\n${stderr}`);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/healthz`);
+      if (response.ok) return;
+    } catch { /* startup is still in progress */ }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`timeout waiting for HTTP server health\n${stderr}`);
 }
 
 function waitForExit(child, timeoutMs = 7000) {
@@ -92,6 +107,7 @@ const fixtureRootB = await fs.mkdtemp(path.join(os.tmpdir(), "codexpro-pty-http-
 const realFixtureRootB = await fs.realpath(fixtureRootB);
 await fs.writeFile(path.join(realFixtureRootB, "package.json"), JSON.stringify({ name: "http-fixture-b" }, null, 2));
 await fs.mkdir(path.join(realFixtureRootB, ".git"), { recursive: true });
+const isolatedCodexProHome = await fs.mkdtemp(path.join(os.tmpdir(), "codexpro-pty-http-home-"));
 
 // Setup interactive CLI script in Workspace A
 const promptScriptPath = path.join(realFixtureRootA, "prompt_http_cli.mjs");
@@ -124,10 +140,12 @@ const serverEnv = {
   CODEXPRO_HOST: "127.0.0.1",
   CODEXPRO_PORT: String(port),
   CODEXPRO_HTTP_TOKEN: strongToken,
+  CODEXPRO_MAX_OUTPUT_BYTES: "120000",
   CODEXPRO_BASH_MODE: "full",
   CODEXPRO_WRITE_MODE: "workspace",
   CODEXPRO_TOOL_MODE: "full"
 };
+if (process.env.CODEXPRO_TEST_LAUNCHER) serverEnv.CODEXPRO_HOME = isolatedCodexProHome;
 
 let serverChild = null;
 
@@ -142,12 +160,15 @@ async function createHttpClient() {
 
 try {
   console.log(`Starting real HTTP server on port ${port}...`);
-  serverChild = spawn("node", ["dist/http.js"], {
+  const launchArgs = process.env.CODEXPRO_TEST_LAUNCHER
+    ? [process.env.CODEXPRO_TEST_LAUNCHER, "start", "--root", realFixtureRootA, "--allow-root", realFixtureRootB, "--tunnel", "none", "--port", String(port), "--headless", "--no-profile", "--no-auth", "--tool-mode", "full", "--bash", "full", "--write", "workspace"]
+    : [path.join(repoRoot, "dist/http.js")];
+  serverChild = spawn(process.execPath, launchArgs, {
     cwd: repoRoot,
     env: serverEnv,
     stdio: ["ignore", "pipe", "pipe"]
   });
-  await waitForListening(serverChild);
+  await waitForListening(serverChild, port);
   console.log("  ✓ HTTP server listening");
 
   // Step 1: Client A prompt/response round-trip + sent sentinel leak prevention
@@ -166,7 +187,7 @@ try {
         name: "pty_run",
         arguments: {
           workspace_id: wsIdA,
-          argv: ["node", promptScriptPath],
+          argv: [process.execPath, promptScriptPath],
           steps: [
             {
               wait_for: "Enter verification token: ",
@@ -194,6 +215,90 @@ try {
         ptyResult.structuredContent?.transcript?.includes("[REDACTED_SECRET]"),
         "Transcript must contain [REDACTED_SECRET] redaction marker"
       );
+
+      const missionControlValue = { mission_control: { response: "x".repeat(13_500) } };
+      const missionControlPayload = JSON.stringify(missionControlValue);
+      const missionControlCode = syncStdoutWriteCode(`JSON.stringify({mission_control:{response:"x".repeat(13500)}})+"\\n"`);
+      const longJsonResult = await client.callTool({
+        name: "pty_run",
+        arguments: {
+          workspace_id: wsIdA,
+          argv: [process.execPath, "-e", missionControlCode]
+        }
+      });
+      assert.ok(!longJsonResult.isError, `long JSON pty_run over HTTP must succeed: ${JSON.stringify(longJsonResult)}`);
+      assert.equal(longJsonResult.structuredContent?.state, "succeeded");
+      assert.equal(longJsonResult.structuredContent?.truncated, false);
+      const longJsonTranscript = longJsonResult.structuredContent?.transcript ?? "";
+      const expectedLongJsonTranscript = `${missionControlPayload}\n`;
+      assert.equal(longJsonTranscript.length, expectedLongJsonTranscript.length, `long JSON output length mismatch: raw=${longJsonResult.structuredContent?.raw_observed_bytes}, actual=${longJsonTranscript.length}, expected=${expectedLongJsonTranscript.length}, suffix=${JSON.stringify(longJsonTranscript.slice(-40))}`);
+      assert.equal(longJsonTranscript, expectedLongJsonTranscript, "long JSON output must survive intact");
+      assert.doesNotMatch(longJsonResult.structuredContent?.transcript ?? "", /\[REDACTED_SECRET\]/);
+
+      const runtimeStatus = await client.callTool({ name: "runtime_status", arguments: {} });
+      assert.notEqual(runtimeStatus.isError, true);
+      assert.equal(runtimeStatus.structuredContent?.build_identity?.package_version, "0.31.0");
+      assert.equal(await fs.realpath(runtimeStatus.structuredContent?.build_identity?.package_root), await fs.realpath(repoRoot));
+      if (process.env.CODEXPRO_EXPECTED_SOURCE_COMMIT) {
+        assert.equal(runtimeStatus.structuredContent?.build_identity?.source_commit, process.env.CODEXPRO_EXPECTED_SOURCE_COMMIT);
+        assert.equal(runtimeStatus.structuredContent?.build_identity?.source_state, "clean");
+        assert.equal(runtimeStatus.structuredContent?.build_identity?.identity_status, "exact");
+      } else {
+        assert.match(runtimeStatus.structuredContent?.build_identity?.source_commit ?? "", /^[0-9a-f]{40}$/u);
+        assert.equal(runtimeStatus.structuredContent?.build_identity?.identity_status, "bounded");
+      }
+
+      const lineCases = [
+        { text: "s".repeat(3_000), label: "below the former boundary" },
+        { text: "x".repeat(5_000), label: "above the former boundary" },
+        { text: "b".repeat(5_000), label: "repeated benign character line" },
+        { text: "L".repeat(100_000), label: "large within-budget line" }
+      ];
+      for (const { text, label } of lineCases) {
+        const result = await client.callTool({
+          name: "pty_run",
+          arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", syncStdoutWriteCode(`${JSON.stringify(text[0])}.repeat(${text.length})+"\\n"`)] }
+        });
+        assert.equal(result.structuredContent?.state, "succeeded", `${label} must complete`);
+        assert.equal(result.structuredContent?.truncated, false, `${label} must not be truncated`);
+        assert.equal(result.structuredContent?.transcript?.length, text.length + 1, `${label} must preserve the full transcript length`);
+        assert.equal(result.structuredContent?.transcript, `${text}\n`, `${label} must be returned intact`);
+        assert.doesNotMatch(result.structuredContent?.transcript ?? "", /\[REDACTED_SECRET\]/);
+      }
+
+      const multiline = Array.from({ length: 135 }, () => "m".repeat(100)).join("\n") + "\n";
+      const multilineCode = `const fs=require("node:fs");let written=0;for(let line=0;line<135;line++){const output=Buffer.from("m".repeat(100)+"\\n");let offset=0;while(offset<output.length){const count=fs.writeSync(1,output,offset,output.length-offset);if(count<=0)throw new Error("stdout write made no progress");offset+=count;written+=count}}fs.writeSync(2,Buffer.from("END:"+written+"\\n"))`;
+      const multilineWithCompletion = `${multiline}END:${Buffer.byteLength(multiline)}\n`;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const multilineResult = await client.callTool({
+          name: "pty_run",
+          arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", multilineCode] }
+        });
+        assert.equal(multilineResult.structuredContent?.state, "succeeded", `multiline producer must exit normally: ${JSON.stringify(multilineResult.structuredContent)}`);
+        assert.equal(multilineResult.structuredContent?.exit_code, 0, `multiline producer must exit 0: ${JSON.stringify(multilineResult.structuredContent)}`);
+        assert.equal(multilineResult.structuredContent?.truncated, false, `multiline output attempt ${attempt + 1} must not be truncated: ${ptyResultSummary(multilineResult)}`);
+        assert.equal(multilineResult.structuredContent?.output_drain_incomplete, undefined, `multiline output attempt ${attempt + 1} must report a complete drain: ${ptyResultSummary(multilineResult)}`);
+        assert.equal(multilineResult.structuredContent?.raw_observed_bytes, Buffer.byteLength(multilineWithCompletion) + 136, `multiline output attempt ${attempt + 1} must observe every emitted byte including PTY newline expansion; actual=${multilineResult.structuredContent?.raw_observed_bytes}, text=${multilineResult.structuredContent?.transcript?.length}, suffix=${JSON.stringify(multilineResult.structuredContent?.transcript?.slice(-40))}`);
+        assert.equal(multilineResult.structuredContent?.transcript?.length, multilineWithCompletion.length, `multiline output attempt ${attempt + 1} must preserve the full length`);
+        assert.equal(multilineResult.structuredContent?.transcript, multilineWithCompletion, `multiline output attempt ${attempt + 1} must survive intact`);
+      }
+
+      const splitCredential = "API_TOKEN=chunk-cross-credential-value-9384756102";
+      const splitCredentialCode = `const fs=require("node:fs");fs.writeSync(1,${JSON.stringify(splitCredential.slice(0, 13))});setTimeout(()=>{fs.writeSync(1,${JSON.stringify(splitCredential.slice(13) + "\\n")})},100)`;
+      const splitCredentialResult = await client.callTool({
+        name: "pty_run",
+        arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", splitCredentialCode] }
+      });
+      assert.doesNotMatch(splitCredentialResult.structuredContent?.transcript ?? "", /chunk-cross-credential-value-9384756102/);
+      assert.match(splitCredentialResult.structuredContent?.transcript ?? "", /\[REDACTED_SECRET\]/);
+
+      const overBudgetResult = await client.callTool({
+        name: "pty_run",
+        arguments: { workspace_id: wsIdA, argv: [process.execPath, "-e", syncStdoutWriteCode(`"z".repeat(125000)+"\\n"`)] }
+      });
+      assert.equal(overBudgetResult.structuredContent?.truncated, true);
+      assert.match(overBudgetResult.structuredContent?.transcript ?? "", /\[OUTPUT_SUPPRESSED: line exceeds configured retention limit\]/);
+      assert.doesNotMatch(overBudgetResult.structuredContent?.transcript ?? "", /\[REDACTED_SECRET\]/);
     } finally {
       await close();
     }
@@ -241,7 +346,7 @@ try {
         name: "pty_run",
         arguments: {
           workspace_id: wsIdA,
-          argv: ["node", "-e", `console.log("${sentinelA}"); setTimeout(() => {}, 800)`],
+          argv: [process.execPath, "-e", `console.log("${sentinelA}"); setTimeout(() => {}, 800)`],
           timeout_ms: 10000
         }
       });
@@ -251,7 +356,7 @@ try {
         name: "pty_run",
         arguments: {
           workspace_id: wsIdB,
-          argv: ["node", "-e", `console.log("${sentinelB}"); setTimeout(() => {}, 800)`],
+          argv: [process.execPath, "-e", `console.log("${sentinelB}"); setTimeout(() => {}, 800)`],
           timeout_ms: 10000
         }
       });
@@ -271,7 +376,7 @@ try {
         name: "pty_run",
         arguments: {
           workspace_id: wsIdA,
-          argv: ["node", "-e", `console.log("${sentinelC}")`]
+          argv: [process.execPath, "-e", `console.log("${sentinelC}")`]
         }
       });
 
@@ -309,14 +414,14 @@ try {
           name: "pty_run",
           arguments: {
             workspace_id: wsIdA,
-            argv: ["node", "-e", "console.log('CWD:' + process.cwd()); setTimeout(() => {}, 100);"]
+            argv: [process.execPath, "-e", "console.log('CWD:' + process.cwd()); setTimeout(() => {}, 100);"]
           }
         }),
         clientB.client.callTool({
           name: "pty_run",
           arguments: {
             workspace_id: wsIdB,
-            argv: ["node", "-e", "console.log('CWD:' + process.cwd()); setTimeout(() => {}, 100);"]
+            argv: [process.execPath, "-e", "console.log('CWD:' + process.cwd()); setTimeout(() => {}, 100);"]
           }
         })
       ]);
@@ -352,7 +457,7 @@ try {
         name: "pty_run",
         arguments: {
           workspace_id: wsIdA,
-          argv: ["node", "-e", `console.log("${shutdownSentinel}"); setInterval(() => {}, 1000)`],
+          argv: [process.execPath, "-e", `console.log("${shutdownSentinel}"); setInterval(() => {}, 1000)`],
           timeout_ms: 30000
         }
       });
@@ -395,6 +500,7 @@ try {
   }
   await Promise.allSettled([
     fs.rm(realFixtureRootA, { recursive: true, force: true }),
-    fs.rm(realFixtureRootB, { recursive: true, force: true })
+    fs.rm(realFixtureRootB, { recursive: true, force: true }),
+    fs.rm(isolatedCodexProHome, { recursive: true, force: true })
   ]);
 }
