@@ -36,11 +36,51 @@ const smallLines = [metaLine(sessionId), jsonl({ type: "event", payload: { note:
 const smallSource = smallLines.join("\n") + "\n";
 await fs.writeFile(sourcePath, smallSource, "utf8");
 
-const noiseBlock = Array.from({ length: 36_000 }, (_, ordinal) =>
-  jsonl({ type: "event", payload: { ordinal, note: "N".repeat(700) } })
+function syntheticNoiseText(length, seed) {
+  const bytes = Buffer.alloc(length);
+  for (let index = 0; index < length; index += 1) {
+    bytes[index] = 97 + ((index * 17 + Math.floor(index / 97) + seed) % 26);
+  }
+  return bytes.toString("ascii");
+}
+const noiseBlock = [0, 1].map((ordinal) =>
+  jsonl({ type: "event", payload: { ordinal, note: syntheticNoiseText(600_000, ordinal) } })
 ).join("\n") + "\n";
 const largeSessionId = "019cc368-1111-7222-8333-123456789abc";
 const largePath = path.join(sessionDir, "rollout-2026-10-03T12-01-00-" + largeSessionId + ".jsonl");
+const alignedSessionId = "019cc367-aaaa-7bbb-8ccc-123456789abc";
+const alignedTailPath = path.join(sessionDir, "rollout-2026-10-03T12-02-00-" + alignedSessionId + ".jsonl");
+const alignedTailBlockBytes = 64 * 1024;
+const alignedTargetLine = messageLine("assistant", "Synthetic aligned tail message", 4);
+const alignedPrefix = metaLine(alignedSessionId) + "\n" +
+  jsonl({ type: "event", payload: { note: "synthetic boundary prefix" } });
+const alignedRows = [alignedTargetLine];
+let alignedTailSuffix = "\n" + alignedRows.join("\n");
+function alignmentEvent(ordinal, note) {
+  return jsonl({ type: "event", payload: { ordinal, note } });
+}
+const alignmentBaseEvent = alignmentEvent(999_999, "");
+let alignmentOrdinal = 0;
+while (alignedTailBlockBytes - Buffer.byteLength(alignedTailSuffix, "utf8") >
+  Buffer.byteLength(alignmentBaseEvent, "utf8") + 100) {
+  alignedRows.unshift(alignmentEvent(alignmentOrdinal++, "synthetic tail padding " + alignmentOrdinal));
+  alignedTailSuffix = "\n" + alignedRows.join("\n");
+}
+const alignmentNoteBytes = alignedTailBlockBytes -
+  Buffer.byteLength(alignedTailSuffix, "utf8") -
+  Buffer.byteLength(alignmentBaseEvent, "utf8") - 2;
+const alignmentFiller = alignmentEvent(999_999, "x".repeat(alignmentNoteBytes));
+alignedRows.unshift(alignmentFiller);
+alignedTailSuffix = "\n" + alignedRows.join("\n");
+assert.equal(Buffer.byteLength(alignedTailSuffix, "utf8"), alignedTailBlockBytes);
+assert.equal(alignedTailSuffix[0], "\n");
+const alignedTailSource = alignedPrefix + alignedTailSuffix;
+assert.equal(
+  Buffer.byteLength(alignedTailSource, "utf8") - alignedTailBlockBytes,
+  Buffer.byteLength(alignedPrefix, "utf8")
+);
+assert.equal(alignedTailSource[Buffer.byteLength(alignedPrefix, "utf8")], "\n");
+await fs.writeFile(alignedTailPath, alignedTailSource, "utf8");
 
 function largeSource(layout) {
   const meta = metaLine(largeSessionId) + "\n";
@@ -274,12 +314,30 @@ try {
     const logStart = client.logs.length;
     const call = client.call(toolName, args(largePath, direction), 15_000);
     const locallySettled = call.promise.catch(() => undefined);
-    await delay(5);
+    const heartbeat = client.call("server_config", {}, 5_000);
+    let heartbeatError;
+    try {
+      await heartbeat.promise;
+    } catch (error) {
+      heartbeatError = error;
+    }
+    const scanCompletedBeforeHeartbeat = client.logs.slice(logStart)
+      .some((line) => line.startsWith("[CodexProTool] " + toolName + " "));
     client.cancel(call.id);
     await locallySettled;
     const outcome = await client.waitForLog(
       logStart,
       (line) => line.startsWith("[CodexProTool] " + toolName + " ")
+    );
+    assert.equal(
+      heartbeatError,
+      undefined,
+      label + " scan blocked the server heartbeat: " + String(heartbeatError?.message ?? heartbeatError)
+    );
+    assert.equal(
+      scanCompletedBeforeHeartbeat,
+      false,
+      label + " completed before the heartbeat, so cancellation was not during an active scan"
     );
     assert.match(
       outcome,
@@ -329,6 +387,31 @@ try {
     assert.ok(beat.structuredContent, "server heartbeat returned no structured result");
     assert.ok(order.indexOf("heartbeat") >= 0 && order.indexOf("heartbeat") < order.indexOf("read"),
       "server_config did not complete before the substantial session read");
+  });
+
+  await check("ordinary tail read handles a newline at the aligned 64 KiB block start", async () => {
+    const sourceSize = Buffer.byteLength(alignedTailSource, "utf8");
+    const targetStart = sourceSize - Buffer.byteLength(alignedTargetLine, "utf8");
+    assert.equal(sourceSize - alignedTailBlockBytes, Buffer.byteLength(alignedPrefix, "utf8"));
+    assert.equal(alignedTailSource[sourceSize - alignedTailBlockBytes], "\n");
+    const logStart = client.logs.length;
+    const result = await client.request("tools/call", {
+      name: "read_codex_session",
+      arguments: { source_path: alignedTailPath, direction: "tail", max_messages: 1 }
+    }, 3_000);
+    assert.equal(result.isError, undefined, "aligned tail session read returned an MCP error");
+    assert.equal(result.structuredContent.direction, "tail");
+    assert.deepEqual(result.structuredContent.messages.map((message) => message.content), [
+      "Synthetic aligned tail message"
+    ]);
+    assert.equal(result.structuredContent.cursor, sourceSize);
+    assert.equal(result.structuredContent.resume_cursor, targetStart);
+    assert.equal(result.structuredContent.next_cursor, undefined);
+    assert.equal(result.structuredContent.has_more, false);
+    assert.equal(result.structuredContent.source_size_bytes, sourceSize);
+    const outcome = await client.waitForLog(logStart,
+      (line) => line.startsWith("[CodexProTool] read_codex_session "));
+    assert.match(outcome, /\bok\b/u, "aligned tail read did not complete successfully");
   });
 
   process.stdout.write("SESSION_READ_CANCELLATION_MATRIX: " + passed + "/" + (passed + failed) + " checks passed; " + failed + " failed.\n");
