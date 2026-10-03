@@ -706,6 +706,113 @@ assert.equal(hasSecretValue(python312Lawful, pythonPolicy), false, 'Python 3.12 
 assert.equal(redactSensitiveText(python312Hostile, pythonPolicy), python312HostileRedacted, 'Python 3.12 hostile ownership projection changed');
 assert.equal(hasSecretValue(python312Hostile, pythonPolicy), true, 'Python 3.12 hostile ownership fixture was not classified as hostile');
 
+const pythonCallKeywordFailures = [];
+let pythonCallKeywordCheckCount = 0;
+function checkPythonCallKeyword(label, callback) {
+  pythonCallKeywordCheckCount += 1;
+  try {
+    callback();
+    console.log(`PASS Python call-keyword ${label}`);
+  } catch (error) {
+    pythonCallKeywordFailures.push(`${label}: ${error?.message ?? String(error)}`);
+    console.log(`FAIL Python call-keyword ${label}: ${error?.message ?? String(error)}`);
+  }
+}
+async function checkPythonCallKeywordAsync(label, callback) {
+  pythonCallKeywordCheckCount += 1;
+  try {
+    await callback();
+    console.log(`PASS Python call-keyword ${label}`);
+  } catch (error) {
+    pythonCallKeywordFailures.push(`${label}: ${error?.message ?? String(error)}`);
+    console.log(`FAIL Python call-keyword ${label}: ${error?.message ?? String(error)}`);
+  }
+}
+function assertPythonCallKeywordAllowed(label, source) {
+  assertPythonParserAccepted(source, label);
+  assert.equal(hasSecretValue(source, pythonPolicy), false, `${label} was classified as hostile`);
+  assert.equal(redactSensitiveText(source, pythonPolicy), source, `${label} changed source bytes`);
+}
+function assertPythonCallKeywordDenied(label, source, rawMarker = undefined, syntaxValid = true) {
+  if (syntaxValid) assertPythonParserAccepted(source, label);
+  assert.equal(hasSecretValue(source, pythonPolicy), true, `${label} was not classified as hostile`);
+  const projection = redactSensitiveText(source, pythonPolicy);
+  if (rawMarker) assert.equal(projection.includes(rawMarker), false, `${label} leaked its synthetic marker`);
+}
+const pythonCallKeywordReference = [
+  'def run(token_ref, work_ref, client):',
+  '    send(token=token_ref, work_token=work_ref, state=client.session.state)',
+  ''
+].join('\n');
+const pythonCallKeywordMultilineLf = [
+  'send(',
+  '    token=token_ref,',
+  '    work_token=client.session.state,',
+  ')',
+  ''
+].join('\n');
+const pythonCallKeywordMultilineCrlf = pythonCallKeywordMultilineLf.replaceAll('\n', '\r\n');
+const pythonCallKeywordReturnComposition = [
+  'def run(token_ref: Token) -> Result:',
+  '    send(token=token_ref, work_token=client.session.state)',
+  ''
+].join('\n');
+const pythonCallKeywordSyntheticCredential = ['ghp_', 'A'.repeat(24)].join('');
+const pythonCallKeywordMarker = 'QZ7';
+const pythonCallKeywordPositiveCases = [
+  ['noncredential helper keyword', 'helper(timeout=timeout_value)\n'],
+  ['variable and dotted references', pythonCallKeywordReference],
+  ['multiline LF references', pythonCallKeywordMultilineLf],
+  ['multiline CRLF references', pythonCallKeywordMultilineCrlf],
+  ['return annotation composition', pythonCallKeywordReturnComposition]
+];
+for (const [label, source] of pythonCallKeywordPositiveCases) {
+  checkPythonCallKeyword(label, () => assertPythonCallKeywordAllowed(label, source));
+}
+const pythonCallKeywordHostileCases = [
+  ['concatenated reference', 'send(token=client.session.token_ref + suffix)\n'],
+  ['indexed reference', 'send(token=client.session.token_refs[0])\n'],
+  ['called reference', 'send(token=client.get_token())\n'],
+  ['parenthesized reference', 'send(token=(token_ref))\n'],
+  ['string reference', `send(token="${pythonCallKeywordMarker}")\n`],
+  ['nested hostile call', `outer(token=token_ref, extra=inner(password="${pythonCallKeywordMarker}"))\n`],
+  ['safe reference with hostile sibling', `send(token=token_ref, password="${pythonCallKeywordMarker}")\n`],
+  ['whole-file hostile match after safe call', `send(token=token_ref)\npassword = "${pythonCallKeywordMarker}"\n`],
+  ['credential-shaped root in keyword value', `send(token=${pythonCallKeywordSyntheticCredential})\n`, pythonCallKeywordSyntheticCredential],
+  ['credential-shaped attribute in keyword value', `send(token=provider.${pythonCallKeywordSyntheticCredential})\n`, pythonCallKeywordSyntheticCredential],
+  ['credential-shaped root outside keyword', `credential = ${pythonCallKeywordSyntheticCredential}\n`, pythonCallKeywordSyntheticCredential],
+  ['credential-shaped attribute outside keyword', `credential = provider.${pythonCallKeywordSyntheticCredential}\n`, pythonCallKeywordSyntheticCredential],
+  ['return annotation followed by hostile field', `def run() -> Result:\n    password: str = "${pythonCallKeywordMarker}"\n`],
+  ['return annotation followed by hostile assignment', `def run() -> Result:\n    client.password = "${pythonCallKeywordMarker}"\n`]
+];
+for (const [label, source, marker = pythonCallKeywordMarker] of pythonCallKeywordHostileCases) {
+  checkPythonCallKeyword(label, () => assertPythonCallKeywordDenied(label, source, marker));
+}
+for (const [label, source] of [
+  ['malformed LF call', 'send(token=token_ref, password=)\n'],
+  ['malformed CRLF call', 'send(token=token_ref, password=)\r\n']
+]) {
+  checkPythonCallKeyword(label, () => {
+    assertPythonAstRejected(source, label);
+    assertPythonCallKeywordDenied(label, source, undefined, false);
+  });
+}
+checkPythonCallKeyword('mixed diff sides preserve language agreement', () => {
+  const mixedReferenceDiff = [
+    'diff --git a/old.txt b/new.py',
+    '--- a/old.txt',
+    '+++ b/new.py',
+    '@@ -1 +1 @@',
+    '-send(token="QZ7")',
+    '+send(token=token_ref)',
+    ''
+  ].join('\n');
+  assert.equal(hasSecretValueInUnifiedDiff(mixedReferenceDiff), true, 'non-Python old side was not classified as hostile');
+  const projection = redactUnifiedDiff(mixedReferenceDiff);
+  assert.equal(projection.includes('-send(token="QZ7")'), false, 'non-Python old side leaked its synthetic marker');
+  assert.equal(projection.includes('+send(token=token_ref)'), true, 'Python new side lost lawful reference bytes');
+});
+
 const multilineHostileAliasDiff = [
   'diff --git a/multiline.py b/multiline.py',
   '--- a/multiline.py',
@@ -1834,6 +1941,26 @@ const pythonMultilineFieldEditBefore = [
   ''
 ].join('\n');
 const pythonMalformedAnnotationEditPath = 'python-malformed-annotation-edit.py';
+const pythonCallKeywordWritePath = 'python-call-keyword-write.py';
+const pythonCallKeywordReadPath = 'python-call-keyword-read.py';
+const pythonCallKeywordReadSource = pythonCallKeywordReference;
+const pythonCallKeywordEditPath = 'python-call-keyword-edit.py';
+const pythonCallKeywordEditBefore = [
+  '# marker: before',
+  'def run(token_ref, work_ref):',
+  '    send(token=token_ref, work_token=work_ref)',
+  ''
+].join('\n');
+const pythonCallKeywordEditAfter = pythonCallKeywordEditBefore.replace('# marker: before', '# marker: after');
+const pythonCallKeywordHostilePath = 'python-call-keyword-hostile.py';
+const pythonCallKeywordHostileSource = [
+  '# marker: before',
+  'def run(token_ref):',
+  `    send(token=token_ref, password="${pythonCallKeywordMarker}")`,
+  ''
+].join('\n');
+const pythonCallKeywordMalformedWritePath = 'python-call-keyword-malformed.py';
+const pythonCallKeywordMalformedSource = 'send(token=token_ref, password=)\n';
 
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-source-redaction-'));
 const rawArtifactDir = process.env.SOURCE_REDACTION_RAW_ARTIFACT_DIR;
@@ -1847,6 +1974,9 @@ try {
   await writeFixture(tmp, 'python-provenance-hostile.py', pythonProvenanceHostile);
   await writeFixture(tmp, pythonReturnAnnotationEditPath, pythonReturnAnnotationLawful);
   await writeFixture(tmp, pythonReturnAnnotationCredentialFieldEditPath, pythonReturnAnnotationCredentialField);
+  await writeFixture(tmp, pythonCallKeywordReadPath, pythonCallKeywordReadSource);
+  await writeFixture(tmp, pythonCallKeywordEditPath, pythonCallKeywordEditBefore);
+  await writeFixture(tmp, pythonCallKeywordHostilePath, pythonCallKeywordHostileSource);
   await writeFixture(tmp, pythonMultilineAssignmentEditPath, pythonMultilineAssignmentEditBefore);
   await writeFixture(tmp, pythonMultilineFieldEditPath, pythonMultilineFieldEditBefore);
   await writeFixture(tmp, pythonMalformedAnnotationEditPath, pythonMalformedReturnAnnotation);
@@ -2027,6 +2157,114 @@ try {
   assert.equal(await fs.readFile(path.join(tmp, looksPythonWritePath), 'utf8'), looksPythonEdited, 'looks-Python lawful edit changed source bytes');
   assert.ok(looksPythonEdit.structuredContent, 'looks-Python lawful edit omitted structured output');
   assert.equal(looksPythonEdit.structuredContent.diff.includes('ACTUAL_LITERAL_SECRET_8Y9'), true, 'looks-Python lawful edit diff was re-redacted after path-aware policy');
+
+  await checkPythonCallKeywordAsync('ordinary MCP write accepts complete call-keyword references', async () => {
+    const written = assertToolSuccess(await client.request('tools/call', {
+      name: 'write',
+      arguments: { workspace_id: workspaceId, path: pythonCallKeywordWritePath, content: pythonCallKeywordReturnComposition }
+    }), 'Python call-keyword reference write');
+    assert.equal(await fs.readFile(path.join(tmp, pythonCallKeywordWritePath), 'utf8'), pythonCallKeywordReturnComposition, 'Python call-keyword write changed exact bytes');
+    assert.equal(written.structuredContent.sha256, sha256(pythonCallKeywordReturnComposition), 'Python call-keyword write returned a different source hash');
+  });
+
+  await checkPythonCallKeywordAsync('ordinary MCP read preserves complete reference source bytes', async () => {
+    const read = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: pythonCallKeywordReadPath }
+    }), 'Python call-keyword reference read');
+    assertReadMetadata(read, pythonCallKeywordReadSource, 1, undefined, 'Python call-keyword reference read');
+    assert.equal(read.structuredContent.text, numbered(pythonCallKeywordReadSource), 'Python call-keyword read changed source projection');
+  });
+
+  await checkPythonCallKeywordAsync('ordinary MCP edit accepts references in the complete resulting file', async () => {
+    const edited = assertToolSuccess(await client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: workspaceId,
+        path: pythonCallKeywordEditPath,
+        old_text: '# marker: before',
+        new_text: '# marker: after',
+        expected_replacements: 1
+      }
+    }), 'Python call-keyword reference edit');
+    assert.equal(await fs.readFile(path.join(tmp, pythonCallKeywordEditPath), 'utf8'), pythonCallKeywordEditAfter, 'Python call-keyword edit changed unexpected bytes');
+    assert.equal(edited.structuredContent.sha256, sha256(pythonCallKeywordEditAfter), 'Python call-keyword edit returned a different source hash');
+  });
+
+  await checkPythonCallKeywordAsync('ordinary MCP malformed-source write refuses without creating a file', async () => {
+    const refused = assertToolError(await client.request('tools/call', {
+      name: 'write',
+      arguments: { workspace_id: workspaceId, path: pythonCallKeywordMalformedWritePath, content: pythonCallKeywordMalformedSource }
+    }), 'Python call-keyword malformed-source write');
+    assert.match(resultText(refused), /Secret-looking content is blocked/);
+    await assert.rejects(fs.access(path.join(tmp, pythonCallKeywordMalformedWritePath)), (error) => error?.code === 'ENOENT');
+  });
+
+  const pythonCallKeywordHostileTarget = path.join(tmp, pythonCallKeywordHostilePath);
+  const pythonCallKeywordHostileBefore = await fs.readFile(pythonCallKeywordHostileTarget);
+  const pythonCallKeywordHostileStat = await fs.stat(pythonCallKeywordHostileTarget, { bigint: true });
+  const pythonCallKeywordHostileIdentity = {
+    bytes: pythonCallKeywordHostileBefore.toString('utf8'),
+    hash: sha256(pythonCallKeywordHostileBefore),
+    dev: pythonCallKeywordHostileStat.dev.toString(),
+    ino: pythonCallKeywordHostileStat.ino.toString(),
+    size: pythonCallKeywordHostileStat.size.toString(),
+    mtimeNs: pythonCallKeywordHostileStat.mtimeNs.toString()
+  };
+
+  await checkPythonCallKeywordAsync('ordinary MCP read redacts a hostile sibling in the same call', async () => {
+    const read = assertToolSuccess(await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: workspaceId, path: pythonCallKeywordHostilePath }
+    }), 'Python call-keyword hostile read');
+    expectNoHostileResponseFields(read, [pythonCallKeywordMarker], 'Python call-keyword hostile read');
+    assert.equal(read.structuredContent.text.includes(pythonCallKeywordMarker), false, 'hostile sibling survived the read projection');
+    assert.deepEqual(await fs.readFile(pythonCallKeywordHostileTarget), pythonCallKeywordHostileBefore, 'hostile read mutated target bytes');
+  });
+
+  await checkPythonCallKeywordAsync('ordinary MCP write refuses hostile sibling without changing bytes or metadata', async () => {
+    const refused = assertToolError(await client.request('tools/call', {
+      name: 'write',
+      arguments: { workspace_id: workspaceId, path: pythonCallKeywordHostilePath, content: pythonCallKeywordHostileSource }
+    }), 'Python call-keyword hostile write');
+    assert.match(resultText(refused), /Secret-looking content is blocked/);
+    expectNoHostileResponseFields(refused, [pythonCallKeywordMarker], 'Python call-keyword hostile write refusal');
+    const bytes = await fs.readFile(pythonCallKeywordHostileTarget);
+    const stat = await fs.stat(pythonCallKeywordHostileTarget, { bigint: true });
+    assert.deepEqual({
+      bytes: bytes.toString('utf8'),
+      hash: sha256(bytes),
+      dev: stat.dev.toString(),
+      ino: stat.ino.toString(),
+      size: stat.size.toString(),
+      mtimeNs: stat.mtimeNs.toString()
+    }, pythonCallKeywordHostileIdentity, 'refused hostile write changed bytes, inode, metadata, or hash');
+  });
+
+  await checkPythonCallKeywordAsync('ordinary MCP edit refuses hostile sibling without changing bytes or metadata', async () => {
+    const refused = assertToolError(await client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: workspaceId,
+        path: pythonCallKeywordHostilePath,
+        old_text: '# marker: before',
+        new_text: '# marker: after',
+        expected_replacements: 1
+      }
+    }), 'Python call-keyword hostile edit');
+    assert.match(resultText(refused), /Secret-looking content is blocked/);
+    expectNoHostileResponseFields(refused, [pythonCallKeywordMarker], 'Python call-keyword hostile edit refusal');
+    const bytes = await fs.readFile(pythonCallKeywordHostileTarget);
+    const stat = await fs.stat(pythonCallKeywordHostileTarget, { bigint: true });
+    assert.deepEqual({
+      bytes: bytes.toString('utf8'),
+      hash: sha256(bytes),
+      dev: stat.dev.toString(),
+      ino: stat.ino.toString(),
+      size: stat.size.toString(),
+      mtimeNs: stat.mtimeNs.toString()
+    }, pythonCallKeywordHostileIdentity, 'refused hostile edit changed bytes, inode, metadata, or hash');
+  });
 
   for (const [relativePath, source] of Object.entries(looksPythonHostileFixtures)) {
     const before = await fs.readFile(path.join(tmp, relativePath), 'utf8');
@@ -4526,3 +4764,6 @@ try {
   client?.close();
   await fs.rm(tmp, { recursive: true, force: true });
 }
+
+console.log(`PYTHON_CALL_KEYWORD_MATRIX: ${pythonCallKeywordCheckCount - pythonCallKeywordFailures.length}/${pythonCallKeywordCheckCount} checks passed; ${pythonCallKeywordFailures.length} failed.`);
+assert.deepEqual(pythonCallKeywordFailures, [], `Python call-keyword regression failures: ${pythonCallKeywordFailures.join('; ')}`);
