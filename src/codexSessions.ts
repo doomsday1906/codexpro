@@ -430,7 +430,7 @@ async function* readJsonlLinesFromTail(filePath: string, endOffset: number, sign
       if (!bytesRead) break;
       const current = chunk.subarray(0, bytesRead);
       let lineEnd = current.length;
-      while (true) {
+      while (lineEnd > 0) {
         const newline = current.lastIndexOf(0x0a, lineEnd - 1);
         if (newline === -1) break;
         const lineStart = newline + 1;
