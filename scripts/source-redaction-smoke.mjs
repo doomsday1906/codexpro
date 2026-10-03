@@ -5233,6 +5233,207 @@ try {
     throw error;
   });
   assert.equal(oneSidedNewAfter, oneSidedNewBefore, 'one-sided rename refusal changed new-side presence');
+
+  const fstringRelativePath = 'source-approval-fstrings.py';
+  const fstringAbsolutePath = path.join(tmp, fstringRelativePath);
+  const fstringSource = [
+    '# fstring approval marker: before',
+    'def run(token_ref, count, batch):',
+    '    send(token=f"scope-{token_ref}", work_token=f"count-{count:04d}")',
+    '    client.session.send(token=f"batch-{batch:02d}", work_token=None)',
+    ''
+  ].join('\n');
+  const fstringAfterMarker = fstringSource.replace(
+    '# fstring approval marker: before',
+    '# fstring approval marker: after'
+  );
+  const fstringCallLine = '    send(token=f"scope-{token_ref}", work_token=f"count-{count:04d}")';
+  const fstringValues = ['f"scope-{token_ref}"', 'f"count-{count:04d}"', 'f"batch-{batch:02d}"'];
+  const fstringLiterals = ['scope-', 'count-', 'batch-', 'FSTRING_MARK'];
+  await fs.writeFile(fstringAbsolutePath, fstringSource, { encoding: 'utf8', flag: 'wx' });
+  const fstringBeforeEnrollment = await approvalSnapshot(fstringAbsolutePath);
+  const unapprovedFstringRead = assertToolSuccess(await client.request('tools/call', {
+    name: 'read', arguments: { workspace_id: workspaceId, path: fstringRelativePath }
+  }), 'unapproved f-string source read');
+  assert.equal(unapprovedFstringRead.structuredContent.text.includes('[REDACTED_SECRET]'), true, 'unenrolled f-string values were not redacted');
+  expectNoHostileResponseFields(unapprovedFstringRead, fstringLiterals, 'unenrolled f-string read');
+  const unapprovedFstringEdit = assertToolError(await client.request('tools/call', {
+    name: 'edit',
+    arguments: {
+      workspace_id: workspaceId,
+      path: fstringRelativePath,
+      old_text: '# fstring approval marker: before',
+      new_text: '# fstring approval marker: after',
+      expected_replacements: 1
+    }
+  }), 'unenrolled f-string unrelated edit');
+  assert.match(resultText(unapprovedFstringEdit), /Secret-looking content is blocked/);
+  assert.deepEqual(await approvalSnapshot(fstringAbsolutePath), fstringBeforeEnrollment, 'unenrolled f-string edit changed bytes or metadata');
+
+  const fstringEnrollment = runApprovalCommand(fstringAbsolutePath, sha256(fstringSource));
+  assert.equal(fstringEnrollment.error?.code ?? null, null, 'f-string owner enrollment command could not start');
+  assert.equal(fstringEnrollment.status, 0, `owner CLI rejected complete parser-owned f-string values: ${fstringEnrollment.stderr || fstringEnrollment.stdout}`);
+  expectNoHostileResponseFields({ stdout: fstringEnrollment.stdout, stderr: fstringEnrollment.stderr }, fstringLiterals, 'f-string owner enrollment');
+  const fstringRegistryBytes = await fs.readFile(approvalRegistryPath);
+  const fstringRegistry = JSON.parse(fstringRegistryBytes.toString('utf8'));
+  const fstringEntry = fstringRegistry.files.find((entry) => entry.path === path.resolve(fstringAbsolutePath));
+  assert.ok(fstringEntry, 'owner registry omitted the exact f-string source path');
+  assert.equal(fstringEntry.source_sha256, sha256(fstringSource), 'f-string registry entry omitted its enrollment source hash');
+  const expectedFstringRows = [
+    ['token', 'send', fstringValues[0]],
+    ['work_token', 'send', fstringValues[1]],
+    ['token', 'client.session.send', fstringValues[2]],
+    ['work_token', 'client.session.send', 'None']
+  ].map((row) => row.map(sha256).join(':')).sort();
+  const actualFstringRows = fstringEntry.entries.map((row) => [row.keyword_sha256, row.callee_sha256, row.value_sha256].join(':')).sort();
+  assert.deepEqual(actualFstringRows, expectedFstringRows, 'owner registry omitted or widened exact f-string RHS approvals');
+  expectNoHostileResponseFields(fstringEntry, fstringLiterals, 'f-string approval entry');
+  assert.deepEqual(await approvalSnapshot(fstringAbsolutePath), fstringBeforeEnrollment, 'f-string owner enrollment changed source bytes or metadata');
+  const fstringRead = assertToolSuccess(await client.request('tools/call', {
+    name: 'read', arguments: { workspace_id: workspaceId, path: fstringRelativePath }
+  }), 'approved f-string source read');
+  assert.equal(fstringRead.structuredContent.text, numbered(fstringSource), 'approved f-string read changed exact source bytes');
+  const fstringWrite = assertToolSuccess(await client.request('tools/call', {
+    name: 'write', arguments: { workspace_id: workspaceId, path: fstringRelativePath, content: fstringSource }
+  }), 'approved f-string ordinary MCP write');
+  assert.equal(fstringWrite.structuredContent.sha256, sha256(fstringSource), 'approved f-string write returned an incorrect hash');
+  const fstringMarkerEdit = assertToolSuccess(await client.request('tools/call', {
+    name: 'edit',
+    arguments: {
+      workspace_id: workspaceId,
+      path: fstringRelativePath,
+      old_text: '# fstring approval marker: before',
+      new_text: '# fstring approval marker: after',
+      expected_replacements: 1
+    }
+  }), 'approved f-string unrelated MCP edit');
+  assert.equal(await fs.readFile(fstringAbsolutePath, 'utf8'), fstringAfterMarker, 'approved f-string edit changed unexpected bytes');
+  assert.equal(fstringMarkerEdit.structuredContent.sha256, sha256(fstringAfterMarker), 'approved f-string edit returned an incorrect hash');
+  assert.deepEqual(await fs.readFile(approvalRegistryPath), fstringRegistryBytes, 'unrelated f-string edit rewrote approval rows');
+
+  const dottedFstringRelativePath = 'source-approval-fstring-dotted.py';
+  const dottedFstringAbsolutePath = path.join(tmp, dottedFstringRelativePath);
+  const dottedFstringSource = '# dotted fstring marker: before\ndef run(context):\n    send(token=f"member-{context.scope}")\n';
+  await fs.writeFile(dottedFstringAbsolutePath, dottedFstringSource, { encoding: 'utf8', flag: 'wx' });
+  const dottedFstringBefore = await approvalSnapshot(dottedFstringAbsolutePath);
+  const dottedFstringEnrollment = runApprovalCommand(dottedFstringAbsolutePath, sha256(dottedFstringSource));
+  assert.equal(dottedFstringEnrollment.status, 0, `owner CLI rejected a complete f-string with a dotted-member interpolation: ${dottedFstringEnrollment.stderr || dottedFstringEnrollment.stdout}`);
+  const dottedFstringRegistryBytes = await fs.readFile(approvalRegistryPath);
+  const dottedFstringRegistry = JSON.parse(dottedFstringRegistryBytes.toString('utf8'));
+  const dottedFstringEntry = dottedFstringRegistry.files.find((entry) => entry.path === path.resolve(dottedFstringAbsolutePath));
+  assert.ok(dottedFstringEntry, 'owner registry omitted the dotted f-string source path');
+  assert.deepEqual(
+    dottedFstringEntry.entries.map((row) => [row.keyword_sha256, row.callee_sha256, row.value_sha256].join(':')),
+    [['token', 'send', 'f"member-{context.scope}"'].map(sha256).join(':')],
+    'dotted-member f-string approval did not bind the exact whole RHS'
+  );
+  assert.deepEqual(await approvalSnapshot(dottedFstringAbsolutePath), dottedFstringBefore, 'dotted f-string enrollment changed source bytes or metadata');
+  const dottedFstringRead = assertToolSuccess(await client.request('tools/call', {
+    name: 'read', arguments: { workspace_id: workspaceId, path: dottedFstringRelativePath }
+  }), 'approved dotted-member f-string read');
+  assert.equal(dottedFstringRead.structuredContent.text, numbered(dottedFstringSource), 'approved dotted-member f-string read changed source bytes');
+  const dottedFstringEdit = assertToolSuccess(await client.request('tools/call', {
+    name: 'edit',
+    arguments: {
+      workspace_id: workspaceId,
+      path: dottedFstringRelativePath,
+      old_text: '# dotted fstring marker: before',
+      new_text: '# dotted fstring marker: after',
+      expected_replacements: 1
+    }
+  }), 'approved dotted-member f-string unrelated edit');
+  assert.equal(await fs.readFile(dottedFstringAbsolutePath, 'utf8'), dottedFstringSource.replace('before', 'after'), 'dotted f-string edit changed unexpected bytes');
+  assert.deepEqual(await fs.readFile(approvalRegistryPath), dottedFstringRegistryBytes, 'dotted f-string edit rewrote approval rows');
+
+  const fstringProviderIdentifier = syntheticProviderIdentifier;
+  const rejectedFstringEnrollmentValues = [
+    ['call interpolation', 'f"scope-{token_factory()}"'],
+    ['indexed interpolation', 'f"scope-{tokens[0]}"'],
+    ['arithmetic interpolation', 'f"scope-{count + 1}"'],
+    ['dynamic nested format specification', 'f"count-{count:{width}}"'],
+    ['arithmetic around f-string', '(f"scope-{token_ref}" + suffix)'],
+    ['indexed f-string expression', 'f"scope-{token_ref}"[0]'],
+    ['concatenated f-string expression', 'f"scope-{token_ref}" + suffix'],
+    ['called f-string expression', 'wrap(f"scope-{token_ref}")'],
+    ['credential in f-string raw part', 'f"scope-' + fstringProviderIdentifier + '"'],
+    ['credential-shaped f-string interpolation root', 'f"{' + fstringProviderIdentifier + '}"'],
+    ['credential-shaped f-string interpolation attribute', 'f"{provider.' + fstringProviderIdentifier + '}"']
+  ];
+  for (const [label, rhs] of rejectedFstringEnrollmentValues) {
+    const source = `def run(token_ref, count, tokens, width):\n    send(token=${rhs})\n`;
+    assertPythonAstAccepted(source, `f-string ${label} enrollment source`);
+    const file = path.join(tmp, `fstring-enrollment-refusal-${label.replaceAll(/[^a-z0-9]+/giu, '-')}.py`);
+    await fs.writeFile(file, source, { encoding: 'utf8', flag: 'wx' });
+    const sourceBefore = await approvalSnapshot(file);
+    const registryBefore = await fs.readFile(approvalRegistryPath);
+    const rejected = runApprovalCommand(file, sha256(source));
+    assert.equal(rejected.error?.code ?? null, null, `f-string ${label} enrollment command could not start`);
+    assert.notEqual(rejected.status, 0, `owner command enrolled ineligible f-string ${label}`);
+    expectNoHostileResponseFields({ stdout: rejected.stdout, stderr: rejected.stderr }, [fstringProviderIdentifier], `f-string ${label} enrollment refusal`);
+    assert.deepEqual(await approvalSnapshot(file), sourceBefore, `f-string ${label} enrollment changed source bytes or metadata`);
+    assert.deepEqual(await fs.readFile(approvalRegistryPath), registryBefore, `f-string ${label} enrollment changed the registry`);
+  }
+  const fstringRefusalCases = [
+    ['changed f-string interpolation', '    send(token=f"scope-{other_ref}", work_token=f"count-{count:04d}")', true],
+    ['changed f-string format specification', '    send(token=f"scope-{token_ref}", work_token=f"count-{count:05d}")', true],
+    ['changed f-string credential key', '    send(api_token=f"scope-{token_ref}", work_token=f"count-{count:04d}")', true],
+    ['changed f-string callee', '    client.forward(token=f"scope-{token_ref}", work_token=f"count-{count:04d}")', true],
+    ['f-string concatenation', '    send(token=f"scope-{token_ref}" + suffix, work_token=f"count-{count:04d}")', true],
+    ['f-string indexing', '    send(token=f"scope-{token_ref}"[0], work_token=f"count-{count:04d}")', true],
+    ['f-string function call', '    send(token=wrap(f"scope-{token_ref}"), work_token=f"count-{count:04d}")', true],
+    ['parenthesized f-string', '    send(token=(f"scope-{token_ref}"), work_token=f"count-{count:04d}")', true],
+    ['approved f-string with hostile sibling', '    send(token=f"scope-{token_ref}", work_token=f"count-{count:04d}", password="OPAQUE_LITERAL")', true],
+    ['provider in f-string literal segment', '    send(token=f"scope-' + fstringProviderIdentifier + '")', true],
+    ['provider identifier in f-string interpolation root', '    send(token=f"{' + fstringProviderIdentifier + '}")', true],
+    ['provider identifier in f-string interpolation attribute', '    send(token=f"{provider.' + fstringProviderIdentifier + '}")', true],
+    ['malformed f-string interpolation', '    send(token=f"scope-{token_ref", work_token=f"count-{count:04d}")', false]
+  ];
+  for (const [label, replacement, syntaxValid] of fstringRefusalCases) {
+    const before = await approvalSnapshot(fstringAbsolutePath);
+    const candidate = fstringAfterMarker.replace(fstringCallLine, replacement);
+    assert.notEqual(candidate, fstringAfterMarker, `${label} did not replace the enrolled call`);
+    const syntax = spawnSync('python3', ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'], {
+      input: candidate, encoding: 'utf8', timeout: 10000
+    });
+    if (syntaxValid) assert.equal(syntax.status, 0, `${label} candidate was malformed before policy evaluation: ${syntax.stderr || syntax.stdout}`);
+    else assert.notEqual(syntax.status, 0, `${label} candidate unexpectedly parsed`);
+    const refused = assertToolError(await client.request('tools/call', {
+      name: 'edit',
+      arguments: { workspace_id: workspaceId, path: fstringRelativePath, old_text: fstringCallLine, new_text: replacement, expected_replacements: 1 }
+    }), label);
+    assert.match(resultText(refused), /Secret-looking content is blocked/);
+    expectNoHostileResponseFields(refused, [...approvalLiterals, ...fstringLiterals, fstringProviderIdentifier], label);
+    assert.deepEqual(await approvalSnapshot(fstringAbsolutePath), before, `${label} changed source bytes or metadata`);
+  }
+
+  const fstringDiffPath = 'source-approval-fstring-diff.py';
+  const fstringUnapprovedDiffPath = 'source-approval-fstring-unapproved-diff.py';
+  const fstringDiffSource = '# fstring diff marker: before\ndef run(token_ref):\n    send(token=f"diff-{token_ref}")\n';
+  const fstringDiffAfter = fstringDiffSource.replace('# fstring diff marker: before', '# fstring diff marker: after');
+  await fs.writeFile(path.join(tmp, fstringDiffPath), fstringDiffSource, { encoding: 'utf8', flag: 'wx' });
+  await fs.writeFile(path.join(tmp, fstringUnapprovedDiffPath), fstringDiffSource, { encoding: 'utf8', flag: 'wx' });
+  const stageFstringDiffFixtures = spawnSync('git', ['add', '--', fstringDiffPath, fstringUnapprovedDiffPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(stageFstringDiffFixtures.status, 0, `f-string diff fixture staging failed: ${stageFstringDiffFixtures.stderr || stageFstringDiffFixtures.stdout}`);
+  const commitFstringDiffFixtures = spawnSync('git', ['-c', 'user.email=source-redaction-smoke@example.com', '-c', 'user.name=Source Redaction Smoke', 'commit', '-m', 'f-string approval diff fixture'], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(commitFstringDiffFixtures.status, 0, `f-string diff fixture commit failed: ${commitFstringDiffFixtures.stderr || commitFstringDiffFixtures.stdout}`);
+  const fstringDiffAbsolute = path.join(tmp, fstringDiffPath);
+  const fstringDiffEnrollment = runApprovalCommand(fstringDiffAbsolute, sha256(fstringDiffSource));
+  assert.equal(fstringDiffEnrollment.status, 0, `f-string diff path enrollment failed: ${fstringDiffEnrollment.stderr || fstringDiffEnrollment.stdout}`);
+  await fs.writeFile(fstringDiffAbsolute, fstringDiffAfter, 'utf8');
+  await fs.writeFile(path.join(tmp, fstringUnapprovedDiffPath), fstringDiffAfter, 'utf8');
+  const fstringMixedDiff = spawnSync('git', ['diff', '--no-ext-diff', '--unified=3', '--', fstringDiffPath, fstringUnapprovedDiffPath], { cwd: tmp, encoding: 'utf8' });
+  assert.equal(fstringMixedDiff.status, 0, `f-string mixed-side Git diff failed: ${fstringMixedDiff.stderr || fstringMixedDiff.stdout}`);
+  await fs.writeFile(fstringDiffAbsolute, fstringDiffSource, 'utf8');
+  await fs.writeFile(path.join(tmp, fstringUnapprovedDiffPath), fstringDiffSource, 'utf8');
+  const approvedFstringDiffBefore = await approvalSnapshot(fstringDiffAbsolute);
+  const unapprovedFstringDiffBefore = await approvalSnapshot(path.join(tmp, fstringUnapprovedDiffPath));
+  const fstringMixedRefusal = assertToolError(await client.request('tools/call', {
+    name: 'apply_patch', arguments: { workspace_id: workspaceId, patch: fstringMixedDiff.stdout }
+  }), 'f-string diff path approval does not donate to sibling');
+  assert.match(resultText(fstringMixedRefusal), /Secret-looking content is blocked/);
+  expectNoHostileResponseFields(fstringMixedRefusal, ['diff-'], 'f-string mixed-side refusal');
+  assert.deepEqual(await approvalSnapshot(fstringDiffAbsolute), approvedFstringDiffBefore, 'f-string diff refusal changed approved-side bytes or metadata');
+  assert.deepEqual(await approvalSnapshot(path.join(tmp, fstringUnapprovedDiffPath)), unapprovedFstringDiffBefore, 'f-string diff refusal changed unapproved-side bytes or metadata');
   console.log('SOURCE_APPROVAL_MATRIX: owner CLI hash-only enrollment; ordinary MCP approval/read/write/edit/refusal; registry non-mutation; exact Git diff path-side agreement');
   } finally {
     let closeTimer;
