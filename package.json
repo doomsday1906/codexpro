@@ -96,6 +96,7 @@
     "verification:r5-falsifier": "node scripts/verification-r5-falsifier.mjs",
     "verification:r6-falsifier": "node scripts/verification-r6-falsifier.mjs",
     "source-redaction:smoke": "npm run build && node scripts/source-redaction-smoke.mjs",
+    "source-approval-prospective:smoke": "npm run build && node scripts/source-approval-prospective-smoke.mjs",
     "source-scanner:smoke": "npm run build && node scripts/source-scanner-smoke.mjs",
     "source-projection:smoke": "npm run build && node scripts/source-projection-smoke.mjs",
     "large-file-readability:smoke": "npm run build && node scripts/large-file-readability-smoke.mjs",
