@@ -26,7 +26,13 @@ import { subscriptionsPath } from "./delegationStore.js";
 
 export const RUN_ATTENTION_EVENT = "run-attention";
 export const EVENTS_VERSION = "mcp-events/1";
-/** Official protocol version advertised by server/discover. */
+/**
+ * Official MCP-Events draft versions advertised by server/discover.
+ * Events-draft namespace ONLY: these are not MCP transport protocol versions
+ * and must never be sent as the `mcp-protocol-version` transport header.
+ * Transport-header compatibility for clients that echo such a value lives in
+ * src/http.ts (NEWER_DRAFT_TRANSPORT_VERSION_ALIASES), never here.
+ */
 export const MCP_EVENTS_SUPPORTED_VERSIONS = ["2026-07-28"] as const;
 /** JSON-RPC-style error code surfaced when challenge verification fails. */
 export const SUBSCRIPTION_CHALLENGE_ERROR_CODE = -32015;

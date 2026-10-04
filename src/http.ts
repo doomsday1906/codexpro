@@ -7,7 +7,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import cors from "cors";
 import { z } from "zod";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { isInitializeRequest, LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
 import { expandHome, loadConfig, type CodexProConfig } from "./config.js";
 import {
   aiBridgeEnabledFromProfile,
@@ -29,6 +29,96 @@ import { tryHandleDelegationProtocolBody } from "./delegationProtocol.js";
 import { defaultGitPushPolicy, normalizeGitPushPolicy, sanitizeGitPushPolicy, summarizeGitPushPolicy, type GitPushPolicy } from "./gitPushPolicy.js";
 import { VerificationManager } from "./verificationOps.js";
 import { PtyRunManager } from "./ptyRunManager.js";
+
+/**
+ * Transport `mcp-protocol-version` header compatibility.
+ *
+ * The rejecting layer for unknown newer header values is the MCP SDK's
+ * WebStandardStreamableHTTPServerTransport gate (SDK 1.30.0 supports through
+ * 2025-11-25), NOT a repo version gate: a client that requests the newer
+ * 2026-07-28 draft in its initialize body still downgrades cleanly (the SDK
+ * answers the latest supported version), but the same client may then echo
+ * its requested 2026-07-28 value as the `mcp-protocol-version` header on
+ * ordinary post-init calls, which the SDK gate answers with 400.
+ *
+ * The 2026-07-28 value lives in the MCP-Events draft namespace advertised by
+ * server/discover (see MCP_EVENTS_SUPPORTED_VERSIONS in delegationEvents.ts):
+ * it is NOT an MCP transport protocol version and must never leak into the
+ * transport header as authority. The alias below exists only so such clients
+ * keep working: the header is normalized to the latest SDK-supported
+ * transport version BEFORE it reaches `transport.handleRequest`. Older
+ * transport versions pass through byte-identical, and truly invalid values
+ * pass through untouched so SDK validation still rejects them.
+ */
+export const NEWER_DRAFT_TRANSPORT_VERSION_ALIASES = ["2026-07-28"] as const;
+
+function negotiateSingleTransportProtocolVersion(value: string): string {
+  if ((SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(value)) return value;
+  if ((NEWER_DRAFT_TRANSPORT_VERSION_ALIASES as readonly string[]).includes(value)) {
+    return LATEST_PROTOCOL_VERSION;
+  }
+  return value;
+}
+
+/**
+ * Compatibly negotiate one inbound `mcp-protocol-version` header value for
+ * the SDK transport: supported versions pass through unchanged, known newer
+ * draft aliases downgrade to the latest supported version, and anything else
+ * (including absent/empty) passes through untouched so SDK validation still
+ * applies. Never throws.
+ */
+export function negotiateTransportProtocolVersion(
+  headerValue: string | string[] | undefined
+): string | string[] | undefined {
+  if (headerValue === undefined) return undefined;
+  if (Array.isArray(headerValue)) {
+    if (headerValue.length === 0) return headerValue;
+    const [first, ...rest] = headerValue;
+    const negotiated = negotiateSingleTransportProtocolVersion(first);
+    return negotiated === first ? headerValue : [negotiated, ...rest];
+  }
+  return negotiateSingleTransportProtocolVersion(headerValue);
+}
+
+export interface TransportProtocolNegotiationReceipt {
+  readonly received: string | string[] | undefined;
+  readonly sent: string | string[] | undefined;
+  readonly downgraded: boolean;
+}
+
+/**
+ * Normalize the inbound `mcp-protocol-version` header on one Express request
+ * in place, before `transport.handleRequest` converts it to a Web Standard
+ * request. Rewrites BOTH `req.headers` (the Express view used by repo code)
+ * and `req.rawHeaders` (the flat array the `@hono/node-server` conversion
+ * inside the SDK transport actually forwards: mutating `req.headers` alone
+ * never reaches the SDK gate). Returns the negotiation receipt
+ * (received/sent/downgraded). Never throws: on any unexpected shape the
+ * request is left untouched.
+ */
+export function normalizeMcpProtocolVersionHeader(req: Request): TransportProtocolNegotiationReceipt {
+  try {
+    const received = req.headers["mcp-protocol-version"];
+    const sent = negotiateTransportProtocolVersion(received);
+    if (sent !== received && sent !== undefined) {
+      req.headers["mcp-protocol-version"] = sent;
+      const values = Array.isArray(sent) ? sent : [sent];
+      const raw = (req as { rawHeaders?: unknown }).rawHeaders;
+      if (Array.isArray(raw)) {
+        let seen = 0;
+        for (let i = 0; i + 1 < raw.length; i += 2) {
+          if (typeof raw[i] === "string" && (raw[i] as string).toLowerCase() === "mcp-protocol-version") {
+            raw[i + 1] = values[Math.min(seen, values.length - 1)];
+            seen += 1;
+          }
+        }
+      }
+    }
+    return { received, sent, downgraded: sent !== received };
+  } catch {
+    return { received: undefined, sent: undefined, downgraded: false };
+  }
+}
 
 export type StatelessHttpLifecycleEventName =
   | "handler_success"
@@ -2251,6 +2341,11 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
 
   const handleStatelessRequest = async (req: express.Request, res: express.Response): Promise<void> => {
     observeHttpRequest(req, res, req.body);
+    // Compatible transport negotiation BEFORE the SDK transport sees the
+    // request: a client echoing a newer draft (e.g. the events-draft
+    // 2026-07-28) as the transport header is downgraded to the latest
+    // supported version; everything else passes through to SDK validation.
+    normalizeMcpProtocolVersionHeader(req);
     // Real MCP-Events wire methods (server/discover, events/*) are routed to
     // the official protocol handlers BEFORE the SDK transport: the bearer gate
     // above already auth-checked this request, and non-protocol traffic falls
@@ -2369,6 +2464,10 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
       await handleStatelessRequest(req, res);
       return;
     }
+    // Same compatible negotiation as the stateless path: normalize the
+    // transport header before protocol interception / transport.handleRequest
+    // so post-init calls carrying a newer-draft echo keep working.
+    normalizeMcpProtocolVersionHeader(req);
     // Retained mode: same real protocol interception before any session
     // routing or transport.handleRequest (auth already checked by the bearer
     // gate). Non-protocol traffic falls through untouched.
@@ -2574,6 +2673,8 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
 
   const handleSessionRequest = async (req: express.Request, res: express.Response) => {
     observeHttpRequest(req, res);
+    // Retained GET/DELETE carry the same transport header gate.
+    normalizeMcpProtocolVersionHeader(req);
     const sessionId = requestSessionId(req);
     const record = getTransportRecord(sessionId);
     if (!record) {

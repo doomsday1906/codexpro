@@ -1170,6 +1170,53 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
     wrongK.close();
     loopK.close();
     delete process.env.CODEXPRO_EVENTS_ALLOW_PRIVATE;
+    // K7: transport header negotiation (SDK gate compat, hermetic).
+    // Init requesting the newer 2026-07-28 draft downgrades cleanly, and an
+    // ordinary tools/call carrying that draft as the transport header succeeds
+    // via repo-side normalization; older + invalid headers behave as before.
+    {
+      const { negotiateTransportProtocolVersion: negotiateKt } = await import(pathToFileUrl(path.join(ROOT, 'dist', 'http.js')));
+      assert(negotiateKt('2026-07-28') === '2025-11-25', 'newer draft 2026-07-28 must negotiate to latest supported 2025-11-25');
+      for (const older of ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07']) {
+        assert(negotiateKt(older) === older, `supported ${older} must pass through unchanged`);
+      }
+      assert(negotiateKt('bogus-99') === 'bogus-99', 'truly invalid versions must pass through so SDK validation still rejects');
+      assert(negotiateKt(undefined) === undefined, 'absent header must stay absent');
+      const parseSseK = (text) => {
+        try { return JSON.parse(text); } catch { /* SSE envelope below */ }
+        const line = String(text).split(/\r?\n/).find((l) => l.startsWith('data:'));
+        return line ? JSON.parse(line.slice(5).trim()) : null;
+      };
+      const postRawK = async (body, headers = {}) => {
+        const response = await fetch(`${baseK}/mcp`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...headers },
+          body: JSON.stringify(body)
+        });
+        const text = await response.text();
+        return { response, json: parseSseK(text) };
+      };
+      // K7a: initialize requesting 2026-07-28 downgrades to 2025-11-25.
+      const initKt = await postRawK({ jsonrpc: '2.0', id: 101, method: 'initialize', params: { protocolVersion: '2026-07-28', capabilities: {}, clientInfo: { name: 'k7', version: '1' } } });
+      assert(initKt.response.status === 200, `k7 initialize http status ${initKt.response.status}`);
+      assert(initKt.json?.result?.protocolVersion === '2025-11-25', `k7 initialize must negotiate downgrade, got ${JSON.stringify(initKt.json)}`);
+      // K7b: ordinary tools/call carrying the newer draft as the transport header succeeds.
+      const callKt = await postRawK({ jsonrpc: '2.0', id: 102, method: 'tools/call', params: { name: 'runtime_status', arguments: {} } }, { 'mcp-protocol-version': '2026-07-28' });
+      assert(callKt.response.status === 200, `k7 tools/call with 2026-07-28 header http status ${callKt.response.status}`);
+      assert(callKt.json?.result && !callKt.json?.error, `k7 tools/call must succeed, got ${JSON.stringify(callKt.json)?.slice(0, 200)}`);
+      // K7c: older header passes through unchanged (still succeeds).
+      const oldKt = await postRawK({ jsonrpc: '2.0', id: 103, method: 'tools/call', params: { name: 'runtime_status', arguments: {} } }, { 'mcp-protocol-version': '2025-03-26' });
+      assert(oldKt.response.status === 200 && oldKt.json?.result, 'k7 tools/call with 2025-03-26 must still succeed');
+      // K7d: truly invalid header still rejected by SDK validation.
+      const badKt = await postRawK({ jsonrpc: '2.0', id: 104, method: 'tools/call', params: { name: 'runtime_status', arguments: {} } }, { 'mcp-protocol-version': 'bogus-99' });
+      assert(badKt.response.status === 400, `k7 invalid header must still 400, got ${badKt.response.status}`);
+      // K7e: real protocol methods stay reachable with the compat header present.
+      const disKt = await postRawK({ jsonrpc: '2.0', id: 105, method: 'server/discover', params: {} }, { 'mcp-protocol-version': '2026-07-28' });
+      assert(disKt.response.status === 200 && disKt.json?.result?.resultType === 'complete', 'k7 server/discover must reach the real handler');
+      const listKt = await postRawK({ jsonrpc: '2.0', id: 106, method: 'events/list', params: {} }, { 'mcp-protocol-version': '2026-07-28' });
+      assert(listKt.response.status === 200 && listKt.json?.result?.events?.[0]?.name === 'run-attention', 'k7 events/list must reach the real handler');
+      console.log('ok: K7 transport negotiation (init 2026-07-28 -> 2025-11-25; tools/call runtime_status with draft/older headers; invalid still 400; discover/list with compat header)');
+    }
     console.log('ok: K endpoint wire proof (POST /mcp server/discover + events/* reach the real handlers, auth-checked, batch, -32015 mapping)');
   } finally {
     await new Promise((resolve) => listenerK.close(resolve));
