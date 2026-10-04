@@ -697,6 +697,270 @@ async function runTests() {
     console.log(`  PASS: cleanup_incomplete with recovery hint in ${elapsed}ms, single terminal, no orphan`);
   }
 
+  // Test 18 [direct-manager]: pipe-holder admission allowlist + double identity binding
+  // via injected snapshots exercising the REAL capturePipeHolders function (not
+  // just the identity helper). Deterministic: no live-unrelated PIDs touched;
+  // signalling is a suppressed dry-run (recorded, never delivered).
+  console.log("\n[Test 18] direct-manager: pipe-holder admission rejects shared files/terminals + PID reuse...");
+  {
+    const mgr = new VerificationManager(baseConfig, { minLifetimeMs: 500, defaultLifetimeMs: 30000 });
+    const started = await mgr.startVerification(fakeWorkspace, guard, {
+      workspace_id: fakeWorkspace.id,
+      runner: "package_script",
+      package_manager: "npm",
+      script: "verification:fixture",
+      args: ["--sleep", "20000"]
+    });
+    const jobObj = mgr.getActiveJobs().find((j) => j.jobId === started.jobId);
+    assert.ok(jobObj, "Admission job must be active");
+    const captureScan = () => {
+      if (typeof jobObj.testOnlyCapturePipeHolders === "function") jobObj.testOnlyCapturePipeHolders();
+      else jobObj.capturePipeHolders();
+    };
+    const signalTree = (sig) => {
+      if (typeof jobObj.testOnlySignalOwnedTree === "function") jobObj.testOnlySignalOwnedTree(sig);
+      else jobObj.signalOwnedProcessTree(sig);
+    };
+    if (typeof jobObj.testOnlySetPipeInodes === "function") jobObj.testOnlySetPipeInodes(["pipe:[991001]", "socket:[992002]"]);
+    else { jobObj.jobPipeInodes.clear(); jobObj.jobPipeInodes.add("pipe:[991001]"); jobObj.jobPipeInodes.add("socket:[992002]"); }
+    const clearOwned = () => {
+      if (typeof jobObj.testOnlyClearOwned === "function") jobObj.testOnlyClearOwned();
+      else jobObj.ownedDescendants.clear();
+    };
+    const getOwned = (pid) => jobObj.ownedDescendants.get(pid);
+    // Suppressed dry-run: group + per-PID kills are recorded, never delivered,
+    // so the real fixture job is never touched while gating is still exercised.
+    jobObj.testHookSuppressSignals = true;
+    jobObj.testHookKillAttempts = [];
+    const resetAttempts = () => { jobObj.testHookKillAttempts = []; };
+    const attemptsFor = (pid) => jobObj.testHookKillAttempts.filter((a) => a.pid === pid);
+
+    // (i) shared regular file must NOT adopt, NOT signal.
+    clearOwned(); resetAttempts();
+    jobObj.testHookPipeScan = {
+      listPids: () => ["91001"],
+      listFds: (pid) => (pid === 91001 ? ["0", "1"] : []),
+      readFdTarget: (pid, fd) => (pid === 91001 && fd === "1" ? "/tmp/shared.log" : "pipe:[0]"),
+      readIdentity: (pid) => (pid === 91001 ? { pid, startTime: "1111", processGroup: 1, state: "S" } : undefined)
+    };
+    captureScan();
+    assert.ok(!jobObj.ownedDescendants.has(91001), "Shared regular-file holder must NOT be adopted");
+    signalTree("SIGTERM");
+    assert.equal(attemptsFor(91001).length, 0, "Shared-file PID must NOT be signalled");
+    console.log("  sub(i) PASS: shared regular file rejected (no adopt, no signal)");
+
+    // (ii) shared terminal (+ anon_inode + /dev/null spot checks) must NOT adopt/signal.
+    clearOwned(); resetAttempts();
+    jobObj.testHookPipeScan = {
+      listPids: () => ["91002", "91003", "91004"],
+      listFds: () => ["0", "1"],
+      readFdTarget: (pid, fd) => {
+        if (fd !== "1") return "pipe:[0]";
+        if (pid === 91002) return "/dev/pts/7";
+        if (pid === 91003) return "anon_inode:[eventpoll]";
+        return "/dev/null";
+      },
+      readIdentity: (pid) => ({ pid, startTime: "2222", processGroup: 1, state: "S" })
+    };
+    captureScan();
+    assert.ok(!jobObj.ownedDescendants.has(91002), "Shared terminal holder must NOT be adopted");
+    assert.ok(!jobObj.ownedDescendants.has(91003), "anon_inode holder must NOT be adopted");
+    assert.ok(!jobObj.ownedDescendants.has(91004), "/dev/null holder must NOT be adopted");
+    signalTree("SIGTERM");
+    assert.equal(attemptsFor(91002).length, 0, "Terminal PID must NOT be signalled");
+    assert.equal(attemptsFor(91003).length, 0, "anon_inode PID must NOT be signalled");
+    console.log("  sub(ii) PASS: terminal/anon_inode//dev/null rejected (no adopt, no signal)");
+
+    // (iii-a) PID reuse: stale baseline T1 vs stable replacement T2 -> prune, never refresh, never signal.
+    clearOwned(); resetAttempts();
+    jobObj.ownedDescendants.set(92001, "T1-baseline");
+    jobObj.testHookPipeScan = {
+      listPids: () => ["92001"],
+      listFds: () => ["3"],
+      readFdTarget: () => "pipe:[991001]",
+      readIdentity: (pid) => (pid === 92001 ? { pid, startTime: "T2-replacement", processGroup: 1, state: "S" } : undefined)
+    };
+    captureScan();
+    assert.notEqual(getOwned(92001), "T2-replacement", "Stale baseline must NEVER be refreshed to replacement identity");
+    assert.ok(!jobObj.ownedDescendants.has(92001) || getOwned(92001) === "T1-baseline", "Replacement must be pruned, never adopted as T2");
+    // Re-seed stale for the signal phase (capture pruned it); signal must prune again, never signal.
+    jobObj.ownedDescendants.set(92001, "T1-baseline");
+    resetAttempts();
+    signalTree("SIGTERM");
+    assert.equal(attemptsFor(92001).length, 0, "Replaced PID must NOT be signalled after prune");
+    assert.notEqual(getOwned(92001), "T2-replacement", "Signal path must never refresh baseline to T2");
+    console.log("  sub(iii-a) PASS: stale baseline pruned, replacement rejected + not signalled");
+
+    // (iii-b) PID changes mid-scan (before T1, after T2) -> reject, never refresh, never signal.
+    clearOwned(); resetAttempts();
+    jobObj.ownedDescendants.set(92002, "T1-mid");
+    let midCalls = 0;
+    jobObj.testHookPipeScan = {
+      listPids: () => ["92002"],
+      listFds: () => ["3"],
+      readFdTarget: () => "pipe:[991001]",
+      readIdentity: (pid) => {
+        if (pid !== 92002) return undefined;
+        midCalls += 1;
+        return { pid, startTime: midCalls === 1 ? "T1-mid" : "T2-mid", processGroup: 1, state: "S" };
+      }
+    };
+    captureScan();
+    assert.equal(midCalls, 2, "Double identity binding must read before AND after the fd scan");
+    assert.notEqual(getOwned(92002), "T2-mid", "Mid-scan replacement must never refresh baseline");
+    // Signal phase with stable replacement vs re-seeded stale baseline.
+    jobObj.ownedDescendants.set(92002, "T1-mid");
+    resetAttempts();
+    jobObj.testHookPipeScan = {
+      listPids: () => ["92002"],
+      listFds: () => ["3"],
+      readFdTarget: () => "pipe:[991001]",
+      readIdentity: (pid) => (pid === 92002 ? { pid, startTime: "T2-mid", processGroup: 1, state: "S" } : undefined)
+    };
+    signalTree("SIGTERM");
+    assert.equal(attemptsFor(92002).length, 0, "Mid-scan-changed PID must NOT be signalled");
+    console.log("  sub(iii-b) PASS: mid-scan PID reuse rejected, baseline not refreshed, not signalled");
+
+    // (iv) positive: genuinely-owned pipe + socket holders adopted + eligible for gated signal.
+    clearOwned(); resetAttempts();
+    jobObj.testHookPipeScan = {
+      listPids: () => ["93001"],
+      listFds: (pid) => (pid === 93001 ? ["0", "3"] : []),
+      readFdTarget: (pid, fd) => (pid === 93001 && fd === "3" ? "pipe:[991001]" : "pipe:[0]"),
+      readIdentity: (pid) => (pid === 93001 ? { pid, startTime: "5555", processGroup: 1, state: "S" } : undefined)
+    };
+    captureScan();
+    assert.equal(getOwned(93001), "5555", "Genuinely-owned pipe holder must be adopted with stable identity");
+    signalTree("SIGTERM");
+    assert.equal(attemptsFor(93001).length, 1, "Adopted pipe holder must be eligible for gated signal (recorded attempt)");
+    clearOwned(); resetAttempts();
+    jobObj.testHookPipeScan = {
+      listPids: () => ["93002"],
+      listFds: () => ["4"],
+      readFdTarget: () => "socket:[992002]",
+      readIdentity: (pid) => (pid === 93002 ? { pid, startTime: "6666", processGroup: 1, state: "S" } : undefined)
+    };
+    captureScan();
+    assert.equal(getOwned(93002), "6666", "Socket-pair holder must be adopted");
+    signalTree("SIGTERM");
+    assert.equal(attemptsFor(93002).length, 1, "Socket holder must be signal-eligible");
+    console.log("  sub(iv) PASS: genuinely-owned pipe/socket holders adopted + signal-eligible");
+
+    // Teardown: clear injection + fake owned; cancel real job; no orphans.
+    jobObj.testHookPipeScan = null;
+    jobObj.testHookSuppressSignals = false;
+    jobObj.testHookStubKill = false;
+    clearOwned();
+    const cancelled = await mgr.cancelVerification(started.jobId);
+    assert.equal(cancelled.state, "cancelled");
+    assert.equal(mgr.getActiveCount(), 0);
+    try { await mgr.close(); } catch {}
+    console.log("  PASS: Admission allowlist + double-identity binding proven on real scan function");
+  }
+
+  // Test 16b [direct-manager]: discovery-miss -> pipe-holder scan still admits the
+  // genuinely-owned holder. Forces the tree-walk to miss by clearing the owned
+  // set after root exit (owned empty before pipe scan), then proves the REAL
+  // pipe scan re-admits via allowlisted endpoint + stable identity and bounds
+  // cleanup with a cleanup-aware terminal + no orphan.
+  console.log("\n[Test 16b] direct-manager: discovery-miss still bounds via pipe-holder scan...");
+  {
+    const mgr = new VerificationManager(baseConfig, { minLifetimeMs: 500, defaultLifetimeMs: 30000 });
+    const pidName = "detached-16b.pid";
+    try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
+    const startT = Date.now();
+    const started = await mgr.startVerification(fakeWorkspace, guard, {
+      workspace_id: fakeWorkspace.id,
+      runner: "package_script",
+      package_manager: "npm",
+      script: "verification:lifecycle",
+      args: ["--detached-child-ms", "8000", "--detached-ignore-term", "--detached-pid-file", pidName, "--run-ms", "400"]
+    });
+    // Root runs 400ms then exits; exit-handler TERMs (ignored) so the
+    // inherited-pipe holder survives into the KILL window. Intervene at ~800ms:
+    // job still running (close held by pipes), holder still alive pre-KILL.
+    await new Promise((r) => setTimeout(r, 800));
+    const jobObj = mgr.getActiveJobs().find((j) => j.jobId === started.jobId);
+    assert.ok(jobObj, "16b job must still be running at intervention (close pending proves pipes held)");
+    const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
+    assert.ok(childPid > 0, "Fixture must record detached child PID");
+    assert.ok(isPidAlive(childPid), `Holder PID ${childPid} must be alive at intervention (pre-KILL window)`);
+    // Force discovery-miss: drop all tree-walk state.
+    if (typeof jobObj.testOnlyClearOwned === "function") jobObj.testOnlyClearOwned();
+    else jobObj.ownedDescendants.clear();
+    assert.equal(jobObj.ownedDescendants.size, 0, "Discovery-miss condition: owned set empty before pipe scan");
+    // Real pipe scan (no hooks) must re-admit the genuinely-owned holder.
+    assert.ok(!jobObj.testHookPipeScan, "16b must use the real /proc scan, not injected snapshots");
+    if (typeof jobObj.testOnlyCapturePipeHolders === "function") jobObj.testOnlyCapturePipeHolders();
+    else jobObj.capturePipeHolders();
+    const adopted = jobObj.ownedDescendants.size;
+    assert.ok(adopted >= 1, `Pipe scan must adopt >=1 genuinely-owned holder after miss (got ${adopted})`);
+    assert.equal(jobObj.ownedDescendants.get(childPid) !== undefined, true, `Pipe scan must re-admit the real holder PID ${childPid}`);
+    const result = await mgr.waitVerification(started.jobId, 10);
+    const elapsed = Date.now() - startT;
+    assert.ok(elapsed < 9000, `Discovery-miss holder must bound before self-exit (elapsed ${elapsed}ms)`);
+    assert.equal(result.state, "failed", `Discovery-miss intervention must be cleanup-aware failure, got ${result.state}`);
+    assert.match(result.terminalReason ?? "", /cleanup|owned descendant/i, "Terminal reason must be cleanup-aware");
+    assert.equal(mgr.getActiveCount(), 0);
+    assert.ok(!isPidAlive(childPid), `Pipe-holding child PID ${childPid} must be dead (no orphan)`);
+    try { await mgr.close(); } catch {}
+    try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
+    console.log(`  PASS: Miss forced (0 before, ${adopted} adopted) + bounded ${elapsed}ms cleanup-aware failure, no orphan`);
+  }
+
+  // Test 17b [direct-manager]: independent watchdog with `close` pending.
+  // Holder keeps job pipes open (inherited stdio); signalling is suppressed so
+  // `close` stays pending past the 4000ms settle deadline. The watchdog must
+  // reach EXACTLY ONE terminal within its bound with truthful
+  // cleanup_incomplete + bounded recovery evidence and single finishedAt.
+  console.log("\n[Test 17b] direct-manager: watchdog bounds close-pending holder to single cleanup_incomplete...");
+  {
+    const mgr = new VerificationManager(baseConfig, { minLifetimeMs: 500, defaultLifetimeMs: 30000 });
+    const pidName = "detached-17b.pid";
+    try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
+    const started = await mgr.startVerification(fakeWorkspace, guard, {
+      workspace_id: fakeWorkspace.id,
+      runner: "package_script",
+      package_manager: "npm",
+      script: "verification:lifecycle",
+      args: ["--detached-child-ms", "15000", "--detached-pid-file", pidName, "--run-ms", "400"]
+    });
+    const jobObj = mgr.getActiveJobs().find((j) => j.jobId === started.jobId);
+    assert.ok(jobObj, "17b job must be active to suppress signals");
+    // Suppress ALL delivery (group + per-PID) so the pipe holder survives and
+    // `close` stays pending; gating + capture still run and are recorded.
+    jobObj.testHookSuppressSignals = true;
+    jobObj.testHookKillAttempts = [];
+    const startT = Date.now();
+    // At ~2s (pre-watchdog) the job must still be running: proves `close` is
+    // pending (pipes held), not early-settled via the close path.
+    await new Promise((r) => setTimeout(r, 2000));
+    assert.equal(mgr.getActiveCount(), 1, "Job must still be running pre-watchdog (close pending, pipes held)");
+    const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
+    assert.ok(childPid > 0, "Fixture must record close-pending holder PID");
+    assert.ok(isPidAlive(childPid), `Holder PID ${childPid} must be alive pre-watchdog (suppressed kills)`);
+    const result = await mgr.waitVerification(started.jobId, 10);
+    const elapsed = Date.now() - startT;
+    assert.equal(result.state, "failed", `Watchdog incomplete must be failure, got ${result.state}`);
+    assert.match(result.terminalReason ?? "", /cleanup_incomplete/, "Terminal reason must carry cleanup_incomplete evidence");
+    assert.ok((result.recoveryHint ?? "").length <= 600, "Recovery hint must stay bounded");
+    assert.ok((result.recoveryHint ?? "").includes("live"), "Recovery hint must carry live-set evidence");
+    assert.ok(elapsed < 9000, `Watchdog must bound (elapsed ${elapsed}ms)`);
+    assert.equal(mgr.getActiveCount(), 0);
+    // Single terminal assignment: re-wait observes the identical terminal.
+    const second = await mgr.waitVerification(started.jobId, 2);
+    assert.equal(second.state, result.state);
+    assert.equal(second.finishedAt, result.finishedAt, "Finished timestamp must be single-assigned (exactly one terminal)");
+    // Cleanup the suppressed holder (reap stubbed/real holder, no orphans).
+    try { jobObj.testHookSuppressSignals = false; } catch {}
+    try { process.kill(childPid, "SIGKILL"); } catch {}
+    await new Promise((r) => setTimeout(r, 500));
+    assert.ok(!isPidAlive(childPid), `Close-pending holder PID ${childPid} must be reaped by test cleanup (no orphan)`);
+    try { await mgr.close(); } catch {}
+    try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
+    console.log(`  PASS: watchdog single cleanup_incomplete in ${elapsed}ms, single finishedAt, no orphan`);
+  }
+
   // Test 15 [public-mcp public-default]: actual MCP start/wait/list/cancel/reconnect +
   // workspace isolation through the real HTTP transport with default limits.
   console.log("\n[Test 15] public-mcp public-default: start/wait/list/cancel/reconnect + isolation...");

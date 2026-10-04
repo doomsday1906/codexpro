@@ -459,7 +459,7 @@ export function clampLifetime(
   return Math.max(minMs, Math.min(Math.floor(requestedMs), maxMs));
 }
 
-interface LinuxProcessIdentity {
+export interface LinuxProcessIdentity {
   pid: number;
   startTime: string;
   processGroup: number;
@@ -505,6 +505,39 @@ function readLinuxProcessIdentity(pid: number): LinuxProcessIdentity | undefined
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Allowlisted private job-channel endpoint check (ownership admission gate).
+ *
+ * Lineage reasoning (documented): `pipe:[inode]` and `socket:[inode]` name a
+ * private kernel object. Only processes that inherited the exact open file
+ * description (fork/spawn inheritance, or SCM_RIGHTS passing which this job
+ * never uses) can hold that inode, so equality with a root-captured job pipe
+ * inode is positive lineage evidence. A shared regular-file path
+ * (`/tmp/shared.log`) or terminal (`/dev/pts/N`) is rendezvous by name: any
+ * unrelated process can open the same path without any fork relationship to
+ * the job, so path equality proves nothing about lineage and must never
+ * adopt. `anon_inode:*`, `/dev/*`, and every other family are rejected for
+ * the same reason. Allowlist, not denylist: unknown families default to
+ * reject.
+ */
+export function isPrivateJobChannelTarget(target: unknown): boolean {
+  if (typeof target !== "string" || !target) return false;
+  return /^pipe:\[\d+\]$/u.test(target) || /^socket:\[\d+\]$/u.test(target);
+}
+
+/**
+ * Deterministic injection hooks for the pipe-holder admission path.
+ * Production leaves every field unset (real /proc scan). Tests inject bounded
+ * snapshots to exercise the REAL `capturePipeHolders` admission function
+ * (allowlist + double identity binding) without touching unrelated live PIDs.
+ */
+export interface PipeHolderScanHooks {
+  listPids?: () => string[];
+  listFds?: (pid: number) => string[];
+  readFdTarget?: (pid: number, fd: string) => string | undefined;
+  readIdentity?: (pid: number) => LinuxProcessIdentity | undefined;
 }
 
 interface StreamChunk {
@@ -775,6 +808,29 @@ export class ManagedVerificationJob {
    * still-live owned set after the bounded drain, proving the
    * `cleanup_incomplete` path without real unkillable D-state or stress. */
   public testHookForceLive: number[] | null = null;
+  /**
+   * Test-only deterministic pipe-scan injection. When set, `capturePipeHolders`
+   * uses these snapshots instead of the live /proc walk, exercising the REAL
+   * admission function (allowlist + double identity binding). Identity reads
+   * via `readIdentity` are also honoured by the per-PID signal/prune gates so
+   * stubbed holders gate exactly like real ones. Production leaves this null.
+   */
+  public testHookPipeScan: PipeHolderScanHooks | null = null;
+  /**
+   * Test-only kill stub. When true, per-PID signals are RECORDED in
+   * `testHookKillAttempts` instead of signalling real PIDs, so unrelated-PID
+   * admission tests prove NOT-signalled without touching live processes.
+   */
+  public testHookStubKill = false;
+  public testHookKillAttempts: Array<{ pid: number; signal: NodeJS.Signals }> = [];
+  /**
+   * Test-only signal suppression. When true, `signalOwnedProcessTree` records
+   * intent but delivers NO signal (group or per-PID), keeping pipe holders
+   * alive so the independent settle watchdog (close pending) can be proven
+   * deterministically. Cleared by the test before real reaping; never set in
+   * production.
+   */
+  public testHookSuppressSignals = false;
   // Private pipe inodes of this job's stdio (write ends inherited by every
   // pipe-holding descendant). Captured from /proc/<rootPid>/fd/1+2 while the
   // root is alive. A process holding one of these inodes inherited it from our
@@ -1059,18 +1115,65 @@ export class ManagedVerificationJob {
     return root.startTime === this.rootProcessStartTime;
   }
 
+  private readOwnedIdentity(pid: number): LinuxProcessIdentity | undefined {
+    const hook = this.testHookPipeScan?.readIdentity;
+    if (hook) {
+      try {
+        return hook(pid);
+      } catch {
+        return undefined;
+      }
+    }
+    return readLinuxProcessIdentity(pid);
+  }
+
+  /** Test-only: invoke the real pipe-holder admission scan deterministically. */
+  public testOnlyCapturePipeHolders(): void {
+    this.capturePipeHolders();
+  }
+
+  /** Test-only: invoke the identity-gated signal path (honours stub/suppress hooks). */
+  public testOnlySignalOwnedTree(signal: NodeJS.Signals): void {
+    this.signalOwnedProcessTree(signal);
+  }
+
+  /** Test-only: replace the stored job pipe inodes with an exact controlled set. */
+  public testOnlySetPipeInodes(inodes: string[]): void {
+    this.jobPipeInodes.clear();
+    for (const inode of inodes) this.jobPipeInodes.add(inode);
+  }
+
+  public testOnlyGetPipeInodes(): string[] {
+    return [...this.jobPipeInodes];
+  }
+
+  public testOnlyOwnedEntries(): Array<[number, string]> {
+    return [...this.ownedDescendants];
+  }
+
+  public testOnlyClearOwned(): void {
+    this.ownedDescendants.clear();
+  }
+
   private captureJobPipeInodes(): void {
     if (process.platform !== "linux") return;
     const rootPid = this.child?.pid;
     if (!rootPid) return;
+    // Only capture from the live OWNED root: after root exit + PID reuse,
+    // fd 1/2 would belong to an unrelated replacement, so refuse to learn new
+    // inodes once the root identity is no longer current.
+    if (!this.isRootIdentityCurrent()) return;
     for (const fd of ["1", "2"]) {
       try {
         const target = fs.readlinkSync(`/proc/${rootPid}/fd/${fd}`);
-        // Node presents child stdio as socketpair sockets (socket:[...]), plain
-        // pipes as pipe:[...]; store whatever fd 1/2 point at while the root
-        // is alive. Matching is always against these exact stored inodes, so
-        // the prefix family does not matter.
-        if (target && target !== "/dev/null") {
+        // Allowlist only: retain verified original job pipe/socket endpoints.
+        // Node child stdio is normally socketpair sockets (socket:[inode]);
+        // plain pipes appear as pipe:[inode]. Both name a private kernel
+        // object whose inode equality proves inheritance lineage (only
+        // inheritors share it). Regular files (/path/file), terminals
+        // (/dev/pts/N), /dev/null, anon_inode, and every other family are
+        // rendezvous-by-name or non-inheritable and prove nothing, so reject.
+        if (isPrivateJobChannelTarget(target)) {
           this.jobPipeInodes.add(target);
         }
       } catch {
@@ -1084,19 +1187,33 @@ export class ManagedVerificationJob {
     if (this.jobPipeInodes.size === 0) return;
     let procEntries: string[];
     try {
-      procEntries = fs.readdirSync("/proc");
+      const hookList = this.testHookPipeScan?.listPids;
+      procEntries = hookList ? hookList() : fs.readdirSync("/proc");
     } catch {
       return;
     }
     const selfPid = process.pid;
+    const hookListFds = this.testHookPipeScan?.listFds;
+    const hookReadTarget = this.testHookPipeScan?.readFdTarget;
     for (const entry of procEntries) {
       const pid = Number(entry);
       if (!Number.isSafeInteger(pid) || pid <= 0 || pid === selfPid) continue;
-      // Skip PIDs already owned with a current identity (prune/signalling
-      // below revalidates them); the scan exists to ADD missed holders.
+      // Bind inspection to identity checked BEFORE the descriptor scan.
+      const before = this.readOwnedIdentity(pid);
+      if (!before) continue;
+      const knownBefore = this.ownedDescendants.get(pid);
+      if (knownBefore !== undefined && knownBefore !== before.startTime) {
+        // Stale baseline vs replacement occupant: never overwrite the baseline
+        // with the replacement's identity (that would launder an unrelated
+        // process into the owned set). Prune stale and reject this pass; a
+        // genuinely-owned replacement can only be adopted once no stale
+        // baseline remains, via a fresh stable double-read below.
+        this.ownedDescendants.delete(pid);
+        continue;
+      }
       let fdNames: string[];
       try {
-        fdNames = fs.readdirSync(`/proc/${pid}/fd`);
+        fdNames = hookListFds ? hookListFds(pid) : fs.readdirSync(`/proc/${pid}/fd`);
       } catch {
         continue;
       }
@@ -1104,27 +1221,49 @@ export class ManagedVerificationJob {
       const capped = fdNames.slice(0, 128);
       let holds = false;
       for (const fd of capped) {
-        let target = "";
+        let target: string | undefined;
         try {
-          target = fs.readlinkSync(`/proc/${pid}/fd/${fd}`);
+          target = hookReadTarget
+            ? hookReadTarget(pid, fd)
+            : fs.readlinkSync(`/proc/${pid}/fd/${fd}`);
         } catch {
           continue;
         }
+        if (target === undefined) continue;
+        // Double-gate: the match must be an allowlisted private channel AND
+        // one of this job's stored inodes. jobPipeInodes is already
+        // allowlisted at capture, but re-check here so a poisoned or legacy
+        // non-private entry can never adopt (defence in depth).
+        if (!isPrivateJobChannelTarget(target)) continue;
         if (this.jobPipeInodes.has(target)) {
           holds = true;
           break;
         }
       }
       if (!holds) continue;
-      const identity = readLinuxProcessIdentity(pid);
-      if (!identity) continue;
-      const known = this.ownedDescendants.get(pid);
-      if (known !== identity.startTime) {
-        // Holding our private pipe write end proves tree lineage, so a stale
-        // entry (PID reuse) is refreshed to the current occupant; a new holder
-        // is adopted with its exact identity for PID+starttime-gated kills.
-        this.ownedDescendants.set(pid, identity.startTime);
+      // Re-read identity AFTER the scan; adopt ONLY if both reads succeed and
+      // agree. A vanished process (undefined) or a PID reused mid-scan
+      // (starttime changed) is rejected. Unadopted holders stay unowned and
+      // are left for `cleanup_incomplete` with recovery evidence, never killed.
+      const after = this.readOwnedIdentity(pid);
+      if (!after) continue;
+      if (after.startTime !== before.startTime) continue;
+      const knownAfter = this.ownedDescendants.get(pid);
+      if (knownAfter !== undefined) {
+        if (knownAfter !== after.startTime) {
+          // Baseline changed mid-scan: prune stale, never refresh.
+          this.ownedDescendants.delete(pid);
+          continue;
+        }
+        // Already owned + stable: preserve the existing baseline (no
+        // overwrite), mark observed. Per-PID signalling later revalidates
+        // identity immediately before any kill.
+        this.descendantsEverObserved = true;
+        continue;
       }
+      // Unknown PID with stable identity + allowlisted match: adopt with its
+      // exact identity for PID+starttime-gated kills.
+      this.ownedDescendants.set(pid, after.startTime);
       this.descendantsEverObserved = true;
     }
   }
@@ -1160,7 +1299,7 @@ export class ManagedVerificationJob {
         const pid = Number(token);
         if (!Number.isSafeInteger(pid) || pid <= 0 || visited.has(pid)) continue;
         visited.add(pid);
-        const identity = readLinuxProcessIdentity(pid);
+        const identity = this.readOwnedIdentity(pid);
         if (!identity) continue;
         this.ownedDescendants.set(pid, identity.startTime);
         pending.push(pid);
@@ -1176,18 +1315,20 @@ export class ManagedVerificationJob {
     if (!child?.pid) return;
     this.captureOwnedDescendants();
     // Pipe-holder fallback: tree-walk misses holders that detached+reparented
-    // before any capture pass (narrow with fast-exiting roots). Holding our
-    // private pipe proves lineage, so adopt them with exact identity.
+    // before any capture pass (narrow with fast-exiting roots). Only
+    // allowlisted private-channel holders with stable double-read identity are
+    // adopted; anything else is left for `cleanup_incomplete`, never killed.
     try {
       this.capturePipeHolders();
     } catch {
       // Best effort; identity-gated kills below decide.
     }
+    const suppress = this.testHookSuppressSignals === true;
     // Only use the process-group kill while the root PID still identifies the
     // exact owned root (PID + starttime). After root exit + PID reuse, kill(-pid)
     // could signal an unrelated group, so skip it and rely on per-PID kills below.
     const rootCurrent = this.isRootIdentityCurrent();
-    if (rootCurrent || process.platform !== "linux") {
+    if (!suppress && (rootCurrent || process.platform !== "linux")) {
       terminateProcessTree(child, signal);
     }
 
@@ -1196,17 +1337,31 @@ export class ManagedVerificationJob {
     // Group kill already covers pgid == root members when it succeeds, but a
     // failed/racing group kill must not leave same-group orphans, and detached
     // escapees (new pgid/session holding pipes open) are only reachable here.
-    // Each kill is gated on exact PID + starttime identity; stale entries are pruned.
+    // Each kill is gated on exact PID + starttime identity revalidated
+    // immediately before signalling; stale entries are pruned, never signalled.
     let signalled = 0;
     for (const [pid, startTime] of [...this.ownedDescendants]) {
-      const current = readLinuxProcessIdentity(pid);
+      const current = this.readOwnedIdentity(pid);
       if (!current || current.startTime !== startTime) {
         this.ownedDescendants.delete(pid);
         continue;
       }
+      if (suppress) {
+        // Deterministic watchdog proof: record gated eligibility without
+        // delivering, so the holder survives and `close` stays pending.
+        this.testHookKillAttempts.push({ pid, signal });
+        continue;
+      }
       try {
-        process.kill(pid, signal);
-        signalled += 1;
+        if (this.testHookStubKill) {
+          // Deterministic admission proof: record instead of signalling real
+          // PIDs, counting gated eligibility without touching live processes.
+          this.testHookKillAttempts.push({ pid, signal });
+          signalled += 1;
+        } else {
+          process.kill(pid, signal);
+          signalled += 1;
+        }
       } catch {
         // The exact descendant may have exited between identity check and signal.
       }
@@ -1226,15 +1381,22 @@ export class ManagedVerificationJob {
       this.ownedDescendants.clear();
       return [];
     }
+    const hookIdentity = this.testHookPipeScan?.readIdentity;
     const live: number[] = [];
     for (const [pid, startTime] of [...this.ownedDescendants]) {
-      const current = readLinuxProcessIdentity(pid);
+      const current = this.readOwnedIdentity(pid);
       if (!current || current.startTime !== startTime) {
         this.ownedDescendants.delete(pid);
         continue;
       }
       if (current.state === "Z" || current.state === "X" || current.state === "x") {
         this.ownedDescendants.delete(pid);
+        continue;
+      }
+      if (hookIdentity) {
+        // Deterministic injected-identity mode: trust the hook's stable
+        // identity + state (fake PIDs have no kernel entry for kill probing).
+        live.push(pid);
         continue;
       }
       try {
