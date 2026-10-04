@@ -75,6 +75,149 @@ export function descendantProcessIds(processes, rootPid) {
   return [...found];
 }
 
+// Identity-gated traversal: validate parent identity BEFORE expanding children.
+// A reused parent PID must never cause unrelated children (of the replacement
+// process) to acquire ownership records. Callers must use these helpers instead
+// of bare descendantProcessIds for owned-tree discovery.
+// Linux: PID+starttime (readLinuxProcessStartTime/verifyProcessIdentity).
+//   current identity is currentIdentities.get(pid) when that Map carries the
+//   PID (stubbed snapshot/test seam), else a live /proc read. Strict.
+// Windows: CIM CreationDate baseline where available, else unprovable and NOT
+//   expanded. currentIdentities is the CIM snapshot Map (pid -> CreationDate);
+//   when it is absent (CIM unavailable) expansion is refused (fail closed).
+//   Honest limitation (preserved): CIM CreationDate granularity plus snapshot
+//   TOCTOU mean a PID recycled inside the same timestamp window cannot be fully
+//   excluded; callers keep signalling narrowed to the directly-owned child
+//   plus snapshot-verified descendants and never broaden to pattern sweeps.
+// Never-refresh rule: a failed validation never overwrites the recorded
+// baseline with the replacement's identity; stale parents contribute no
+// children and stale known children are never adopted.
+export function isParentIdentityValidForExpansion(pid, knownIdentities, currentIdentities, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const readStartTime = options.readStartTime ?? ((candidate) => readLinuxProcessStartTime(candidate, platform));
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  const hasBaseline = knownIdentities instanceof Map && knownIdentities.has(pid);
+  if (!hasBaseline) {
+    // Unknown parent: bootstrap only with a provable current identity.
+    if (platform === 'win32') {
+      if (!(currentIdentities instanceof Map)) return false;
+      const current = currentIdentities.get(pid);
+      return current != null && current !== '';
+    }
+    let current;
+    if (currentIdentities instanceof Map && currentIdentities.has(pid)) current = currentIdentities.get(pid);
+    else current = readStartTime(pid);
+    return current != null && current !== '';
+  }
+  const expected = knownIdentities.get(pid);
+  if (expected == null || expected === '') return false;
+  if (platform === 'win32') {
+    if (!(currentIdentities instanceof Map)) return false;
+    const current = currentIdentities.get(pid);
+    if (current == null || current === '') return false;
+    return current === expected;
+  }
+  let current;
+  if (currentIdentities instanceof Map && currentIdentities.has(pid)) current = currentIdentities.get(pid);
+  else current = readStartTime(pid);
+  if (current == null || current === '') return false;
+  return current === expected;
+}
+
+// Validated transitive descendants: only PIDs reachable through valid parents.
+// Never returns children of a stale/unprovable parent. Stale known children
+// are pruned (never returned); unprovable unknown children are returned for
+// bookkeeping but their subtrees are never expanded. Pure: never mutates
+// inputs. Callers record baselines store-if-absent via the mutating helpers
+// below (or their own equivalent that never overwrites).
+export function validatedDescendantProcessIds(processes, rootPid, knownIdentities, currentIdentities, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const readStartTime = options.readStartTime ?? ((candidate) => readLinuxProcessStartTime(candidate, platform));
+  if (!Number.isSafeInteger(rootPid) || rootPid <= 0) return [];
+  const isValid = (pid) => isParentIdentityValidForExpansion(pid, knownIdentities, currentIdentities, { platform, readStartTime });
+  if (!isValid(rootPid)) return [];
+  const childrenByParent = new Map();
+  for (const entry of processes ?? []) {
+    if (!entry || !Number.isSafeInteger(entry.pid) || !Number.isSafeInteger(entry.parentPid)) continue;
+    const children = childrenByParent.get(entry.parentPid) ?? [];
+    children.push(entry.pid);
+    childrenByParent.set(entry.parentPid, children);
+  }
+  const found = new Set();
+  const pending = [rootPid];
+  const queued = new Set([rootPid]);
+  while (pending.length) {
+    const parentPid = pending.shift();
+    if (!isValid(parentPid)) continue;
+    for (const childPid of childrenByParent.get(parentPid) ?? []) {
+      if (childPid === rootPid || found.has(childPid)) continue;
+      if (knownIdentities instanceof Map && knownIdentities.has(childPid)) {
+        if (!isValid(childPid)) continue;
+      }
+      found.add(childPid);
+      if (!queued.has(childPid) && isValid(childPid)) {
+        pending.push(childPid);
+        queued.add(childPid);
+      } else {
+        queued.add(childPid);
+      }
+    }
+  }
+  return [...found];
+}
+
+function recordValidatedBaseline(knownIdentities, currentIdentities, pid, platform, readStartTime) {
+  if (!(knownIdentities instanceof Map) || knownIdentities.has(pid)) return;
+  let observed = null;
+  if (currentIdentities instanceof Map && currentIdentities.has(pid)) observed = currentIdentities.get(pid) ?? null;
+  else if (platform === 'linux') observed = readStartTime(pid);
+  else observed = null;
+  if (observed === '') observed = null;
+  knownIdentities.set(pid, observed);
+}
+
+// Mutating validated discovery: validates the root BEFORE expanding, adds only
+// valid-lineage descendants to knownPids, records baselines store-if-absent
+// (never refreshes a stale record with the replacement's identity), and never
+// expands when identity is unprovable. Returns { added, staleRoot }.
+export function addValidatedObservedDescendants(processes, rootPid, knownPids, knownIdentities, currentIdentities, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const readStartTime = options.readStartTime ?? ((candidate) => readLinuxProcessStartTime(candidate, platform));
+  if (!Number.isSafeInteger(rootPid) || rootPid <= 0) return { added: [], staleRoot: false };
+  if (!isParentIdentityValidForExpansion(rootPid, knownIdentities, currentIdentities, { platform, readStartTime })) {
+    return { added: [], staleRoot: true };
+  }
+  if (knownPids instanceof Set && knownIdentities instanceof Map) {
+    recordValidatedBaseline(knownIdentities, currentIdentities, rootPid, platform, readStartTime);
+  }
+  const found = validatedDescendantProcessIds(processes, rootPid, knownIdentities, currentIdentities, { platform, readStartTime });
+  const added = [];
+  if (knownPids instanceof Set) {
+    for (const pid of found) {
+      if (!knownPids.has(pid)) {
+        knownPids.add(pid);
+        added.push(pid);
+      }
+      recordValidatedBaseline(knownIdentities, currentIdentities, pid, platform, readStartTime);
+    }
+  }
+  return { added, staleRoot: false };
+}
+
+export function addValidatedObservedDescendantsOfKnownProcesses(processes, knownPids, knownIdentities, currentIdentities, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const readStartTime = options.readStartTime ?? ((candidate) => readLinuxProcessStartTime(candidate, platform));
+  const parents = knownPids instanceof Set ? [...knownPids] : [];
+  const added = [];
+  let staleCount = 0;
+  for (const pid of parents) {
+    const result = addValidatedObservedDescendants(processes, pid, knownPids, knownIdentities, currentIdentities, { platform, readStartTime });
+    if (result.staleRoot) staleCount += 1;
+    added.push(...result.added);
+  }
+  return { added, staleCount };
+}
+
 // Linux process birth marker: field 22 (starttime, clock ticks since boot) of
 // /proc/<pid>/stat. Combined with the PID it identifies a specific process
 // incarnation, so a recycled PID cannot verify against a stale baseline.

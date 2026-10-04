@@ -4,10 +4,14 @@ import syncFs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  addValidatedObservedDescendants,
+  addValidatedObservedDescendantsOfKnownProcesses,
   captureProcessIdentity,
+  isParentIdentityValidForExpansion,
   parseProcessIdentityTable,
   processIdentityTableInvocation,
   readLinuxProcessStartTime,
+  validatedDescendantProcessIds,
   verifyProcessIdentity,
   windowsRootTaskkillDecision
 } from './launcher-process-tree.mjs';
@@ -428,6 +432,95 @@ fs.writeFileSync('big.txt', \`base\n\${'y'.repeat(60_000)}\n\`);
     throw new Error('Windows identity snapshot must be win32-only');
   }
   console.log('ok: stale/reused PIDs never verify (fail closed)');
+}
+
+// --- 6b. Reused parent PID never yields unrelated children (validated traversal) ---
+// Exercises the ACTUAL owned-tree discovery path shared with codexpro.mjs:
+// codexpro.mjs addObservedDescendants /
+// addObservedDescendantsOfKnownProcesses delegate to
+// addValidatedObservedDescendants(OfKnownProcesses) /
+// validatedDescendantProcessIds in launcher-process-tree.mjs for every
+// POSIX and Windows kill/wait discovery call. Stubbed process tables plus
+// stubbed birth markers; no real kills, no signalling, fixtures are four
+// small PIDs. A dry-run signalling set derived from knownPids would never
+// contain the unrelated child because it is never added.
+{
+  const stubReadNull = () => null;
+  const assert = (condition, message) => {
+    if (!condition) throw new Error(message);
+  };
+  // A: reused root 1234 (recorded T1, current T2) with unrelated child 9999.
+  {
+    const knownPids = new Set([1234, 1235]);
+    const knownIdentities = new Map([[1234, '1000'], [1235, '2000']]);
+    const current = new Map([[1234, '1001'], [1235, '2000'], [9999, '3000']]);
+    const table = [{ pid: 1234, parentPid: 1 }, { pid: 9999, parentPid: 1234 }];
+    assert(
+      isParentIdentityValidForExpansion(1234, knownIdentities, current, { platform: 'linux', readStartTime: stubReadNull }) === false,
+      'reused root 1234 must validate as stale (T1 vs T2)'
+    );
+    assert(
+      validatedDescendantProcessIds(table, 1234, knownIdentities, current, { platform: 'linux', readStartTime: stubReadNull }).length === 0,
+      'validated BFS from stale root must return no descendants'
+    );
+    const before = knownIdentities.get(1234);
+    addValidatedObservedDescendantsOfKnownProcesses(table, knownPids, knownIdentities, current, { platform: 'linux', readStartTime: stubReadNull });
+    assert(!knownPids.has(9999), 'unrelated child 9999 of reused parent 1234 was added to knownPids');
+    assert(!knownIdentities.has(9999), 'unrelated child 9999 acquired an ownership baseline');
+    assert(knownIdentities.get(1234) === before && before === '1000', `stale 1234 baseline refreshed to ${knownIdentities.get(1234)} (must stay T1)`);
+    // Dry-run signalling set derived from knownPids never targets 9999.
+    const wouldSignal = [...knownPids].filter((pid) => pid === 9999);
+    assert(wouldSignal.length === 0, 'dry-run signalling set contains unrelated 9999');
+  }
+  // B: positive control — valid root still discovers its child (helper is not always-empty).
+  {
+    const knownPids = new Set();
+    const knownIdentities = new Map([[1234, '1000']]);
+    const current = new Map([[1234, '1000'], [1235, '2000']]);
+    const table = [{ pid: 1234, parentPid: 1 }, { pid: 1235, parentPid: 1234 }];
+    assert(
+      isParentIdentityValidForExpansion(1234, knownIdentities, current, { platform: 'linux', readStartTime: stubReadNull }) === true,
+      'valid root 1234 must validate'
+    );
+    const { added, staleRoot } = addValidatedObservedDescendants(table, 1234, knownPids, knownIdentities, current, { platform: 'linux', readStartTime: stubReadNull });
+    assert(staleRoot === false, 'valid root reported stale');
+    assert(knownPids.has(1235) && added.includes(1235), 'valid child 1235 was not adopted');
+    assert(knownIdentities.get(1235) === '2000', 'valid child baseline not recorded');
+    assert(knownIdentities.get(1234) === '1000', 'valid root baseline must not change');
+  }
+  // C: reused intermediate 200 under valid root 100 must prune grandchild 9999.
+  {
+    const knownPids = new Set([100, 200]);
+    const knownIdentities = new Map([[100, 'A1'], [200, 'B1']]);
+    const current = new Map([[100, 'A1'], [200, 'B2'], [9999, 'C1']]);
+    const table = [{ pid: 100, parentPid: 1 }, { pid: 200, parentPid: 100 }, { pid: 9999, parentPid: 200 }];
+    addValidatedObservedDescendantsOfKnownProcesses(table, knownPids, knownIdentities, current, { platform: 'linux', readStartTime: stubReadNull });
+    assert(!knownPids.has(9999), 'grandchild 9999 of stale intermediate 200 was added');
+    assert(!knownIdentities.has(9999), 'grandchild 9999 acquired a baseline via stale intermediate');
+    assert(knownIdentities.get(200) === 'B1', `stale intermediate 200 baseline refreshed to ${knownIdentities.get(200)}`);
+  }
+  // D: Windows CreationDate path (platform override, mocked CIM values).
+  {
+    const t1 = '20260101000000000000';
+    const t2 = '20260101000001000000';
+    const knownPids = new Set([1234]);
+    const knownIdentities = new Map([[1234, t1]]);
+    const current = new Map([[1234, t2], [9999, t2]]);
+    const table = [{ pid: 1234, parentPid: 1 }, { pid: 9999, parentPid: 1234 }];
+    assert(
+      isParentIdentityValidForExpansion(1234, knownIdentities, current, { platform: 'win32' }) === false,
+      'Windows reused root must validate as stale'
+    );
+    addValidatedObservedDescendantsOfKnownProcesses(table, knownPids, knownIdentities, current, { platform: 'win32' });
+    assert(!knownPids.has(9999), 'Windows: unrelated 9999 of reused parent was added');
+    assert(knownIdentities.get(1234) === t1, 'Windows: stale baseline refreshed');
+    // Snapshot unavailable on Windows refuses expansion (fail closed, narrowed).
+    const knownPids2 = new Set([1234]);
+    const knownIdentities2 = new Map([[1234, t1]]);
+    addValidatedObservedDescendantsOfKnownProcesses(table, knownPids2, knownIdentities2, null, { platform: 'win32' });
+    assert(!knownPids2.has(9999), 'Windows without CIM snapshot must not expand');
+  }
+  console.log('ok: reused parent PID never yields unrelated children (validated traversal, no refresh)');
 }
 
 // --- 7. Windows root-taskkill identity gate (mocked CIM, pure unit) ---

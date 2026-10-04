@@ -525,6 +525,9 @@ async function runTests() {
   // Test 12 [direct-manager]: early-exiting root with inherited pipes + detached child
   // retaining pipes. 'close' is held back by the pipe holder; the exit handler must
   // TERM/KILL it boundedly so the job settles without hanging to self-exit.
+  // Contract: normal-completion-with-intervention is a cleanup-aware `failed`
+  // (never ordinary `succeeded`), even when the exit handler reaped the holder
+  // before `close` pruned it (history recorded via cleanupPerformed).
   console.log("\n[Test 12] direct-manager: early root exit with inherited-pipe holder settles boundedly...");
   {
     const mgr = new VerificationManager(baseConfig, { minLifetimeMs: 500, defaultLifetimeMs: 30000 });
@@ -542,12 +545,10 @@ async function runTests() {
     const elapsed = Date.now() - startT;
     const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
     assert.ok(elapsed < 6000, `Pipe-holder must be reaped boundedly, not held to self-exit (elapsed ${elapsed}ms)`);
-    // Either cleaned (succeeded, no orphan, bounded) or explicit cleanup failure (failed
-    // with cleanup evidence) is acceptable; hanging (running) or orphan is not.
-    assert.ok(result.state === "succeeded" || result.state === "failed", `Terminal must be settled, got ${result.state}`);
-    if (result.state === "failed") {
-      assert.match(result.terminalReason ?? "", /cleanup|owned descendant/i);
-    }
+    assert.equal(result.state, "failed", `Intervention must be cleanup-aware failure, got ${result.state}`);
+    assert.match(result.terminalReason ?? "", /cleanup|owned descendant/i, "Terminal reason must be cleanup-aware");
+    assert.ok((result.cleanupPerformed ?? 0) >= 1, `cleanupPerformed must record intervention, got ${result.cleanupPerformed}`);
+    assert.equal(result.descendantsObserved, true, "Descendants must have been observed");
     assert.equal(mgr.getActiveCount(), 0);
     if (childPid > 0) {
       assert.ok(!isPidAlive(childPid), `Pipe-holding child PID ${childPid} must be dead (no orphan)`);
@@ -620,6 +621,80 @@ async function runTests() {
     assert.ok(!isPidAlive(innocentPid), "Innocent must be reaped by exact-owned test cleanup");
     try { await mgr.close(); } catch {}
     console.log("  PASS: Stale starttime mismatch pruned without signaling innocent");
+  }
+
+  // Test 16 [direct-manager]: early-exiting root WITHOUT the 400ms discovery
+  // cushion (--run-ms 0) + inherited-pipes holder. Must still bound (no hang past
+  // the independent settle deadline + wait bound), terminal cleanup-aware
+  // (failed, never plain succeeded), no orphan. All kills PID+starttime gated.
+  console.log("\n[Test 16] direct-manager: zero-cushion early exit with inherited-pipe holder still bounds...");
+  {
+    const mgr = new VerificationManager(baseConfig, { minLifetimeMs: 500, defaultLifetimeMs: 30000 });
+    const pidName = "detached-16.pid";
+    try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
+    const startT = Date.now();
+    const started = await mgr.startVerification(fakeWorkspace, guard, {
+      workspace_id: fakeWorkspace.id,
+      runner: "package_script",
+      package_manager: "npm",
+      script: "verification:lifecycle",
+      args: ["--detached-child-ms", "8000", "--detached-pid-file", pidName, "--run-ms", "0"]
+    });
+    const result = await mgr.waitVerification(started.jobId, 10);
+    const elapsed = Date.now() - startT;
+    const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
+    assert.ok(elapsed < 6000, `Zero-cushion pipe-holder must bound before self-exit (elapsed ${elapsed}ms)`);
+    assert.equal(result.state, "failed", `Zero-cushion intervention must be cleanup-aware failure, got ${result.state}`);
+    assert.match(result.terminalReason ?? "", /cleanup|owned descendant/i, "Terminal reason must be cleanup-aware");
+    assert.equal(mgr.getActiveCount(), 0);
+    if (childPid > 0) {
+      assert.ok(!isPidAlive(childPid), `Pipe-holding child PID ${childPid} must be dead (no orphan)`);
+    }
+    try { await mgr.close(); } catch {}
+    try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
+    console.log(`  PASS: Zero-cushion holder bounded in ${elapsed}ms with cleanup-aware failure, no orphan`);
+  }
+
+  // Test 17 [direct-manager]: controlled cleanup-failure via deterministic hook.
+  // SIGKILL always succeeds on Linux, so real D-state is never manufactured;
+  // instead testHookForceLive (fake PIDs, never signalled) forces the drain to
+  // report live after the deadline, proving the `cleanup_incomplete` path with
+  // truthful evidence, single terminal assignment, and retained recovery info.
+  console.log("\n[Test 17] direct-manager: forced drain-timeout proves cleanup_incomplete with recovery hint...");
+  {
+    const mgr = new VerificationManager(baseConfig, { minLifetimeMs: 500, defaultLifetimeMs: 30000 });
+    const pidName = "detached-17.pid";
+    try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
+    const started = await mgr.startVerification(fakeWorkspace, guard, {
+      workspace_id: fakeWorkspace.id,
+      runner: "package_script",
+      package_manager: "npm",
+      script: "verification:lifecycle",
+      args: ["--detached-child-ms", "15000", "--detached-separate", "--detached-pid-file", pidName, "--run-ms", "400"]
+    });
+    const jobObj = mgr.getActiveJobs().find((j) => j.jobId === started.jobId);
+    assert.ok(jobObj, "Job object must be active to inject deterministic failure");
+    jobObj.testHookForceLive = [5999911, 5999912];
+    const startT = Date.now();
+    const result = await mgr.waitVerification(started.jobId, 10);
+    const elapsed = Date.now() - startT;
+    const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
+    assert.equal(result.state, "failed", `Forced incomplete must be failure, got ${result.state}`);
+    assert.match(result.terminalReason ?? "", /cleanup_incomplete/, "Terminal reason must carry cleanup_incomplete evidence");
+    assert.ok((result.recoveryHint ?? "").includes("5999911"), "Recovery hint must retain forced live identities");
+    assert.ok((result.recoveryHint ?? "").length <= 600, "Recovery hint must stay bounded");
+    assert.equal(mgr.getActiveCount(), 0);
+    // Single terminal assignment: a second wait observes the identical terminal.
+    const second = await mgr.waitVerification(started.jobId, 2);
+    assert.equal(second.state, result.state);
+    assert.equal(second.finishedAt, result.finishedAt, "Finished timestamp must be single-assigned");
+    if (childPid > 0) {
+      assert.ok(!isPidAlive(childPid), `Real detached child PID ${childPid} must still be reaped (no orphan)`);
+    }
+    assert.ok(elapsed < 9000, `Forced incomplete must bound (elapsed ${elapsed}ms)`);
+    try { await mgr.close(); } catch {}
+    try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
+    console.log(`  PASS: cleanup_incomplete with recovery hint in ${elapsed}ms, single terminal, no orphan`);
   }
 
   // Test 15 [public-mcp public-default]: actual MCP start/wait/list/cancel/reconnect +
@@ -760,7 +835,7 @@ async function runTests() {
     await fs.rm(fixtureRoot, { recursive: true, force: true });
   } catch {}
 
-  console.log("\nALL 10 ADVERSARIAL MATRIX TESTS PASSED + 5 CLEANUP REGRESSIONS PASSED.");
+  console.log("\nALL 10 ADVERSARIAL MATRIX TESTS PASSED + 7 CLEANUP REGRESSIONS PASSED.");
 }
 
 runTests().catch((err) => {

@@ -65,6 +65,10 @@ export interface VerificationJobRecord {
   terminalReason?: string;
   lifetimeMs: number;
   containmentWrapper?: string[];
+  cleanupAttempted?: boolean;
+  cleanupPerformed?: number;
+  descendantsObserved?: boolean;
+  recoveryHint?: string;
 }
 
 export interface VerificationJobSummary {
@@ -465,6 +469,17 @@ interface LinuxProcessIdentity {
 const VERIFICATION_CLEANUP_TERM_WAIT_MS = 1000;
 const VERIFICATION_CLEANUP_KILL_WAIT_MS = 1000;
 const VERIFICATION_CLEANUP_POLL_MS = 50;
+// Independent settlement deadline, started on root exit (or when root is
+// known-exited). It does NOT depend on `close` firing, so a missed reparented
+// child or unkillable pipe holder can never hold the job in `running` forever.
+// Duration reuses the TERM+KILL totals plus margin: 1000 + 1000 + 2000 = 4000ms
+// (~3-5s per design). This is the single authoritative ref'd watchdog for the
+// exit->close gap; escalation timers stay unref'd best-effort and are cleared
+// once settlement owns the terminal.
+const VERIFICATION_SETTLE_DEADLINE_MS =
+  VERIFICATION_CLEANUP_TERM_WAIT_MS + VERIFICATION_CLEANUP_KILL_WAIT_MS + 2000;
+const VERIFICATION_SETTLE_SAMPLE_MAX = 5;
+const VERIFICATION_RECOVERY_HINT_MAX_CHARS = 500;
 
 function readLinuxProcessIdentity(pid: number): LinuxProcessIdentity | undefined {
   if (process.platform !== "linux") return undefined;
@@ -720,6 +735,7 @@ export class ManagedVerificationJob {
   private lifetimeTimer?: NodeJS.Timeout;
   private killEscalationTimer?: NodeJS.Timeout;
   private descendantMonitorTimer?: NodeJS.Timeout;
+  private settleDeadlineTimer?: NodeJS.Timeout;
   private rootProcessStartTime?: string;
   private readonly ownedDescendants = new Map<number, string>();
   private closed = false;
@@ -729,6 +745,43 @@ export class ManagedVerificationJob {
   private pendingTerminalState?: VerificationJobState;
   private pendingTerminalReason?: string;
   private startTimeMs: number;
+  // Cleanup history, independent of the final live-set emptiness. Set by
+  // signalOwnedProcessTree (exit-handler AND settleRootClose paths) whenever at
+  // least one identity-gated owned descendant is signalled, even if that PID is
+  // already dead by the later prune. Final status must reflect this
+  // intervention: normal-completion-with-intervention is a cleanup-aware
+  // `failed`, never ordinary `succeeded`. `cleanup_incomplete` stays reserved
+  // for the unreaped case.
+  private cleanupAttempted = false;
+  private cleanupPerformedCount = 0;
+  // Discovery observability. Set the first time any capture pass observes a
+  // descendant. If no pass ever observed one (monitor missed window), the
+  // record carries descendantsObserved:false. Contract choice (documented):
+  // ordinary fast close with no descendant ever captured keeps ordinary success
+  // (preserves the quick-job contract: no child, no intervention, pipes
+  // released promptly; group kill was still attempted on exit). Only a delayed
+  // close (pipes held) with nothing captured is dishonest as success, and that
+  // case is owned by the independent settle deadline, which reports
+  // cleanup_incomplete with an `unobserved` note instead of claiming all
+  // children gone.
+  private descendantsEverObserved = false;
+  private descendantCapturePasses = 0;
+  private exitCodeAtExit: number | null = null;
+  private exitSignalAtExit: NodeJS.Signals | null = null;
+  private recoveryHintText?: string;
+  private lastKnownLiveSample: number[] = [];
+  /** Test-only deterministic cleanup-failure injection (fake PIDs, never
+   * signalled to real processes). When set, settlement treats these as the
+   * still-live owned set after the bounded drain, proving the
+   * `cleanup_incomplete` path without real unkillable D-state or stress. */
+  public testHookForceLive: number[] | null = null;
+  // Private pipe inodes of this job's stdio (write ends inherited by every
+  // pipe-holding descendant). Captured from /proc/<rootPid>/fd/1+2 while the
+  // root is alive. A process holding one of these inodes inherited it from our
+  // tree, so pipe-holder discovery is ownership proof (not a broad sweep):
+  // tree-walk discovery misses fast-detach holders that reparent to init
+  // before any capture pass runs, but the pipe scan still finds them.
+  private readonly jobPipeInodes = new Set<string>();
 
   private observedStdoutBytes = 0;
   private observedStderrBytes = 0;
@@ -809,9 +862,13 @@ export class ManagedVerificationJob {
 
     if (process.platform === "linux") {
       this.captureOwnedDescendants();
+      this.captureJobPipeInodes();
       this.descendantMonitorTimer = setInterval(() => this.captureOwnedDescendants(), 50);
       this.descendantMonitorTimer.unref();
-      this.child.once("spawn", () => this.captureOwnedDescendants());
+      this.child.once("spawn", () => {
+        this.captureOwnedDescendants();
+        this.captureJobPipeInodes();
+      });
     }
 
     this.lifetimeTimer = setTimeout(() => {
@@ -858,9 +915,12 @@ export class ManagedVerificationJob {
     // lifetime. A detached descendant that inherits job pipes holds 'close'
     // back until its pipes release, so signal owned survivors here (best
     // effort) to unblock 'close' boundedly. Terminal settlement stays owned
-    // by the 'close' handler below.
-    this.child.on("exit", () => {
+    // by the 'close' handler below, with the independent settle deadline
+    // (startSettleDeadline) as the truthful fallback when `close` never fires.
+    this.child.on("exit", (code, sig) => {
       this.rootExited = true;
+      this.exitCodeAtExit = code;
+      this.exitSignalAtExit = sig;
       try {
         this.signalOwnedProcessTree("SIGTERM");
       } catch {
@@ -878,6 +938,10 @@ export class ManagedVerificationJob {
         }, 1000);
         this.killEscalationTimer.unref();
       }
+      // Bound terminal settlement independently of pipe closure: a missed
+      // reparented child or unkillable pipe holder can prevent `close`
+      // forever, so start the single ref'd settlement watchdog here.
+      this.startSettleDeadline();
     });
 
     this.child.on("close", (code, sig) => {
@@ -886,7 +950,13 @@ export class ManagedVerificationJob {
       this.closed = true;
       // Freeze periodic discovery and lifetime, but preserve ownership +
       // escalation for settleRootClose. The old kill-escalation timer (root
-      // focused) is superseded by the bounded owned-settlement below.
+      // focused) is superseded by the bounded owned-settlement below. The
+      // independent settle deadline is also superseded now that `close`
+      // fired: clear it so only one settlement path owns the terminal.
+      if (this.settleDeadlineTimer) {
+        clearTimeout(this.settleDeadlineTimer);
+        this.settleDeadlineTimer = undefined;
+      }
       if (this.lifetimeTimer) {
         clearTimeout(this.lifetimeTimer);
         this.lifetimeTimer = undefined;
@@ -989,6 +1059,76 @@ export class ManagedVerificationJob {
     return root.startTime === this.rootProcessStartTime;
   }
 
+  private captureJobPipeInodes(): void {
+    if (process.platform !== "linux") return;
+    const rootPid = this.child?.pid;
+    if (!rootPid) return;
+    for (const fd of ["1", "2"]) {
+      try {
+        const target = fs.readlinkSync(`/proc/${rootPid}/fd/${fd}`);
+        // Node presents child stdio as socketpair sockets (socket:[...]), plain
+        // pipes as pipe:[...]; store whatever fd 1/2 point at while the root
+        // is alive. Matching is always against these exact stored inodes, so
+        // the prefix family does not matter.
+        if (target && target !== "/dev/null") {
+          this.jobPipeInodes.add(target);
+        }
+      } catch {
+        // Root already gone or fd closed; stored inodes (if any) still apply.
+      }
+    }
+  }
+
+  private capturePipeHolders(): void {
+    if (process.platform !== "linux") return;
+    if (this.jobPipeInodes.size === 0) return;
+    let procEntries: string[];
+    try {
+      procEntries = fs.readdirSync("/proc");
+    } catch {
+      return;
+    }
+    const selfPid = process.pid;
+    for (const entry of procEntries) {
+      const pid = Number(entry);
+      if (!Number.isSafeInteger(pid) || pid <= 0 || pid === selfPid) continue;
+      // Skip PIDs already owned with a current identity (prune/signalling
+      // below revalidates them); the scan exists to ADD missed holders.
+      let fdNames: string[];
+      try {
+        fdNames = fs.readdirSync(`/proc/${pid}/fd`);
+      } catch {
+        continue;
+      }
+      // Bounded: a pipe holder is proven by a single matching fd.
+      const capped = fdNames.slice(0, 128);
+      let holds = false;
+      for (const fd of capped) {
+        let target = "";
+        try {
+          target = fs.readlinkSync(`/proc/${pid}/fd/${fd}`);
+        } catch {
+          continue;
+        }
+        if (this.jobPipeInodes.has(target)) {
+          holds = true;
+          break;
+        }
+      }
+      if (!holds) continue;
+      const identity = readLinuxProcessIdentity(pid);
+      if (!identity) continue;
+      const known = this.ownedDescendants.get(pid);
+      if (known !== identity.startTime) {
+        // Holding our private pipe write end proves tree lineage, so a stale
+        // entry (PID reuse) is refreshed to the current occupant; a new holder
+        // is adopted with its exact identity for PID+starttime-gated kills.
+        this.ownedDescendants.set(pid, identity.startTime);
+      }
+      this.descendantsEverObserved = true;
+    }
+  }
+
   private captureOwnedDescendants(): void {
     const rootPid = this.child?.pid;
     if (process.platform !== "linux" || !rootPid) return;
@@ -1000,6 +1140,9 @@ export class ManagedVerificationJob {
     }
     if (root.startTime !== this.rootProcessStartTime) return;
 
+    this.descendantCapturePasses += 1;
+    // Refresh while the root is provably alive (cheap: two readlinks).
+    this.captureJobPipeInodes();
     const pending = [rootPid];
     const visited = new Set<number>(pending);
     while (pending.length > 0) {
@@ -1023,12 +1166,23 @@ export class ManagedVerificationJob {
         pending.push(pid);
       }
     }
+    if (this.ownedDescendants.size > 0) {
+      this.descendantsEverObserved = true;
+    }
   }
 
   private signalOwnedProcessTree(signal: NodeJS.Signals): void {
     const child = this.child;
     if (!child?.pid) return;
     this.captureOwnedDescendants();
+    // Pipe-holder fallback: tree-walk misses holders that detached+reparented
+    // before any capture pass (narrow with fast-exiting roots). Holding our
+    // private pipe proves lineage, so adopt them with exact identity.
+    try {
+      this.capturePipeHolders();
+    } catch {
+      // Best effort; identity-gated kills below decide.
+    }
     // Only use the process-group kill while the root PID still identifies the
     // exact owned root (PID + starttime). After root exit + PID reuse, kill(-pid)
     // could signal an unrelated group, so skip it and rely on per-PID kills below.
@@ -1043,6 +1197,7 @@ export class ManagedVerificationJob {
     // failed/racing group kill must not leave same-group orphans, and detached
     // escapees (new pgid/session holding pipes open) are only reachable here.
     // Each kill is gated on exact PID + starttime identity; stale entries are pruned.
+    let signalled = 0;
     for (const [pid, startTime] of [...this.ownedDescendants]) {
       const current = readLinuxProcessIdentity(pid);
       if (!current || current.startTime !== startTime) {
@@ -1051,9 +1206,18 @@ export class ManagedVerificationJob {
       }
       try {
         process.kill(pid, signal);
+        signalled += 1;
       } catch {
         // The exact descendant may have exited between identity check and signal.
       }
+    }
+    // Record intervention independently of the later live set: even if every
+    // signalled PID is dead by prune time, the job did intervene and must not
+    // report ordinary success.
+    if (signalled > 0) {
+      this.cleanupAttempted = true;
+      this.cleanupPerformedCount += signalled;
+      this.descendantsEverObserved = true;
     }
   }
 
@@ -1106,6 +1270,126 @@ export class ManagedVerificationJob {
     return poll();
   }
 
+  private startSettleDeadline(): void {
+    if (this.settleDeadlineTimer || this.closed || this.rootCloseSettling) return;
+    if (this.state !== "running") return;
+    // Single ref'd watchdog: deliberately NOT unref'd so bounded settlement
+    // cannot evaporate while root pipes are held open. Cleared on `close`
+    // (settleRootClose supersedes) and on any terminal transition.
+    this.settleDeadlineTimer = setTimeout(() => {
+      this.handleSettleDeadline();
+    }, VERIFICATION_SETTLE_DEADLINE_MS);
+  }
+
+  private buildRecoveryHint(live: number[], context: string): string {
+    const sample = live.slice(0, VERIFICATION_SETTLE_SAMPLE_MAX).join(",");
+    const hint =
+      `recovery(${context}): live ${live.length}` +
+      (sample ? ` [${sample}]` : "") +
+      `; performed ${this.cleanupPerformedCount}` +
+      `; attempted ${this.cleanupAttempted ? "SIGTERM/SIGKILL" : "none"}` +
+      `; observed ${this.descendantsEverObserved ? "true" : "false"}` +
+      `; root exit code ${this.exitCodeAtExit}`;
+    return hint.slice(0, VERIFICATION_RECOVERY_HINT_MAX_CHARS);
+  }
+
+  private handleSettleDeadline(): void {
+    this.settleDeadlineTimer = undefined;
+    // `close` already settled (or job already terminal): deadline is superseded.
+    // Single terminal assignment is enforced by transitionToTerminal's guard.
+    if (this.state !== "running" || this.closed || this.rootCloseSettling) return;
+    let live: number[] = [];
+    try {
+      this.captureOwnedDescendants();
+      this.capturePipeHolders();
+    } catch {
+      // Best effort; prune below decides.
+    }
+    if (this.testHookForceLive && this.testHookForceLive.length > 0) {
+      // Deterministic failure injection: fake PIDs only, never signalled.
+      live = [...this.testHookForceLive].slice(0, 32);
+      this.lastKnownLiveSample = [...live];
+    } else {
+      live = this.pruneOwnedDescendants();
+      this.lastKnownLiveSample = [...live];
+    }
+    const code = this.exitCodeAtExit;
+    const sig = this.exitSignalAtExit;
+    const intendedState = this.pendingTerminalState;
+    const intendedReason = this.pendingTerminalReason;
+    if (live.length > 0) {
+      const sample = live.slice(0, VERIFICATION_SETTLE_SAMPLE_MAX).join(",");
+      // Snapshot ownership BEFORE transitionToTerminal clears the map: the
+      // string hint is the persisted recovery record (bounded, single write).
+      this.recoveryHintText = this.buildRecoveryHint(live, "settle-deadline");
+      const suffix =
+        `cleanup_incomplete: ${live.length} owned descendant(s) [${sample}] still alive at independent settle ` +
+        `deadline (${VERIFICATION_SETTLE_DEADLINE_MS}ms after root exit) without 'close'; attempted SIGTERM/SIGKILL. ` +
+        `${this.recoveryHintText}.`;
+      if (intendedState) {
+        const base = intendedReason ? `${intendedReason} ` : "";
+        this.transitionToTerminal(intendedState, {
+          exitCode: code,
+          signal: sig,
+          reason: `${base}${suffix}`.trim()
+        });
+        return;
+      }
+      this.transitionToTerminal("failed", {
+        exitCode: code,
+        signal: sig,
+        reason: `${suffix} Original exit code ${code}.`
+      });
+      return;
+    }
+    if (this.cleanupPerformedCount > 0) {
+      const count = this.cleanupPerformedCount;
+      const suffix =
+        `Cleanup performed: ${count} owned descendant(s) required termination after root exit (code ${code}); ` +
+        `'close' still pending at settle deadline (${VERIFICATION_SETTLE_DEADLINE_MS}ms). ` +
+        `Not reporting clean success while intervention occurred.`;
+      if (intendedState) {
+        const base = intendedReason ? `${intendedReason} ` : "";
+        this.transitionToTerminal(intendedState, {
+          exitCode: code,
+          signal: sig,
+          reason: `${base}[Cleanup: ${count} owned descendant(s) terminated after root exit; close pending at deadline.]`.trim()
+        });
+        return;
+      }
+      this.transitionToTerminal("failed", {
+        exitCode: code,
+        signal: sig,
+        reason: suffix
+      });
+      return;
+    }
+    // Nothing reaped and nothing signalled, yet `close` never fired: pipes are
+    // held by something discovery never captured (missed window / reparented
+    // before capture). Claiming clean success would be dishonest, so report
+    // cleanup_incomplete with an explicit unobserved note.
+    this.recoveryHintText = this.buildRecoveryHint(live, "settle-deadline-unobserved");
+    const observedFlag = this.descendantsEverObserved ? "true" : "false";
+    const suffix =
+      `cleanup_incomplete: 'close' pending at settle deadline (${VERIFICATION_SETTLE_DEADLINE_MS}ms after root exit) ` +
+      `with no live owned descendant at deadline (descendantsObserved:${observedFlag}, capture passes ${this.descendantCapturePasses}); ` +
+      `pipes held by an uncaptured holder; attempted SIGTERM/SIGKILL group kill. ${this.recoveryHintText}.`;
+    if (intendedState) {
+      const base = intendedReason ? `${intendedReason} ` : "";
+      this.transitionToTerminal(intendedState, {
+        exitCode: code,
+        signal: sig,
+        reason: `${base}${suffix}`.trim()
+      });
+      return;
+    }
+    this.transitionToTerminal("failed", {
+      exitCode: code,
+      signal: sig,
+      reason: `${suffix} Original exit code ${code}.`
+    });
+  }
+
   private async settleRootClose(code: number | null, sig: NodeJS.Signals | null): Promise<void> {
     let intendedState: VerificationJobState = "succeeded";
     let intendedReason: string | undefined;
@@ -1120,13 +1404,15 @@ export class ManagedVerificationJob {
     if (process.platform === "linux") {
       try {
         this.captureOwnedDescendants();
+        this.capturePipeHolders();
       } catch {
         // Best effort; prune below decides liveness.
       }
       const initialLive = this.pruneOwnedDescendants();
+      this.lastKnownLiveSample = [...initialLive];
       if (initialLive.length > 0) {
         const initialCount = initialLive.length;
-        const initialSample = initialLive.slice(0, 5).join(",");
+        const initialSample = initialLive.slice(0, VERIFICATION_SETTLE_SAMPLE_MAX).join(",");
         try {
           this.signalOwnedProcessTree("SIGTERM");
         } catch {
@@ -1142,6 +1428,11 @@ export class ManagedVerificationJob {
           }
           remaining = await this.waitForOwnedDrain(VERIFICATION_CLEANUP_KILL_WAIT_MS);
         }
+        if (this.testHookForceLive && this.testHookForceLive.length > 0) {
+          remaining = [...this.testHookForceLive].slice(0, 32);
+          killNeeded = true;
+        }
+        this.lastKnownLiveSample = [...remaining];
         if (remaining.length === 0) {
           if (intendedState === "succeeded") {
             this.transitionToTerminal("failed", {
@@ -1164,11 +1455,13 @@ export class ManagedVerificationJob {
           });
           return;
         }
-        const sample = remaining.slice(0, 5).join(",");
+        const sample = remaining.slice(0, VERIFICATION_SETTLE_SAMPLE_MAX).join(",");
+        // Snapshot ownership BEFORE transitionToTerminal clears the map.
+        this.recoveryHintText = this.buildRecoveryHint(remaining, "root-close");
         const cleanupSuffix =
           `cleanup_incomplete: ${remaining.length} owned descendant(s) [${sample}] still alive after bounded ` +
           `SIGTERM (${VERIFICATION_CLEANUP_TERM_WAIT_MS}ms) + SIGKILL (${VERIFICATION_CLEANUP_KILL_WAIT_MS}ms) ` +
-          `escalation (initial ${initialCount}).`;
+          `escalation (initial ${initialCount}). ${this.recoveryHintText}.`;
         if (intendedState === "succeeded") {
           this.transitionToTerminal("failed", {
             exitCode: code,
@@ -1184,6 +1477,59 @@ export class ManagedVerificationJob {
           reason: `${base}${cleanupSuffix}`.trim()
         });
         return;
+      }
+      // Live set is empty at `close`, but intervention history is independent
+      // of it: if the exit handler (or an earlier settle signal) already
+      // terminated an owned descendant, the job intervened and must not report
+      // ordinary success.
+      if (this.testHookForceLive && this.testHookForceLive.length > 0) {
+        const forced = [...this.testHookForceLive].slice(0, 32);
+        this.lastKnownLiveSample = [...forced];
+        this.recoveryHintText = this.buildRecoveryHint(forced, "root-close-forced");
+        const sample = forced.slice(0, VERIFICATION_SETTLE_SAMPLE_MAX).join(",");
+        const cleanupSuffix =
+          `cleanup_incomplete: ${forced.length} owned descendant(s) [${sample}] still alive after bounded ` +
+          `SIGTERM (${VERIFICATION_CLEANUP_TERM_WAIT_MS}ms) + SIGKILL (${VERIFICATION_CLEANUP_KILL_WAIT_MS}ms) ` +
+          `escalation (test-forced). ${this.recoveryHintText}.`;
+        if (intendedState === "succeeded") {
+          this.transitionToTerminal("failed", {
+            exitCode: code,
+            signal: sig,
+            reason: `${cleanupSuffix} Original exit code ${code}.`
+          });
+          return;
+        }
+        const base = intendedReason ? `${intendedReason} ` : "";
+        this.transitionToTerminal(intendedState, {
+          exitCode: code,
+          signal: sig,
+          reason: `${base}${cleanupSuffix}`.trim()
+        });
+        return;
+      }
+      if (this.cleanupPerformedCount > 0) {
+        const count = this.cleanupPerformedCount;
+        if (intendedState === "succeeded") {
+          this.transitionToTerminal("failed", {
+            exitCode: code,
+            signal: sig,
+            reason:
+              `Cleanup performed: ${count} owned descendant(s) required termination ` +
+              `after root exit (code ${code}); live set already reaped by exit-handler signalling. ` +
+              `Not reporting clean success while an owned child was alive.`
+          });
+          return;
+        }
+        if (intendedState !== undefined) {
+          const base = intendedReason ? `${intendedReason} ` : "";
+          this.transitionToTerminal(intendedState, {
+            exitCode: code,
+            signal: sig,
+            reason:
+              `${base}[Cleanup: ${count} owned descendant(s) terminated after root exit.]`.trim()
+          });
+          return;
+        }
       }
     }
 
@@ -1207,6 +1553,14 @@ export class ManagedVerificationJob {
       clearInterval(this.descendantMonitorTimer);
       this.descendantMonitorTimer = undefined;
     }
+    if (this.settleDeadlineTimer) {
+      clearTimeout(this.settleDeadlineTimer);
+      this.settleDeadlineTimer = undefined;
+    }
+    // Owned-descendant map is cleared only here, AFTER the terminal reason +
+    // recoveryHint string have been snapshotted above. The string hint (bounded)
+    // is the persisted recovery record exposed via toRecord(); the raw map is
+    // teardown, not evidence. lastKnownLiveSample + recoveryHintText survive.
     this.ownedDescendants.clear();
   }
 
@@ -1335,7 +1689,11 @@ export class ManagedVerificationJob {
       observedTotalBytes: observedTotal,
       ...(this.terminalReason ? { terminalReason: this.terminalReason } : {}),
       lifetimeMs: this.lifetimeMs,
-      ...(this.containmentWrapper ? { containmentWrapper: [...this.containmentWrapper] } : {})
+      ...(this.containmentWrapper ? { containmentWrapper: [...this.containmentWrapper] } : {}),
+      cleanupAttempted: this.cleanupAttempted,
+      cleanupPerformed: this.cleanupPerformedCount,
+      descendantsObserved: this.descendantsEverObserved,
+      ...(this.recoveryHintText ? { recoveryHint: this.recoveryHintText } : {})
     };
   }
 

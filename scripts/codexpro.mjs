@@ -17,8 +17,9 @@ import {
   verifyCloudflaredAsset
 } from './cloudflared-release.mjs';
 import {
+  addValidatedObservedDescendants,
+  addValidatedObservedDescendantsOfKnownProcesses,
   captureProcessIdentity,
-  descendantProcessIds,
   parseProcessIdentityTable,
   parseProcessTable,
   processIdentityTableInvocation,
@@ -1624,31 +1625,58 @@ function readManagedProcessTable() {
   return parseProcessTable(result.stdout);
 }
 
+function seedKnownBaselineFromChild(child, knownIdentities) {
+  if (!child || !Number.isSafeInteger(child.pid) || child.pid <= 0) return;
+  if (!(knownIdentities instanceof Map) || knownIdentities.has(child.pid)) return;
+  // Seed the root spawn-time baseline so the first expansion validates the
+  // current incarnation against spawn instead of bootstrapping blindly from a
+  // possibly reused PID. Only non-null (provable) spawn baselines are seeded;
+  // a null spawn baseline leaves the root unknown so later validation
+  // bootstraps fail-closed from the first provable snapshot/live read.
+  if (process.platform === 'linux') {
+    const spawnStart = child.codexproIdentity?.startTime ?? null;
+    if (spawnStart != null && spawnStart !== '') knownIdentities.set(child.pid, spawnStart);
+    return;
+  }
+  if (process.platform === 'win32') {
+    const spawnCreation = child.codexproWindowsIdentity?.creationDate ?? null;
+    if (spawnCreation != null && spawnCreation !== '') knownIdentities.set(child.pid, spawnCreation);
+  }
+}
+
 function addObservedDescendants(processes, rootPid, knownPids, knownIdentities, identityDates) {
   if (!Number.isSafeInteger(rootPid) || rootPid <= 0) return;
-  const found = descendantProcessIds(processes, rootPid);
-  for (const pid of found) knownPids.add(pid);
-  rememberDiscoveredIdentities(found, knownIdentities, identityDates);
+  // Validate parent identity BEFORE expanding children (PID-reuse guard).
+  // A stale/unprovable parent contributes no children and its recorded
+  // baseline is never refreshed with the replacement's identity. Windows
+  // without a CIM snapshot (identityDates not a Map) refuses expansion;
+  // Linux uses stubbed snapshot identities when threaded (test seam), else
+  // live /proc reads. Delegates to the shared validated helper in
+  // launcher-process-tree.mjs so qualification smoke exercises this path.
+  const currentIdentities = identityDates instanceof Map ? identityDates : undefined;
+  addValidatedObservedDescendants(processes, rootPid, knownPids, knownIdentities, currentIdentities, { platform: process.platform });
 }
 
 function addObservedDescendantsOfKnownProcesses(processes, knownPids, knownIdentities, identityDates) {
-  const parents = [...knownPids];
-  for (const pid of parents) addObservedDescendants(processes, pid, knownPids, knownIdentities, identityDates);
+  const currentIdentities = identityDates instanceof Map ? identityDates : undefined;
+  addValidatedObservedDescendantsOfKnownProcesses(processes, knownPids, knownIdentities, currentIdentities, { platform: process.platform });
 }
 
 // Record the identity baseline for newly discovered PIDs so later signalling
 // can refuse recycled PIDs instead of trusting bare presence. On Linux the
-// baseline is the /proc starttime; on Windows it is the CIM CreationDate from
-// the snapshot that observed the PID (threaded via identityDates). A null
-// baseline means identity is unprovable for that PID: it stays in the known
-// set for liveness bookkeeping but is never signalled without a fresh
-// snapshot match. Linux behaviour is unchanged: identical store-if-absent
-// semantics when identityDates is absent.
+// baseline is the /proc starttime (or the stubbed snapshot identity when a Map
+// is threaded explicitly, e.g. deterministic qualification fixtures); on
+// Windows it is the CIM CreationDate from the snapshot that observed the PID
+// (threaded via identityDates). A null baseline means identity is unprovable
+// for that PID: it stays in the known set for liveness bookkeeping but is
+// never signalled without a fresh snapshot match. Store-if-absent: never
+// refreshes an existing baseline with a replacement incarnation. Linux
+// behaviour is unchanged when identityDates is absent (live /proc reads).
 function rememberDiscoveredIdentities(pids, knownIdentities, identityDates) {
   if (!knownIdentities) return;
   for (const pid of pids) {
     if (process.platform === 'win32') {
-      const observed = identityDates?.get(pid) ?? null;
+      const observed = identityDates instanceof Map ? (identityDates.get(pid) ?? null) : null;
       const existing = knownIdentities.get(pid);
       if (existing !== undefined && existing !== null) continue;
       if (observed == null && existing !== undefined) continue;
@@ -1656,6 +1684,11 @@ function rememberDiscoveredIdentities(pids, knownIdentities, identityDates) {
       continue;
     }
     if (knownIdentities.has(pid)) continue;
+    if (identityDates instanceof Map && identityDates.has(pid)) {
+      const observed = identityDates.get(pid) ?? null;
+      knownIdentities.set(pid, observed === '' ? null : observed);
+      continue;
+    }
     knownIdentities.set(pid, readLinuxProcessStartTime(pid));
   }
 }
@@ -1665,20 +1698,36 @@ function rememberDiscoveredIdentities(pids, knownIdentities, identityDates) {
 // changed (or can no longer be proven) is excluded from the live owned set so
 // it is neither signalled nor waited on as ours. Fresh sightings from the
 // current table read pass through; the signalling step revalidates them again
-// immediately before any kill.
-function processIdentityStillOurs(pid, knownIdentities) {
-  if (process.platform === 'win32') return true; // Windows uses the separate CIM identity check.
+// immediately before any kill. Windows stays narrowed: with a threaded CIM
+// snapshot the CreationDate baseline is enforced; without one the check stays
+// permissive here (presence-only) and per-descendant snapshot gates before
+// signalling remain the enforcement point (no broad kills).
+function processIdentityStillOurs(pid, knownIdentities, identityDates) {
+  if (process.platform === 'win32') {
+    if (!knownIdentities || !knownIdentities.has(pid)) return true;
+    const expected = knownIdentities.get(pid);
+    if (expected == null || expected === '') return false;
+    if (!(identityDates instanceof Map)) return true;
+    const current = identityDates.get(pid);
+    if (current == null || current === '') return false;
+    return current === expected;
+  }
   if (!knownIdentities || !knownIdentities.has(pid)) return true;
   const expected = knownIdentities.get(pid);
   if (expected == null) return false;
+  if (identityDates instanceof Map && identityDates.has(pid)) {
+    const current = identityDates.get(pid);
+    if (current == null || current === '') return false;
+    return current === expected;
+  }
   return verifyProcessIdentity(pid, { pid, startTime: expected });
 }
 
-function liveManagedPids(processes, rootPid, knownPids, knownIdentities) {
+function liveManagedPids(processes, rootPid, knownPids, knownIdentities, identityDates) {
   const present = new Set(processes.map(({ pid }) => pid));
   return [...new Set([...(rootPid ? [rootPid] : []), ...knownPids])]
     .filter((pid) => pid && present.has(pid))
-    .filter((pid) => pid === rootPid || processIdentityStillOurs(pid, knownIdentities));
+    .filter((pid) => processIdentityStillOurs(pid, knownIdentities, identityDates));
 }
 
 function pauseForProcessPoll(ms) {
@@ -1721,6 +1770,7 @@ function signalManagedPosixPid(pid, signal, child, knownIdentities) {
 }
 
 async function waitForManagedPosixTree(child, knownPids, knownIdentities, deadline, signal) {
+  seedKnownBaselineFromChild(child, knownIdentities);
   let latest = [];
   while (Date.now() <= deadline) {
     latest = readManagedProcessTable();
@@ -1760,6 +1810,10 @@ async function killPosixProcessTree(child, seedPids, seedIdentities) {
   // identity-verified signalling even after reparenting.
   const knownPids = seedPids ?? new Set();
   const knownIdentities = seedIdentities ?? new Map();
+  // Validate the root against its spawn-time baseline before any expansion so
+  // a reused root PID never yields unrelated children. Seeded once here;
+  // later polls keep the original baseline (never refreshed with reuse).
+  seedKnownBaselineFromChild(child, knownIdentities);
   let processes = [];
   let tableError = null;
   try {
@@ -1867,6 +1921,9 @@ async function killWindowsProcessTree(child, seedPids, seedIdentities) {
   // presence; the per-descendant reap below additionally requires a fresh
   // pre-kill/post-kill snapshot match.
   const knownIdentities = seedIdentities ?? new Map();
+  // Seed the root spawn-time CreationDate baseline before any expansion so a
+  // reused root PID never yields unrelated children. Never refreshed later.
+  seedKnownBaselineFromChild(child, knownIdentities);
   let processes;
   let tableError = null;
   // The identity snapshot is read BEFORE discovery so every newly observed PID
@@ -1925,7 +1982,7 @@ async function killWindowsProcessTree(child, seedPids, seedIdentities) {
     }
     if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids, knownIdentities, preKillIdentities);
     addObservedDescendantsOfKnownProcesses(processes, knownPids, knownIdentities, preKillIdentities);
-    const alive = liveManagedPids(processes, childHasExited(child) ? null : pid, knownPids);
+    const alive = liveManagedPids(processes, childHasExited(child) ? null : pid, knownPids, knownIdentities, preKillIdentities);
     if (childHasExited(child) && alive.length === 0 && (!tableError || treeKillSucceeded)) return;
 
     // If the direct process disappeared while a previously observed descendant
@@ -1957,7 +2014,7 @@ async function killWindowsProcessTree(child, seedPids, seedIdentities) {
       processes = readManagedProcessTable();
       if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids, knownIdentities, preKillIdentities);
       addObservedDescendantsOfKnownProcesses(processes, knownPids, knownIdentities, preKillIdentities);
-      const alive = liveManagedPids(processes, childHasExited(child) ? null : pid, knownPids);
+      const alive = liveManagedPids(processes, childHasExited(child) ? null : pid, knownPids, knownIdentities, preKillIdentities);
       if (!childHasExited(child) && !alive.includes(pid)) await waitForChildExit(child, 250);
       if (childHasExited(child) && alive.length === 0) return;
     } catch {
@@ -2003,6 +2060,7 @@ async function boundedKillProcess(child, seedPids, seedIdentities, timeoutMs) {
 }
 
 async function settleHandoffTree(child, knownPids, knownIdentities) {
+  seedKnownBaselineFromChild(child, knownIdentities);
   let table;
   try {
     table = readManagedProcessTable();
@@ -2538,6 +2596,7 @@ function runProcessCaptured(command, args, options) {
     // reachable for direct, identity-verified signalling later.
     const knownTreePids = new Set();
     const knownTreeIdentities = new Map();
+    seedKnownBaselineFromChild(child, knownTreeIdentities);
     const snapshotTreeOwnership = () => {
       if (childHasExited(child)) return;
       if (!Number.isSafeInteger(child.pid) || child.pid <= 0) return;

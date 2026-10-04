@@ -5132,6 +5132,147 @@ try {
     console.log('APPLY_PATCH_CONSISTENCY_MATRIX: ordinary edit and apply_patch agree on allow and block; whole-file and undefined-language routes refused with bounded diagnostics');
   }
   {
+    // FINDING 4 bounded whole-file patch validation: small files plus
+    // stubbed/low limits prove the gate logic without huge-memory stress.
+    // Per-file cap and aggregate total both reuse CODEXPRO_MAX_WRITE_BYTES
+    // (1000-byte stub); the canonical diff stays under CODEXPRO_MAX_OUTPUT_BYTES.
+    const boundedTmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-bounded-patch-'));
+    let boundedClient;
+    try {
+      const boundedLine = 'note line\n';
+      await writeFixture(boundedTmp, 'bounded-single.txt', boundedLine.repeat(105));
+      for (const name of ['bounded-agg-a.txt', 'bounded-agg-b.txt', 'bounded-agg-c.txt']) {
+        await writeFixture(boundedTmp, name, boundedLine.repeat(40));
+      }
+      for (const args of [['init'], ['add', '.']]) {
+        const staged = spawnSync('git', args, { cwd: boundedTmp, encoding: 'utf8' });
+        assert.equal(staged.status, 0, `bounded git ${args.join(' ')} failed: ${staged.stderr || staged.stdout}`);
+      }
+      const boundedCommit = spawnSync('git', ['-c', 'user.email=bounded-patch-smoke@example.com', '-c', 'user.name=Bounded Patch Smoke', 'commit', '-m', 'bounded patch fixture'], { cwd: boundedTmp, encoding: 'utf8' });
+      assert.equal(boundedCommit.status, 0, `bounded git commit failed: ${boundedCommit.stderr || boundedCommit.stdout}`);
+      const snapshotFile = async (name) => ({
+        bytes: await fs.readFile(path.join(boundedTmp, name)),
+        stat: await fs.stat(path.join(boundedTmp, name))
+      });
+      const gitDiffPatch = (files) => {
+        const diffed = spawnSync('git', ['diff', '--no-color', '--no-ext-diff', '--', ...files], { cwd: boundedTmp, encoding: 'utf8' });
+        assert.equal(diffed.status, 0, `bounded git diff failed: ${diffed.stderr || diffed.stdout}`);
+        assert.ok(diffed.stdout.trim(), 'bounded git diff produced an empty patch');
+        return diffed.stdout;
+      };
+      const revertFiles = async (names, snapshots) => {
+        for (const name of names) await fs.writeFile(path.join(boundedTmp, name), snapshots[name].bytes);
+      };
+      boundedClient = new McpStdioClient('node', ['dist/stdio.js', '--root', boundedTmp, '--allow-root', boundedTmp, '--bash', 'off', '--write', 'workspace', '--tool-mode', 'full'], {
+        cwd: path.resolve('.'),
+        env: {
+          ...process.env,
+          CODEXPRO_ROOT: boundedTmp,
+          CODEXPRO_ALLOWED_ROOTS: boundedTmp,
+          CODEXPRO_BASH_MODE: 'off',
+          CODEXPRO_WRITE_MODE: 'workspace',
+          CODEXPRO_TOOL_MODE: 'full',
+          CODEXPRO_TOOL_CARDS: '0',
+          CODEXPRO_ANALYSIS: '1',
+          CODEXPRO_MAX_WRITE_BYTES: '1000',
+          CODEXPRO_MAX_OUTPUT_BYTES: '4000'
+        }
+      });
+      await boundedClient.request('initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'codexpro-bounded-patch-smoke', version: '0.1.0' }
+      });
+      boundedClient.notify('notifications/initialized');
+      const boundedOpened = assertToolSuccess(await boundedClient.request('tools/call', {
+        name: 'open_current_workspace', arguments: { include_tree: false }
+      }), 'bounded open_current_workspace');
+      const boundedWorkspaceId = boundedOpened.structuredContent.workspace_id;
+      assert.ok(boundedWorkspaceId, 'bounded open_current_workspace omitted workspace id');
+
+      // (i) Oversized single-file admission refusal: benign small patch
+      // against a synthetic target just over the 1000-byte per-file cap.
+      const singleName = 'bounded-single.txt';
+      const singleBaseline = { [singleName]: await snapshotFile(singleName) };
+      assert.ok(singleBaseline[singleName].bytes.length > 1000, 'bounded single fixture did not exceed the stubbed per-file cap');
+      await fs.writeFile(path.join(boundedTmp, singleName), Buffer.concat([singleBaseline[singleName].bytes, Buffer.from('tail marker\n', 'utf8')]));
+      const singlePatch = gitDiffPatch([singleName]);
+      assert.ok(Buffer.byteLength(singlePatch, 'utf8') < 1000, 'bounded single patch was not small');
+      await revertFiles([singleName], singleBaseline);
+      const singleBefore = await snapshotFile(singleName);
+      const singleRefusal = assertToolError(await boundedClient.request('tools/call', {
+        name: 'apply_patch', arguments: { workspace_id: boundedWorkspaceId, patch: singlePatch }
+      }), 'bounded oversized single-file apply_patch');
+      const singleText = resultText(singleRefusal);
+      assert.match(singleText, /too large/, 'bounded single-file refusal omitted the size reason');
+      assert.match(singleText, /Limit: 1000 bytes per file/, 'bounded single-file refusal omitted the per-file limit');
+      assert.match(singleText, /Patch refused without applying any file/, 'bounded single-file refusal omitted the all-or-nothing outcome');
+      assert.ok(singleText.includes(singleName), 'bounded single-file refusal omitted the file identity');
+      assert.equal(/Secret-looking/.test(singleText), false, 'bounded single-file size refusal was misreported as a secret refusal');
+      assert.equal(/\brule\b/i.test(singleText), false, 'bounded single-file refusal inferred a detector rule name');
+      const singleAfter = await snapshotFile(singleName);
+      assert.deepEqual(singleAfter.bytes, singleBefore.bytes, 'bounded single-file refusal mutated target bytes');
+      assert.equal(singleAfter.stat.ino, singleBefore.stat.ino, 'bounded single-file refusal changed target inode');
+      assert.equal(singleAfter.stat.size, singleBefore.stat.size, 'bounded single-file refusal changed target size');
+      assert.equal(singleAfter.stat.mtimeMs, singleBefore.stat.mtimeMs, 'bounded single-file refusal changed target mtime');
+      console.log(`BOUNDED_PATCH_SINGLE: per-file gate refused ${singleBefore.bytes.length}-byte target against 1000-byte cap for a ${Buffer.byteLength(singlePatch, 'utf8')}-byte benign patch; target bytes/inode/mtime unchanged`);
+
+      // (ii) Aggregate multi-file limit: three admitted-sized files whose
+      // post-apply sum exceeds the 1000-byte total with a small multi-file patch.
+      const aggNames = ['bounded-agg-a.txt', 'bounded-agg-b.txt', 'bounded-agg-c.txt'];
+      const aggBaseline = {};
+      for (const name of aggNames) aggBaseline[name] = await snapshotFile(name);
+      for (const name of aggNames) {
+        assert.ok(aggBaseline[name].bytes.length < 1000, `bounded aggregate fixture ${name} did not stay under the per-file cap`);
+      }
+      for (const name of aggNames) {
+        await fs.writeFile(path.join(boundedTmp, name), Buffer.concat([aggBaseline[name].bytes, Buffer.from('added note\n', 'utf8')]));
+      }
+      const aggPatch = gitDiffPatch(aggNames);
+      assert.ok(Buffer.byteLength(aggPatch, 'utf8') < 1000, 'bounded aggregate patch was not small');
+      await revertFiles(aggNames, aggBaseline);
+      const aggBefore = {};
+      for (const name of aggNames) aggBefore[name] = await snapshotFile(name);
+      const aggRefusal = assertToolError(await boundedClient.request('tools/call', {
+        name: 'apply_patch', arguments: { workspace_id: boundedWorkspaceId, patch: aggPatch }
+      }), 'bounded aggregate multi-file apply_patch');
+      const aggText = resultText(aggRefusal);
+      assert.match(aggText, /in aggregate/, 'bounded aggregate refusal omitted the aggregate reason');
+      assert.match(aggText, /3 files/, 'bounded aggregate refusal omitted the file count');
+      assert.match(aggText, /Limit: 1000 bytes total/, 'bounded aggregate refusal omitted the total limit');
+      assert.match(aggText, /Patch refused without applying any file/, 'bounded aggregate refusal omitted the all-or-nothing outcome');
+      assert.equal(/Secret-looking/.test(aggText), false, 'bounded aggregate size refusal was misreported as a secret refusal');
+      assert.equal(/\brule\b/i.test(aggText), false, 'bounded aggregate refusal inferred a detector rule name');
+      for (const name of aggNames) {
+        const after = await snapshotFile(name);
+        assert.deepEqual(after.bytes, aggBefore[name].bytes, `bounded aggregate refusal mutated ${name} bytes`);
+        assert.equal(after.stat.ino, aggBefore[name].stat.ino, `bounded aggregate refusal changed ${name} inode`);
+        assert.equal(after.stat.size, aggBefore[name].stat.size, `bounded aggregate refusal changed ${name} size`);
+        assert.equal(after.stat.mtimeMs, aggBefore[name].stat.mtimeMs, `bounded aggregate refusal changed ${name} mtime`);
+      }
+      console.log(`BOUNDED_PATCH_AGGREGATE: total gate refused 3 admitted-sized files summing past the 1000-byte total for a ${Buffer.byteLength(aggPatch, 'utf8')}-byte benign patch; every target bytes/inode/mtime unchanged`);
+    } finally {
+      if (boundedClient) {
+        let boundedTimer;
+        const boundedExit = boundedClient.child.exitCode !== null || boundedClient.child.signalCode !== null
+          ? Promise.resolve()
+          : new Promise((resolve) => boundedClient.child.once('exit', resolve));
+        boundedClient.child.stdin.end();
+        try {
+          await Promise.race([
+            boundedExit,
+            new Promise((_, reject) => {
+              boundedTimer = setTimeout(() => reject(new Error('bounded stdio server did not exit after stdin close')), 10000);
+            })
+          ]);
+        } finally {
+          clearTimeout(boundedTimer);
+        }
+      }
+      await fs.rm(boundedTmp, { recursive: true, force: true });
+    }
+  }
+  {
   const approvalRegistryPath = path.join(tmp, 'source-approvals.json');
   const approvalClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--bash', 'off', '--write', 'workspace', '--tool-mode', 'full'], {
     cwd: path.resolve('.'),

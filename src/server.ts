@@ -2523,14 +2523,66 @@ async function simulateWorkspacePatch(config: CodexProConfig, records: Validated
     // Whole-file protection: the canonical diff only proves added lines, so
     // capture the simulated post-apply bytes now (before the sandbox is
     // removed) for a full-content source-policy scan in validateSimulatedSource.
+    // FINDING 4 bounded admission (no new limit names): per-file content is
+    // capped by the existing maxWriteBytes write envelope (the same envelope
+    // write/edit enforce for after-image bytes), the aggregate retained
+    // post-apply total is capped by that same maxWriteBytes budget, and the
+    // canonical rawDiff stays capped by the existing maxOutputBytes git-output
+    // envelope (runApplyGit maxBuffer). Combined retained validation bytes are
+    // therefore bounded by maxWriteBytes + maxOutputBytes. Admission is
+    // enforced by stat-before-read plus a running total before each
+    // allocation; over-limit refuses all files with targets unchanged (the
+    // real workspace apply below never runs). Whole-file secret scanning for
+    // admitted files is unchanged in validateSimulatedSource.
+    const perFileLimit = config.maxWriteBytes;
+    const totalFileLimit = config.maxWriteBytes;
+    const rawDiffBytes = Buffer.byteLength(rawDiff, "utf8");
+    if (rawDiffBytes > config.maxOutputBytes) {
+      throw new CodexProError(
+        `Patch validation output is too large (${rawDiffBytes} bytes). Limit: ${config.maxOutputBytes} bytes. Patch refused without applying any file.`
+      );
+    }
+    const sanitizeValidationPath = (value: string): string =>
+      redactDiagnosticText(String(value ?? "")).replace(/[\r\n]/gu, " ").slice(0, 512) || "<unknown>";
     const postApplyFiles: SimulatedPatch["postApplyFiles"] = [];
+    let retainedFileBytes = 0;
     for (const record of records) {
-      let content: string;
+      const simulatedPath = simulationPath(root, record.gitPath);
+      let statedSize: number;
       try {
-        content = await fsp.readFile(simulationPath(root, record.gitPath), "utf8");
+        statedSize = (await fsp.stat(simulatedPath)).size;
       } catch (error) {
         if ((error as NodeJS.ErrnoException)?.code === "ENOENT") continue;
         throw new CodexProError("Canonical Git diff source validation failed.");
+      }
+      if (statedSize > perFileLimit) {
+        throw new CodexProError(
+          `Patch validation needs whole-file review but ${sanitizeValidationPath(record.relPath)} is too large (${statedSize} bytes). Limit: ${perFileLimit} bytes per file, ${totalFileLimit} bytes total across ${records.length} files. Patch refused without applying any file.`
+        );
+      }
+      if (retainedFileBytes + statedSize > totalFileLimit) {
+        throw new CodexProError(
+          `Patch validation needs whole-file review but the touched files are too large in aggregate (${records.length} files, ${retainedFileBytes + statedSize} bytes). Limit: ${totalFileLimit} bytes total (${perFileLimit} bytes per file). Patch refused without applying any file.`
+        );
+      }
+      let content: string;
+      try {
+        content = await fsp.readFile(simulatedPath, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+        throw new CodexProError("Canonical Git diff source validation failed.");
+      }
+      const contentBytes = Buffer.byteLength(content, "utf8");
+      if (contentBytes > perFileLimit) {
+        throw new CodexProError(
+          `Patch validation needs whole-file review but ${sanitizeValidationPath(record.relPath)} is too large (${contentBytes} bytes). Limit: ${perFileLimit} bytes per file, ${totalFileLimit} bytes total across ${records.length} files. Patch refused without applying any file.`
+        );
+      }
+      retainedFileBytes += contentBytes;
+      if (retainedFileBytes > totalFileLimit) {
+        throw new CodexProError(
+          `Patch validation needs whole-file review but the touched files are too large in aggregate (${records.length} files, ${retainedFileBytes} bytes). Limit: ${totalFileLimit} bytes total (${perFileLimit} bytes per file). Patch refused without applying any file.`
+        );
       }
       postApplyFiles.push({ gitPath: record.gitPath, relPath: record.relPath, absPath: record.absPath, content });
     }
