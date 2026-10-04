@@ -831,6 +831,25 @@ export function subscriptionMatches(sub: EventSubscription, event: { delegationG
   return true;
 }
 
+/**
+ * Constant-time owner check between a run record and a subscription.
+ * Knowing a group, run, or subscription id grants no access: a delivery
+ * target is selected only when the subscription owner's hash AND kind match
+ * the run owner's. Used both when selecting targets (enqueue/replay) and as
+ * a fail-closed recheck at pump time.
+ */
+export function subscriptionOwnerMatchesRecord(
+  ownerIdHash: string,
+  ownerKind: "token" | "local",
+  sub: Pick<EventSubscription, "ownerIdHash" | "ownerKind">
+): boolean {
+  if (ownerKind !== sub.ownerKind) return false;
+  const a = Buffer.from(ownerIdHash, "utf8");
+  const b = Buffer.from(sub.ownerIdHash, "utf8");
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
 export function loadSubscriptions(bridgeDir: string): EventSubscription[] {
   let raw: string;
   try {

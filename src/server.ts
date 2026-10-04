@@ -1830,6 +1830,7 @@ const STANDARD_TOOL_NAMES = [
   "delegation_read_result",
   "delegation_followup",
   "delegation_cancel",
+  "delegation_replay_events",
   "events_list",
   "events_subscribe",
   "events_unsubscribe"
@@ -1890,6 +1891,7 @@ const FULL_TOOL_NAMES = [
   "delegation_read_result",
   "delegation_followup",
   "delegation_cancel",
+  "delegation_replay_events",
   "events_list",
   "events_subscribe",
   "events_unsubscribe"
@@ -1918,6 +1920,7 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "delegation_read_result",
   "delegation_followup",
   "delegation_cancel",
+  "delegation_replay_events",
   "events_list",
   "events_subscribe",
   "events_unsubscribe"

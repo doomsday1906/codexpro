@@ -185,9 +185,10 @@ function collectCallKeywordLiterals(nodes, source) {
 
 // Reviewed-source assignment approval shares the hash-only triple shape with
 // call keywords: keyword_sha256 carries the assignment target name,
-// callee_sha256 carries the scoped enclosing-function key (prefixed so a
-// function scope never collides with a call callee), and value_sha256 carries
-// the exact RHS bytes. The registry never holds literals.
+// callee_sha256 carries the scoped enclosing key (dotted function chain plus
+// class chain, "" for module; prefixed so a scope never collides with a call
+// callee), and value_sha256 carries the exact RHS bytes. The registry never
+// holds literals.
 export const PYTHON_ASSIGN_SCOPE_PREFIX = 'assign-scope:';
 const pythonAssignScopeKey = (scopeName) => `${PYTHON_ASSIGN_SCOPE_PREFIX}${scopeName ?? ''}`;
 
@@ -199,13 +200,90 @@ function enclosingPythonAssignScope(nodes, source, nodeIndex) {
     seen.add(current);
     const node = nodes[current];
     if (!node) break;
-    if (node.type === 'FunctionDefinition') {
+    // Scope key includes class context: dotted function chain plus class
+    // chain in nesting order (outer-to-inner), "" for module. Both
+    // FunctionDefinition and ClassDefinition donate their VariableName.
+    if (node.type === 'FunctionDefinition' || node.type === 'ClassDefinition') {
       const nameNode = directChildren(nodes, current).find((child) => child.type === 'VariableName');
       if (nameNode) names.unshift(source.slice(nameNode.from, nameNode.to));
     }
     current = node.parent;
   }
   return names.join('.');
+}
+
+// Parser-owned computed RHS for reviewed assignments (no literal
+// substitution, hash-only exact bytes). Allowed shapes:
+// - None, plain String, f-string FormatString with reference interpolations
+//   (isApprovalString, parser-owned only)
+// - Ternary ConditionalExpression (`A if C else B`): both branches must be
+//   approvable (recursively) or bare references; the condition is
+//   parser-owned by construction (its bytes are part of the hashed RHS, and
+//   direct credential shapes never reach the assignment exemption).
+// - BinOp Add concat (BinaryExpression with `+` only): operands must be
+//   approvable or bare references (recursively, so `'a' + 'b' + ref` works).
+//   Other operators (`-`, `*`, `%`, etc.) stay fail-closed.
+// - `.format()` CallExpression (`"<str>".format(...)`): receiver must be an
+//   approval string, args must be references or approvable (parser-owned
+//   only). Bare `func('a')` and other calls stay fail-closed.
+// - ParenthesizedExpression: unwraps to the inner RHS.
+// Bare VariableName/MemberExpression references are allowed ONLY as
+// subcomponents of the computed shapes above (operands/branches/args), never
+// as a whole RHS on their own (which stays String/None/computed only).
+function isApprovalRhs(nodes, node, source) {
+  if (!node) return false;
+  if (node.type === 'None') return true;
+  if (isApprovalString(nodes, node, source)) return true;
+  if (node.type === 'ParenthesizedExpression') {
+    const inner = meaningfulChildren(nodes, node.index);
+    if (inner.length !== 1) return false;
+    return isApprovalRhs(nodes, inner[0], source);
+  }
+  if (node.type === 'ConditionalExpression') {
+    const kids = directChildren(nodes, node.index).filter((child) => child.type !== 'if' && child.type !== 'else');
+    if (kids.length !== 3) return false;
+    const [thenBranch, , elseBranch] = kids;
+    const branchOk = (branch) => isApprovalRhs(nodes, branch, source)
+      || isCallKeywordReference(nodes, branch, source);
+    return branchOk(thenBranch) && branchOk(elseBranch);
+  }
+  if (node.type === 'BinaryExpression') {
+    const kids = directChildren(nodes, node.index);
+    if (kids.length !== 3) return false;
+    const [left, op, right] = kids;
+    if (op.type !== 'ArithOp' || source.slice(op.from, op.to) !== '+') return false;
+    const operandOk = (operand) => isApprovalRhs(nodes, operand, source)
+      || isCallKeywordReference(nodes, operand, source);
+    return operandOk(left) && operandOk(right);
+  }
+  if (node.type === 'CallExpression') {
+    const kids = directChildren(nodes, node.index);
+    if (kids.length !== 2) return false;
+    const [callee, argList] = kids;
+    if (callee.type !== 'MemberExpression' || argList.type !== 'ArgList') return false;
+    const memKids = directChildren(nodes, callee.index);
+    if (memKids.length !== 3) return false;
+    const [receiver, dot, prop] = memKids;
+    if (dot.type !== '.' || prop.type !== 'PropertyName' || source.slice(prop.from, prop.to) !== 'format') return false;
+    if (!isApprovalString(nodes, receiver, source)) return false;
+    const argKids = directChildren(nodes, argList.index).filter((child) => !['(', ')', ',', 'Comment'].includes(child.type));
+    for (const arg of argKids) {
+      // Keyword args (`name=value`) appear as VariableName + AssignOp + value
+      // in some lezer shapes; handle both positional and keyword forms.
+      if (arg.type === 'VariableName' && argKids.length === 1) {
+        if (!isCallKeywordReference(nodes, arg, source) && !isApprovalRhs(nodes, arg, source)) return false;
+        continue;
+      }
+      // Generic positional: must be a reference or approvable computed value.
+      if (isCallKeywordReference(nodes, arg, source) || isApprovalRhs(nodes, arg, source)) continue;
+      // Keyword-form `k=v`: check the value side when the arg itself is an
+      // assignment-like pair (defensive; lezer may surface it as separate
+      // nodes, in which case the filter above already split them).
+      return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 function collectAssignLiterals(nodes, source) {
@@ -230,7 +308,10 @@ function collectAssignLiterals(nodes, source) {
     if (meaningful[0].index !== target.index || target.to > assignOps[0].from) continue;
     if (before.length === 2 && before[1].type !== 'TypeDef') continue;
     const rhs = after[0];
-    if (rhs.type !== 'None' && !isApprovalString(nodes, rhs, source)) continue;
+    // Computed/conditional RHS (ternary, + concat, .format/f-string with
+    // refs) via parser-owned isApprovalRhs; plain String/None via the same
+    // path. No literal substitution: the exact RHS bytes are hashed.
+    if (!isApprovalRhs(nodes, rhs, source)) continue;
     const scope = enclosingPythonAssignScope(nodes, source, node.index);
     literals.push({ targetFrom: target.from, targetTo: target.to,
       rhsFrom: rhs.from, rhsTo: rhs.to, scope,

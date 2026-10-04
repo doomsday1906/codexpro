@@ -1217,6 +1217,86 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
       assert(listKt.response.status === 200 && listKt.json?.result?.events?.[0]?.name === 'run-attention', 'k7 events/list must reach the real handler');
       console.log('ok: K7 transport negotiation (init 2026-07-28 -> 2025-11-25; tools/call runtime_status with draft/older headers; invalid still 400; discover/list with compat header)');
     }
+    // K8: wire contract qualified against actual schemas, not status alone
+    // (hermetic loopback, no live network). Proves the 2026-07-28 draft
+    // interoperates: modern advertise (discover 2026-07-28) with
+    // legacy-compatible bodies (CallToolResult content[] + structuredContent)
+    // that validate against the SDK shapes and are accepted by the client.
+    {
+      const SdkTypes = await import(pathToFileUrl(path.join(ROOT, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm', 'types.js')));
+      const parseSseK8 = (text) => {
+        try { return JSON.parse(text); } catch { /* SSE envelope below */ }
+        const line = String(text).split(/\r?\n/).find((l) => l.startsWith('data:'));
+        return line ? JSON.parse(line.slice(5).trim()) : null;
+      };
+      const postRawK8 = async (body, headers = {}) => {
+        const response = await fetch(`${baseK}/mcp`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...headers },
+          body: JSON.stringify(body)
+        });
+        const text = await response.text();
+        return { response, json: parseSseK8(text) };
+      };
+      // K8a: initialize requesting 2026-07-28 negotiates to 2025-11-25 with
+      // the correct version field, validated against the SDK InitializeResult
+      // shape (protocolVersion string + capabilities + serverInfo).
+      const initK8 = await postRawK8({ jsonrpc: '2.0', id: 201, method: 'initialize', params: { protocolVersion: '2026-07-28', capabilities: {}, clientInfo: { name: 'k8', version: '1' } } });
+      assert(initK8.response.status === 200, `k8 initialize http status ${initK8.response.status}`);
+      assert(initK8.json?.result?.protocolVersion === '2025-11-25', `k8 initialize must downgrade to 2025-11-25, got ${JSON.stringify(initK8.json)}`);
+      const initParsed = SdkTypes.InitializeResultSchema.safeParse(initK8.json?.result);
+      assert(initParsed.success, `k8 initialize result must validate against SDK InitializeResultSchema: ${initParsed.success ? '' : JSON.stringify(initParsed.error?.issues)?.slice(0, 300)}`);
+      // K8b: ordinary tools/call (runtime_status) with the 2026-07-28 header
+      // returns 200 with a legacy-compatible body (content[] text +
+      // structuredContent) validated against the SDK CallToolResult shape.
+      const callK8 = await postRawK8({ jsonrpc: '2.0', id: 202, method: 'tools/call', params: { name: 'runtime_status', arguments: {} } }, { 'mcp-protocol-version': '2026-07-28' });
+      assert(callK8.response.status === 200, `k8 tools/call http status ${callK8.response.status}`);
+      assert(callK8.json?.result && !callK8.json?.error, `k8 tools/call must succeed, got ${JSON.stringify(callK8.json)?.slice(0, 200)}`);
+      const callBody = callK8.json.result;
+      assert(Array.isArray(callBody.content) && callBody.content.length >= 1 && callBody.content[0]?.type === 'text' && typeof callBody.content[0]?.text === 'string', 'k8 tools/call body must carry content[] with a text block (legacy-compatible)');
+      assert(callBody.structuredContent && typeof callBody.structuredContent === 'object', 'k8 tools/call body must carry structuredContent (legacy-compatible)');
+      const callParsed = SdkTypes.CallToolResultSchema.safeParse(callBody);
+      const compatParsed = SdkTypes.CompatibilityCallToolResultSchema.safeParse(callBody);
+      assert(callParsed.success || compatParsed.success, `k8 tools/call body must validate against SDK CallToolResult shape: ${JSON.stringify((callParsed.error ?? compatParsed.error)?.issues)?.slice(0, 300)}`);
+      // K8c: server/discover returns resultType complete + supportedVersions +
+      // capabilities.tools+events matching the official narrow shape.
+      const disK8 = await postRawK8({ jsonrpc: '2.0', id: 203, method: 'server/discover', params: {} }, { 'mcp-protocol-version': '2026-07-28' });
+      assert(disK8.response.status === 200 && disK8.json?.result?.resultType === 'complete', `k8 discover must be complete, got ${JSON.stringify(disK8.json)}`);
+      assert(Array.isArray(disK8.json.result.supportedVersions) && disK8.json.result.supportedVersions.includes('2026-07-28'), 'k8 discover must advertise 2026-07-28');
+      assert(disK8.json.result.capabilities && disK8.json.result.capabilities.tools !== undefined && disK8.json.result.capabilities.events !== undefined, 'k8 discover must carry capabilities.tools+events (official)');
+      // K8d: events/list returns run-attention with delivery/inputSchema/
+      // payloadSchema matching the official narrow shape.
+      const listK8 = await postRawK8({ jsonrpc: '2.0', id: 204, method: 'events/list', params: {} }, { 'mcp-protocol-version': '2026-07-28' });
+      assert(listK8.response.status === 200, `k8 events/list http status ${listK8.response.status}`);
+      const evtK8 = listK8.json?.result?.events?.[0];
+      assert(evtK8?.name === 'run-attention', `k8 events/list must return run-attention, got ${JSON.stringify(listK8.json)}`);
+      assert(Array.isArray(evtK8.delivery) && evtK8.delivery.includes('webhook'), 'k8 event delivery must be ["webhook"] (official)');
+      assert(evtK8.inputSchema?.type === 'object' && evtK8.inputSchema?.properties?.delegationGroup && evtK8.inputSchema?.properties?.runId, 'k8 event inputSchema must carry delegationGroup/runId (official)');
+      assert(evtK8.payloadSchema?.type === 'object' && Array.isArray(evtK8.payloadSchema?.required) && evtK8.payloadSchema.required.includes('runId'), 'k8 event payloadSchema must require runId (official)');
+      // K8e: challenge/event envelopes + headers validated (official shapes,
+      // hermetic stubs, no network). Modern advertise (2026-07-28) with
+      // legacy bodies interoperates: the SDK client accepts the
+      // content[]+structuredContent body above (K8b validated + client
+      // callTool in Part F/J/L already accepts it; here the HTTP wire proves
+      // the same body traverses the compat header path).
+      const vBodyK8 = JSON.parse(Events.buildVerificationBody('k8challenge'));
+      assert(vBodyK8.type === 'verification' && vBodyK8.challenge === 'k8challenge' && Object.keys(vBodyK8).length === 2, 'k8 challenge envelope must be exactly {type, challenge} (official)');
+      const sampleK8 = { event: 'run-attention', eventId: 'evt_k8', runId: 'run_aaaaaaaaaaaaaaaa', engine: 'codex', delegationGroup: 'g1', state: 'completed', seq: 1, version: 1, summary: 'completed exit 0', createdAt: '2026-10-01T12:05:00Z' };
+      const eBodyK8 = JSON.parse(Events.buildEventBody(sampleK8));
+      assert(eBodyK8.eventId === 'evt_k8' && eBodyK8.name === 'run-attention' && eBodyK8.timestamp === '2026-10-01T12:05:00Z' && eBodyK8.cursor === null, 'k8 event envelope must carry eventId/name/timestamp/cursor null (official)');
+      assert(eBodyK8.data?.runId === 'run_aaaaaaaaaaaaaaaa', 'k8 event data must carry run fields (official)');
+      assert(Events.deliveryWebhookId(sampleK8) === 'evt_k8', 'k8 delivery webhook-id must equal eventId (official)');
+      assert(Events.newVerificationWebhookId().startsWith('msg_verification_'), 'k8 challenge webhook-id must be msg_verification_* (official)');
+      let seenK8 = null;
+      const stubK8 = async (target, body, headers) => {
+        seenK8 = { headers };
+        return { status: 200, bodyText: JSON.stringify({ challenge: JSON.parse(body).challenge }) };
+      };
+      const secK8 = Buffer.alloc(32, 77);
+      await Events.verifySubscriptionChallenge('https://example.com/hook', secK8, 'run-attention', {}, fetch, 10_000, { lookupHost: publicLookup, subId: 'sub_k8', postImpl: stubK8 });
+      assert(seenK8.headers['webhook-id']?.startsWith('msg_verification_') && String(seenK8.headers['webhook-signature']).startsWith('v1,') && seenK8.headers['X-MCP-Subscription-Id'] === 'sub_k8', 'k8 challenge headers must carry webhook-id/timestamp/signature + X-MCP-Subscription-Id (official)');
+      console.log('ok: K8 wire contract schemas (init 2026-07-28->2025-11-25 InitializeResult; tools/call CallToolResult content[]+structuredContent; discover complete+versions+tools/events; list run-attention delivery/schemas; envelopes+headers; modern advertise + legacy body interoperate)');
+    }
     console.log('ok: K endpoint wire proof (POST /mcp server/discover + events/* reach the real handlers, auth-checked, batch, -32015 mapping)');
   } finally {
     await new Promise((resolve) => listenerK.close(resolve));
@@ -1342,6 +1422,193 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
   await callL('delegation_cancel', { run_id: launchA.structuredContent.run_id });
   await clientL.close();
   console.log('ok: L3 conflicting-retry (same pending ID same payload reuses, different payload rejected; launch task/group conflicts rejected)');
+}
+
+// ---------- Part M: crash-window fail-closed regressions (initial + followup pid-less, hermetic) ----------
+// Real window: spawnCanaryChild spawn (~538) + pid save (~560-567). An
+// initial launch now stages pending BEFORE spawn (reserve attemptN); a crash
+// between spawn success and pid save leaves a pid-less pending with NO
+// observed failure marker. Retry of the same id must NOT launch another
+// worker when prior dispatch is uncertain: explicit uncertain/failed-closed
+// (inspect + cancel/replay, never auto-spawn). The stagedAlivePid liveness
+// gate alone is insufficient for pid-less pending. Observed async
+// spawn-errors stay explicitly retryable via lastDispatchError (same id,
+// same attemptN). Deterministic fault injection: crafted pid-less pending
+// files simulate the kill between spawn and save (no orphan processes, no
+// live network); BAD_BIN simulates async spawn failure.
+{
+  const { loadConfig: loadConfigM } = await import(pathToFileUrl(path.join(ROOT, 'dist', 'config.js')));
+  const { createCodexProServer: createServerM } = await import(pathToFileUrl(path.join(ROOT, 'dist', 'server.js')));
+  const { Client: ClientM } = await import(pathToFileUrl(path.join(ROOT, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm', 'client', 'index.js')));
+  const { InMemoryTransport: InMemoryTransportM } = await import(pathToFileUrl(path.join(ROOT, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm', 'inMemory.js')));
+  const wsRootM = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-delegation-crashwindow-'));
+  const configM = loadConfigM(['--root', wsRootM]);
+  const serverM = createServerM(configM);
+  const [ctM, stM] = InMemoryTransportM.createLinkedPair();
+  const clientM = new ClientM({ name: 'crashwindow-smoke', version: '1' }, { capabilities: {} });
+  await Promise.all([serverM.connect(stM), clientM.connect(ctM)]);
+  const callM = async (name, args) => clientM.callTool({ name, arguments: args });
+  const openedM = await callM('open_workspace', { root: wsRootM });
+  assert(!openedM.isError, 'crashwindow open_workspace must succeed');
+  const widM = openedM.structuredContent.workspace_id;
+  const realM = fs.realpathSync.native(wsRootM);
+  const bridgeM = path.join(realM, '.ai-bridge');
+  const runFileM = (id) => path.join(bridgeM, 'delegation-runs', `${id}.json`);
+  async function awaitStateM(id, pred) {
+    for (let i = 0; i < 200; i += 1) {
+      await new Promise((r) => setTimeout(r, 100));
+      try {
+        const cur = readJson(runFileM(id));
+        if (pred(cur)) return cur;
+      } catch { /* not yet */ }
+    }
+    return null;
+  }
+  // Seed owner via one real launch (fake codex on PATH from top fixtures).
+  const seedM = await callM('delegation_launch', { workspace_id: widM, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 'crash-seed', canary: true, request_id: 'req-m-seed', timeout_ms: 60000 });
+  assert(!seedM.isError, `crashwindow seed launch failed: ${JSON.stringify(seedM.structuredContent)}`);
+  assert((await awaitStateM(seedM.structuredContent.run_id, (r) => r.state === 'completed'))?.state === 'completed', 'seed must complete');
+  const seedRun = readJson(runFileM(seedM.structuredContent.run_id));
+  // M1: initial-launch crash-before-save (fault-injected pid-less pending
+  // launch, no observed failure) -> retry same request_id returns
+  // launch_uncertain and spawns no second worker.
+  const crashLaunchId = 'run_aaaaaaaaaaaaaaaa';
+  const nowM = new Date().toISOString();
+  let crashLaunch = {
+    version: 1, runId: crashLaunchId, requestId: 'req-m-crash-launch', delegationGroup: 'hestia-cli-canary',
+    engine: 'codex', profile: 'CODEX_SCOUT_FAST', isCanary: true,
+    session: { engine: 'codex', resumable: false, reason: 'seed' },
+    attemptTimeoutMs: 60000, workspaceId: seedRun.workspaceId, workspaceCanonical: seedRun.workspaceCanonical,
+    workdir: path.join(realM, 'crash-launch-m1'), ownerIdHash: seedRun.ownerIdHash, ownerKind: seedRun.ownerKind,
+    state: 'queued', seq: 0, attempts: [], pendingEvents: [], checkpoints: [], appliedCheckpointIds: [], lastAppliedCheckpointSeq: -1,
+    inputRequests: [], nextAction: 'x', createdAt: nowM, updatedAt: nowM
+  };
+  fs.mkdirSync(crashLaunch.workdir, { recursive: true });
+  crashLaunch = Store.stagePendingLaunch(crashLaunch, { requestId: 'req-m-crash-launch', attemptN: 1, timeoutMs: 60000, prompt: 'crash task', sessionEvidence: 'ev' });
+  assert(Store.isUncertainDispatch(crashLaunch) === true, 'fault-injected crash launch must be uncertain (pid-less, no marker)');
+  assert(Store.reconcileRunState(crashLaunch, () => false).classification === 'uncertain', 'reconcile must classify crash launch uncertain, never interrupted');
+  Store.saveDelegationRun(bridgeM, crashLaunch);
+  const runsBeforeM1 = (await callM('delegation_list', {})).structuredContent.runs.length;
+  const retryM1 = await callM('delegation_launch', { workspace_id: widM, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 'crash-launch-m1', canary: true, request_id: 'req-m-crash-launch', timeout_ms: 60000 });
+  assert(retryM1.isError && retryM1.structuredContent.error === 'launch_uncertain' && retryM1.structuredContent.uncertain_dispatch === true, `crash-before-save retry must fail closed launch_uncertain, got ${JSON.stringify(retryM1.structuredContent)}`);
+  assert(retryM1.structuredContent.stored === false && retryM1.structuredContent.executed === false, 'uncertain retry must consume nothing');
+  const runsAfterM1 = (await callM('delegation_list', {})).structuredContent.runs.length;
+  assert(runsAfterM1 === runsBeforeM1, 'uncertain launch retry must spawn no second worker');
+  assert(readJson(runFileM(crashLaunchId)).attempts.length === 1, 'uncertain launch must not append attempts');
+  console.log('ok: M1 initial-launch crash-before-save (fault-injected pid-less pending -> retry same ID launch_uncertain, no second worker)');
+  // M2: followup pid-less pending (fault-injected, no marker) -> retry same
+  // checkpoint returns dispatch_uncertain and spawns no second worker. The
+  // stagedAlivePid gate alone is insufficient: with no pid there is nothing
+  // to probe, so liveness cannot prove safety.
+  const fLaunched = await callM('delegation_launch', { workspace_id: widM, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 'crash-followup', canary: true, request_id: 'req-m-followup', timeout_ms: 60000 });
+  assert(!fLaunched.isError, 'followup seed launch failed');
+  const fRunId = fLaunched.structuredContent.run_id;
+  assert((await awaitStateM(fRunId, (r) => r.state === 'completed'))?.state === 'completed', 'followup seed must complete');
+  const fQ = await callM('delegation_followup', { run_id: fRunId, checkpoint: { id: 'mq-1', run_id: fRunId, seq: 0, payload: {}, questions: [{ id: 'q1', question: 'm confirm?' }] } });
+  assert(!fQ.isError, 'followup question must reach needs-input');
+  let fCur = readJson(runFileM(fRunId));
+  const fCp = { id: 'mr-uncertain', run_id: fRunId, seq: 1, payload: { answer: 'x' }, input_request_id: 'mq-1' };
+  fCur = Store.stagePendingDispatch(fCur, { checkpoint: fCp, requestId: 'mq-1', attemptN: 2, continuation: 'new-continuation-attempt', timeoutMs: 60000, prompt: 'p', sessionEvidence: 'e' });
+  assert(Store.isUncertainDispatch(fCur) === true, 'fault-injected followup pending must be uncertain');
+  Store.saveDelegationRun(bridgeM, fCur);
+  const attemptsBeforeM2 = readJson(runFileM(fRunId)).attempts.length;
+  const retryM2 = await callM('delegation_followup', { run_id: fRunId, checkpoint: { id: 'mr-uncertain', run_id: fRunId, seq: 1, payload: { answer: 'x' }, input_request_id: 'mq-1' } });
+  assert(retryM2.isError && retryM2.structuredContent.error === 'dispatch_uncertain' && retryM2.structuredContent.uncertain_dispatch === true, `pid-less pending retry must fail closed dispatch_uncertain, got ${JSON.stringify(retryM2.structuredContent)}`);
+  assert(readJson(runFileM(fRunId)).attempts.length === attemptsBeforeM2, 'uncertain followup retry must spawn no second worker');
+  console.log('ok: M2 followup pid-less pending (fault-injected -> retry same ID dispatch_uncertain, stagedAlivePid gate insufficient alone, no second worker)');
+  // M3: async spawn-error stays explicitly retryable via lastDispatchError
+  // (same id, same attemptN). BAD_BIN fault injection, hermetic, no network.
+  const aLaunched = await callM('delegation_launch', { workspace_id: widM, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 'crash-async', canary: true, request_id: 'req-m-async', timeout_ms: 60000 });
+  assert(!aLaunched.isError, 'async seed launch failed');
+  const aRunId = aLaunched.structuredContent.run_id;
+  assert((await awaitStateM(aRunId, (r) => r.state === 'completed'))?.state === 'completed', 'async seed must complete');
+  const aQ = await callM('delegation_followup', { run_id: aRunId, checkpoint: { id: 'aq-1', run_id: aRunId, seq: 0, payload: {}, questions: [{ id: 'q1', question: 'async confirm?' }] } });
+  assert(!aQ.isError, 'async question must reach needs-input');
+  process.env.CODEXPRO_CODEX_BIN = '/nonexistent/codexpro-async-fail-bin';
+  const aFail = await callM('delegation_followup', { run_id: aRunId, checkpoint: { id: 'ar-1', run_id: aRunId, seq: 1, payload: { answer: 'async-retry-me' }, input_request_id: 'aq-1' } });
+  assert(aFail.isError && aFail.structuredContent.error === 'dispatch_pending' && aFail.structuredContent.pending_dispatch === true, `async spawn error must leave retryable pending, got ${JSON.stringify(aFail.structuredContent)}`);
+  const aPersisted = readJson(runFileM(aRunId));
+  assert(typeof aPersisted.pendingDispatch?.lastDispatchError === 'string' && aPersisted.pendingDispatch.lastDispatchError.length > 0, 'observed async failure must mark lastDispatchError (explicitly retryable)');
+  assert(Store.isUncertainDispatch(aPersisted) === false, 'marked async failure must NOT be uncertain');
+  assert(aPersisted.inputRequests.find((x) => x.id === 'aq-1')?.status === 'open', 'async failure must leave request open');
+  delete process.env.CODEXPRO_CODEX_BIN;
+  const aRetry = await callM('delegation_followup', { run_id: aRunId, checkpoint: { id: 'ar-1', run_id: aRunId, seq: 1, payload: { answer: 'async-retry-me' }, input_request_id: 'aq-1' } });
+  assert(!aRetry.isError && aRetry.structuredContent.executed === true && aRetry.structuredContent.attempt_n === 2, `async retry same ID must dispatch attempt 2, got ${JSON.stringify(aRetry.structuredContent)}`);
+  assert((await awaitStateM(aRunId, (r) => r.state === 'completed' && r.attempts.length === 2))?.attempts.length === 2, 'async retried continuation must complete');
+  await clientM.close();
+  console.log('ok: M3 async spawn-error (observed failure marks retryable pending with lastDispatchError, same ID retries to success)');
+}
+
+// ---------- Part N: reviewed assignment computed RHS specimens (hermetic, no lane files) ----------
+// Extends the reviewed assignment binding to computed/conditional RHS
+// (ternary IfExp, BinOp Add concat, .format/f-string with refs,
+// parser-owned only) with class-context scope (dotted function chain plus
+// class chain, "" for module). Retains credential detection + .env, uses
+// hash-only triples (no literal substitution). Fixtures below mirror PR
+// shapes (ternary line-555 style, concat line-556 style) as inline regression
+// specimens (NOT lane files: no worktree/primary paths, no Git lane state).
+{
+  const Prov = await import(pathToFileUrl(path.join(ROOT, 'scripts', 'python-provenance.mjs')));
+  const { hasSecretValue } = await import(pathToFileUrl(path.join(ROOT, 'dist', 'redact.js')));
+  const sha = (s) => createHash('sha256').update(s, 'utf8').digest('hex');
+  const scopeHash = (scope) => sha(`${Prov.PYTHON_ASSIGN_SCOPE_PREFIX}${scope}`);
+  const expectNoLiterals = (value, literals, label) => {
+    const serialized = JSON.stringify(value) ?? '';
+    for (const literal of literals) assert(!serialized.includes(literal), `${label} leaked ${literal}`);
+  };
+  // PR-shape specimens (inline, NOT lane files).
+  const ternaryPR555 = "def handle_request(cond, fallback):\n    send(token=fallback)\n    api_token = 'primary_555' if cond else fallback";
+  const concatPR556 = "def build_prefix(prefix):\n    send(token=prefix)\n    api_token = prefix + '_suffix_556'";
+  const formatPR = "def build_greeting(name):\n    send(token=name)\n    api_token = 'hello {}'.format(name)";
+  const fstringPR = "def build_f(n):\n    send(token=n)\n    api_token = f'fstring_{n}'";
+  const classPR = "class Config:\n    def get_token(self, cond):\n        api_token = 'cls_marker' if cond else 'fallback_cls'";
+  const nestedPR = "def outer():\n    def inner():\n        api_token = 'nested_marker'";
+  const modulePR = "api_token = 'module_marker'";
+  const hostileCred = "def f():\n    token = 'sk-XXXXXXXXXXXXXXXXXXXX'";
+  for (const [label, src] of [['ternaryPR555', ternaryPR555], ['concatPR556', concatPR556], ['formatPR', formatPR], ['fstringPR', fstringPR], ['classPR', classPR], ['nestedPR', nestedPR], ['modulePR', modulePR]]) {
+    let astOk = true;
+    try {
+      const { spawnSync: ss } = await import('node:child_process');
+      const r = ss('python3', ['-c', 'import ast, sys; ast.parse(sys.stdin.read())'], { input: src, encoding: 'utf8' });
+      astOk = r.status === 0;
+    } catch { astOk = false; }
+    assert(astOk, `${label} specimen must be accepted by ast.parse`);
+  }
+  // Without approval every computed RHS is refused (secret-looking).
+  for (const [label, src] of [['ternaryPR555', ternaryPR555], ['concatPR556', concatPR556], ['formatPR', formatPR], ['fstringPR', fstringPR]]) {
+    assert(hasSecretValue(src, { context: 'source', language: 'python' }) === true, `${label} must be refused without approval`);
+  }
+  // With the exact triple approved, each computed RHS is exempted (hash-only).
+  const cases = [
+    { label: 'ternaryPR555', src: ternaryPR555, keyword: 'api_token', scope: 'handle_request', rhs: "'primary_555' if cond else fallback" },
+    { label: 'concatPR556', src: concatPR556, keyword: 'api_token', scope: 'build_prefix', rhs: "prefix + '_suffix_556'" },
+    { label: 'formatPR', src: formatPR, keyword: 'api_token', scope: 'build_greeting', rhs: "'hello {}'.format(name)" },
+    { label: 'fstringPR', src: fstringPR, keyword: 'api_token', scope: 'build_f', rhs: "f'fstring_{n}'" },
+    { label: 'classPR', src: classPR, keyword: 'api_token', scope: 'Config.get_token', rhs: "'cls_marker' if cond else 'fallback_cls'" },
+    { label: 'nestedPR', src: nestedPR, keyword: 'api_token', scope: 'outer.inner', rhs: "'nested_marker'" },
+    { label: 'modulePR', src: modulePR, keyword: 'api_token', scope: '', rhs: "'module_marker'" }
+  ];
+  for (const c of cases) {
+    const entries = Prov.collectPythonAssignApprovals(c.src, [c.keyword]);
+    assert(entries.length === 1, `${c.label} must enroll exactly one triple, got ${entries.length}`);
+    const expected = { keyword_sha256: sha(c.keyword), callee_sha256: scopeHash(c.scope), value_sha256: sha(c.rhs) };
+    assert(JSON.stringify(entries[0]) === JSON.stringify(expected), `${c.label} triple mismatch: got ${JSON.stringify(entries[0])} expected ${JSON.stringify(expected)}`);
+    expectNoLiterals(entries, [c.rhs, c.keyword], `${c.label} hash-only registry`);
+    assert(hasSecretValue(c.src, { context: 'source', language: 'python', approvedCallKeywordValues: entries }) === false, `${c.label} must be nonsecret with its exact triple approved`);
+    // Changed RHS (different bytes) stays refused with the same approval.
+    const drifted = c.src.replace(c.rhs, "'changed_unapproved'");
+    assert(hasSecretValue(drifted, { context: 'source', language: 'python', approvedCallKeywordValues: entries }) === true, `${c.label} changed RHS must stay refused`);
+  }
+  // Credential detection retained: a real credential inside a computed RHS
+  // is still secret even with its triple approved (direct shapes never reach
+  // the assignment exemption). .env retained: non-Python routes never use it.
+  const credEntries = Prov.collectPythonAssignApprovals(hostileCred, ['token']);
+  assert(hasSecretValue(hostileCred, { context: 'source', language: 'python', approvedCallKeywordValues: credEntries }) === true, 'real credential in computed RHS must stay secret even with approval');
+  assert(hasSecretValue('TOKEN=abc', { context: 'source' }) === true, '.env/non-Python routes must stay blocked regardless of Python approvals');
+  // Non-add operators and generic calls stay fail-closed (no blanket exemption).
+  assert(Prov.collectPythonAssignApprovals("def f():\n    token = 'a' - 'b'", ['token']).length === 0, 'BinOp minus must stay fail-closed');
+  assert(Prov.collectPythonAssignApprovals("def f():\n    token = func('a')", ['token']).length === 0, 'generic calls must stay fail-closed');
+  console.log('ok: N reviewed assignment computed RHS (ternary IfExp PR555 + concat PR556 + format/f-string with refs, class/nested/module scope, credential+.env retained, hash-only, no literal substitution)');
 }
 
 console.log('\ndelegation-canary-smoke: PASS (code SUBSCRIBED-loopback OBSERVED; ChatGPT-side subscription pending coordination)');

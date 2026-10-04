@@ -24,6 +24,18 @@
  * the run/subscription record. Knowing a group or run id grants no access.
  * On the HTTP endpoint this rides the existing bearer-token gate; on stdio
  * the owner is the local user + server root.
+ *
+ * Subscription routing: ONE canonical subscription authority (the server
+ * defaultRoot bridge dir) serves every permitted workspace. Subscription
+ * storage (events_subscribe, official POST /mcp events/subscribe) AND
+ * completion delivery lookup (enqueue, pump, delegation_replay_events) all
+ * use the authority dir; run state stays in the run workspace bridge dir.
+ * Delivery targets are selected by owner identity (hash + kind,
+ * constant-time) plus group/run filters. Subscription records (whsec_
+ * secrets) are never copied into run workspaces: runs reference subIds only.
+ * Stored events with zero targets are explicit no-target state (truthful
+ * undelivered counts, never silent 0); delegation_replay_events explicitly
+ * attaches currently matching in-scope targets without backfilling history.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -37,14 +49,20 @@ import { CodexProError, PathGuard, WorkspaceManager } from "./guard.js";
 import {
   DELEGATION_BOUNDS,
   DELEGATION_GROUP_DEFAULT,
+  DELEGATION_TERMINAL_STATES,
   activeSessionHolders,
   applyCheckpointReply,
+  authorityBridgeDirFor,
   clearPendingDispatch,
   findRunByRequestId,
   isDelegationGroupId,
+  isEventUndelivered,
   isLaunchRequestConflict,
+  isRunPidLess,
+  isUncertainDispatch,
   listDelegationRuns,
   loadDelegationRun,
+  markPendingDispatchFailed,
   newRunId,
   nextActionFor,
   openInputRequests,
@@ -58,6 +76,7 @@ import {
   saveDelegationRun,
   stableEventId,
   stagePendingDispatch,
+  stagePendingLaunch,
   summarizeTerminal,
   validateCheckpointForRun,
   verifyRunOwner,
@@ -112,6 +131,7 @@ import {
   saveSubscriptions,
   SUBSCRIPTION_CHALLENGE_ERROR_CODE,
   subscriptionMatches,
+  subscriptionOwnerMatchesRecord,
   validateSubscriptionInput,
   verifySubscriptionChallenge,
   type EventSubscription,
@@ -148,6 +168,33 @@ function localOwnerId(config: CodexProConfig): string {
 
 function bridgeDirFor(config: CodexProConfig, workspaceRoot: string): string {
   return path.join(workspaceRoot, config.contextDir);
+}
+
+/**
+ * Canonical subscription authority dir (server defaultRoot bridge), shared
+ * across ALL permitted workspaces. Subscription storage (events_subscribe /
+ * official POST /mcp events/subscribe) AND completion delivery lookup
+ * (enqueue + pump + replay) all use this dir; run state stays in the
+ * per-workspace run bridge dir. Subscription records (which carry whsec_
+ * secrets) are never copied into run workspaces: runs reference targets by
+ * subId only.
+ */
+function subscriptionAuthorityDirFor(config: CodexProConfig): string {
+  return authorityBridgeDirFor(config.defaultRoot, config.contextDir);
+}
+
+/**
+ * Delivery target selection: owner identity (hash + kind, constant-time)
+ * AND group/run filters (subscriptionMatches). Knowing a group, run, or
+ * subscription id grants no access; only the run owner's currently matching
+ * subscriptions become targets. Expiry is adjudicated at pump time (clear
+ * permanent error), not by silently dropping targets here.
+ */
+function selectDeliveryTargets(run: DelegationRunRecord, subs: EventSubscription[]): EventSubscription[] {
+  return subs.filter((sub) =>
+    sub.eventName === RUN_ATTENTION_EVENT &&
+    subscriptionOwnerMatchesRecord(run.ownerIdHash, run.ownerKind, sub) &&
+    subscriptionMatches(sub, { delegationGroup: run.delegationGroup, runId: run.runId }));
 }
 
 function fixtureSourceDir(): string {
@@ -248,7 +295,11 @@ async function pumpDeliveries(
   // events_subscribe -> handleEventsSubscribe). While app delivery is OFF,
   // pending deliveries stay pending and remain replayable via read_result.
   if (!isAppEventDeliveryEnabled()) return run;
-  const subs = loadSubscriptions(bridgeDir);
+  // Delivery lookup reads the canonical subscription authority (server
+  // defaultRoot bridge), NOT the run workspace bridge: a subscription stored
+  // via the official protocol path is visible to runs in every permitted
+  // workspace. Run state still persists in bridgeDir (the run bridge).
+  const subs = loadSubscriptions(subscriptionAuthorityDirFor(deps.config));
   const byId = new Map(subs.map((sub) => [sub.subId, sub]));
   let changed = false;
   const now = Date.now();
@@ -266,6 +317,15 @@ async function pumpDeliveries(
       if (!sub) {
         delivery.status = "permanent";
         delivery.lastError = "subscription removed; delivery stopped";
+        changed = true;
+        continue;
+      }
+      // Fail-closed owner recheck at pump time: only the run owner's
+      // subscription may receive this run's wake-up, even if the authority
+      // file changed between target selection and delivery.
+      if (!subscriptionOwnerMatchesRecord(run.ownerIdHash, run.ownerKind, sub)) {
+        delivery.status = "permanent";
+        delivery.lastError = "subscription owner mismatch; delivery stopped";
         changed = true;
         continue;
       }
@@ -323,6 +383,12 @@ function enqueueTerminalEvent(run: DelegationRunRecord, subs: EventSubscription[
   const seq = run.seq + 1;
   const summary = sanitizeSummary(run.result?.summary ?? summarizeTerminal(run.state, run.result?.exitCode, run.result?.timedOut));
   run.seq = seq;
+  // Target selection is owner-checked (run owner vs subscription owner,
+  // constant-time) plus group/run-filtered. Callers pass the canonical
+  // authority subscriptions; a run in any permitted workspace sees the same
+  // targets. Zero matches => deliveries:[] (explicit no-target state, never
+  // silent 0-delivered): truthful counts + delegation_replay_events cover it.
+  const targets = selectDeliveryTargets(run, subs);
   run.pendingEvents = [
     ...run.pendingEvents,
     {
@@ -331,13 +397,45 @@ function enqueueTerminalEvent(run: DelegationRunRecord, subs: EventSubscription[
       state: run.state,
       summary,
       createdAt: new Date().toISOString(),
-      deliveries: subs.filter((sub) => subscriptionMatches(sub, { delegationGroup: run.delegationGroup, runId: run.runId }))
-        .map((sub) => ({ subId: sub.subId, status: "pending" as const, attempts: 0 }))
+      deliveries: targets.map((sub) => ({ subId: sub.subId, status: "pending" as const, attempts: 0 }))
     }
   ].slice(-DELEGATION_BOUNDS.maxPendingEventsPerRun);
-  run.nextAction = nextActionFor(run.state, run.pendingEvents.some((event) =>
-    event.deliveries.some((delivery) => delivery.status === "pending" || delivery.status === "failed")));
+  run.nextAction = nextActionFor(run.state, run.pendingEvents.some(isEventUndelivered),
+    run.pendingEvents.some((event) => event.deliveries.length === 0));
   return run;
+}
+
+interface ReplayAttachment {
+  eventId: string;
+  subIds: string[];
+}
+
+/**
+ * Explicit replay target attachment: for stored events with ZERO deliveries
+ * (explicit no-target state), attach the CURRENTLY matching authority
+ * subscriptions (owner-checked + group/run-filtered via
+ * selectDeliveryTargets) as fresh pending deliveries. Events that already
+ * carry deliveries are NEVER touched: no historical event is backfilled to
+ * new/wider scopes, and delivery history is preserved. Secrets are never
+ * copied: only subIds enter the run record.
+ */
+function attachReplayTargets(
+  run: DelegationRunRecord,
+  authoritySubs: EventSubscription[]
+): { attached: ReplayAttachment[]; stillNoTarget: string[] } {
+  const attached: ReplayAttachment[] = [];
+  const stillNoTarget: string[] = [];
+  for (const event of run.pendingEvents) {
+    if (event.deliveries.length > 0) continue;
+    const targets = selectDeliveryTargets(run, authoritySubs);
+    if (targets.length === 0) {
+      stillNoTarget.push(event.eventId);
+      continue;
+    }
+    event.deliveries = targets.map((sub) => ({ subId: sub.subId, status: "pending" as const, attempts: 0 }));
+    attached.push({ eventId: event.eventId, subIds: targets.map((sub) => sub.subId) });
+  }
+  return { attached, stillNoTarget };
 }
 
 function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: string, final: {
@@ -419,7 +517,7 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
     stderrTail: live ? tailText(live.stderrChunks, DELEGATION_BOUNDS.maxTailBytes) : undefined,
     ...(fixturesUnchanged === undefined ? {} : { fixturesUnchanged })
   };
-  enqueueTerminalEvent(run, loadSubscriptions(bridgeDir));
+  enqueueTerminalEvent(run, loadSubscriptions(subscriptionAuthorityDirFor(deps.config)));
   // Atomic: terminal state + pending wake-up event persist in one write.
   saveDelegationRun(bridgeDir, run);
   void pumpDeliveries(deps, bridgeDir, loadDelegationRun(bridgeDir, runId) ?? run).catch(() => undefined);
@@ -578,8 +676,9 @@ function launchCodexResume(
 }
 
 function runSummary(run: DelegationRunRecord): Record<string, unknown> {
-  const undelivered = run.pendingEvents.filter((event) =>
-    event.deliveries.some((delivery) => delivery.status === "pending" || delivery.status === "failed")).length;
+  // Truthful: no-target events count as undelivered (never silent 0).
+  const undelivered = run.pendingEvents.filter(isEventUndelivered).length;
+  const noTarget = run.pendingEvents.filter((event) => event.deliveries.length === 0).length;
   const failedDeliveries = run.pendingEvents.flatMap((event) =>
     event.deliveries.filter((delivery) => delivery.status === "failed" || delivery.status === "permanent")
       .map((delivery) => ({ eventId: event.eventId, subId: delivery.subId, status: delivery.status, error: delivery.lastError ?? null })));
@@ -596,6 +695,7 @@ function runSummary(run: DelegationRunRecord): Record<string, unknown> {
     attempts: run.attempts.length,
     pending_events: run.pendingEvents.length,
     undelivered_events: undelivered,
+    no_target_events: noTarget,
     ...(failedDeliveries.length ? { failed_deliveries: failedDeliveries } : {}),
     next_action: run.nextAction,
     updated_at: run.updatedAt
@@ -672,8 +772,13 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     workspace_id: WORKSPACE_ID.optional()
   }).strict();
 
+  const replayArgs = z.object({
+    run_id: RUN_ID,
+    workspace_id: WORKSPACE_ID.optional()
+  }).strict();
+
   const eventsSubscribeArgs = z.object({
-    workspace_id: WORKSPACE_ID.optional().describe("Workspace id whose bridge dir owns the subscription. Omit for the session workspace."),
+    workspace_id: WORKSPACE_ID.optional().describe("Workspace id for access validation (must be permitted). Subscriptions always persist under the canonical subscription authority shared across permitted workspaces. Omit for the session workspace."),
     callback_url: z.string().max(2048).describe("HTTPS webhook callback. Private/local targets and redirects are refused."),
     event_name: z.string().optional().describe("Must be run-attention when set."),
     filter: z.object({
@@ -684,7 +789,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
   }).strict();
 
   const eventsUnsubscribeArgs = z.object({
-    workspace_id: WORKSPACE_ID.optional().describe("Workspace id whose bridge dir owns the subscription. Omit for the session workspace."),
+    workspace_id: WORKSPACE_ID.optional().describe("Workspace id for access validation (must be permitted). Removal applies to the canonical subscription authority. Omit for the session workspace."),
     subscription_id: z.string().min(1).max(128)
   }).strict();
 
@@ -803,6 +908,35 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               executed: false
             });
           }
+          // Fail-closed crash window: a staged launch that never persisted a
+          // pid and never observed a spawn failure is uncertain (possible
+          // pid-less orphan). Never auto-spawn a second worker; require
+          // explicit recover (inspect + cancel/replay). The same holds for
+          // legacy pid-less running/queued launches that predate pending
+          // staging. Terminal runs are not uncertain: they already settled.
+          if (!DELEGATION_TERMINAL_STATES.has(existing.state) && isUncertainDispatch(existing)) {
+            return failResult(`Launch dispatch for request ${requestId} is uncertain (run ${existing.runId} holds a pid-less pending launch with no observed spawn failure; a crash between spawn and pid save is possible with a pid-less orphan). No second worker spawned. Inspect via delegation_read_result, cancel any orphan via delegation_cancel, then relaunch only with explicit recover (never auto-spawn).`, {
+              error: "launch_uncertain",
+              run_id: existing.runId,
+              request_id: requestId,
+              stored: false,
+              executed: false,
+              uncertain_dispatch: true,
+              next_action: existing.nextAction
+            });
+          }
+          if (!DELEGATION_TERMINAL_STATES.has(existing.state) && !existing.pendingDispatch && isRunPidLess(existing) &&
+            (existing.state === "running" || existing.state === "queued")) {
+            return failResult(`Launch dispatch for request ${requestId} is uncertain (run ${existing.runId} is ${existing.state} but never persisted a pid; a crash between spawn and pid save is possible with a pid-less orphan). No second worker spawned. Inspect via delegation_read_result, cancel any orphan via delegation_cancel, then relaunch only with explicit recover (never auto-spawn).`, {
+              error: "launch_uncertain",
+              run_id: existing.runId,
+              request_id: requestId,
+              stored: false,
+              executed: false,
+              uncertain_dispatch: true,
+              next_action: existing.nextAction
+            });
+          }
           return okResult(`Idempotent replay: request ${requestId} already owns run ${existing.runId} (state ${existing.state}). No second worker spawned.`, {
             run_id: existing.runId, request_id: requestId, state: existing.state, idempotent_replay: true, next_action: existing.nextAction
           });
@@ -878,23 +1012,31 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           workdir: resolved.absPath,
           ownerIdHash: owner.ownerIdHash,
           ownerKind: owner.ownerKind,
-          state: "running",
+          state: "queued",
           seq: 0,
-          attempts: [{
-            n: 1,
-            startedAt: now,
-            state: "running",
-            summary: sanitizeSummary(attemptSummary)
-          }],
+          attempts: [],
           pendingEvents: [],
           checkpoints: [],
           appliedCheckpointIds: [],
           lastAppliedCheckpointSeq: -1,
           inputRequests: [],
-          nextAction: "poll delegation_read_result or await the run-attention event",
+          nextAction: "launch staged as pending-dispatch; dispatching initial attempt",
           createdAt: now,
           updatedAt: now
         };
+        // Crash-safe initial launch: reserve attempt 1 as pending-dispatch
+        // BEFORE spawn (request id reserved, no pid yet). A crash between
+        // spawn success and pid save leaves a pid-less pending launch that
+        // retry must fail closed as launch_uncertain (never a second worker).
+        run = stagePendingLaunch(run, {
+          requestId,
+          attemptN: 1,
+          timeoutMs,
+          prompt,
+          sessionEvidence: engine === "codex"
+            ? `initial launch via codex exec --profile ${profile} (Luna verified)`
+            : `initial launch via opencode run --model ${model} (host-model verified)`
+        });
         saveDelegationRun(bridgeDir, run);
         try {
           if (engine === "codex") {
@@ -904,17 +1046,58 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           }
         } catch (error) {
           run = loadDelegationRun(bridgeDir, runId) ?? run;
+          // Observed sync spawn failure after staging (no worker started):
+          // drop the launch reservation and mark terminal failed. Retry
+          // with the SAME request id replays the failed run (no second
+          // worker); a fresh attempt needs a NEW request id. This is
+          // distinct from crash-before-save (pid-less pending, no observed
+          // failure, non-terminal) which stays uncertain and fails closed
+          // as launch_uncertain on retry.
+          if (run.pendingDispatch?.isLaunch) {
+            run = clearPendingDispatch(run);
+          }
           run.state = "failed";
           const latest = run.attempts.at(-1);
           if (latest) {
             latest.state = "failed";
             latest.finishedAt = new Date().toISOString();
             latest.summary = sanitizeSummary(`launch failed: ${error instanceof Error ? error.message : String(error)}`);
+          } else {
+            run.attempts = [{
+              n: 1,
+              startedAt: now,
+              finishedAt: new Date().toISOString(),
+              state: "failed",
+              summary: sanitizeSummary(`launch failed: ${error instanceof Error ? error.message : String(error)}`)
+            }];
           }
           run.result = { exitCode: 127, signal: null, timedOut: false, summary: sanitizeSummary(error instanceof Error ? error.message : String(error)) };
-          enqueueTerminalEvent(run, loadSubscriptions(bridgeDir));
+          enqueueTerminalEvent(run, loadSubscriptions(subscriptionAuthorityDirFor(deps.config)));
           saveDelegationRun(bridgeDir, run);
           return failResult(`Launch failed: ${error instanceof Error ? error.message : String(error)}`, { error: "launch_failed", run_id: runId });
+        }
+        // Spawn returned synchronously (no throw): confirm the staged launch
+        // in the SAME pid-save boundary. spawnCanaryChild already persisted
+        // the pid on the queued pending attempt (preserving pending); here
+        // promote that queued attempt to running and clear the pending
+        // reservation atomically. A crash before this save leaves pid-less
+        // pending (uncertain, fail closed); a crash after leaves running with
+        // a pid (idempotent replay, no second worker).
+        {
+          const confirmed = loadDelegationRun(bridgeDir, runId) ?? run;
+          const stagedN = confirmed.pendingDispatch?.attemptN ?? 1;
+          const latest = confirmed.attempts.find((a) => a.n === stagedN);
+          if (latest) {
+            latest.state = "running";
+            latest.summary = sanitizeSummary(attemptSummary);
+          }
+          const { pendingDispatch: _droppedLaunch, ...restLaunch } = confirmed as DelegationRunRecord;
+          run = {
+            ...(restLaunch as DelegationRunRecord),
+            state: "running",
+            nextAction: "poll delegation_read_result or await the run-attention event"
+          };
+          saveDelegationRun(bridgeDir, run);
         }
         return okResult(
           engine === "codex"
@@ -1004,8 +1187,13 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           if (acked.length > 0) saveDelegationRun(bridgeDir, current);
         }
         const includeEvents = args.include_events !== false;
-        const undelivered = current.pendingEvents.filter((event) =>
-          event.deliveries.some((delivery) => delivery.status === "pending" || delivery.status === "failed"));
+        // Truthful: events with zero targets are undelivered (no-targets-
+        // pending), never silent 0. Per-event no_targets marks the explicit
+        // no-target state; delegation_replay_events attaches current matches.
+        const undelivered = current.pendingEvents.filter(isEventUndelivered);
+        const noTargetIds = current.pendingEvents
+          .filter((event) => event.deliveries.length === 0)
+          .map((event) => event.eventId);
         const failedDeliveries = current.pendingEvents.flatMap((event) =>
           event.deliveries.filter((delivery) => delivery.status === "failed" || delivery.status === "permanent")
             .map((delivery) => ({ event_id: event.eventId, sub_id: delivery.subId, status: delivery.status, attempts: delivery.attempts, error: delivery.lastError ?? null, next_retry_at: delivery.nextRetryAt ?? null })));
@@ -1043,10 +1231,14 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               pending_events: current.pendingEvents.map((event) => ({
                 event_id: event.eventId, seq: event.seq, state: event.state,
                 summary: event.summary ?? null, acked: event.acked ?? false,
+                ...(event.deliveries.length === 0 ? { no_targets: true } : {}),
                 deliveries: event.deliveries
               })),
-              undelivered_count: undelivered.length
+              undelivered_count: undelivered.length,
+              no_target_events: noTargetIds.length,
+              ...(noTargetIds.length ? { no_target_event_ids: noTargetIds } : {})
             } : {}),
+            ...(noTargetIds.length ? { replay_hint: "stored event(s) have no delivery targets; attach current matching targets via delegation_replay_events" } : {}),
             ...(failedDeliveries.length ? { failed_deliveries: failedDeliveries } : {}),
             ...(acked.length ? { acked_event_ids: acked } : {}),
             next_action: current.nextAction
@@ -1214,12 +1406,34 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             }
           }
           const n = existingPending ? existingPending.attemptN : run.attempts.length + 1;
+          // Fail-closed crash window for follow-up: a pid-less pending with
+          // no observed failure marker is uncertain (crash between spawn
+          // success and pid save is possible, with a pid-less orphan). The
+          // stagedAlivePid liveness gate alone is insufficient: with no pid
+          // there is nothing to probe. Never auto-spawn a second worker;
+          // require explicit recover (inspect + cancel/replay).
+          if (existingPending && isUncertainDispatch(run)) {
+            return failResult(`Follow-up dispatch for checkpoint ${checkpoint.id} is uncertain (run ${run.runId} holds a pid-less pending dispatch with no observed spawn failure; a crash between spawn and pid save is possible with a pid-less orphan). No second worker spawned. Inspect via delegation_read_result, cancel any orphan via delegation_cancel, then replay only with explicit recover (never auto-spawn a second worker).`, {
+              error: "dispatch_uncertain",
+              run_id: run.runId,
+              checkpoint_id: checkpoint.id,
+              input_request_id: request.id,
+              stored: false,
+              executed: false,
+              uncertain_dispatch: true,
+              attempt_n: existingPending.attemptN,
+              next_action: run.nextAction
+            });
+          }
           // Dispatch recovery: reconcile the persisted PID+starttime identity
           // via isProcessIdentityAlive BEFORE any retry, including
           // needs-input. A staged dispatch may have spawned its worker before
           // a crash without confirming (persisted pid on the queued pending
           // attempt). A live staged worker is confirmed without spawning a
           // second worker; only a dead/absent worker respawns (same attemptN).
+          // Pid-less pending WITHOUT an observed failure marker never reaches
+          // here (uncertain above): the liveness gate alone cannot prove a
+          // pid-less dispatch did not spawn.
           let stagedAlivePid: number | undefined;
           if (existingPending) {
             const persistedLatest = run.attempts.at(-1);
@@ -1290,9 +1504,16 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                 child = launchOpenCodeCanary(deps, bridgeDir, run, run.model ?? "", staged.timeoutMs, staged.prompt, runIsCanary, resumeSessionId);
               }
             } catch (error) {
-              // Pending stays: not consumed, retryable with the same reply ID.
+              // Observed sync spawn failure: mark the staged pending with the
+              // failure so the identical reply id stays explicitly retryable
+              // (same attempt number). A pid-less pending WITHOUT this marker
+              // stays uncertain and fails closed instead (never auto-spawn).
               // Reload to preserve the exact persisted pending (spawn may have
               // partially mutated the in-memory run before throwing).
+              const toMarkSync = loadDelegationRun(bridgeDir, run.runId) ?? run;
+              if (toMarkSync.pendingDispatch && toMarkSync.pendingDispatch.checkpointId === checkpoint.id) {
+                saveDelegationRun(bridgeDir, markPendingDispatchFailed(toMarkSync, error instanceof Error ? error.message : String(error)));
+              }
               const pending = loadDelegationRun(bridgeDir, run.runId) ?? run;
               return failResult(`Continuation dispatch failed before attempt start; answer staged as pending-dispatch (not consumed, retryable with the same reply ID): ${error instanceof Error ? error.message : String(error)}`, {
                 error: "dispatch_pending",
@@ -1308,12 +1529,17 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             try {
               await waitForSpawn(child);
             } catch (error) {
-              // Async spawn failure (e.g. missing binary): the staged pending
-              // is untouched (pre-confirm error/close never finalizes while
-              // pending), so the identical reply id stays retryable with the
-              // same attempt number. Drop the dead live handle only.
+              // Observed async spawn failure (e.g. missing binary): mark the
+              // staged pending with the failure so the identical reply id
+              // stays explicitly retryable. The staged pending is otherwise
+              // untouched (pre-confirm error/close never finalizes while
+              // pending). Drop the dead live handle only.
               if (processRuntime().live.get(run.runId)?.child === child) {
                 processRuntime().live.delete(run.runId);
+              }
+              const toMarkAsync = loadDelegationRun(bridgeDir, run.runId) ?? run;
+              if (toMarkAsync.pendingDispatch && toMarkAsync.pendingDispatch.checkpointId === checkpoint.id) {
+                saveDelegationRun(bridgeDir, markPendingDispatchFailed(toMarkAsync, error instanceof Error ? error.message : String(error)));
               }
               const pending = loadDelegationRun(bridgeDir, run.runId) ?? run;
               return failResult(`Continuation dispatch failed before attempt start; answer staged as pending-dispatch (not consumed, retryable with the same reply ID): ${error instanceof Error ? error.message : String(error)}`, {
@@ -1433,11 +1659,12 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           return failResult(error instanceof Error ? error.message : String(error), { error: code, run_id: run.runId });
         }
         run = registered.run;
-        const subs = loadSubscriptions(bridgeDir);
+        // Needs-input wake-up targets come from the canonical authority too,
+        // owner-checked plus group/run-filtered (same selection as terminal).
+        const subs = selectDeliveryTargets(run, loadSubscriptions(subscriptionAuthorityDirFor(deps.config)));
         const event = run.pendingEvents.at(-1);
         if (event) {
           event.deliveries = subs
-            .filter((sub) => subscriptionMatches(sub, { delegationGroup: run.delegationGroup, runId: run.runId }))
             .map((sub) => ({ subId: sub.subId, status: "pending" as const, attempts: 0 }));
         }
         // Atomic: needs-input state + wake-up event persist in one write.
@@ -1491,7 +1718,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         }
         current.state = "cancelled";
         current.result = { exitCode: null, signal: null, timedOut: false, summary: sanitizeSummary("cancelled by owner") };
-        enqueueTerminalEvent(current, loadSubscriptions(bridgeDir));
+        enqueueTerminalEvent(current, loadSubscriptions(subscriptionAuthorityDirFor(deps.config)));
         saveDelegationRun(bridgeDir, current);
         await pumpDeliveries(deps, bridgeDir, loadDelegationRun(bridgeDir, current.runId) ?? current).catch(() => undefined);
         return okResult(
@@ -1503,6 +1730,62 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             cleanup_finished: tree.cleanupFinished,
             remaining_pids: tree.remaining,
             signalled_pids: tree.signalled
+          }
+        );
+      }
+    },
+    {
+      name: "delegation_replay_events",
+      options: {
+        title: "Delegation Replay Events",
+        description: "Explicit replay for stored no-target wake-up events: attaches the CURRENTLY matching canonical-authority subscriptions (owner-checked plus delegation-group/run id filters) as fresh pending deliveries, then pumps through the ordinary app-delivery gate. Only events with zero deliveries are eligible; events that already carry deliveries keep their history and are never backfilled to new/wider scopes. Owner-scoped like every delegation op; knowing a group or run id grants no access.",
+        inputSchema: publicSchemaFrom(replayArgs),
+        runtimeInputSchema: replayArgs,
+        annotations: DESTRUCTIVE
+      },
+      handler: async (args) => {
+        const workspace = deps.workspaces.getWorkspace(args.workspace_id);
+        const bridgeDir = bridgeDirFor(deps.config, workspace.root);
+        const run = loadDelegationRun(bridgeDir, args.run_id);
+        if (!run || !ownerAllowed(deps, run)) return denyAccess();
+        const reconciled = reconcileRunState(run, isProcessIdentityAlive);
+        let current = reconciled.run;
+        if (reconciled.changed) saveDelegationRun(bridgeDir, current);
+        // Targets come from the canonical authority (never the run bridge),
+        // filtered to the run owner's currently matching subscriptions.
+        const authoritySubs = loadSubscriptions(subscriptionAuthorityDirFor(deps.config));
+        const { attached, stillNoTarget } = attachReplayTargets(current, authoritySubs);
+        if (attached.length > 0) {
+          current.nextAction = nextActionFor(current.state,
+            current.pendingEvents.some(isEventUndelivered),
+            current.pendingEvents.some((event) => event.deliveries.length === 0));
+          // Atomic: attached targets persist with the run before any POST.
+          saveDelegationRun(bridgeDir, current);
+        }
+        current = await pumpDeliveries(deps, bridgeDir, loadDelegationRun(bridgeDir, current.runId) ?? current);
+        const attachedSubIds = [...new Set(attached.flatMap((entry) => entry.subIds))];
+        const undelivered = current.pendingEvents.filter(isEventUndelivered).length;
+        if (attached.length === 0 && stillNoTarget.length === 0) {
+          return okResult(`Run ${current.runId}: no no-target events to replay (every stored event already carries deliveries; history is never backfilled).`, {
+            run_id: current.runId, state: current.state,
+            replayed_event_ids: [], attached_sub_ids: [], still_no_target_event_ids: [],
+            undelivered_events: undelivered,
+            delivery_enabled: isAppEventDeliveryEnabled(),
+            next_action: current.nextAction
+          });
+        }
+        return okResult(
+          `Run ${current.runId}: replay attached ${attachedSubIds.length} current matching target(s) to ${attached.length} no-target event(s)` +
+          (stillNoTarget.length ? `; ${stillNoTarget.length} event(s) still have no matching targets` : "") +
+          `.`,
+          {
+            run_id: current.runId, state: current.state,
+            replayed_event_ids: attached.map((entry) => entry.eventId),
+            attached_sub_ids: attachedSubIds,
+            still_no_target_event_ids: stillNoTarget,
+            undelivered_events: undelivered,
+            delivery_enabled: isAppEventDeliveryEnabled(),
+            next_action: current.nextAction
           }
         );
       }
@@ -1529,14 +1812,18 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "events_subscribe",
       options: {
         title: "Events Subscribe",
-        description: "Subscribe a webhook to the run-attention event (official events/subscribe). Validates a whsec_ secret, HTTPS callback, and private/local blocks; verifies the callback with a signed verification challenge (msg_verification_* webhook-id, Standard Webhooks, X-MCP-Subscription-Id binding). Deterministic subscription ids make repeat calls idempotent. Challenge failure is error -32015 with data.reason. Verification + storage are always allowed; only app-event POSTs are gated by CODEXPRO_EVENTS_DELIVERY_ENABLED.",
+        description: "Subscribe a webhook to the run-attention event (official events/subscribe). Validates a whsec_ secret, HTTPS callback, and private/local blocks; verifies the callback with a signed verification challenge (msg_verification_* webhook-id, Standard Webhooks, X-MCP-Subscription-Id binding). Deterministic subscription ids make repeat calls idempotent. Challenge failure is error -32015 with data.reason. Verification + storage are always allowed; only app-event POSTs are gated by CODEXPRO_EVENTS_DELIVERY_ENABLED. Subscriptions persist once under the canonical subscription authority (server defaultRoot bridge) and serve runs in every permitted workspace; run state stays in the run workspace.",
         inputSchema: publicSchemaFrom(eventsSubscribeArgs),
         runtimeInputSchema: eventsSubscribeArgs,
         annotations: DESTRUCTIVE
       },
       handler: async (args) => {
-        const workspace = deps.workspaces.getWorkspace(args.workspace_id);
-        const bridgeDir = bridgeDirFor(deps.config, workspace.root);
+        // Resolve the named workspace for access-boundary validation (outside
+        // allowedRoots still refuses), but store under the canonical
+        // subscription authority so completion in ANY permitted workspace
+        // finds the same targets. Matches POST /mcp events/subscribe.
+        deps.workspaces.getWorkspace(args.workspace_id);
+        const bridgeDir = subscriptionAuthorityDirFor(deps.config);
         const owner = ownerIdFor(deps.config.authToken, localOwnerId(deps.config));
         // Compat wrapper -> official params (verification + storage always
         // allowed; split flags gate only app-event pump, never subscribe).
@@ -1601,14 +1888,16 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "events_unsubscribe",
       options: {
         title: "Events Unsubscribe",
-        description: "Remove one webhook subscription. Idempotent and owner-checked: unknown ids and other owners' ids both report removed:false without disclosure.",
+        description: "Remove one webhook subscription from the canonical subscription authority (server defaultRoot bridge). Idempotent and owner-checked: unknown ids and other owners' ids both report removed:false without disclosure.",
         inputSchema: publicSchemaFrom(eventsUnsubscribeArgs),
         runtimeInputSchema: eventsUnsubscribeArgs,
         annotations: DESTRUCTIVE
       },
       handler: async (args) => {
-        const workspace = deps.workspaces.getWorkspace(args.workspace_id);
-        const bridgeDir = bridgeDirFor(deps.config, workspace.root);
+        // Same access-boundary validation as subscribe; removal applies to
+        // the canonical authority, never a per-workspace copy.
+        deps.workspaces.getWorkspace(args.workspace_id);
+        const bridgeDir = subscriptionAuthorityDirFor(deps.config);
         const subs = loadSubscriptions(bridgeDir);
         const index = subs.findIndex((sub) => sub.subId === String(args.subscription_id));
         if (index < 0) {

@@ -15,14 +15,15 @@
  *
  * Owner/bridge binding matches the compat tools: the owner id is recomputed
  * from the CURRENT server credentials (bearer token or local uid+root) and
- * subscriptions persist under the default workspace bridge dir. Knowing a
- * group, run, or subscription id grants no access.
+ * subscriptions persist under the canonical subscription authority dir
+ * (server defaultRoot bridge). Knowing a group, run, or subscription id
+ * grants no access. Completion delivery lookup reads this SAME authority dir
+ * (never the run workspace bridge), so a subscription is visible to runs in
+ * every permitted workspace; run state itself stays in the run workspace.
  */
 
-import fs from "node:fs";
-import path from "node:path";
 import type { CodexProConfig } from "./config.js";
-import { ownerIdFor } from "./delegationStore.js";
+import { authorityBridgeDirFor, ownerIdFor } from "./delegationStore.js";
 import {
   handleEventsList,
   handleEventsSubscribe,
@@ -55,11 +56,9 @@ function localOwnerIdFor(config: CodexProConfig): string {
 }
 
 function bridgeDirFor(config: CodexProConfig): string {
-  try {
-    return path.join(fs.realpathSync.native(config.defaultRoot), config.contextDir);
-  } catch {
-    return path.join(config.defaultRoot, config.contextDir);
-  }
+  // Canonical subscription authority: the server defaultRoot bridge dir,
+  // shared across all permitted workspaces (run state stays per-workspace).
+  return authorityBridgeDirFor(config.defaultRoot, config.contextDir);
 }
 
 function asParamsRecord(params: unknown): Record<string, unknown> {

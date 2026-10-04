@@ -203,9 +203,16 @@ export interface DelegationRunRecord {
    * Crash-safe pending dispatch: the staged answer persisted BEFORE spawn.
    * While present the reply is NOT consumed (request stays open, no answered
    * mark, no applied checkpoint). On spawn success the pending is confirmed
-   * into an applied checkpoint + running attempt; on spawn failure it stays
-   * pending and the identical checkpoint id remains retryable. Optional:
-   * runs without a pending dispatch predate this field.
+   * into an applied checkpoint + running attempt; on observed spawn failure
+   * it stays pending with lastDispatchError (the identical checkpoint id
+   * remains retryable). On crash between spawn success and pid save the
+   * persisted record is pid-less with NO lastDispatchError: dispatch outcome
+   * is uncertain (possible orphan) and retry must fail closed as
+   * dispatch_uncertain/launch_uncertain (inspect + cancel/replay, never a
+   * second worker). The same staging applies to initial launch (isLaunch):
+   * the launch request id is reserved as pending BEFORE spawn; a
+   * crash-before-save leaves a pid-less pending launch that retry must not
+   * relaunch. Optional: runs without a pending dispatch predate this field.
    */
   pendingDispatch?: DelegationPendingDispatch;
   nextAction: string;
@@ -226,6 +233,20 @@ export interface DelegationPendingDispatch {
   sessionEvidence: string;
   storedAt: string;
   state: "pending-dispatch";
+  /**
+   * True for initial-launch staging (checkpointId === launch request id, no
+   * input request). Follow-up staging omits this flag.
+   */
+  isLaunch?: boolean;
+  /**
+   * Observed spawn-failure marker: set ONLY when a spawn attempt was
+   * observed to fail synchronously or via spawn acknowledgement BEFORE any
+   * pid was persisted. A pending WITH this marker is explicitly retryable
+   * (same id, same attemptN). A pid-less pending WITHOUT it is uncertain
+   * (crash between spawn success and pid save is possible) and must fail
+   * closed, never auto-spawn a second worker.
+   */
+  lastDispatchError?: string;
 }
 
 /** Storage / output / concurrency / execution bounds for this leaf. */
@@ -271,6 +292,23 @@ export function delegationRunPath(bridgeDir: string, runId: string): string {
 
 export function subscriptionsPath(bridgeDir: string): string {
   return path.join(bridgeDir, DELEGATION_SUBSCRIPTIONS_FILENAME);
+}
+
+/**
+ * Canonical subscription authority dir: derived from the SERVER defaultRoot
+ * (plus the workspace-relative context dir), shared across ALL permitted
+ * workspaces. Official protocol subscribe (POST /mcp events/subscribe,
+ * delegationProtocol.ts) stores here; completion delivery lookup MUST read
+ * here too, while run state stays in the run workspace bridge dir. Deriving
+ * strictly from defaultRoot keeps every authority read inside allowedRoots
+ * (defaultRoot is always an allowed root by construction).
+ */
+export function authorityBridgeDirFor(defaultRoot: string, contextDir: string): string {
+  try {
+    return path.join(fs.realpathSync.native(defaultRoot), contextDir);
+  } catch {
+    return path.join(defaultRoot, contextDir);
+  }
 }
 
 export function newRunId(): string {
@@ -763,28 +801,52 @@ export function activeSessionHolders(
 export type LivenessProbe = (pid: number, startTime: string) => boolean;
 export interface ReconcileResult {
   run: DelegationRunRecord;
-  classification: "live" | "interrupted" | "completed-awaiting-delivery" | "terminal" | "needs-input";
+  classification: "live" | "interrupted" | "completed-awaiting-delivery" | "terminal" | "needs-input" | "uncertain";
   changed: boolean;
 }
 
 /**
  * Honest restart reconciliation. Never auto-restarts a potentially mutating
  * task: a dead running attempt becomes `interrupted` with an explicit next
- * action, never a silent relaunch.
+ * action, never a silent relaunch. A pid-less pending dispatch with no
+ * observed failure marker is `uncertain` (crash between spawn success and
+ * pid save is possible): it never auto-spawns and never silently becomes
+ * interrupted (which would invite a NEW request id while a pid-less orphan
+ * may still run). Explicit recover only: inspect + cancel/replay.
  */
 export function reconcileRunState(run: DelegationRunRecord, isAlive: LivenessProbe): ReconcileResult {
-  const undelivered = run.pendingEvents.some((event) =>
-    event.deliveries.some((delivery) => delivery.status === "pending" || delivery.status === "failed")
-  );
+  const undelivered = run.pendingEvents.some(isEventUndelivered);
+  const noTarget = run.pendingEvents.some((event) => event.deliveries.length === 0);
   if (DELEGATION_TERMINAL_STATES.has(run.state)) {
     if (run.state === "completed" && undelivered) {
       return {
-        run: { ...run, nextAction: "terminal result stored but wake-up delivery is pending; replay via delegation_read_result or wait for redelivery" },
+        run: {
+          ...run,
+          nextAction: noTarget
+            ? "terminal result stored but wake-up has no delivery targets; attach current matching targets via delegation_replay_events"
+            : "terminal result stored but wake-up delivery is pending; replay via delegation_read_result or wait for redelivery"
+        },
         classification: "completed-awaiting-delivery",
         changed: false
       };
     }
     return { run, classification: "terminal", changed: false };
+  }
+  // Fail-closed crash window: a staged dispatch that never persisted a pid
+  // and never observed a spawn failure is uncertain. The stagedAlivePid gate
+  // alone is insufficient: with no pid there is nothing to probe, and a
+  // prior spawn may still run as a pid-less orphan. Never auto-spawn, never
+  // silently mark interrupted (which would invite a NEW request id while the
+  // orphan may live). Explicit recover only.
+  if (run.pendingDispatch && isUncertainDispatch(run)) {
+    const launchHint = run.pendingDispatch.isLaunch
+      ? "initial launch dispatch is uncertain (crash between spawn and pid save is possible); inspect via delegation_read_result, cancel any orphan via delegation_cancel, then relaunch only with explicit recover (never auto-spawn)"
+      : "follow-up dispatch is uncertain (crash between spawn and pid save is possible); inspect via delegation_read_result, cancel any orphan via delegation_cancel, then replay only with explicit recover (never auto-spawn a second worker)";
+    return {
+      run: { ...run, nextAction: launchHint },
+      classification: "uncertain",
+      changed: false
+    };
   }
   if (run.state === "needs-input") {
     // No blind short-circuit: a staged dispatch may have spawned its worker
@@ -807,13 +869,11 @@ export function reconcileRunState(run: DelegationRunRecord, isAlive: LivenessPro
         };
       }
     }
-    const undelivered = run.pendingEvents.some((event) =>
-      event.deliveries.some((delivery) => delivery.status === "pending" || delivery.status === "failed")
-    );
+    const undeliveredNeedsInput = run.pendingEvents.some(isEventUndelivered);
     return {
       run: {
         ...run,
-        nextAction: undelivered
+        nextAction: undeliveredNeedsInput
           ? "run is waiting for input and wake-up delivery is pending; answer via delegation_followup with the matching input-request id, or replay via delegation_read_result"
           : "run is waiting for input; answer via delegation_followup with the matching input-request id"
       },
@@ -828,6 +888,20 @@ export function reconcileRunState(run: DelegationRunRecord, isAlive: LivenessPro
     return {
       run: { ...run, nextAction: "attempt process is alive; poll delegation_read_result or await the run-attention event" },
       classification: "live",
+      changed: false
+    };
+  }
+  // Legacy crash window (pre-pending launches): a running/queued attempt
+  // that never persisted a pid is uncertain, not interrupted. Marking it
+  // interrupted would invite a NEW request id while a pid-less orphan may
+  // still run. Fail closed with explicit recover.
+  if ((run.state === "running" || run.state === "queued") && isRunPidLess(run) && !run.pendingDispatch) {
+    return {
+      run: {
+        ...run,
+        nextAction: "initial launch dispatch is uncertain (no pid was ever persisted; crash between spawn and pid save is possible); inspect via delegation_read_result, cancel any orphan via delegation_cancel, then relaunch only with explicit recover (never auto-spawn)"
+      },
+      classification: "uncertain",
       changed: false
     };
   }
@@ -855,24 +929,56 @@ export function reconcileRunState(run: DelegationRunRecord, isAlive: LivenessPro
   return { run: next, classification: "interrupted", changed: true };
 }
 
-export function nextActionFor(state: DelegationRunState, undelivered: boolean): string {
+export function nextActionFor(state: DelegationRunState, undelivered: boolean, noTarget = false): string {
   if (state === "running" || state === "queued") return "poll delegation_read_result or await the run-attention event";
   if (state === "needs-input") return "answer via delegation_followup with the matching input-request id";
-  if (undelivered) return "terminal result stored but wake-up delivery is pending; replay via delegation_read_result";
+  if (undelivered) return noTarget
+    ? "terminal result stored but wake-up has no delivery targets; attach current matching targets via delegation_replay_events"
+    : "terminal result stored but wake-up delivery is pending; replay via delegation_read_result";
   if (state === "interrupted") return "inspect excerpts via delegation_read_result; relaunch only with a NEW request id";
   return "read the terminal result via delegation_read_result";
 }
 
 /**
- * Crash-safe pending dispatch helpers (defect 5).
+ * Truthful undelivered predicate: an event is undelivered when it carries
+ * pending/failed deliveries OR when it has no delivery targets at all. A
+ * stored event with zero targets must NEVER read as silent 0-delivered: it
+ * is no-targets-pending until an explicit replay attaches current matching
+ * targets (see delegation_replay_events).
+ */
+export function isEventUndelivered(event: DelegationPendingEvent): boolean {
+  if (event.deliveries.length === 0) return true;
+  return event.deliveries.some((delivery) => delivery.status === "pending" || delivery.status === "failed");
+}
+
+/** Stored events with zero delivery targets (explicit no-target state). */
+export function noTargetEvents(run: DelegationRunRecord): DelegationPendingEvent[] {
+  return run.pendingEvents.filter((event) => event.deliveries.length === 0);
+}
+
+/** All truthfully undelivered events (pending/failed deliveries OR no targets). */
+export function undeliveredEvents(run: DelegationRunRecord): DelegationPendingEvent[] {
+  return run.pendingEvents.filter(isEventUndelivered);
+}
+
+/**
+ * Crash-safe pending dispatch helpers (defect 5 + initial-launch crash window).
  *
  * stagePendingDispatch persists the answer BEFORE spawn without consuming it:
  * the request stays open, no applied checkpoint is recorded, and a queued
  * pending attempt reserves the attempt number. confirmPendingDispatch applies
  * the answer (answered mark + applied checkpoint + running attempt) only
- * after the spawn succeeds. On spawn failure the pending record stays and the
- * identical checkpoint id remains retryable (same attempt number, no
- * duplicate_conflicting). Pending records never count as consumed replies.
+ * after the spawn succeeds. On OBSERVED spawn failure the pending record
+ * stays with lastDispatchError and the identical checkpoint id remains
+ * retryable (same attempt number, no duplicate_conflicting). A pid-less
+ * pending WITHOUT lastDispatchError is uncertain (crash between spawn
+ * success and pid save is possible) and must fail closed, never auto-spawn.
+ * Pending records never count as consumed replies.
+ *
+ * stagePendingLaunch applies the same discipline to initial launch: the
+ * launch request id is reserved as pending BEFORE spawn (queued attempt 1).
+ * Crash-before-save leaves a pid-less pending launch that retry must not
+ * relaunch (dispatch_uncertain/launch_uncertain, explicit recover only).
  */
 export function stagePendingDispatch(
   run: DelegationRunRecord,
@@ -885,6 +991,7 @@ export function stagePendingDispatch(
     timeoutMs: number;
     prompt: string;
     sessionEvidence: string;
+    isLaunch?: boolean;
   }
 ): DelegationRunRecord {
   const now = new Date().toISOString();
@@ -900,10 +1007,14 @@ export function stagePendingDispatch(
     prompt: opts.prompt,
     sessionEvidence: opts.sessionEvidence,
     storedAt: now,
-    state: "pending-dispatch"
+    state: "pending-dispatch",
+    ...(opts.isLaunch ? { isLaunch: true as const } : {})
   };
   // Reuse the same attempt number when retrying the identical pending id;
-  // otherwise append a fresh queued pending attempt.
+  // otherwise append a fresh queued pending attempt. A restage preserves an
+  // existing observed-failure marker only when the caller does not replace
+  // it: a fresh stage starts uncertain (no marker) until a failure is
+  // observed and marked via markPendingDispatchFailed.
   const existingPending = run.attempts.find(
     (a) => a.n === opts.attemptN && a.state === "queued" && a.summary?.includes("pending dispatch")
   );
@@ -922,7 +1033,84 @@ export function stagePendingDispatch(
     ...run,
     pendingDispatch: pending,
     attempts,
-    nextAction: "answer staged as pending-dispatch; dispatching continuation attempt"
+    nextAction: opts.isLaunch
+      ? "launch staged as pending-dispatch; dispatching initial attempt"
+      : "answer staged as pending-dispatch; dispatching continuation attempt"
+  };
+}
+
+/**
+ * Stage a pending dispatch for initial launch (reserve attempt 1 BEFORE
+ * spawn). The launch request id doubles as the checkpoint id: there is no
+ * input request to answer, only the idempotency reservation. The persisted
+ * pending makes a crash-before-save explicitly uncertain on retry.
+ */
+export function stagePendingLaunch(
+  run: DelegationRunRecord,
+  opts: {
+    requestId: string;
+    attemptN: number;
+    timeoutMs: number;
+    prompt: string;
+    sessionEvidence: string;
+  }
+): DelegationRunRecord {
+  return stagePendingDispatch(run, {
+    checkpoint: { id: opts.requestId, run_id: run.runId, seq: 0, payload: {} },
+    requestId: opts.requestId,
+    attemptN: opts.attemptN,
+    continuation: "new-continuation-attempt",
+    timeoutMs: opts.timeoutMs,
+    prompt: opts.prompt,
+    sessionEvidence: opts.sessionEvidence,
+    isLaunch: true
+  });
+}
+
+/** True when an attempt never persisted PID+starttime identity. */
+export function isPidLessAttempt(attempt: DelegationAttempt | undefined): boolean {
+  if (!attempt) return true;
+  return attempt.pid === undefined || attempt.processStartTime === undefined;
+}
+
+/** True when the latest attempt never persisted PID+starttime identity. */
+export function isRunPidLess(run: DelegationRunRecord): boolean {
+  return isPidLessAttempt(run.attempts.at(-1));
+}
+
+/**
+ * Uncertain dispatch predicate: a staged pending whose latest attempt is
+ * pid-less AND no spawn failure was ever observed (no lastDispatchError).
+ * The stagedAlivePid liveness gate alone is insufficient here: with no pid
+ * there is nothing to probe, and a prior spawn may still run as a pid-less
+ * orphan. Uncertain retries must fail closed (dispatch_uncertain /
+ * launch_uncertain), never auto-spawn a second worker.
+ */
+export function isUncertainDispatch(run: DelegationRunRecord): boolean {
+  const pending = run.pendingDispatch;
+  if (!pending) return false;
+  if (pending.lastDispatchError) return false;
+  return isRunPidLess(run);
+}
+
+/**
+ * Mark an observed spawn failure on the staged pending (sync throw or async
+ * spawn acknowledgement failure BEFORE any pid was persisted). The pending
+ * stays with the marker, the request stays open, and the identical id
+ * remains retryable with the same attempt number. Never marks applied or
+ * consumed. The caller persists the returned run before returning
+ * dispatch_pending.
+ */
+export function markPendingDispatchFailed(run: DelegationRunRecord, errorMessage: string): DelegationRunRecord {
+  const pending = run.pendingDispatch;
+  if (!pending) return run;
+  return {
+    ...run,
+    pendingDispatch: {
+      ...pending,
+      lastDispatchError: sanitizeSummary(errorMessage || "spawn failed before attempt start")
+    },
+    nextAction: "answer staged as pending-dispatch but the last spawn attempt failed before start; retry the identical reply id (same attempt number)"
   };
 }
 
