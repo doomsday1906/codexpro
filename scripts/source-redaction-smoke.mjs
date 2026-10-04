@@ -4883,8 +4883,254 @@ try {
     }
   }), 'private-key write');
   assert.match(resultText(privateWrite), /Secret-looking content is blocked/);
+  assert.ok(resultText(privateWrite).includes('Path blocked-private-key.txt; source line(s) 1, 2, 3; matched content omitted'));
+  assert.equal(/\brule\b/i.test(resultText(privateWrite)), false, 'private-key refusal inferred a detector rule name');
   await assert.rejects(fs.access(path.join(tmp, 'blocked-private-key.txt')), (error) => error?.code === 'ENOENT');
 
+  {
+    const labelNames = [['to', 'ken_label'], ['work_', 'token_label']].map((parts) => parts.join(''));
+    const labelValue = 'NONSECRET_TEST_LABEL_42';
+    const labelPath = 'ordinary-token-labels.cs';
+    const labelAbsolutePath = path.join(tmp, labelPath);
+    const labelBase = [
+      'class OrdinaryLabelFixture {',
+      '    string fixture_kind = "test";',
+      '    string fixture_marker = "before";',
+      '}',
+      ''
+    ].join(String.fromCharCode(10));
+    const labelCandidate = [
+      'class OrdinaryLabelFixture {',
+      '    string fixture_kind = "test";',
+      `    string ${labelNames[0]} = "${labelValue}";`,
+      `    string ${labelNames[1]} = "${labelValue}";`,
+      '    string fixture_marker = "after";',
+      '}',
+      ''
+    ].join(String.fromCharCode(10));
+    await fs.writeFile(labelAbsolutePath, labelBase, { encoding: 'utf8', flag: 'wx' });
+    const labelBytesBefore = await fs.readFile(labelAbsolutePath);
+    const labelStatBefore = await fs.stat(labelAbsolutePath, { bigint: true });
+    const labelRefusal = assertToolError(await client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: workspaceId,
+        path: labelPath,
+        old_text: '    string fixture_marker = "before";',
+        new_text: [
+          '    string ' + labelNames[0] + ' = "' + labelValue + '";',
+          '    string ' + labelNames[1] + ' = "' + labelValue + '";',
+          '    string fixture_marker = "after";'
+        ].join(String.fromCharCode(10)),
+        expected_replacements: 1
+      }
+    }), 'synthetic harmless token-label MCP edit');
+    assert.ok(resultText(labelRefusal).includes('Path ' + labelPath + '; source line(s) 3, 4; matched content omitted'));
+    assert.equal(/\brule\b/i.test(resultText(labelRefusal)), false, 'token-label refusal inferred a detector rule name');
+    expectNoHostileResponseFields(labelRefusal, [labelValue], 'synthetic harmless token-label refusal');
+    assert.deepEqual(await fs.readFile(labelAbsolutePath), labelBytesBefore, 'harmless token-label refusal changed file bytes');
+    const labelStatAfter = await fs.stat(labelAbsolutePath, { bigint: true });
+    assert.equal(labelStatAfter.ino, labelStatBefore.ino, 'harmless token-label refusal replaced the file');
+    assert.equal(labelStatAfter.mtimeNs, labelStatBefore.mtimeNs, 'harmless token-label refusal changed file metadata');
+
+    const labelReadPath = 'ordinary-token-labels-read.cs';
+    await fs.writeFile(path.join(tmp, labelReadPath), labelCandidate, { encoding: 'utf8', flag: 'wx' });
+    const labelRead = assertToolSuccess(await client.request('tools/call', {
+      name: 'read', arguments: { workspace_id: workspaceId, path: labelReadPath }
+    }), 'synthetic harmless token-label read projection');
+    const projected = labelRead.structuredContent.text;
+    assert.equal(projected.includes(labelValue), false, 'source redaction exposed a synthetic label value');
+    for (const lineNo of [3, 4]) {
+      const projectedLine = projected.split(String.fromCharCode(10)).find((line) => line.trimStart().startsWith(`${lineNo} |`));
+      assert.ok(projectedLine?.includes('[REDACTED_SECRET]'), `read projection did not redact label line ${lineNo}`);
+      assert.ok(projectedLine?.includes(labelNames[lineNo - 3]), `read projection lost label identity at line ${lineNo}`);
+    }
+  }
+  {
+    // apply_patch consistency matrix: ordinary edit and apply_patch must
+    // agree on allow and block with bounded safe diagnostics. Hostile
+    // literals are assembled, never written literally, and asserted absent
+    // from every refusal envelope.
+    const matrixPyLabel = ['to', 'ken'].join('');
+    const matrixPyValue = ['SYNTHETIC_PY_', 'SECRET_9Z1'].join('');
+    const matrixCsLabel = ['api', '_key'].join('');
+    const matrixCsValue = ['SYNTHETIC_CS_', 'SECRET_9Z1'].join('');
+    const matrixTxtLabel = ['pass', 'word'].join('');
+    const matrixTxtValue = ['SYNTHETIC_TXT_', 'SECRET_9Z1'].join('');
+    const matrixWholeValue = ['SYNTHETIC_WHOLEFILE_', 'SECRET_9Z1'].join('');
+
+    // Allow agrees: benign content passes both ordinary edit and apply_patch.
+    await writeFixture(tmp, 'matrix-allow.txt', 'line one\n');
+    const matrixAllowEdit = assertToolSuccess(await client.request('tools/call', {
+      name: 'edit',
+      arguments: { workspace_id: workspaceId, path: 'matrix-allow.txt', old_text: 'line one\n', new_text: 'line one\nline two\n', expected_replacements: 1 }
+    }), 'consistency-matrix benign edit');
+    assert.ok(matrixAllowEdit.structuredContent, 'consistency-matrix benign edit omitted structured output');
+    const matrixAllowPatch = [
+      'diff --git a/matrix-allow.txt b/matrix-allow.txt',
+      '--- a/matrix-allow.txt',
+      '+++ b/matrix-allow.txt',
+      '@@ -1,2 +1,3 @@',
+      ' line one',
+      ' line two',
+      '+line three',
+      ''
+    ].join('\n');
+    const matrixAllowPatchResult = assertToolSuccess(await client.request('tools/call', {
+      name: 'apply_patch', arguments: { workspace_id: workspaceId, patch: matrixAllowPatch }
+    }), 'consistency-matrix benign apply_patch');
+    assert.ok(matrixAllowPatchResult.structuredContent, 'consistency-matrix benign apply_patch omitted structured output');
+    assert.equal(await fs.readFile(path.join(tmp, 'matrix-allow.txt'), 'utf8'), 'line one\nline two\nline three\n', 'consistency-matrix benign route changed unexpected bytes');
+
+    // Block agrees on added lines: Python detector language route.
+    const matrixBlockPath = 'matrix-block.py';
+    await writeFixture(tmp, matrixBlockPath, 'x = 1\n');
+    const matrixBlockBefore = await fs.readFile(path.join(tmp, matrixBlockPath));
+    const matrixBlockEdit = assertToolError(await client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: workspaceId,
+        path: matrixBlockPath,
+        old_text: 'x = 1\n',
+        new_text: `x = 1\n${matrixPyLabel} = ${matrixPyValue}\n`,
+        expected_replacements: 1
+      }
+    }), 'consistency-matrix hostile Python edit');
+    assert.ok(resultText(matrixBlockEdit).includes(`Path ${matrixBlockPath}; source line(s) 2; matched content omitted`), 'consistency-matrix hostile Python edit omitted bounded source-line diagnostics');
+    assert.equal(/\brule\b/i.test(resultText(matrixBlockEdit)), false, 'consistency-matrix hostile Python edit inferred a detector rule name');
+    expectNoHostileResponseFields(matrixBlockEdit, [matrixPyValue], 'consistency-matrix hostile Python edit refusal');
+    const matrixBlockPatch = [
+      `diff --git a/${matrixBlockPath} b/${matrixBlockPath}`,
+      `--- a/${matrixBlockPath}`,
+      `+++ b/${matrixBlockPath}`,
+      '@@ -1,1 +1,2 @@',
+      ' x = 1',
+      `+${matrixPyLabel} = ${matrixPyValue}`,
+      ''
+    ].join('\n');
+    const matrixBlockPatchRefusal = assertToolError(await client.request('tools/call', {
+      name: 'apply_patch', arguments: { workspace_id: workspaceId, patch: matrixBlockPatch }
+    }), 'consistency-matrix hostile Python apply_patch');
+    assert.match(resultText(matrixBlockPatchRefusal), /Secret-looking content is blocked from apply_patch/);
+    assert.match(resultText(matrixBlockPatchRefusal), new RegExp(`Path ${matrixBlockPath}; patch line\\(s\\) [0-9, +more]+; matched content omitted`), 'consistency-matrix hostile Python apply_patch omitted bounded patch-line diagnostics');
+    assert.equal(/\brule\b/i.test(resultText(matrixBlockPatchRefusal)), false, 'consistency-matrix hostile Python apply_patch inferred a detector rule name');
+    expectNoHostileResponseFields(matrixBlockPatchRefusal, [matrixPyValue], 'consistency-matrix hostile Python apply_patch refusal');
+    assert.deepEqual(await fs.readFile(path.join(tmp, matrixBlockPath)), matrixBlockBefore, 'consistency-matrix hostile Python apply_patch partially mutated the file');
+
+    // Whole-file protection: the patch hunk is benign and the canonical diff
+    // context (3 lines) cannot see the secret kept further away, but
+    // unpatched regions keep secret-looking content. Both routes must block.
+    // The hunk touches only the tail; the secret stays at source line 2.
+    const matrixWholePath = 'matrix-wholefile.py';
+    await fs.writeFile(path.join(tmp, matrixWholePath), [
+      '# benign header',
+      `${matrixPyLabel} = ${matrixWholeValue}`,
+      'x = 1',
+      '# pad a',
+      '# pad b',
+      '# pad c',
+      '# pad d',
+      '# tail marker',
+      ''
+    ].join('\n'), 'utf8');
+    const matrixWholeBefore = await fs.readFile(path.join(tmp, matrixWholePath));
+    const matrixWholePatch = [
+      `diff --git a/${matrixWholePath} b/${matrixWholePath}`,
+      `--- a/${matrixWholePath}`,
+      `+++ b/${matrixWholePath}`,
+      '@@ -6,3 +6,4 @@',
+      ' # pad c',
+      ' # pad d',
+      ' # tail marker',
+      '+# appended note',
+      ''
+    ].join('\n');
+    const matrixWholePatchRefusal = assertToolError(await client.request('tools/call', {
+      name: 'apply_patch', arguments: { workspace_id: workspaceId, patch: matrixWholePatch }
+    }), 'consistency-matrix whole-file apply_patch');
+    assert.match(resultText(matrixWholePatchRefusal), /Secret-looking content is blocked from apply_patch/);
+    assert.ok(resultText(matrixWholePatchRefusal).includes(`Path ${matrixWholePath}; source line(s) 2; matched content omitted`), 'consistency-matrix whole-file apply_patch omitted source-line diagnostics');
+    assert.equal(/\brule\b/i.test(resultText(matrixWholePatchRefusal)), false, 'consistency-matrix whole-file apply_patch inferred a detector rule name');
+    expectNoHostileResponseFields(matrixWholePatchRefusal, [matrixWholeValue], 'consistency-matrix whole-file apply_patch refusal');
+    assert.deepEqual(await fs.readFile(path.join(tmp, matrixWholePath)), matrixWholeBefore, 'consistency-matrix whole-file apply_patch partially mutated the file');
+    const matrixWholeEdit = assertToolError(await client.request('tools/call', {
+      name: 'edit',
+      arguments: {
+        workspace_id: workspaceId,
+        path: matrixWholePath,
+        old_text: '# tail marker\n',
+        new_text: '# tail marker\n# appended note\n',
+        expected_replacements: 1
+      }
+    }), 'consistency-matrix whole-file edit');
+    assert.ok(resultText(matrixWholeEdit).includes(`Path ${matrixWholePath}; source line(s) 2; matched content omitted`), 'consistency-matrix whole-file edit disagreed with apply_patch diagnostics');
+    expectNoHostileResponseFields(matrixWholeEdit, [matrixWholeValue], 'consistency-matrix whole-file edit refusal');
+    assert.deepEqual(await fs.readFile(path.join(tmp, matrixWholePath)), matrixWholeBefore, 'consistency-matrix whole-file edit mutated the file');
+
+    // Language handling: .cs and .txt have no dedicated parser (undefined
+    // language) and must still block hostile content without crashing, while
+    // benign .cs content stays allowed.
+    const matrixBenignCsPath = 'matrix-lang-benign.cs';
+    await writeFixture(tmp, matrixBenignCsPath, 'class Benign {\n}\n');
+    const matrixBenignCsPatch = [
+      `diff --git a/${matrixBenignCsPath} b/${matrixBenignCsPath}`,
+      `--- a/${matrixBenignCsPath}`,
+      `+++ b/${matrixBenignCsPath}`,
+      '@@ -1,2 +1,3 @@',
+      ' class Benign {',
+      '+    // harmless note',
+      ' }',
+      ''
+    ].join('\n');
+    assertToolSuccess(await client.request('tools/call', {
+      name: 'apply_patch', arguments: { workspace_id: workspaceId, patch: matrixBenignCsPatch }
+    }), 'consistency-matrix benign C# apply_patch');
+    assert.equal(await fs.readFile(path.join(tmp, matrixBenignCsPath), 'utf8'), 'class Benign {\n    // harmless note\n}\n', 'consistency-matrix benign C# apply_patch changed unexpected bytes');
+
+    const matrixCsPath = 'matrix-lang.cs';
+    await writeFixture(tmp, matrixCsPath, 'class Lang {\n}\n');
+    const matrixCsBefore = await fs.readFile(path.join(tmp, matrixCsPath));
+    const matrixCsPatch = [
+      `diff --git a/${matrixCsPath} b/${matrixCsPath}`,
+      `--- a/${matrixCsPath}`,
+      `+++ b/${matrixCsPath}`,
+      '@@ -1,2 +1,3 @@',
+      ' class Lang {',
+      `+    string ${matrixCsLabel} = "${matrixCsValue}";`,
+      ' }',
+      ''
+    ].join('\n');
+    const matrixCsRefusal = assertToolError(await client.request('tools/call', {
+      name: 'apply_patch', arguments: { workspace_id: workspaceId, patch: matrixCsPatch }
+    }), 'consistency-matrix hostile C# apply_patch');
+    assert.match(resultText(matrixCsRefusal), /Secret-looking content is blocked from apply_patch/);
+    assert.match(resultText(matrixCsRefusal), new RegExp(`Path ${matrixCsPath}; patch line\\(s\\) [0-9, +more]+; matched content omitted`), 'consistency-matrix hostile C# apply_patch omitted bounded patch-line diagnostics');
+    assert.equal(/\brule\b/i.test(resultText(matrixCsRefusal)), false, 'consistency-matrix hostile C# apply_patch inferred a detector rule name');
+    expectNoHostileResponseFields(matrixCsRefusal, [matrixCsValue], 'consistency-matrix hostile C# apply_patch refusal');
+    assert.deepEqual(await fs.readFile(path.join(tmp, matrixCsPath)), matrixCsBefore, 'consistency-matrix hostile C# apply_patch partially mutated the file');
+
+    const matrixTxtPath = 'matrix-lang.txt';
+    await writeFixture(tmp, matrixTxtPath, 'note = 1\n');
+    const matrixTxtBefore = await fs.readFile(path.join(tmp, matrixTxtPath));
+    const matrixTxtPatch = [
+      `diff --git a/${matrixTxtPath} b/${matrixTxtPath}`,
+      `--- a/${matrixTxtPath}`,
+      `+++ b/${matrixTxtPath}`,
+      '@@ -1,1 +1,2 @@',
+      ' note = 1',
+      `+${matrixTxtLabel} = "${matrixTxtValue}"`,
+      ''
+    ].join('\n');
+    const matrixTxtRefusal = assertToolError(await client.request('tools/call', {
+      name: 'apply_patch', arguments: { workspace_id: workspaceId, patch: matrixTxtPatch }
+    }), 'consistency-matrix hostile txt apply_patch');
+    assert.match(resultText(matrixTxtRefusal), /Secret-looking content is blocked from apply_patch/);
+    assert.match(resultText(matrixTxtRefusal), new RegExp(`Path ${matrixTxtPath}; patch line\\(s\\) [0-9, +more]+; matched content omitted`), 'consistency-matrix hostile txt apply_patch omitted bounded patch-line diagnostics');
+    assert.equal(/\brule\b/i.test(resultText(matrixTxtRefusal)), false, 'consistency-matrix hostile txt apply_patch inferred a detector rule name');
+    expectNoHostileResponseFields(matrixTxtRefusal, [matrixTxtValue], 'consistency-matrix hostile txt apply_patch refusal');
+    assert.deepEqual(await fs.readFile(path.join(tmp, matrixTxtPath)), matrixTxtBefore, 'consistency-matrix hostile txt apply_patch partially mutated the file');
+    console.log('APPLY_PATCH_CONSISTENCY_MATRIX: ordinary edit and apply_patch agree on allow and block; whole-file and undefined-language routes refused with bounded diagnostics');
+  }
   {
   const approvalRegistryPath = path.join(tmp, 'source-approvals.json');
   const approvalClient = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--bash', 'off', '--write', 'workspace', '--tool-mode', 'full'], {

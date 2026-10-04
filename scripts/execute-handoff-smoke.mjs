@@ -374,6 +374,8 @@ import fs from 'node:fs';
 console.log('x'.repeat(200000));
 fs.appendFileSync('app.txt', 'after noisy output\\n');
 `, 'utf8');
+requireSuccess(spawnSync('git', ['init'], { cwd: noisyRoot, encoding: 'utf8' }), 'noisy git init');
+requireSuccess(spawnSync('git', ['add', 'app.txt'], { cwd: noisyRoot, encoding: 'utf8' }), 'noisy git add');
 requireSuccess(run([
   'execute-handoff',
   '--root',

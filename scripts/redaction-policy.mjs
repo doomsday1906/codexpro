@@ -261,12 +261,25 @@ function sourceLineBounds(code, offset) {
 
 function hasVariableInitializerAnchor(code, offset) {
   const prefix = sourceAnchorPrefix(code, offset);
-  return /(?:^|[\n;{}])\s*(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*:\s*[^=;{}]+)?\s*=\s*$/u.test(prefix);
+  // `import x = ...` (TypeScript import-equals, including `export import`)
+  // and `using x = ...` (C# using-alias / using declaration) bind a name to
+  // a module/namespace reference exactly like a const/let/var initializer, so
+  // they share this declaration anchor. This cannot allowlist a quoted
+  // literal: string/comment bytes never survive trivia masking, and callers
+  // reject the match before this anchor is consulted. Known token shapes
+  // (provider/JWT/OpenAI/Authorization/URL) are caught by the direct patterns
+  // independently of any anchor, so parity with const introduces no new hole.
+  // The optional leading `+` is unified-diff added-line framing, so an added
+  // declaration is judged as the statement the edit path scans post-apply and
+  // both mutation paths agree. Removal (`-`) lines stay framed and fail closed.
+  return /(?:^|[\n;{}])[+]?\s*(?:export\s+)?(?:const|let|var|import|using)\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*:\s*[^=;{}]+)?\s*=\s*$/u.test(prefix);
 }
 
 function hasAssignmentAnchor(code, offset, value = '') {
   const prefix = sourceAnchorPrefix(code, offset);
-  if (!/(?:^|[\n;{}])\s*(?:[+-]\s*)?[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*$/u.test(prefix)) return false;
+  // Optional leading `+` is unified-diff added-line framing (see the
+  // declaration anchor above); removals stay framed and fail closed.
+  if (!/(?:^|[\n;{}])[+]?\s*(?:[+-]\s*)?[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*$/u.test(prefix)) return false;
   // Compact assignment syntax is ambiguous with env/config records. Retain
   // only the existing root-call compatibility (`TOKEN=getToken(...)`); a
   // compact member or member-call value stays conservative.

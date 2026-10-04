@@ -6,7 +6,7 @@ import { minimatch } from "minimatch";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, displayPath, normalizeRelPath, PathGuard } from "./guard.js";
-import { hasSecretValue, redactSensitiveText, redactSensitiveTextPreservingLines, sourceLanguageForPath } from "./redact.js";
+import { hasSecretValue, redactSensitiveText, redactSensitiveTextPreservingLines, sourceLanguageForPath, sourceSafetyRefusalMessage } from "./redact.js";
 import {
   FIXED_SNAPSHOT_BYTES,
   LINE_FRAG_CAP_BYTES,
@@ -1009,8 +1009,10 @@ export async function writeTextFile(
   if (contentBytes > config.maxWriteBytes) {
     throw new CodexProError(`Write content is too large (${contentBytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
   }
-  if (hasSecretValue(content, { context: "source", language: sourceLanguageForPath(resolved.relPath), sourcePath: resolved.absPath })) {
-    throw new CodexProError("Secret-looking content is blocked from write. Use placeholders such as [REDACTED_SECRET] in handoff files.");
+  const sourceOptions = { context: "source" as const, language: sourceLanguageForPath(resolved.relPath), sourcePath: resolved.absPath };
+  if (hasSecretValue(content, sourceOptions)) {
+    const redacted = redactSensitiveTextPreservingLines(content, sourceOptions);
+    throw new CodexProError(sourceSafetyRefusalMessage("write", resolved.relPath, content, redacted));
   }
 
   const releaseWriteLock = await acquireFileWriteLock(resolved.absPath);
@@ -1087,8 +1089,10 @@ export async function editTextFile(
     if (afterBytes > config.maxWriteBytes) {
       throw new CodexProError(`Edited file would be too large (${afterBytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
     }
-    if (hasSecretValue(after, { context: "source", language: sourceLanguageForPath(resolved.relPath), sourcePath: resolved.absPath })) {
-      throw new CodexProError("Secret-looking content is blocked from edit. Use placeholders such as [REDACTED_SECRET] in handoff files.");
+    const sourceOptions = { context: "source" as const, language: sourceLanguageForPath(resolved.relPath), sourcePath: resolved.absPath };
+    if (hasSecretValue(after, sourceOptions)) {
+      const redacted = redactSensitiveTextPreservingLines(after, sourceOptions);
+      throw new CodexProError(sourceSafetyRefusalMessage("edit", resolved.relPath, after, redacted));
     }
 
     const diff = makeUnifiedDiff(before, after, resolved.relPath);

@@ -76,6 +76,37 @@ export function redactSensitiveTextPreservingLines(text: string, options: Redact
   return policyRedactSensitiveTextPreservingLines(text, options);
 }
 
+/** Describe a blocked source candidate without echoing matched content. */
+export function sourceSafetyRefusalMessage(
+  operation: "write" | "edit" | "apply_patch",
+  filePath: string,
+  source: string,
+  redacted: string,
+  coordinate: "source line" | "patch line" = "source line"
+): string {
+  const sourceLines = String(source ?? "").split(/\r\n|\n|\r/u);
+  const redactedLines = String(redacted ?? "").split(/\r\n|\n|\r/u);
+  const lineNumbers: number[] = [];
+  if (sourceLines.length === redactedLines.length) {
+    for (let index = 0; index < sourceLines.length; index += 1) {
+      if (sourceLines[index] !== redactedLines[index]) lineNumbers.push(index + 1);
+    }
+  }
+
+  const shownLines = lineNumbers.slice(0, 12).join(", ");
+  const overflow = lineNumbers.length > 12 ? `, +${lineNumbers.length - 12} more` : "";
+  const location = lineNumbers.length > 0
+    ? `${coordinate}(s) ${shownLines}${overflow}`
+    : `${coordinate}(s) unavailable (line-preserving evidence unavailable)`;
+  // The diagnostic stays generic on purpose: the detector reports only a
+  // boolean, never a rule name, so no rule identity is claimed here. Only the
+  // sanitized path and bounded physical line numbers are disclosed; matched
+  // content is never echoed.
+  const safePath = redactDiagnosticText(String(filePath ?? ""))
+    .replace(/[\r\n]/gu, " ")
+    .slice(0, 512) || "<unknown>";
+  return `Secret-looking content is blocked from ${operation}. Use placeholders such as [REDACTED_SECRET] in handoff files. Path ${safePath}; ${location}; matched content omitted.`;
+}
 export function redactUnifiedDiff(
   text: string,
   languageForPath?: (path: string | undefined) => SourceLanguage | undefined,

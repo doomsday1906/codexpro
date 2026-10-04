@@ -39,7 +39,7 @@ import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
 import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
-import { hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactStructured, redactUnifiedDiff, sourceLanguageForPath, truncateUtf8 } from "./redact.js";
+import { hasSecretValue, hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactSensitiveTextPreservingLines, redactStructured, redactUnifiedDiff, redactUnifiedDiffPreservingLines, sourceLanguageForPath, sourceSafetyRefusalMessage, truncateUtf8 } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { createDiagnosticContext, type CodexProDiagnosticContext } from "./diagnosticContext.js";
 import { normalizeGitPushPolicy, sanitizeGitPushPolicy } from "./gitPushPolicy.js";
@@ -2148,6 +2148,7 @@ type SimulatedPatch = {
   additions: number;
   deletions: number;
   changed: boolean;
+  postApplyFiles: { gitPath: string; relPath: string; absPath: string; content: string }[];
 };
 type ValidatedSimulation = SimulatedPatch & { diff: string };
 
@@ -2519,12 +2520,27 @@ async function simulateWorkspacePatch(config: CodexProConfig, records: Validated
     const numstat = parseGitNumstat(numstatResult.stdout ?? "");
     const summary = summarizeNumstat(numstat);
     const rawDiff = gitOutputText(diffResult.stdout);
+    // Whole-file protection: the canonical diff only proves added lines, so
+    // capture the simulated post-apply bytes now (before the sandbox is
+    // removed) for a full-content source-policy scan in validateSimulatedSource.
+    const postApplyFiles: SimulatedPatch["postApplyFiles"] = [];
+    for (const record of records) {
+      let content: string;
+      try {
+        content = await fsp.readFile(simulationPath(root, record.gitPath), "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+        throw new CodexProError("Canonical Git diff source validation failed.");
+      }
+      postApplyFiles.push({ gitPath: record.gitPath, relPath: record.relPath, absPath: record.absPath, content });
+    }
     return {
       rawDiff,
       numstat,
       additions: summary.additions,
       deletions: summary.deletions,
-      changed: Boolean(rawDiff.trim())
+      changed: Boolean(rawDiff.trim()),
+      postApplyFiles
     };
   } catch (error) {
     if (error instanceof CodexProError) throw error;
@@ -2543,7 +2559,25 @@ function validateSimulatedSource(simulated: SimulatedPatch, records: ValidatedPa
   };
   try {
     if (hasSecretValueInUnifiedDiff(simulated.rawDiff, languageForPath, sourcePathForPath)) {
-      throw new CodexProError("Secret-looking content is blocked from apply_patch. Use placeholders such as [REDACTED_SECRET].");
+      // Bounded patch-line coordinates from a line-preserving redaction of
+      // the canonical diff, consistent with ordinary edit/write refusals.
+      // Only sanitized touched paths and physical diff line numbers are
+      // disclosed; matched content is never echoed and no detector rule
+      // identity is claimed.
+      const redactedDiff = redactUnifiedDiffPreservingLines(simulated.rawDiff, languageForPath);
+      const touchedPaths = records.slice(0, 4).map((record) => record.relPath).join("; ") +
+        (records.length > 4 ? ` (+${records.length - 4} more)` : "");
+      throw new CodexProError(sourceSafetyRefusalMessage("apply_patch", touchedPaths || "<unknown>", simulated.rawDiff, redactedDiff, "patch line"));
+    }
+    // Whole-file protection: a benign hunk must not leave secret-looking
+    // content in unpatched regions. Scan the simulated post-apply bytes with
+    // the same source policy ordinary edits use, reporting source lines.
+    for (const file of simulated.postApplyFiles) {
+      const sourceOptions = { context: "source" as const, language: sourceLanguageForPath(file.relPath), sourcePath: file.absPath };
+      if (hasSecretValue(file.content, sourceOptions)) {
+        const redacted = redactSensitiveTextPreservingLines(file.content, sourceOptions);
+        throw new CodexProError(sourceSafetyRefusalMessage("apply_patch", file.relPath, file.content, redacted, "source line"));
+      }
     }
     return { ...simulated, diff: redactUnifiedDiff(simulated.rawDiff, languageForPath, sourcePathForPath) };
   } catch (error) {
@@ -4597,6 +4631,63 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
       });
       const text = verificationTextResult(config, record, "started");
       return diagnosticTextResult(text, { workspace_id: workspace.id, root: workspace.root, ...record });
+    }
+  );
+
+  // MCP transport stays permissive while the strict runtime schema below
+  // owns rejection, matching START/WAIT/CANCEL_VERIFICATION. The public
+  // schema spoofs safeParse to the passthrough transport schema so hostile
+  // unknown keys (including secret-looking values) never surface through SDK
+  // transport errors; runtime validation rejects them with a clean error that
+  // names only caller keys, never secret values.
+  const LIST_VERIFICATION_JOBS_ARGUMENTS_SCHEMA = z.object({
+    workspace_id: SESSION_WORKSPACE_DIAGNOSTICS_WORKSPACE_ID_SCHEMA,
+    session_id: z.string().max(64).optional().describe("Bash session id required when CODEXPRO_REQUIRE_BASH_SESSION=1 is configured.")
+  }).strict();
+
+  const LIST_VERIFICATION_JOBS_TRANSPORT_SCHEMA = z.object({
+    workspace_id: z.unknown().optional(),
+    session_id: z.unknown().optional()
+  }).passthrough();
+
+  const LIST_VERIFICATION_JOBS_PUBLIC_SCHEMA = z.object(LIST_VERIFICATION_JOBS_ARGUMENTS_SCHEMA.shape);
+  LIST_VERIFICATION_JOBS_PUBLIC_SCHEMA.safeParse = ((args: unknown) => LIST_VERIFICATION_JOBS_TRANSPORT_SCHEMA.safeParse(args)) as typeof LIST_VERIFICATION_JOBS_PUBLIC_SCHEMA.safeParse;
+  LIST_VERIFICATION_JOBS_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => LIST_VERIFICATION_JOBS_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof LIST_VERIFICATION_JOBS_PUBLIC_SCHEMA.safeParseAsync;
+
+  registerCodexTool(
+    config,
+    server,
+    "list_verification_jobs",
+    {
+      title: "List Managed Verification Jobs",
+      description:
+        "List retained managed verification summaries for the explicitly selected workspace in this CodexPro process. Output content and command arguments are omitted. Records are process-local and disappear on restart.",
+      inputSchema: LIST_VERIFICATION_JOBS_PUBLIC_SCHEMA,
+      runtimeInputSchema: LIST_VERIFICATION_JOBS_ARGUMENTS_SCHEMA,
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false, idempotentHint: true },
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Listing managed verification jobs...",
+        "openai/toolInvocation/invoked": "Managed verification job list received"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      if (workspace.id !== args.workspace_id) {
+        throw new CodexProError("workspace_id mismatch.");
+      }
+      const jobs = verificationManager.listJobSummaries(workspace.id, args.session_id);
+      const activeCount = jobs.filter((job) => job.state === "running").length;
+      const text = `# Managed Verification Jobs
+${activeCount} active; ${jobs.length} retained in generation ${verificationManager.generationId}.`;
+      return diagnosticTextResult(text, {
+        workspace_id: workspace.id,
+        generationId: verificationManager.generationId,
+        managerState: verificationManager.state,
+        activeCount,
+        retainedCount: jobs.length,
+        jobs
+      });
     }
   );
 

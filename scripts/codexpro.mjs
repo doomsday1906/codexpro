@@ -17,10 +17,16 @@ import {
   verifyCloudflaredAsset
 } from './cloudflared-release.mjs';
 import {
+  captureProcessIdentity,
   descendantProcessIds,
+  parseProcessIdentityTable,
   parseProcessTable,
+  processIdentityTableInvocation,
   processTableInvocation,
-  processTreeTerminationInvocation
+  processTreeTerminationInvocation,
+  readLinuxProcessStartTime,
+  verifyProcessIdentity,
+  windowsRootTaskkillDecision
 } from './launcher-process-tree.mjs';
 import {
   createPrivateKeyScanner,
@@ -36,6 +42,7 @@ import {
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const UNTRACKED_FILE_HASH_BYTES = 64 * 1024;
 const UNTRACKED_SYMLINK_TARGET_BYTES = 512;
+const GIT_EVIDENCE_ERROR_MAX_BYTES = 2_000;
 const RUNTIME_FAILURE_DETAIL_MAX_BYTES = 2048;
 const RUNTIME_FAILURE_RECORD_MAX_BYTES = 16_384;
 
@@ -162,6 +169,11 @@ Execute handoff options:
   --agent <opencode|pi|codex|custom>
                              Local implementation agent adapter.
   --model <provider/model>  Optional model name passed to the adapter.
+  --profile <name>          Codex named profile ($CODEX_HOME/<name>.config.toml). Only with --agent codex.
+                              The profile governs model/reasoning/sandbox/approval; the adapter does not
+                              force workspace-write/approval-never when a profile is selected.
+  --reasoning-effort <low|medium|high|xhigh>
+                              Reasoning override (-c model_reasoning_effort). Only with --agent codex.
   --command <template>      Custom command template. Supports {{model}}, {{plan_file}}, {{plan_text}}, {{root}}.
   --dry-run                 Print the command that would run without executing it.
   --timeout-ms <ms>         Execution timeout. Default: 600000.
@@ -178,6 +190,7 @@ Watch handoff options:
   --debounce-ms <ms>        Wait for plan file stability. Default: 500.
   --state-file <path>       Watch state file. Default: .ai-bridge/watch-handoff-state.json.
   --yes                     Start automatic local execution without startup confirmation.
+  (--profile/--reasoning-effort from execute-handoff options also apply here.)
 
 Loop handoff options:
   codexpro loop-handoff --agent opencode --model provider/model --review-command "reviewer --status {{status_file}} --diff {{diff_file}} --plan-file {{plan_file}}"
@@ -198,6 +211,7 @@ Loop handoff options:
                              Ask before running a reviewer-generated follow-up plan.
   --dry-run                 Print executor/reviewer/test commands without executing them.
   --yes                     Start the local loop without startup confirmation.
+  (--profile/--reasoning-effort from execute-handoff options also apply here.)
 
 Default agent mode:
   codexpro start --root /path/to/repo
@@ -1313,6 +1327,15 @@ function spawnLogged(name, command, args, options = {}) {
   child.codexproClosed = false;
   child.once('spawn', () => { child.codexproSpawned = true; });
   child.once('exit', () => { child.codexproExited = true; });
+  // Identity baseline for PID-reuse protection on later signalling. A null
+  // startTime means identity is unprovable: descendants are then never
+  // signalled by bare PID.
+  child.codexproIdentity = captureProcessIdentity(child.pid);
+  // Windows-only spawn-time birth marker (CIM CreationDate) for the
+  // root-taskkill identity gate. Null off Windows; on Windows a null
+  // creationDate records unprovable root identity so later cleanup refuses
+  // the root taskkill instead of signalling a possibly recycled PID.
+  child.codexproWindowsIdentity = captureWindowsSpawnIdentity(child.pid);
   const logLines = [];
   const streamState = new Map([
     ['stdout', { decoder: new StringDecoder('utf8'), scanner: createPrivateKeyScanner(), pending: '', pendingBytes: 0, overflowing: false }],
@@ -1601,29 +1624,95 @@ function readManagedProcessTable() {
   return parseProcessTable(result.stdout);
 }
 
-function addObservedDescendants(processes, rootPid, knownPids) {
+function addObservedDescendants(processes, rootPid, knownPids, knownIdentities, identityDates) {
   if (!Number.isSafeInteger(rootPid) || rootPid <= 0) return;
-  for (const pid of descendantProcessIds(processes, rootPid)) knownPids.add(pid);
+  const found = descendantProcessIds(processes, rootPid);
+  for (const pid of found) knownPids.add(pid);
+  rememberDiscoveredIdentities(found, knownIdentities, identityDates);
 }
 
-function addObservedDescendantsOfKnownProcesses(processes, knownPids) {
+function addObservedDescendantsOfKnownProcesses(processes, knownPids, knownIdentities, identityDates) {
   const parents = [...knownPids];
-  for (const pid of parents) addObservedDescendants(processes, pid, knownPids);
+  for (const pid of parents) addObservedDescendants(processes, pid, knownPids, knownIdentities, identityDates);
 }
 
-function liveManagedPids(processes, rootPid, knownPids) {
+// Record the identity baseline for newly discovered PIDs so later signalling
+// can refuse recycled PIDs instead of trusting bare presence. On Linux the
+// baseline is the /proc starttime; on Windows it is the CIM CreationDate from
+// the snapshot that observed the PID (threaded via identityDates). A null
+// baseline means identity is unprovable for that PID: it stays in the known
+// set for liveness bookkeeping but is never signalled without a fresh
+// snapshot match. Linux behaviour is unchanged: identical store-if-absent
+// semantics when identityDates is absent.
+function rememberDiscoveredIdentities(pids, knownIdentities, identityDates) {
+  if (!knownIdentities) return;
+  for (const pid of pids) {
+    if (process.platform === 'win32') {
+      const observed = identityDates?.get(pid) ?? null;
+      const existing = knownIdentities.get(pid);
+      if (existing !== undefined && existing !== null) continue;
+      if (observed == null && existing !== undefined) continue;
+      knownIdentities.set(pid, observed);
+      continue;
+    }
+    if (knownIdentities.has(pid)) continue;
+    knownIdentities.set(pid, readLinuxProcessStartTime(pid));
+  }
+}
+
+// A bare PID is not an identity: the OS may recycle it for unrelated work
+// between discovery and signalling. A stale known PID whose incarnation
+// changed (or can no longer be proven) is excluded from the live owned set so
+// it is neither signalled nor waited on as ours. Fresh sightings from the
+// current table read pass through; the signalling step revalidates them again
+// immediately before any kill.
+function processIdentityStillOurs(pid, knownIdentities) {
+  if (process.platform === 'win32') return true; // Windows uses the separate CIM identity check.
+  if (!knownIdentities || !knownIdentities.has(pid)) return true;
+  const expected = knownIdentities.get(pid);
+  if (expected == null) return false;
+  return verifyProcessIdentity(pid, { pid, startTime: expected });
+}
+
+function liveManagedPids(processes, rootPid, knownPids, knownIdentities) {
   const present = new Set(processes.map(({ pid }) => pid));
-  return [...new Set([...(rootPid ? [rootPid] : []), ...knownPids])].filter((pid) => pid && present.has(pid));
+  return [...new Set([...(rootPid ? [rootPid] : []), ...knownPids])]
+    .filter((pid) => pid && present.has(pid))
+    .filter((pid) => pid === rootPid || processIdentityStillOurs(pid, knownIdentities));
 }
 
 function pauseForProcessPoll(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function signalManagedPosixPid(pid, signal, child) {
+function signalManagedPosixPid(pid, signal, child, knownIdentities) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
-    if (pid === child.pid) return child.kill(signal);
+    if (pid === child.pid) {
+      // Directly-owned child: Node tracks this exact process object, and its
+      // PID cannot be recycled while it is still alive. Never signal it after
+      // it has exited, and revalidate the Linux birth marker when one was
+      // captured at spawn so a stale handle can never target a reused PID.
+      if (childHasExited(child)) return false;
+      if (process.platform === 'linux' && child.codexproIdentity?.startTime) {
+        if (readLinuxProcessStartTime(pid) !== child.codexproIdentity.startTime) return false;
+      }
+      return child.kill(signal);
+    }
+    // Descendant: revalidate PID+starttime immediately before signalling so a
+    // recycled PID can never target unrelated work. Unprovable or mismatched
+    // identities are skipped (fail closed); the final verification reports
+    // the tree as incompletely cleaned instead of signalling blindly.
+    if (process.platform === 'linux') {
+      const expected = knownIdentities?.get(pid);
+      const current = readLinuxProcessStartTime(pid);
+      if (current == null) return false;
+      if (expected === undefined) {
+        knownIdentities?.set(pid, current);
+      } else if (expected == null || current !== expected) {
+        return false;
+      }
+    }
     process.kill(pid, signal);
     return true;
   } catch {
@@ -1631,22 +1720,22 @@ function signalManagedPosixPid(pid, signal, child) {
   }
 }
 
-async function waitForManagedPosixTree(child, knownPids, deadline, signal) {
+async function waitForManagedPosixTree(child, knownPids, knownIdentities, deadline, signal) {
   let latest = [];
   while (Date.now() <= deadline) {
     latest = readManagedProcessTable();
-    if (!childHasExited(child)) addObservedDescendants(latest, child.pid, knownPids);
-    addObservedDescendantsOfKnownProcesses(latest, knownPids);
-    const alive = liveManagedPids(latest, childHasExited(child) ? null : child.pid, knownPids);
+    if (!childHasExited(child)) addObservedDescendants(latest, child.pid, knownPids, knownIdentities);
+    addObservedDescendantsOfKnownProcesses(latest, knownPids, knownIdentities);
+    const alive = liveManagedPids(latest, childHasExited(child) ? null : child.pid, knownPids, knownIdentities);
     if (childHasExited(child) && alive.length === 0) return { exited: true, processes: latest };
 
     if (signal) {
       const descendantPids = [...knownPids].filter((pid) => pid !== child.pid);
       for (const pid of descendantPids.reverse()) {
-        if (latest.some((entry) => entry.pid === pid)) signalManagedPosixPid(pid, signal, child);
+        if (latest.some((entry) => entry.pid === pid)) signalManagedPosixPid(pid, signal, child, knownIdentities);
       }
       if (!childHasExited(child) && latest.some((entry) => entry.pid === child.pid)) {
-        signalManagedPosixPid(child.pid, signal, child);
+        signalManagedPosixPid(child.pid, signal, child, knownIdentities);
       }
     }
 
@@ -1655,17 +1744,22 @@ async function waitForManagedPosixTree(child, knownPids, deadline, signal) {
     await pauseForProcessPoll(Math.min(CHILD_PROCESS_POLL_INTERVAL_MS, remaining));
   }
   latest = readManagedProcessTable();
-  if (!childHasExited(child)) addObservedDescendants(latest, child.pid, knownPids);
-  addObservedDescendantsOfKnownProcesses(latest, knownPids);
+  if (!childHasExited(child)) addObservedDescendants(latest, child.pid, knownPids, knownIdentities);
+  addObservedDescendantsOfKnownProcesses(latest, knownPids, knownIdentities);
   return {
-    exited: childHasExited(child) && liveManagedPids(latest, null, knownPids).length === 0,
+    exited: childHasExited(child) && liveManagedPids(latest, null, knownPids, knownIdentities).length === 0,
     processes: latest
   };
 }
 
-async function killPosixProcessTree(child) {
+async function killPosixProcessTree(child, seedPids, seedIdentities) {
   const pid = child.pid;
-  const knownPids = new Set();
+  // Seed with PIDs captured DURING execution: a detached grandchild may
+  // already be reparented (PPID 1) by kill time, so a fresh chain walk from
+  // the root would miss it. The seed keeps owned PIDs reachable for direct,
+  // identity-verified signalling even after reparenting.
+  const knownPids = seedPids ?? new Set();
+  const knownIdentities = seedIdentities ?? new Map();
   let processes = [];
   let tableError = null;
   try {
@@ -1673,32 +1767,32 @@ async function killPosixProcessTree(child) {
     if (!childHasExited(child) && !processes.some((entry) => entry.pid === pid)) {
       throw new Error('managed process was missing from the process table');
     }
-    if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids);
-    addObservedDescendantsOfKnownProcesses(processes, knownPids);
+    if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids, knownIdentities);
+    addObservedDescendantsOfKnownProcesses(processes, knownPids, knownIdentities);
   } catch {
     tableError = true;
   }
 
   let termSignalSent = false;
-  if (!childHasExited(child)) termSignalSent = signalManagedPosixPid(pid, 'SIGTERM', child);
+  if (!childHasExited(child)) termSignalSent = signalManagedPosixPid(pid, 'SIGTERM', child, knownIdentities);
 
   const graceMs = child.codexproShutdownGraceMs ?? CHILD_SHUTDOWN_GRACE_MS;
   if (tableError) {
     if (!await waitForChildExit(child, graceMs)) {
-      signalManagedPosixPid(pid, 'SIGKILL', child);
+      signalManagedPosixPid(pid, 'SIGKILL', child, knownIdentities);
       await waitForChildExit(child, CHILD_FORCE_EXIT_TIMEOUT_MS);
     }
     throw new Error(`Could not verify the process tree for managed child ${pid ?? 'with unknown pid'} after shutdown.`);
   }
 
-  const graceful = await waitForManagedPosixTree(child, knownPids, Date.now() + graceMs, null);
+  const graceful = await waitForManagedPosixTree(child, knownPids, knownIdentities, Date.now() + graceMs, null);
   if (graceful.exited) return;
 
   processes = graceful.processes;
-  if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids);
-  addObservedDescendantsOfKnownProcesses(processes, knownPids);
+  if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids, knownIdentities);
+  addObservedDescendantsOfKnownProcesses(processes, knownPids, knownIdentities);
   const forceDeadline = Date.now() + CHILD_FORCE_EXIT_TIMEOUT_MS;
-  const forced = await waitForManagedPosixTree(child, knownPids, forceDeadline, 'SIGKILL');
+  const forced = await waitForManagedPosixTree(child, knownPids, knownIdentities, forceDeadline, 'SIGKILL');
   if (forced.exited) return;
 
   throw new Error(
@@ -1718,31 +1812,108 @@ function taskkillProcessTree(pid, timeoutMs) {
   return !result.error && result.status === 0;
 }
 
-async function killWindowsProcessTree(child) {
+// Best-effort Windows identity snapshot (PID -> CreationDate). Returns a Map,
+// or null when CIM is unavailable. Honest limitation: CIM CreationDate
+// granularity plus snapshot TOCTOU mean PID reuse inside the same timestamp
+// window cannot be fully excluded on Windows, so callers keep signalling
+// narrowed to the directly-owned child subtree root plus snapshot-verified
+// still-alive descendants, and never broaden to pattern sweeps.
+function readWindowsIdentitySnapshot() {
+  const invocation = processIdentityTableInvocation('win32');
+  if (!invocation) return null;
+  try {
+    const result = spawnSync(invocation.command, invocation.args, {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: PROCESS_TABLE_TIMEOUT_MS,
+      maxBuffer: 4 * 1024 * 1024
+    });
+    if (result.error || result.status !== 0) return null;
+    const rows = parseProcessIdentityTable(result.stdout);
+    return new Map(rows.map((row) => [row.pid, row.creationDate]));
+  } catch {
+    return null;
+  }
+}
+
+// Windows-only spawn-time identity baseline for the root-taskkill gate. Takes
+// a CIM CreationDate snapshot at spawn when available; otherwise records that
+// root identity is unprovable ({ creationDate: null, snapshotAvailable: false }).
+// A null creationDate (snapshot unavailable, unusable PID, or PID not yet
+// visible in the spawn snapshot) makes the root-taskkill gate refuse later:
+// fail closed, never signal blind. Returns null on non-Windows platforms
+// (POSIX uses the /proc starttime baseline instead). Never spawns a subprocess
+// off Windows.
+function captureWindowsSpawnIdentity(pid) {
+  if (process.platform !== 'win32') return null;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return { creationDate: null, snapshotAvailable: false };
+  const snapshot = readWindowsIdentitySnapshot();
+  if (!snapshot) return { creationDate: null, snapshotAvailable: false };
+  return { creationDate: snapshot.get(pid) ?? null, snapshotAvailable: true };
+}
+
+async function killWindowsProcessTree(child, seedPids, seedIdentities) {
   const pid = child.pid;
   if (!Number.isSafeInteger(pid) || pid <= 0) {
     if (childHasExited(child)) return;
     throw new Error('Could not confirm a process ID for a managed Windows child.');
   }
 
-  const knownPids = new Set();
+  const knownPids = seedPids ?? new Set();
+  // Windows identity baselines: PID -> CIM CreationDate observed at discovery
+  // (null = observed without a birth marker: unprovable, never signalled
+  // without a fresh snapshot match). Threaded through every discovery call so
+  // later signalling can refuse recycled PIDs instead of trusting bare
+  // presence; the per-descendant reap below additionally requires a fresh
+  // pre-kill/post-kill snapshot match.
+  const knownIdentities = seedIdentities ?? new Map();
   let processes;
   let tableError = null;
+  // The identity snapshot is read BEFORE discovery so every newly observed PID
+  // records the CreationDate baseline from the snapshot that saw it.
+  let preKillIdentities = null;
   try {
     processes = readManagedProcessTable();
+    preKillIdentities = readWindowsIdentitySnapshot();
     if (!childHasExited(child) && !processes.some((entry) => entry.pid === pid)) {
       throw new Error('managed process was missing from the process table');
     }
-    if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids);
-    addObservedDescendantsOfKnownProcesses(processes, knownPids);
+    if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids, knownIdentities, preKillIdentities);
+    addObservedDescendantsOfKnownProcesses(processes, knownPids, knownIdentities, preKillIdentities);
   } catch {
     processes = [];
     tableError = new Error(`Could not inspect the process tree for managed Windows child ${pid}.`);
   }
 
-  // Windows child_process signals do not provide POSIX graceful-shutdown semantics.
-  // Use taskkill's native tree operation for direct executables and batch wrappers alike.
-  const treeKillSucceeded = taskkillProcessTree(pid, CHILD_FORCE_EXIT_TIMEOUT_MS);
+  // Separate identity check before signalling: compare the root PID's fresh
+  // CreationDate against the spawn-time baseline. taskkill /T /F alone is NOT
+  // identity proof: without a matching birth marker the PID may have been
+  // recycled for unrelated work since spawn (or since the child exited).
+  // Mismatch, absent PID, unavailable snapshot, unprovable spawn baseline, or
+  // an already-exited child (POSIX exit-guard parity: never signal an exited
+  // child) all refuse the root taskkill; cleanup then reaps only
+  // snapshot-verified descendants and reports anything left as incomplete.
+  // No broad kills: only the verified root PID or individually verified
+  // descendant PIDs are ever signalled.
+  // Honest limitation: CIM CreationDate granularity plus snapshot TOCTOU mean
+  // a PID recycled inside the same timestamp window cannot be fully excluded;
+  // this gate narrows signalling to a verified incarnation but is not proof.
+  const spawnBaseline = child.codexproWindowsIdentity?.creationDate ?? null;
+  const rootCurrent = preKillIdentities?.get(pid) ?? null;
+  const rootDecision = windowsRootTaskkillDecision(spawnBaseline, rootCurrent, childHasExited(child));
+  // When the CIM snapshot itself is unavailable (preKillIdentities === null),
+  // per-descendant iteration below is disabled and only a verified
+  // directly-owned root taskkill may run: narrowed signalling under a
+  // documented limitation. An unverified root is never signalled.
+  let treeKillSucceeded = false;
+  let rootSkippedReason = null;
+  if (rootDecision.proceed) {
+    // Windows child_process signals do not provide POSIX graceful-shutdown semantics.
+    // Use taskkill's native tree operation for direct executables and batch wrappers alike.
+    treeKillSucceeded = taskkillProcessTree(pid, CHILD_FORCE_EXIT_TIMEOUT_MS);
+  } else {
+    rootSkippedReason = rootDecision.reason;
+  }
   const forceDeadline = Date.now() + CHILD_FORCE_EXIT_TIMEOUT_MS;
 
   while (Date.now() <= forceDeadline) {
@@ -1752,16 +1923,29 @@ async function killWindowsProcessTree(child) {
       tableError ??= new Error(`Could not inspect the process tree for managed Windows child ${pid}.`);
       break;
     }
-    if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids);
-    addObservedDescendantsOfKnownProcesses(processes, knownPids);
+    if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids, knownIdentities, preKillIdentities);
+    addObservedDescendantsOfKnownProcesses(processes, knownPids, knownIdentities, preKillIdentities);
     const alive = liveManagedPids(processes, childHasExited(child) ? null : pid, knownPids);
     if (childHasExited(child) && alive.length === 0 && (!tableError || treeKillSucceeded)) return;
 
     // If the direct process disappeared while a previously observed descendant
-    // remained, taskkill can still reap that child's current subtree by PID.
+    // remained, taskkill can still reap that child's current subtree by PID —
+    // but only for descendants verified in the pre-kill identity snapshot and
+    // still present with an unchanged CreationDate. Unverifiable PIDs are
+    // never signalled; leftover state surfaces as an incomplete-cleanup error.
+    const postKillIdentities = readWindowsIdentitySnapshot();
     for (const descendantPid of alive.filter((entry) => entry !== pid)) {
       const remaining = forceDeadline - Date.now();
       if (remaining <= 0) break;
+      if (!preKillIdentities || !postKillIdentities) break;
+      if (preKillIdentities.get(descendantPid) === undefined) continue;
+      // Second opinion from the threaded discovery baseline: a PID adopted
+      // with a non-null baseline must agree with the pre-kill snapshot, so a
+      // PID recycled between discovery and the pre-kill snapshot is never
+      // signalled even when both fresh snapshots agree with each other.
+      const threadedBaseline = knownIdentities.get(descendantPid);
+      if (threadedBaseline !== undefined && threadedBaseline !== null && threadedBaseline !== preKillIdentities.get(descendantPid)) continue;
+      if (postKillIdentities.get(descendantPid) !== preKillIdentities.get(descendantPid)) continue;
       taskkillProcessTree(descendantPid, Math.min(1_000, remaining));
     }
     const pause = forceDeadline - Date.now();
@@ -1771,8 +1955,8 @@ async function killWindowsProcessTree(child) {
   if (!tableError) {
     try {
       processes = readManagedProcessTable();
-      if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids);
-      addObservedDescendantsOfKnownProcesses(processes, knownPids);
+      if (!childHasExited(child)) addObservedDescendants(processes, pid, knownPids, knownIdentities, preKillIdentities);
+      addObservedDescendantsOfKnownProcesses(processes, knownPids, knownIdentities, preKillIdentities);
       const alive = liveManagedPids(processes, childHasExited(child) ? null : pid, knownPids);
       if (!childHasExited(child) && !alive.includes(pid)) await waitForChildExit(child, 250);
       if (childHasExited(child) && alive.length === 0) return;
@@ -1782,11 +1966,11 @@ async function killWindowsProcessTree(child) {
   }
   if (tableError) throw tableError;
   throw new Error(
-    `Could not confirm managed Windows child ${pid} and its process tree exited after taskkill.`
+    `Could not confirm managed Windows child ${pid} and its process tree exited${rootSkippedReason ? ` (root taskkill skipped: ${rootSkippedReason}; only snapshot-verified descendants were signalled)` : ' after taskkill'}.`
   );
 }
 
-async function killProcess(child) {
+async function killProcess(child, seedPids, seedIdentities) {
   if (!child) return;
   if (!child.codexproSpawned) {
     const spawnState = await waitForChildSpawn(child, CHILD_FORCE_EXIT_TIMEOUT_MS);
@@ -1795,8 +1979,63 @@ async function killProcess(child) {
       throw new Error(`Could not confirm managed child ${child.pid ?? 'with unknown pid'} spawned or closed.`);
     }
   }
-  if (process.platform === 'win32') return killWindowsProcessTree(child);
-  return killPosixProcessTree(child);
+  if (process.platform === 'win32') return killWindowsProcessTree(child, seedPids, seedIdentities);
+  return killPosixProcessTree(child, seedPids, seedIdentities);
+}
+
+// Bounded tree settlement shared by the handoff execution path: re-check the
+// owned tree and escalate through the qualified killProcess discipline with an
+// overall deadline, so results are published only after the tree is confirmed
+// gone or explicitly reported incomplete. Never invents a second killer.
+const HANDOFF_TREE_SETTLE_TIMEOUT_MS = 5_000;
+
+async function boundedKillProcess(child, seedPids, seedIdentities, timeoutMs) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`process-tree cleanup exceeded ${timeoutMs} ms`)), timeoutMs);
+    if (timer.unref) timer.unref();
+  });
+  try {
+    await Promise.race([killProcess(child, seedPids, seedIdentities), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function settleHandoffTree(child, knownPids, knownIdentities) {
+  let table;
+  try {
+    table = readManagedProcessTable();
+  } catch {
+    return { incomplete: true, reason: 'PROCESS_TABLE_UNAVAILABLE' };
+  }
+  if (!childHasExited(child) && Number.isSafeInteger(child.pid)) {
+    addObservedDescendants(table, child.pid, knownPids, knownIdentities);
+  }
+  addObservedDescendantsOfKnownProcesses(table, knownPids, knownIdentities);
+  const alive = liveManagedPids(table, childHasExited(child) ? null : child.pid, knownPids, knownIdentities);
+  if (!alive.length) return { incomplete: false, reason: null };
+  try {
+    await boundedKillProcess(child, knownPids, knownIdentities, HANDOFF_TREE_SETTLE_TIMEOUT_MS);
+  } catch (error) {
+    return { incomplete: true, reason: error instanceof Error ? error.message : String(error) };
+  }
+  let recheck;
+  try {
+    recheck = readManagedProcessTable();
+  } catch {
+    return { incomplete: true, reason: 'PROCESS_TABLE_UNAVAILABLE' };
+  }
+  addObservedDescendantsOfKnownProcesses(recheck, knownPids, knownIdentities);
+  const remaining = liveManagedPids(recheck, null, knownPids, knownIdentities);
+  if (remaining.length) {
+    return { incomplete: true, reason: `owned descendant process(es) still alive: ${remaining.join(',')}` };
+  }
+  if (!childHasExited(child)) {
+    const exited = await waitForChildExit(child, 250);
+    if (!exited) return { incomplete: true, reason: 'managed child still alive after tree cleanup' };
+  }
+  return { incomplete: false, reason: null };
 }
 
 function cleanupChildren() {
@@ -2057,9 +2296,71 @@ function applyCommandTemplate(value, replacements) {
   return String(value).replace(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g, (_, key) => replacements[key] ?? '');
 }
 
+function codexHomeDir() {
+  const explicit = String(process.env.CODEX_HOME ?? '').trim();
+  if (explicit) return path.resolve(expandHome(explicit));
+  return path.join(os.homedir(), '.codex');
+}
+
+// Read top-level scalar settings (model, model_reasoning_effort, sandbox_mode,
+// approval_policy) from a Codex TOML layer without a TOML dependency. Only
+// lines before the first [section] header are considered so nested table keys
+// (e.g. [sandbox_workspace_write]) never masquerade as top-level settings.
+function readCodexTomlTopLevel(filePath, keys) {
+  const wanted = new Set(keys);
+  const observed = {};
+  let text = '';
+  try {
+    text = fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return observed;
+  }
+  for (const rawLine of String(text).split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    if (/^\[.*\]\s*$/.test(line)) break;
+    const match = line.match(/^([A-Za-z0-9_]+)\s*=\s*"(.*)"\s*$/) || line.match(/^([A-Za-z0-9_]+)\s*=\s*'(.*)'\s*$/);
+    if (match && wanted.has(match[1])) observed[match[1]] = match[2];
+  }
+  return observed;
+}
+
+// Resolve requested-vs-configured Codex settings for `--agent codex`.
+// Requested = explicit CLI flags. Configured/inferred = effective CLI argv
+// plus the layered Codex config files (base config, then
+// $CODEX_HOME/<profile>.config.toml) read BEFORE execution. These values are
+// never runtime-observed: no trustworthy execution metadata supplies the
+// effective model/reasoning/sandbox/approval, so runtime-observed values stay
+// unknown/absent and the configured inference must never be presented as
+// observed.
+function resolveCodexProfileSettings(args) {
+  const profile = String(args.profile ?? '').trim();
+  const reasoningEffort = String(args.reasoningEffort ?? args.reasoning ?? '').trim().toLowerCase();
+  if (profile && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(profile)) {
+    throw new Error(`Invalid --profile ${JSON.stringify(profile)}. Use the Codex profile file name without extension (letters, digits, _, ., -).`);
+  }
+  if (reasoningEffort && !/^(low|medium|high|xhigh)$/.test(reasoningEffort)) {
+    throw new Error(`Invalid --reasoning-effort ${JSON.stringify(reasoningEffort)}. Use low, medium, high, or xhigh.`);
+  }
+  const home = codexHomeDir();
+  const baseConfigured = readCodexTomlTopLevel(path.join(home, 'config.toml'), ['model', 'model_reasoning_effort', 'sandbox_mode', 'approval_policy']);
+  let profileConfigured = {};
+  let profileConfigPath = '';
+  if (profile) {
+    profileConfigPath = path.join(home, `${profile}.config.toml`);
+    profileConfigured = readCodexTomlTopLevel(profileConfigPath, ['model', 'model_reasoning_effort', 'sandbox_mode', 'approval_policy']);
+  }
+  return { profile, reasoningEffort, home, baseConfigured, profileConfigured, profileConfigPath };
+}
+
 function buildExecutorCommand(args, root, planPath, planText) {
   const agent = String(args.agent ?? 'opencode').trim().toLowerCase();
   const model = String(args.model ?? process.env.CODEXPRO_AGENT_MODEL ?? '').trim();
+  if ((args.profile !== undefined && String(args.profile).trim() !== '') || (args.reasoningEffort !== undefined && String(args.reasoningEffort).trim() !== '') || (args.reasoning !== undefined && String(args.reasoning).trim() !== '')) {
+    if (agent !== 'codex') {
+      throw new Error('--profile and --reasoning-effort are only supported with --agent codex. They map to `codex exec --profile` and `-c model_reasoning_effort`.');
+    }
+  }
   const replacements = {
     model,
     plan_file: planPath,
@@ -2112,35 +2413,58 @@ function buildExecutorCommand(args, root, planPath, planText) {
       'Do not modify .ai-bridge/current-plan.md.',
       'When finished, summarize changed files and verification.'
     ].join(' ');
+    // Named Codex profiles ($CODEX_HOME/<name>.config.toml) own their model,
+    // reasoning, sandbox, and approval settings. When --profile is selected the
+    // adapter preserves those permissions: it does NOT inject its default
+    // --sandbox workspace-write / approval_policy=never overrides. An explicit
+    // --model or --reasoning-effort is passed as an override and logged as the
+    // requested value alongside the profile-configured value.
+    const codexProfile = resolveCodexProfileSettings(args);
+    const profileGovernsPermissions = Boolean(codexProfile.profile);
+    const codexArgs = ['exec', '--ephemeral'];
+    if (codexProfile.profile) codexArgs.push('--profile', codexProfile.profile);
+    if (!profileGovernsPermissions) {
+      codexArgs.push('--sandbox', 'workspace-write', '-c', 'approval_policy="never"');
+    }
+    codexArgs.push('--output-last-message', codexLastMessagePath);
+    if (model) codexArgs.push('--model', model);
+    if (codexProfile.reasoningEffort) codexArgs.push('-c', `model_reasoning_effort="${codexProfile.reasoningEffort}"`);
+    codexArgs.push(codexPrompt);
+    const codexDisplayArgs = ['exec', '--ephemeral'];
+    if (codexProfile.profile) codexDisplayArgs.push('--profile', codexProfile.profile);
+    if (!profileGovernsPermissions) {
+      codexDisplayArgs.push('--sandbox', 'workspace-write', '-c', 'approval_policy="never"');
+    }
+    codexDisplayArgs.push(
+      '--output-last-message',
+      path.relative(root, codexLastMessagePath),
+      ...(model ? ['--model', model] : []),
+      ...(codexProfile.reasoningEffort ? ['-c', `model_reasoning_effort="${codexProfile.reasoningEffort}"`] : []),
+      `<read ${relativePlanPath}>`
+    );
+    const configuredModel = model || codexProfile.profileConfigured.model || codexProfile.baseConfigured.model || '';
+    const configuredReasoning = codexProfile.reasoningEffort || codexProfile.profileConfigured.model_reasoning_effort || codexProfile.baseConfigured.model_reasoning_effort || '';
     return {
       agent,
       model,
       command: resolveCodexCommand(),
-      args: [
-        'exec',
-        '--ephemeral',
-        '--sandbox',
-        'workspace-write',
-        '-c',
-        'approval_policy="never"',
-        '--output-last-message',
-        codexLastMessagePath,
-        ...(model ? ['--model', model] : []),
-        codexPrompt
-      ],
-      displayArgs: [
-        'exec',
-        '--ephemeral',
-        '--sandbox',
-        'workspace-write',
-        '-c',
-        'approval_policy="never"',
-        '--output-last-message',
-        path.relative(root, codexLastMessagePath),
-        ...(model ? ['--model', model] : []),
-        `<read ${relativePlanPath}>`
-      ],
-      custom: false
+      args: codexArgs,
+      displayArgs: codexDisplayArgs,
+      custom: false,
+      codexProfile: codexProfile.profile || undefined,
+      codexReasoningEffort: codexProfile.reasoningEffort || undefined,
+      codexPermissions: profileGovernsPermissions ? 'profile' : 'adapter-forced:workspace-write/approval-never',
+      codexConfigured: {
+        model: configuredModel || undefined,
+        reasoning_effort: configuredReasoning || undefined,
+        sandbox_mode: profileGovernsPermissions
+          ? (codexProfile.profileConfigured.sandbox_mode || codexProfile.baseConfigured.sandbox_mode || undefined)
+          : 'workspace-write',
+        approval_policy: profileGovernsPermissions
+          ? (codexProfile.profileConfigured.approval_policy || codexProfile.baseConfigured.approval_policy || undefined)
+          : 'never',
+        profile_config: codexProfile.profileConfigPath || undefined
+      }
     };
   }
   if (agent === 'custom') {
@@ -2192,6 +2516,96 @@ function runProcessCaptured(command, args, options) {
       shell: false,
       windowsVerbatimArguments: invocation.windowsVerbatimArguments
     });
+    // Register as a managed child so timeout cleanup kills the FULL process
+    // tree (owned descendants included) through the shared killProcess
+    // discipline instead of signalling only the direct child. Direct
+    // child.kill leaves orphaned grandchildren holding pipes/files open.
+    child.codexproShutdownGraceMs = CHILD_SHUTDOWN_GRACE_MS;
+    child.codexproSpawned = false;
+    child.codexproExited = false;
+    child.codexproClosed = false;
+    child.once('spawn', () => { child.codexproSpawned = true; });
+    child.once('exit', () => { child.codexproExited = true; });
+    child.codexproIdentity = captureProcessIdentity(child.pid);
+    // Windows-only spawn-time birth marker (CIM CreationDate) for the
+    // root-taskkill identity gate; see spawnLogged. Null off Windows.
+    child.codexproWindowsIdentity = captureWindowsSpawnIdentity(child.pid);
+    spawnedChildren.add(child);
+    // Ownership tracked DURING execution: periodically snapshot the
+    // child+descendants into the known set while running. A root that exits
+    // early (before timeout) can leave a detached, reparented child that a
+    // kill-time-only chain walk would miss; the running snapshot keeps it
+    // reachable for direct, identity-verified signalling later.
+    const knownTreePids = new Set();
+    const knownTreeIdentities = new Map();
+    const snapshotTreeOwnership = () => {
+      if (childHasExited(child)) return;
+      if (!Number.isSafeInteger(child.pid) || child.pid <= 0) return;
+      let table = null;
+      try {
+        table = readManagedProcessTable();
+      } catch {
+        return;
+      }
+      addObservedDescendants(table, child.pid, knownTreePids, knownTreeIdentities);
+      addObservedDescendantsOfKnownProcesses(table, knownTreePids, knownTreeIdentities);
+    };
+    const ownershipSnapshotTimer = setInterval(snapshotTreeOwnership, 250);
+    if (ownershipSnapshotTimer.unref) ownershipSnapshotTimer.unref();
+    snapshotTreeOwnership();
+    const stopOwnershipTracking = () => {
+      clearInterval(ownershipSnapshotTimer);
+      if (exitWatchdogTimer) clearTimeout(exitWatchdogTimer);
+    };
+    // When the root exits but inherited pipes stay open (a retained-pipes
+    // child holds them), 'close' is delayed indefinitely. Bound that wait:
+    // shortly after exit without close, reap the owned tree through the
+    // shared discipline so pipes release and the close handler can publish a
+    // verified outcome instead of hanging or publishing blindly.
+    let exitWatchdogTimer = null;
+    let exitInfo = null;
+    child.on('exit', (exitCode, exitSignal) => {
+      exitInfo = { exitCode, signal: exitSignal };
+      if (closed) return;
+      if (exitWatchdogTimer) clearTimeout(exitWatchdogTimer);
+      exitWatchdogTimer = setTimeout(() => {
+        if (closed) return;
+        void killProcess(child, knownTreePids, knownTreeIdentities).catch((error) => {
+          stderr = appendBounded(stderr, stderrDecoder.write(Buffer.from(`\n[codexpro] Process-tree cleanup incomplete: ${error instanceof Error ? error.message : String(error)}\n`)));
+        });
+      }, CHILD_SHUTDOWN_GRACE_MS);
+      if (exitWatchdogTimer.unref) exitWatchdogTimer.unref();
+    });
+    // Backstop: 'close' must arrive within the execution timeout plus bounded
+    // settle margin. If pipes are held by an undiscovered child, resolve as
+    // explicitly incomplete instead of hanging forever or publishing clean.
+    const closeCapTimer = setTimeout(() => {
+      if (closed) return;
+      closed = true;
+      clearTimeout(timer);
+      stopOwnershipTracking();
+      spawnedChildren.delete(child);
+      stdout = appendBounded(stdout, stdoutDecoder.end());
+      stderr = appendBounded(stderr, stderrDecoder.end());
+      stderr = `${stderr}\n[codexpro] Process-tree cleanup incomplete: close not observed within bounded window; owned descendant state may remain.\n`;
+      void settleHandoffTree(child, knownTreePids, knownTreeIdentities).then((treeCleanup) => {
+        const out = trimBytes(stdout, maxOutputBytes);
+        const err = trimBytes(`${stderr}${timedOut ? `\n[codexpro] Command timed out after ${timeoutMs} ms.` : ''}`, maxOutputBytes);
+        resolve({
+          exitCode: exitInfo?.exitCode ?? null,
+          signal: exitInfo?.signal ?? null,
+          durationMs: Date.now() - started,
+          timedOut,
+          stdout: out.text,
+          stderr: err.text,
+          truncated: out.truncated || err.truncated,
+          spawnError: false,
+          treeCleanupIncomplete: true,
+          treeCleanupReason: treeCleanup.reason ?? 'CLOSE_NOT_OBSERVED'
+        });
+      });
+    }, timeoutMs + HANDOFF_TREE_SETTLE_TIMEOUT_MS + 5_000);
+    if (closeCapTimer.unref) closeCapTimer.unref();
     let stdout = '';
     let stderr = '';
     const stdoutDecoder = new StringDecoder('utf8');
@@ -2208,10 +2622,14 @@ function runProcessCaptured(command, args, options) {
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGTERM');
-      setTimeout(() => {
-        if (!closed) child.kill('SIGKILL');
-      }, 1500).unref();
+      // Full-tree termination (SIGTERM grace, then SIGKILL escalation with
+      // descendant verification). killProcess resolves once the tree is
+      // confirmed gone; the 'close' handler below still runs its bounded
+      // settle before this promise resolves, so no result is published until
+      // the cleanup outcome is known.
+      void killProcess(child, knownTreePids, knownTreeIdentities).catch((error) => {
+        stderr = appendBounded(stderr, stderrDecoder.write(Buffer.from(`\n[codexpro] Process-tree cleanup incomplete: ${error instanceof Error ? error.message : String(error)}\n`)));
+      });
     }, timeoutMs);
     timer.unref();
 
@@ -2222,7 +2640,12 @@ function runProcessCaptured(command, args, options) {
       stderr = appendBounded(stderr, stderrDecoder.write(chunk));
     });
     child.on('error', (error) => {
+      if (closed) return;
+      closed = true;
       clearTimeout(timer);
+      clearTimeout(closeCapTimer);
+      stopOwnershipTracking();
+      spawnedChildren.delete(child);
       resolve({
         exitCode: 127,
         signal: null,
@@ -2230,25 +2653,43 @@ function runProcessCaptured(command, args, options) {
         timedOut,
         stdout: '',
         stderr: error instanceof Error ? error.message : String(error),
-        spawnError: true
+        spawnError: true,
+        treeCleanupIncomplete: false,
+        treeCleanupReason: null
       });
     });
     child.on('close', (exitCode, signal) => {
+      if (closed) return;
       closed = true;
       clearTimeout(timer);
+      clearTimeout(closeCapTimer);
+      stopOwnershipTracking();
+      spawnedChildren.delete(child);
       stdout = appendBounded(stdout, stdoutDecoder.end());
       stderr = appendBounded(stderr, stderrDecoder.end());
-      const out = trimBytes(stdout, maxOutputBytes);
-      const err = trimBytes(`${stderr}${timedOut ? `\n[codexpro] Command timed out after ${timeoutMs} ms.` : ''}`, maxOutputBytes);
-      resolve({
-        exitCode,
-        signal,
-        durationMs: Date.now() - started,
-        timedOut,
-        stdout: out.text,
-        stderr: err.text,
-        truncated: out.truncated || err.truncated,
-        spawnError: false
+      // Bounded cleanup outcome BEFORE publishing: re-check the owned tree
+      // (tracked during execution) and escalate through killProcess when
+      // anything owned remains. A retained-pipes child is reaped here; if it
+      // cannot be confirmed gone the result is explicitly marked incomplete
+      // instead of being published as clean.
+      void settleHandoffTree(child, knownTreePids, knownTreeIdentities).then((treeCleanup) => {
+        if (treeCleanup.incomplete) {
+          stderr = `${stderr}\n[codexpro] Process-tree cleanup incomplete: ${treeCleanup.reason}\n`;
+        }
+        const out = trimBytes(stdout, maxOutputBytes);
+        const err = trimBytes(`${stderr}${timedOut ? `\n[codexpro] Command timed out after ${timeoutMs} ms.` : ''}`, maxOutputBytes);
+        resolve({
+          exitCode,
+          signal,
+          durationMs: Date.now() - started,
+          timedOut,
+          stdout: out.text,
+          stderr: err.text,
+          truncated: out.truncated || err.truncated,
+          spawnError: false,
+          treeCleanupIncomplete: treeCleanup.incomplete,
+          treeCleanupReason: treeCleanup.reason
+        });
       });
     });
   });
@@ -2278,11 +2719,25 @@ function readGitStatus(root, maxBytes) {
     shell: false
   });
   if (result.status !== 0) {
-    const reason = result.stderr || result.stdout || `git status exited ${result.status}`;
-    return `# git status unavailable\n\n${redactForLog(reason).trim()}\n`;
+    const reason = redactForLog(result.stderr || result.stdout || `git status exited ${result.status}`).trim();
+    const bounded = trimBytes(reason, GIT_EVIDENCE_ERROR_MAX_BYTES).text;
+    if (Boolean(result.error && /(maxbuffer|enobufs)/i.test(String(result.error.message || result.error)))) {
+      return { text: gitEvidenceUnavailableText('GIT_OUTPUT_TOO_LARGE', bounded), error: null, incomplete: true, reason: 'GIT_OUTPUT_TOO_LARGE' };
+    }
+    return { text: `# git status unavailable\n\n${bounded}\n`, error: bounded, incomplete: true, reason: 'GIT_COMMAND_FAILED' };
   }
   const status = result.stdout || '';
-  return status.trim() ? trimBytes(status, maxBytes).text : '';
+  if (!status.trim()) return { text: '', error: null, incomplete: false, reason: null };
+  // The capture buffer (maxBuffer, up to ~1M) is wider than the evidence
+  // budget (maxBytes, default 120k): output in that gap trims here without
+  // ENOBUFS. A trimmed listing is partial evidence, not a verified complete
+  // one: flag it incomplete with the distinct GIT_OUTPUT_TRUNCATED reason
+  // (same discipline as GIT_OUTPUT_TOO_LARGE, no hard error).
+  const bounded = trimBytes(status, maxBytes);
+  if (bounded.truncated) {
+    return { text: bounded.text, error: null, incomplete: true, reason: 'GIT_OUTPUT_TRUNCATED' };
+  }
+  return { text: bounded.text, error: null, incomplete: false, reason: null };
 }
 
 function codeBlock(label, value) {
@@ -2296,16 +2751,25 @@ function writeExecutionOutputs(root, contextDir, commandInfo, result, diffText, 
   const diffPath = resolveWorkspaceFile(root, path.join(contextDir, 'implementation-diff.patch'));
   const logPath = resolveWorkspaceFile(root, path.join(contextDir, 'execution-log.jsonl'));
   const commandText = executorCommandPreview(commandInfo);
+  const configured = commandInfo.codexConfigured || {};
   const status = [
     '# Agent Execution Status',
     '',
     `Updated: ${new Date().toISOString()}`,
     `Agent: ${commandInfo.agent}`,
     commandInfo.model ? `Model: ${commandInfo.model}` : '',
+    commandInfo.codexProfile ? `Profile (requested): ${commandInfo.codexProfile}` : '',
+    commandInfo.codexReasoningEffort ? `Reasoning (requested): ${commandInfo.codexReasoningEffort}` : '',
+    (commandInfo.codexProfile || commandInfo.codexReasoningEffort) ? `Model (configured): ${configured.model ?? '(none)'}` : '',
+    (commandInfo.codexProfile || commandInfo.codexReasoningEffort) ? `Reasoning (configured): ${configured.reasoning_effort ?? '(none)'}` : '',
+    commandInfo.codexPermissions ? `Permissions: ${commandInfo.codexPermissions}` : '',
     `Command: ${commandText}`,
     `Exit code: ${result.exitCode ?? 'null'}`,
     result.signal ? `Signal: ${result.signal}` : '',
     `Timed out: ${result.timedOut ? 'yes' : 'no'}`,
+    result.gitEvidenceError ? `Git evidence error: ${result.gitEvidenceError}` : '',
+    result.gitEvidenceIncomplete ? `Git evidence: incomplete (${result.gitEvidenceReason ?? 'unknown reason'}) — ${result.gitEvidenceReason === 'GIT_OUTPUT_TRUNCATED' ? 'diff truncated/partial' : 'diff unavailable'}, not proof of an empty${result.gitEvidenceReason === 'GIT_OUTPUT_TRUNCATED' ? ' or complete' : ''} diff` : '',
+    result.treeCleanupIncomplete ? `Tree cleanup: INCOMPLETE (${result.treeCleanupReason ?? 'unknown reason'}) — owned descendant state may remain` : '',
     `Duration: ${result.durationMs} ms`,
     `Diff path: ${path.posix.join(contextDir, 'implementation-diff.patch')}`,
     `Execution log: ${path.posix.join(contextDir, 'execution-log.jsonl')}`,
@@ -2322,10 +2786,21 @@ function writeExecutionOutputs(root, contextDir, commandInfo, result, diffText, 
     event: 'execute_handoff',
     agent: commandInfo.agent,
     model: commandInfo.model || undefined,
+    ...(commandInfo.codexProfile ? { codex_profile_requested: commandInfo.codexProfile } : {}),
+    ...(commandInfo.codexReasoningEffort ? { reasoning_effort_requested: commandInfo.codexReasoningEffort } : {}),
+    ...((commandInfo.codexProfile || commandInfo.codexReasoningEffort) ? {
+      model_configured: configured.model ?? undefined,
+      reasoning_effort_configured: configured.reasoning_effort ?? undefined,
+      sandbox_mode_configured: configured.sandbox_mode ?? undefined,
+      approval_policy_configured: configured.approval_policy ?? undefined
+    } : {}),
     command: commandText,
     exit_code: result.exitCode,
     signal: result.signal,
     timed_out: result.timedOut,
+    ...(result.gitEvidenceError ? { git_evidence_error: result.gitEvidenceError } : {}),
+    ...(result.gitEvidenceIncomplete ? { git_evidence_incomplete: true, git_evidence_reason: result.gitEvidenceReason ?? null } : {}),
+    ...(result.treeCleanupIncomplete ? { tree_cleanup_incomplete: true, tree_cleanup_reason: result.treeCleanupReason ?? null } : {}),
     duration_ms: result.durationMs,
     stdout_excerpt: result.stdout,
     stderr_excerpt: result.stderr,
@@ -2386,11 +2861,19 @@ function loadHandoffExecution(args) {
 }
 
 function printHandoffDryRun(request, title = 'CodexPro execute-handoff dry run') {
+  const info = request.commandInfo;
   printBox(title, [
     labelValue('Workspace', request.root),
     labelValue('Plan', path.relative(request.root, request.planPath)),
-    labelValue('Agent', request.commandInfo.agent),
-    ...(request.commandInfo.model ? [labelValue('Model', request.commandInfo.model)] : []),
+    labelValue('Agent', info.agent),
+    ...(info.model ? [labelValue('Model', info.model)] : []),
+    ...(info.codexProfile ? [labelValue('Profile (requested)', info.codexProfile)] : []),
+    ...(info.codexReasoningEffort ? [labelValue('Reasoning (requested)', info.codexReasoningEffort)] : []),
+    ...(info.codexProfile || info.codexReasoningEffort ? [
+      labelValue('Model (configured)', info.codexConfigured?.model ?? '(none)'),
+      labelValue('Reasoning (configured)', info.codexConfigured?.reasoning_effort ?? '(none)'),
+      labelValue('Permissions', info.codexPermissions ?? '')
+    ] : []),
     labelValue('Command', request.commandText),
     'No command was executed and no .ai-bridge result files were changed.'
   ]);
@@ -2427,9 +2910,30 @@ async function executeHandoffRequest(request, args, options = {}) {
     timeoutMs: request.timeoutMs,
     maxOutputBytes: request.maxOutputBytes
   });
-  const diffText = readGitDiffExcludingContext(request.root, request.contextDir, request.maxOutputBytes);
-  const gitStatusText = readGitStatus(request.root, request.maxOutputBytes);
-  const outputs = writeExecutionOutputs(request.root, request.contextDir, request.commandInfo, result, diffText, gitStatusText);
+  const diffResult = readGitDiffExcludingContext(request.root, request.contextDir, request.maxOutputBytes);
+  const statusResult = readGitStatus(request.root, request.maxOutputBytes);
+  // A Git evidence failure must never present as success with an empty or
+  // placeholder diff. Force failure when the agent exited 0 but git evidence
+  // collection failed, and record the reason in every result surface.
+  // Oversize (GIT_OUTPUT_TOO_LARGE) is bounded evidence, not a command
+  // failure: the run still succeeds where the pinned loop needs it, but the
+  // incomplete-evidence flag travels in status text, log, and run state so no
+  // consumer can mistake it for a verified empty/complete diff.
+  const gitEvidenceError = diffResult.error || statusResult.error || null;
+  const gitEvidenceIncomplete = Boolean(diffResult.incomplete || statusResult.incomplete);
+  const gitEvidenceReason = diffResult.reason || statusResult.reason || null;
+  if (gitEvidenceError && !result.timedOut && result.exitCode === 0) {
+    result.exitCode = 1;
+  }
+  if (gitEvidenceError) result.gitEvidenceError = gitEvidenceError;
+  if (gitEvidenceIncomplete) {
+    result.gitEvidenceIncomplete = true;
+    result.gitEvidenceReason = gitEvidenceReason;
+  }
+  // Incomplete tree cleanup does not rewrite the agent's own exit code: the
+  // INCOMPLETE marker in status text, log, and run state carries the fact so
+  // the published result never reads as a clean tree.
+  const outputs = writeExecutionOutputs(request.root, request.contextDir, request.commandInfo, result, diffResult.text, statusResult.text);
 
   const runState = result.timedOut ? 'timed_out' : (result.exitCode === 0 ? 'completed' : 'failed');
   const testsAbsPath = path.join(request.bridgeDir, 'loop-tests.txt');
@@ -2441,8 +2945,19 @@ async function executeHandoffRequest(request, args, options = {}) {
     plan_hash: runPlanHash,
     executor: request.commandInfo.agent,
     model: request.commandInfo.model || undefined,
+    ...(request.commandInfo.codexProfile ? { codex_profile: request.commandInfo.codexProfile } : {}),
+    ...(request.commandInfo.codexReasoningEffort ? { codex_reasoning_effort_requested: request.commandInfo.codexReasoningEffort } : {}),
+    ...((request.commandInfo.codexProfile || request.commandInfo.codexReasoningEffort) && request.commandInfo.codexConfigured ? {
+      model_configured: request.commandInfo.codexConfigured.model ?? undefined,
+      reasoning_effort_configured: request.commandInfo.codexConfigured.reasoning_effort ?? undefined,
+      sandbox_mode_configured: request.commandInfo.codexConfigured.sandbox_mode ?? undefined,
+      approval_policy_configured: request.commandInfo.codexConfigured.approval_policy ?? undefined
+    } : {}),
     exit_code: result.exitCode ?? null,
     timed_out: Boolean(result.timedOut),
+    ...(gitEvidenceError ? { git_evidence_error: gitEvidenceError } : {}),
+    ...(gitEvidenceIncomplete ? { git_evidence_incomplete: true, git_evidence_reason: gitEvidenceReason } : {}),
+    ...(result.treeCleanupIncomplete ? { tree_cleanup_incomplete: true, tree_cleanup_reason: result.treeCleanupReason ?? null } : {}),
     duration_ms: result.durationMs,
     status_file: path.posix.join(request.contextDir, 'agent-status.md'),
     diff_file: path.posix.join(request.contextDir, 'implementation-diff.patch'),
@@ -2815,7 +3330,14 @@ function runGitText(root, args, maxBytes) {
   });
   if (result.status !== 0) {
     const reason = result.stderr || result.stdout || `git ${args.join(' ')} exited ${result.status}`;
-    throw new Error(redactForLog(reason).trim());
+    const failure = new Error(redactForLog(reason).trim());
+    // An over-size diff that exceeds the capture buffer is bounded evidence,
+    // not a Git failure: the repository is readable and the change fingerprint
+    // still proves the change. Only genuine git-command failures fail the run.
+    if (result.error && /(maxbuffer|enobufs)/i.test(String(result.error.message || result.error))) {
+      failure.code = 'GIT_OUTPUT_TOO_LARGE';
+    }
+    throw failure;
   }
   return result.stdout || '';
 }
@@ -2930,6 +3452,10 @@ function pathStateForFingerprint(root, relPath, options = {}) {
 }
 
 function changeFingerprintExcludingContext(root, contextDir) {
+  // Change SIGNAL only: proves whether the non-context working tree moved
+  // between two points. It is not standalone diff evidence and must never be
+  // presented as a diff; the implementation-diff.patch artifact (or its
+  // explicit incomplete-evidence marker) remains the only diff evidence.
   const context = normalizedContextDir(contextDir);
   const isContextPath = contextPathPredicate(contextDir);
   const workspacePrefix = gitWorkspacePrefix(root);
@@ -2960,11 +3486,38 @@ function readGitDiffExcludingContext(root, contextDir, maxBytes) {
     if (staged.trim()) sections.push(`# Staged diff\n\n${staged}`);
     if (unstaged.trim()) sections.push(`# Unstaged diff\n\n${unstaged}`);
     if (untracked.trim()) sections.push(`# Untracked files\n\n${untracked}`);
-    if (!sections.length) return '';
-    return trimBytes(sections.join('\n\n'), maxBytes).text;
+    if (!sections.length) return { text: '', error: null, incomplete: false, reason: null };
+    // Same maxBuffer/maxBytes gap as readGitStatus: a trimmed diff is partial
+    // evidence that must never be mistaken for a verified empty or complete
+    // diff. Flag incomplete with GIT_OUTPUT_TRUNCATED and keep the pinned
+    // loop success behaviour (error stays null; only the incomplete flag and
+    // reason travel into status text, log, and run state).
+    const bounded = trimBytes(sections.join('\n\n'), maxBytes);
+    if (bounded.truncated) {
+      return { text: bounded.text, error: null, incomplete: true, reason: 'GIT_OUTPUT_TRUNCATED' };
+    }
+    return { text: bounded.text, error: null, incomplete: false, reason: null };
   } catch (error) {
-    return `# git changes unavailable\n\n${error instanceof Error ? error.message : String(error)}\n`;
+    const reason = error instanceof Error ? error.message : String(error);
+    const bounded = trimBytes(reason, GIT_EVIDENCE_ERROR_MAX_BYTES).text;
+    if (error instanceof Error && error.code === 'GIT_OUTPUT_TOO_LARGE') {
+      // Bounded oversize evidence: the repository is readable and the loop
+      // change fingerprint still signals that something changed, so the run
+      // still succeeds where the pinned loop needs it — but diff evidence is
+      // explicitly INCOMPLETE and must never be mistaken for a verified
+      // empty/complete diff.
+      return { text: gitEvidenceUnavailableText('GIT_OUTPUT_TOO_LARGE', bounded), error: null, incomplete: true, reason: 'GIT_OUTPUT_TOO_LARGE' };
+    }
+    return { text: `# git changes unavailable\n\n${bounded}\n`, error: bounded, incomplete: true, reason: 'GIT_COMMAND_FAILED' };
   }
+}
+
+// Unavailable-diff artifact text. Always names the reason, always states the
+// diff is unavailable (never an empty diff as proof), and always carries the
+// machine-readable incomplete-evidence marker via the caller's
+// git_evidence_incomplete/git_evidence_reason fields.
+function gitEvidenceUnavailableText(reason, detail) {
+  return `# git changes unavailable (incomplete evidence: ${reason})\n\n${detail}\n\nDiff output could not be captured (${reason}). This is NOT proof of an empty or complete diff; treat diff evidence as unavailable.\n`;
 }
 
 function writeLoopTestOutput(paths, result, commandText) {
@@ -3180,8 +3733,20 @@ async function runLoopHandoff(argv) {
 
     const beforeExecutionFingerprint = changeFingerprintExcludingContext(root, contextDir);
     const execution = await executeHandoffRequest(request, { ...args, yes: true }, { skipConfirmation: true, iteration });
-    const diffText = readGitDiffExcludingContext(root, contextDir, maxOutputBytes);
-    fs.writeFileSync(paths.diffPath, diffText || '', { mode: 0o600 });
+    // The loop diff artifact is the only diff evidence; the fingerprints
+    // around it are change signals only (see changeFingerprintExcludingContext).
+    const loopDiff = readGitDiffExcludingContext(root, contextDir, maxOutputBytes);
+    fs.writeFileSync(paths.diffPath, loopDiff.text || '', { mode: 0o600 });
+    // A trimmed or otherwise incomplete loop capture must travel with the
+    // iteration record so no consumer mistakes it for a verified empty or
+    // complete diff. Oversize/trimmed evidence keeps the pinned success
+    // behaviour; only the incomplete flag and reason are added, merged with
+    // the executor record in case the tree moved between the two reads.
+    const loopGitEvidenceIncomplete = Boolean(loopDiff.incomplete || execution.result?.gitEvidenceIncomplete);
+    const loopGitEvidenceReason = loopDiff.reason || execution.result?.gitEvidenceReason || null;
+    if (loopGitEvidenceIncomplete && !execution.result?.gitEvidenceIncomplete) {
+      fs.appendFileSync(paths.statusPath, `\nGit evidence: incomplete (${loopGitEvidenceReason ?? 'unknown reason'}) — loop diff capture ${loopDiff.reason === 'GIT_OUTPUT_TRUNCATED' ? 'truncated/partial' : 'unavailable'}, not proof of an empty or complete diff\n`, { mode: 0o600 });
+    }
     const currentChangeFingerprint = changeFingerprintExcludingContext(root, contextDir);
     const changedThisIteration = currentChangeFingerprint !== beforeExecutionFingerprint;
 
@@ -3249,6 +3814,7 @@ async function runLoopHandoff(argv) {
       followup_plan_exists: afterReviewPlanExists,
       has_usable_followup_plan: Boolean(hasUsableFollowupPlan),
       changed_this_iteration: changedThisIteration,
+      ...(loopGitEvidenceIncomplete ? { git_evidence_incomplete: true, git_evidence_reason: loopGitEvidenceReason } : {}),
       status_path: path.posix.join(contextDir, 'agent-status.md'),
       diff_path: path.posix.join(contextDir, 'implementation-diff.patch'),
       tests_path: iterationTestCommand ? path.posix.join(contextDir, 'loop-tests.txt') : undefined,
@@ -3266,6 +3832,7 @@ async function runLoopHandoff(argv) {
       followupPlanExists: afterReviewPlanExists,
       hasUsableFollowupPlan: Boolean(hasUsableFollowupPlan),
       changedThisIteration,
+      ...(loopGitEvidenceIncomplete ? { gitEvidenceIncomplete: true, gitEvidenceReason: loopGitEvidenceReason } : {}),
       executorExitCode: execution.result?.exitCode ?? null,
       reviewerExitCode: reviewResult.exitCode
     });

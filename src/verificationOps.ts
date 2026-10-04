@@ -67,6 +67,23 @@ export interface VerificationJobRecord {
   containmentWrapper?: string[];
 }
 
+export interface VerificationJobSummary {
+  jobId: string;
+  generationId: string;
+  state: VerificationJobState;
+  workspaceId: string;
+  runner: VerificationRunnerFamily;
+  startedAt: string;
+  finishedAt?: string;
+  elapsedMs: number;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  observedStdoutBytes: number;
+  observedStderrBytes: number;
+  truncated: boolean;
+  terminalReason?: string;
+}
+
 export type VerificationManagerLifecycleState = "open" | "closing" | "closed";
 
 export interface VerificationManagerLimits {
@@ -438,6 +455,43 @@ export function clampLifetime(
   return Math.max(minMs, Math.min(Math.floor(requestedMs), maxMs));
 }
 
+interface LinuxProcessIdentity {
+  pid: number;
+  startTime: string;
+  processGroup: number;
+  state: string;
+}
+
+const VERIFICATION_CLEANUP_TERM_WAIT_MS = 1000;
+const VERIFICATION_CLEANUP_KILL_WAIT_MS = 1000;
+const VERIFICATION_CLEANUP_POLL_MS = 50;
+
+function readLinuxProcessIdentity(pid: number): LinuxProcessIdentity | undefined {
+  if (process.platform !== "linux") return undefined;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    // comm is wrapped in parens and may itself contain spaces or parens;
+    // the last ")" ends comm per proc(5), and the remaining fields never contain ")".
+    const closeParen = stat.lastIndexOf(")");
+    if (closeParen < 0) return undefined;
+    const rest = stat.slice(closeParen + 2).trim();
+    if (!rest) return undefined;
+    const fields = rest.split(/\s+/u);
+    // After "pid (comm)": [state, ppid, pgrp, session, ... starttime at index 19].
+    if (fields.length < 20) return undefined;
+    const state = fields[0];
+    const processGroup = Number(fields[2]);
+    const startTime = fields[19];
+    if (!state) return undefined;
+    if (!Number.isSafeInteger(processGroup) || processGroup <= 0) return undefined;
+    if (!/^\d+$/u.test(startTime)) return undefined;
+    return { pid, processGroup, startTime, state };
+  } catch {
+    return undefined;
+  }
+}
+
 interface StreamChunk {
   stream: "stdout" | "stderr";
   buf: Buffer;
@@ -665,7 +719,12 @@ export class ManagedVerificationJob {
   private child?: ChildProcess;
   private lifetimeTimer?: NodeJS.Timeout;
   private killEscalationTimer?: NodeJS.Timeout;
+  private descendantMonitorTimer?: NodeJS.Timeout;
+  private rootProcessStartTime?: string;
+  private readonly ownedDescendants = new Map<number, string>();
   private closed = false;
+  private rootCloseSettling = false;
+  private rootExited = false;
   private terminationStarted = false;
   private pendingTerminalState?: VerificationJobState;
   private pendingTerminalReason?: string;
@@ -748,6 +807,13 @@ export class ManagedVerificationJob {
       windowsHide: true
     });
 
+    if (process.platform === "linux") {
+      this.captureOwnedDescendants();
+      this.descendantMonitorTimer = setInterval(() => this.captureOwnedDescendants(), 50);
+      this.descendantMonitorTimer.unref();
+      this.child.once("spawn", () => this.captureOwnedDescendants());
+    }
+
     this.lifetimeTimer = setTimeout(() => {
       this.handleLifetimeTimeout();
     }, this.lifetimeMs);
@@ -788,26 +854,61 @@ export class ManagedVerificationJob {
       });
     });
 
+    // 'exit' fires when the root process exits, independent of stdio pipe
+    // lifetime. A detached descendant that inherits job pipes holds 'close'
+    // back until its pipes release, so signal owned survivors here (best
+    // effort) to unblock 'close' boundedly. Terminal settlement stays owned
+    // by the 'close' handler below.
+    this.child.on("exit", () => {
+      this.rootExited = true;
+      try {
+        this.signalOwnedProcessTree("SIGTERM");
+      } catch {
+        // Best effort only; close handler owns bounded escalation.
+      }
+      if (!this.killEscalationTimer && !this.closed) {
+        this.killEscalationTimer = setTimeout(() => {
+          if (!this.closed) {
+            try {
+              this.signalOwnedProcessTree("SIGKILL");
+            } catch {
+              // Best effort only.
+            }
+          }
+        }, 1000);
+        this.killEscalationTimer.unref();
+      }
+    });
+
     this.child.on("close", (code, sig) => {
+      if (this.rootCloseSettling) return;
+      this.rootCloseSettling = true;
       this.closed = true;
-      this.cleanupTimers();
+      // Freeze periodic discovery and lifetime, but preserve ownership +
+      // escalation for settleRootClose. The old kill-escalation timer (root
+      // focused) is superseded by the bounded owned-settlement below.
+      if (this.lifetimeTimer) {
+        clearTimeout(this.lifetimeTimer);
+        this.lifetimeTimer = undefined;
+      }
+      if (this.descendantMonitorTimer) {
+        clearInterval(this.descendantMonitorTimer);
+        this.descendantMonitorTimer = undefined;
+      }
+      if (this.killEscalationTimer) {
+        clearTimeout(this.killEscalationTimer);
+        this.killEscalationTimer = undefined;
+      }
       this.flushRedactors();
 
-      let targetState: VerificationJobState = "succeeded";
-      let reason: string | undefined;
-
-      if (this.pendingTerminalState) {
-        targetState = this.pendingTerminalState;
-        reason = this.pendingTerminalReason;
-      } else if (code !== 0 || sig !== null) {
-        targetState = "failed";
-        reason = sig ? `Terminated with signal ${sig}` : `Exited with code ${code}`;
-      }
-
-      this.transitionToTerminal(targetState, {
-        exitCode: code,
-        signal: sig,
-        reason
+      void this.settleRootClose(code, sig).catch(() => {
+        if (this.state === "running") {
+          this.transitionToTerminal(this.pendingTerminalState ?? "failed", {
+            exitCode: code,
+            signal: sig,
+            reason: this.pendingTerminalReason ?? "Root close cleanup failed unexpectedly."
+          });
+        }
       });
     });
   }
@@ -825,6 +926,7 @@ export class ManagedVerificationJob {
 
   private checkOutputCeiling(): void {
     const total = this.observedStdoutBytes + this.observedStderrBytes;
+    if (this.closed) return;
     if (total > this.hardOutputCeilingBytes && !this.terminationStarted) {
       this.pendingTerminalState = "output_limit_exceeded";
       this.pendingTerminalReason = `Output ceiling of ${this.hardOutputCeilingBytes} bytes exceeded (observed ${total} bytes).`;
@@ -843,13 +945,15 @@ export class ManagedVerificationJob {
     if (this.state !== "running") {
       return Promise.resolve(this.toRecord());
     }
-    if (!this.pendingTerminalState) {
+    // A cancel arriving after root close (settlement pending) must not
+    // rewrite the already-determined terminal; it only awaits settlement.
+    if (!this.pendingTerminalState && !this.closed && !this.rootCloseSettling) {
       this.pendingTerminalState = "cancelled";
       this.pendingTerminalReason = "Cancelled by user";
     }
     this.terminateWithEscalation();
 
-    if (this.closed) {
+    if (this.state !== "running") {
       return Promise.resolve(this.toRecord());
     }
 
@@ -863,13 +967,231 @@ export class ManagedVerificationJob {
     this.terminationStarted = true;
     if (!this.child) return;
 
-    terminateProcessTree(this.child, "SIGTERM");
+    this.signalOwnedProcessTree("SIGTERM");
     this.killEscalationTimer = setTimeout(() => {
       if (!this.closed && this.child) {
-        terminateProcessTree(this.child, "SIGKILL");
+        this.signalOwnedProcessTree("SIGKILL");
       }
     }, 1_500);
     this.killEscalationTimer.unref();
+  }
+
+  private isRootIdentityCurrent(): boolean {
+    const rootPid = this.child?.pid;
+    if (!rootPid) return false;
+    if (process.platform !== "linux") return true;
+    const root = readLinuxProcessIdentity(rootPid);
+    if (!root) return false;
+    if (this.rootProcessStartTime === undefined) {
+      this.rootProcessStartTime = root.startTime;
+      return true;
+    }
+    return root.startTime === this.rootProcessStartTime;
+  }
+
+  private captureOwnedDescendants(): void {
+    const rootPid = this.child?.pid;
+    if (process.platform !== "linux" || !rootPid) return;
+
+    const root = readLinuxProcessIdentity(rootPid);
+    if (!root) return;
+    if (this.rootProcessStartTime === undefined) {
+      this.rootProcessStartTime = root.startTime;
+    }
+    if (root.startTime !== this.rootProcessStartTime) return;
+
+    const pending = [rootPid];
+    const visited = new Set<number>(pending);
+    while (pending.length > 0) {
+      const parentPid = pending.pop()!;
+      let childText = "";
+      try {
+        childText = fs.readFileSync("/proc/" + parentPid + "/task/" + parentPid + "/children", "utf8");
+      } catch {
+        continue;
+      }
+      const trimmed = childText.trim();
+      if (!trimmed) continue;
+      for (const token of trimmed.split(/\s+/u)) {
+        if (!token) continue;
+        const pid = Number(token);
+        if (!Number.isSafeInteger(pid) || pid <= 0 || visited.has(pid)) continue;
+        visited.add(pid);
+        const identity = readLinuxProcessIdentity(pid);
+        if (!identity) continue;
+        this.ownedDescendants.set(pid, identity.startTime);
+        pending.push(pid);
+      }
+    }
+  }
+
+  private signalOwnedProcessTree(signal: NodeJS.Signals): void {
+    const child = this.child;
+    if (!child?.pid) return;
+    this.captureOwnedDescendants();
+    // Only use the process-group kill while the root PID still identifies the
+    // exact owned root (PID + starttime). After root exit + PID reuse, kill(-pid)
+    // could signal an unrelated group, so skip it and rely on per-PID kills below.
+    const rootCurrent = this.isRootIdentityCurrent();
+    if (rootCurrent || process.platform !== "linux") {
+      terminateProcessTree(child, signal);
+    }
+
+    if (process.platform !== "linux") return;
+    // Signal every still-owned descendant individually, regardless of pgid.
+    // Group kill already covers pgid == root members when it succeeds, but a
+    // failed/racing group kill must not leave same-group orphans, and detached
+    // escapees (new pgid/session holding pipes open) are only reachable here.
+    // Each kill is gated on exact PID + starttime identity; stale entries are pruned.
+    for (const [pid, startTime] of [...this.ownedDescendants]) {
+      const current = readLinuxProcessIdentity(pid);
+      if (!current || current.startTime !== startTime) {
+        this.ownedDescendants.delete(pid);
+        continue;
+      }
+      try {
+        process.kill(pid, signal);
+      } catch {
+        // The exact descendant may have exited between identity check and signal.
+      }
+    }
+  }
+
+  private pruneOwnedDescendants(): number[] {
+    if (process.platform !== "linux") {
+      this.ownedDescendants.clear();
+      return [];
+    }
+    const live: number[] = [];
+    for (const [pid, startTime] of [...this.ownedDescendants]) {
+      const current = readLinuxProcessIdentity(pid);
+      if (!current || current.startTime !== startTime) {
+        this.ownedDescendants.delete(pid);
+        continue;
+      }
+      if (current.state === "Z" || current.state === "X" || current.state === "x") {
+        this.ownedDescendants.delete(pid);
+        continue;
+      }
+      try {
+        process.kill(pid, 0);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (code === "ESRCH") {
+          this.ownedDescendants.delete(pid);
+          continue;
+        }
+      }
+      live.push(pid);
+    }
+    return live;
+  }
+
+  private waitForOwnedDrain(timeoutMs: number): Promise<number[]> {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    const poll = (): Promise<number[]> => {
+      const remaining = this.pruneOwnedDescendants();
+      if (remaining.length === 0 || Date.now() >= deadline) {
+        return Promise.resolve(remaining);
+      }
+      return new Promise<number[]>((resolve) => {
+        const timer = setTimeout(() => {
+          resolve(poll());
+        }, VERIFICATION_CLEANUP_POLL_MS);
+        // Keep the poll ref'd so bounded cleanup cannot evaporate before
+        // settlement while the root pipes are already closed.
+        void timer;
+      });
+    };
+    return poll();
+  }
+
+  private async settleRootClose(code: number | null, sig: NodeJS.Signals | null): Promise<void> {
+    let intendedState: VerificationJobState = "succeeded";
+    let intendedReason: string | undefined;
+    if (this.pendingTerminalState) {
+      intendedState = this.pendingTerminalState;
+      intendedReason = this.pendingTerminalReason;
+    } else if (code !== 0 || sig !== null) {
+      intendedState = "failed";
+      intendedReason = sig ? `Terminated with signal ${sig}` : `Exited with code ${code}`;
+    }
+
+    if (process.platform === "linux") {
+      try {
+        this.captureOwnedDescendants();
+      } catch {
+        // Best effort; prune below decides liveness.
+      }
+      const initialLive = this.pruneOwnedDescendants();
+      if (initialLive.length > 0) {
+        const initialCount = initialLive.length;
+        const initialSample = initialLive.slice(0, 5).join(",");
+        try {
+          this.signalOwnedProcessTree("SIGTERM");
+        } catch {
+          // Identity-gated best effort; waits below decide.
+        }
+        let remaining = await this.waitForOwnedDrain(VERIFICATION_CLEANUP_TERM_WAIT_MS);
+        let killNeeded = remaining.length > 0;
+        if (killNeeded) {
+          try {
+            this.signalOwnedProcessTree("SIGKILL");
+          } catch {
+            // Waits below decide.
+          }
+          remaining = await this.waitForOwnedDrain(VERIFICATION_CLEANUP_KILL_WAIT_MS);
+        }
+        if (remaining.length === 0) {
+          if (intendedState === "succeeded") {
+            this.transitionToTerminal("failed", {
+              exitCode: code,
+              signal: sig,
+              reason:
+                `Cleanup performed: ${initialCount} owned descendant(s) [${initialSample}] required termination ` +
+                `via ${killNeeded ? "SIGTERM/SIGKILL" : "SIGTERM"} after root exit (code ${code}). ` +
+                `Not reporting clean success while an owned child was alive.`
+            });
+            return;
+          }
+          const base = intendedReason ? `${intendedReason} ` : "";
+          this.transitionToTerminal(intendedState, {
+            exitCode: code,
+            signal: sig,
+            reason:
+              `${base}[Cleanup: ${initialCount} owned descendant(s) terminated via ` +
+              `${killNeeded ? "SIGTERM/SIGKILL" : "SIGTERM"} after root exit.]`.trim()
+          });
+          return;
+        }
+        const sample = remaining.slice(0, 5).join(",");
+        const cleanupSuffix =
+          `cleanup_incomplete: ${remaining.length} owned descendant(s) [${sample}] still alive after bounded ` +
+          `SIGTERM (${VERIFICATION_CLEANUP_TERM_WAIT_MS}ms) + SIGKILL (${VERIFICATION_CLEANUP_KILL_WAIT_MS}ms) ` +
+          `escalation (initial ${initialCount}).`;
+        if (intendedState === "succeeded") {
+          this.transitionToTerminal("failed", {
+            exitCode: code,
+            signal: sig,
+            reason: `${cleanupSuffix} Original exit code ${code}.`
+          });
+          return;
+        }
+        const base = intendedReason ? `${intendedReason} ` : "";
+        this.transitionToTerminal(intendedState, {
+          exitCode: code,
+          signal: sig,
+          reason: `${base}${cleanupSuffix}`.trim()
+        });
+        return;
+      }
+    }
+
+    this.transitionToTerminal(intendedState, {
+      exitCode: code,
+      signal: sig,
+      reason: intendedReason
+    });
   }
 
   private cleanupTimers(): void {
@@ -881,6 +1203,11 @@ export class ManagedVerificationJob {
       clearTimeout(this.killEscalationTimer);
       this.killEscalationTimer = undefined;
     }
+    if (this.descendantMonitorTimer) {
+      clearInterval(this.descendantMonitorTimer);
+      this.descendantMonitorTimer = undefined;
+    }
+    this.ownedDescendants.clear();
   }
 
   private transitionToTerminal(
@@ -1184,6 +1511,34 @@ export class VerificationManager {
       throw new CodexProError(`Verification job not found or expired: '${cleanId}'.`);
     }
     return job.cancel();
+  }
+
+  public listJobSummaries(workspaceId: string, sessionId?: string): VerificationJobSummary[] {
+    this.prune();
+    if (this.config.requireBashSession || sessionId !== undefined) {
+      assertBashSession(this.config, sessionId);
+    }
+    return [...this.jobs.values()]
+      .filter((job) => job.workspaceId === workspaceId)
+      .map((job) => {
+        const record = job.toRecord();
+        return {
+          jobId: record.jobId,
+          generationId: record.generationId,
+          state: record.state,
+          workspaceId: record.workspaceId,
+          runner: record.runner,
+          startedAt: record.startedAt,
+          ...(record.finishedAt ? { finishedAt: record.finishedAt } : {}),
+          elapsedMs: record.durationMs ?? Math.max(0, Date.now() - Date.parse(record.startedAt)),
+          exitCode: record.exitCode,
+          signal: record.signal,
+          observedStdoutBytes: record.observedStdoutBytes,
+          observedStderrBytes: record.observedStderrBytes,
+          truncated: record.truncated,
+          ...(record.terminalReason ? { terminalReason: record.terminalReason } : {})
+        };
+      });
   }
 
   public getJobRecord(jobId: string): VerificationJobRecord | undefined {

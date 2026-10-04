@@ -24,7 +24,9 @@ const config = loadConfig(["--root", repoRoot]);
 const guard = new PathGuard(config);
 
 async function runTests() {
-  // Test 1: Start and Wait on a quick succeeded verification job
+  // Test 1: Start and Wait on a quick succeeded verification job.
+  // Uses the fast bounded fixture (not the full tsc build) so the quick-success
+  // path never depends on compiler wall-time under build contention.
   console.log("\n[Test 1] Start and wait on a quick succeeded verification job...");
   const mgr1 = new VerificationManager(config, {
     maxActiveJobs: 3,
@@ -37,8 +39,8 @@ async function runTests() {
     workspace_id: fakeWorkspace.id,
     runner: "package_script",
     package_manager: "npm",
-    script: "build",
-    args: ["--help"]
+    script: "verification:fixture",
+    args: ["--sleep", "200"]
   });
 
   assert.match(startRecord1.jobId, /^vjob_[0-9a-f]{24}$/, "jobId must match vjob grammar");
