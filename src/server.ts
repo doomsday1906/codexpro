@@ -37,6 +37,8 @@ import { gitRetireRemoteBranch } from "./gitRetireRemoteBranch.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { buildProContext, exportProContext } from "./proContext.js";
 import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
+import { delegationToolDefs } from "./delegationTools.js";
+import { eventsCapability } from "./delegationEvents.js";
 import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
 import { hasSecretValue, hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactSensitiveTextPreservingLines, redactStructured, redactUnifiedDiff, redactUnifiedDiffPreservingLines, sourceLanguageForPath, sourceSafetyRefusalMessage, truncateUtf8 } from "./redact.js";
@@ -1822,7 +1824,15 @@ const STANDARD_TOOL_NAMES = [
   "read_handoff",
   "wait_for_handoff",
   "export_pro_context",
-  "handoff_to_agent"
+  "handoff_to_agent",
+  "delegation_launch",
+  "delegation_list",
+  "delegation_read_result",
+  "delegation_followup",
+  "delegation_cancel",
+  "events_list",
+  "events_subscribe",
+  "events_unsubscribe"
 ] as const;
 
 const FULL_TOOL_NAMES = [
@@ -1874,7 +1884,15 @@ const FULL_TOOL_NAMES = [
   "codex_context",
   "export_pro_context",
   "handoff_to_agent",
-  "handoff_to_codex"
+  "handoff_to_codex",
+  "delegation_launch",
+  "delegation_list",
+  "delegation_read_result",
+  "delegation_followup",
+  "delegation_cancel",
+  "events_list",
+  "events_subscribe",
+  "events_unsubscribe"
 ] as const;
 
 const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
@@ -1894,7 +1912,15 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "cancel_verification",
   "export_pro_context",
   "handoff_to_agent",
-  "handoff_to_codex"
+  "handoff_to_codex",
+  "delegation_launch",
+  "delegation_list",
+  "delegation_read_result",
+  "delegation_followup",
+  "delegation_cancel",
+  "events_list",
+  "events_subscribe",
+  "events_unsubscribe"
 ]);
 
 function codexSessionToolNames(config: CodexProConfig): string[] {
@@ -3225,6 +3251,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         port: config.port,
         widgetDomain: config.widgetDomain,
         authEnabled: Boolean(config.authToken),
+        capabilities: { events: eventsCapability() },
         bashMode: config.bashMode,
         bashTranscript: config.bashTranscript,
         bashSessionId: config.bashSessionId ?? null,
@@ -5568,7 +5595,9 @@ ${activeCount} active; ${jobs.length} retained in generation ${verificationManag
 
       const stateRel = `${config.contextDir}/handoff-run-state.json`;
       const contextPrefix = `${config.contextDir.replace(/\/+$/, "")}/`;
-      const terminalStates = new Set(["completed", "failed", "timed_out"]);
+      // interrupted/cancelled are honest reconcile outcomes for dead runs;
+      // they are terminal here exactly as completed/failed/timed_out are.
+      const terminalStates = new Set(["completed", "failed", "timed_out", "interrupted", "cancelled"]);
 
       const readState = async (): Promise<Record<string, any> | undefined> => {
         try {
@@ -6021,6 +6050,13 @@ ${result.prompt}
       });
     }
   );
+
+  // Durable Codex delegation + MCP Events transport (Leaf 1: hestia-cli-canary).
+  // Registered through the same mode-gated path as every other tool, so
+  // minimal/connection-test surfaces stay unchanged.
+  for (const def of delegationToolDefs({ config, workspaces, guard })) {
+    registerCodexTool(config, server, def.name, def.options, def.handler);
+  }
 
   return server;
 }

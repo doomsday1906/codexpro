@@ -133,6 +133,8 @@
     "git-diff-range:smoke": "npm run build && node scripts/git-diff-range-smoke.mjs && node scripts/git-diff-range-task005-smoke.mjs && node scripts/git-diff-range-mcp-smoke.mjs",
     "reviewer-surface:smoke": "node scripts/reviewer-surface-smoke.mjs",
     "doctor": "node scripts/codexpro.mjs doctor",
+    "delegation-canary:smoke": "npm run build && node scripts/delegation-canary-smoke.mjs",
+    "delegation-followup:smoke": "npm run build && node scripts/delegation-followup-smoke.mjs",
     "connect": "node scripts/codexpro.mjs",
     "connect:setup": "node scripts/codexpro.mjs setup",
     "connect:local": "node scripts/codexpro.mjs --tunnel none",

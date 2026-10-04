@@ -2952,15 +2952,45 @@ async function executeHandoffRequest(request, args, options = {}) {
   const iteration = Number.isFinite(options.iteration) ? options.iteration : 1;
   const runPlanHash = planHash(request.planText);
   const startedAt = new Date().toISOString();
+  // Durable delegation identity (Leaf 1): reconcile first so a restart is
+  // honest (interrupted vs failed vs completed-awaiting-delivery) and an
+  // idempotent request id never spawns a second worker.
+  const prior = reconcileHandoffRunState(request.root, request.contextDir);
+  if (prior.classification === 'live') {
+    throw new Error(
+      `A handoff run is already in flight (run ${prior.state.run_id ?? 'unknown'}, request ${prior.state.request_id ?? 'unknown'}). ` +
+      'Not spawning a second worker. Wait for completion or cancel the live executor first.'
+    );
+  }
+  const requestId = handoffRequestId(args);
+  const priorAttempts = prior.state && Array.isArray(prior.state.attempts) ? prior.state.attempts : [];
+  const runId = (prior.state && prior.state.request_id === requestId && prior.state.run_id) || newHandoffRunId();
+  const executorStartTime = readLinuxProcessStartTime(process.pid);
+  const runningAttempts = [...priorAttempts, {
+    n: priorAttempts.length + 1,
+    state: 'running',
+    started_at: startedAt,
+    pid: process.pid,
+    summary: `iteration ${iteration} started via ${request.commandInfo.agent}`
+  }].slice(-8);
   writeHandoffRunState(request.root, request.contextDir, {
     state: 'running',
     iteration,
+    run_id: runId,
+    request_id: requestId,
+    workspace_canonical: request.root,
     started_at: startedAt,
     finished_at: null,
     plan_hash: runPlanHash,
     executor: request.commandInfo.agent,
     model: request.commandInfo.model || undefined,
-    pid: process.pid
+    ...(request.commandInfo.codexProfile ? { codex_profile: request.commandInfo.codexProfile } : {}),
+    pid: process.pid,
+    executor_pid: process.pid,
+    executor_starttime: executorStartTime,
+    attempts: runningAttempts,
+    pending_notifications: [],
+    next_action: 'executor running; wait_for_handoff polls this file'
   });
 
   statusLine('wait', `Running ${request.commandInfo.agent}: ${request.commandText}`);
@@ -2996,9 +3026,20 @@ async function executeHandoffRequest(request, args, options = {}) {
 
   const runState = result.timedOut ? 'timed_out' : (result.exitCode === 0 ? 'completed' : 'failed');
   const testsAbsPath = path.join(request.bridgeDir, 'loop-tests.txt');
+  const finishedAttempts = [...runningAttempts.slice(0, -1), {
+    ...runningAttempts.at(-1),
+    state: runState,
+    finished_at: new Date().toISOString(),
+    exit_code: result.exitCode ?? null,
+    timed_out: Boolean(result.timedOut),
+    summary: `iteration ${iteration} ${runState} exit ${result.exitCode ?? 'null'}`
+  }].slice(-8);
   writeHandoffRunState(request.root, request.contextDir, {
     state: runState,
     iteration,
+    run_id: runId,
+    request_id: requestId,
+    workspace_canonical: request.root,
     started_at: startedAt,
     finished_at: new Date().toISOString(),
     plan_hash: runPlanHash,
@@ -3018,6 +3059,14 @@ async function executeHandoffRequest(request, args, options = {}) {
     ...(gitEvidenceIncomplete ? { git_evidence_incomplete: true, git_evidence_reason: gitEvidenceReason } : {}),
     ...(result.treeCleanupIncomplete ? { tree_cleanup_incomplete: true, tree_cleanup_reason: result.treeCleanupReason ?? null } : {}),
     duration_ms: result.durationMs,
+    pid: process.pid,
+    executor_pid: process.pid,
+    executor_starttime: executorStartTime,
+    attempts: finishedAttempts,
+    pending_notifications: [],
+    next_action: runState === 'completed'
+      ? 'result ready; read agent-status.md and implementation-diff.patch'
+      : 'run ended without success; inspect agent-status.md, then relaunch with a NEW request id',
     status_file: path.posix.join(request.contextDir, 'agent-status.md'),
     diff_file: path.posix.join(request.contextDir, 'implementation-diff.patch'),
     log_file: path.posix.join(request.contextDir, 'execution-log.jsonl'),
@@ -3086,6 +3135,80 @@ function writeHandoffRunState(root, contextDir, state) {
   fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
   const payload = { version: 1, updated_at: new Date().toISOString(), ...state };
   fs.writeFileSync(statePath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+}
+
+// Durable delegation identity for the CLI handoff path (Leaf 1 extension).
+// Same file, same writer, no second runner: run identity, workspace canonical
+// path, profile, attempt history, PID+starttime binding, pending
+// notifications, and next action persist here outside tmp.
+function handoffRequestId(args) {
+  const fromArgs = String(args.requestId ?? args.requestid ?? '').trim();
+  if (fromArgs) return fromArgs;
+  const fromEnv = String(process.env.CODEXPRO_HANDOFF_REQUEST_ID ?? '').trim();
+  if (fromEnv) return fromEnv;
+  return `req_${createHash('sha256').update(`${Date.now()}:${process.pid}:${Math.random()}`).digest('hex').slice(0, 16)}`;
+}
+
+function newHandoffRunId() {
+  return `run_${createHash('sha256').update(`handoff:${Date.now()}:${process.pid}:${Math.random()}`).digest('hex').slice(0, 16)}`;
+}
+
+function readHandoffRunStateRecord(root, contextDir) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(handoffRunStatePath(root, contextDir), 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function handoffExecutorAlive(pid, startTime) {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || !startTime) return false;
+  try {
+    return verifyProcessIdentity(pid, { pid, startTime });
+  } catch {
+    return false;
+  }
+}
+
+// Honest restart reconciliation for the CLI handoff run state. A dead running
+// attempt becomes `interrupted` with an explicit next action; a terminal run
+// with undelivered notifications classifies as completed-awaiting-delivery.
+// Never auto-restarts a potentially mutating task.
+function reconcileHandoffRunState(root, contextDir) {
+  const state = readHandoffRunStateRecord(root, contextDir);
+  if (!state) return { state: null, classification: 'none', changed: false };
+  const terminal = new Set(['completed', 'failed', 'timed_out', 'interrupted', 'cancelled']);
+  if (terminal.has(state.state)) {
+    const undelivered = Array.isArray(state.pending_notifications) &&
+      state.pending_notifications.some((note) => note && (note.status === 'pending' || note.status === 'failed'));
+    if (state.state === 'completed' && undelivered) {
+      return { state, classification: 'completed-awaiting-delivery', changed: false };
+    }
+    return { state, classification: 'terminal', changed: false };
+  }
+  if (state.state !== 'running') return { state, classification: 'unknown', changed: false };
+  if (handoffExecutorAlive(state.executor_pid, state.executor_starttime)) {
+    return { state, classification: 'live', changed: false };
+  }
+  const attempts = Array.isArray(state.attempts) ? [...state.attempts] : [];
+  attempts.push({
+    n: attempts.length + 1,
+    state: 'interrupted',
+    finished_at: new Date().toISOString(),
+    summary: 'executor process gone on restart; classified interrupted, never auto-restarted'
+  });
+  const next = {
+    ...state,
+    state: 'interrupted',
+    finished_at: state.finished_at ?? new Date().toISOString(),
+    attempts: attempts.slice(-8),
+    pending_notifications: Array.isArray(state.pending_notifications) ? state.pending_notifications : [],
+    next_action: 'run was interrupted (executor process gone); inspect agent-status.md; relaunch only with a NEW request id'
+  };
+  const { version, updated_at, ...rest } = next;
+  writeHandoffRunState(root, contextDir, rest);
+  return { state: { version: 1, updated_at: new Date().toISOString(), ...rest }, classification: 'interrupted', changed: true };
 }
 
 function appendBridgeLog(root, contextDir, event) {
