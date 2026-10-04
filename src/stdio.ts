@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig } from "./config.js";
 import { createCodexProServer } from "./server.js";
+import { wrapStdioTransportForDelegationProtocol } from "./delegationProtocol.js";
 import { VerificationManager } from "./verificationOps.js";
 import { PtyRunManager } from "./ptyRunManager.js";
 
@@ -92,6 +93,9 @@ async function main(): Promise<void> {
   const server = createCodexProServer(config, { verificationManager, ptyRunManager });
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // Real MCP-Events wire methods reach the same official protocol handlers as
+  // the HTTP interception above; all other stdio traffic forwards untouched.
+  wrapStdioTransportForDelegationProtocol(config, transport);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {

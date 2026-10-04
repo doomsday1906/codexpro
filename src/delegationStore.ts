@@ -390,6 +390,41 @@ export function findRunByRequestId(bridgeDir: string, requestId: string): Delega
   return listDelegationRuns(bridgeDir).find((run) => run.requestId === requestId);
 }
 
+export interface LaunchConflictCandidate {
+  engine: DelegationEngine;
+  delegationGroup: string;
+  isCanary: boolean;
+  task?: string;
+  profile?: string;
+  model?: string;
+  /** Explicit session id supplied at launch, if any. Omitted (minted) sessions never conflict. */
+  sessionId?: string;
+}
+
+/**
+ * Conflicting-payload guard for launch idempotency. The same request id with
+ * identical worker-input content replays (no second worker); the same id with
+ * different task/group/model content is a conflicting re-use and must be
+ * rejected with duplicate_conflicting (no new worker, nothing consumed).
+ * Operational fields (workdir, timeout) are not identity: retries may restate
+ * them. An omitted session id never conflicts with a later-observed minted
+ * session; only two explicit session ids are compared.
+ */
+export function isLaunchRequestConflict(existing: DelegationRunRecord, candidate: LaunchConflictCandidate): boolean {
+  if (existing.engine !== candidate.engine) return true;
+  if (existing.delegationGroup !== candidate.delegationGroup) return true;
+  const existingCanary = existing.isCanary !== false;
+  if (existingCanary !== candidate.isCanary) return true;
+  if (!candidate.isCanary && (existing.task ?? "") !== (candidate.task ?? "")) return true;
+  if (candidate.engine === "codex" && (existing.profile ?? "") !== (candidate.profile ?? "")) return true;
+  if (candidate.engine === "opencode") {
+    if ((existing.model ?? "") !== (candidate.model ?? "")) return true;
+    const candidateSession = candidate.sessionId ?? "";
+    if (candidateSession && (existing.session?.sessionId ?? "") !== candidateSession) return true;
+  }
+  return false;
+}
+
 function pruneDelegationRuns(bridgeDir: string): void {
   const runs = listDelegationRuns(bridgeDir);
   if (runs.length <= DELEGATION_BOUNDS.maxRunsPerWorkspace) return;
@@ -435,7 +470,7 @@ export function sanitizeTaskText(value: unknown, maxChars = DELEGATION_BOUNDS.ma
 }
 
 /** Local stable stringify (events/canonicalJson equivalent without a cycle). */
-function stableStringify(value: unknown): string {
+export function stableStringify(value: unknown): string {
   if (value === null || value === undefined) return "null";
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
   if (typeof value === "object") {
@@ -500,6 +535,23 @@ export function validateCheckpointForRun(run: DelegationRunRecord, checkpoint: C
       (stored.inputRequestId ?? null) === (typeof checkpoint.input_request_id === "string" ? checkpoint.input_request_id : null);
     if (same) return { ok: true, duplicate: true };
     return { ok: false, code: "duplicate_conflicting", message: `Checkpoint ${checkpoint.id} already stored with different content; refusing conflicting re-use (at-most-once).` };
+  }
+  // Crash-boundary pending dispatch: the same checkpoint id may be staged as
+  // pending (persisted before spawn, not yet an applied checkpoint). The same
+  // content stays retryable (falls through to the normal reply path, which
+  // reuses the staged attempt number); different content for the same id is a
+  // conflicting re-use and is rejected here, before any worker spawns and
+  // without consuming the pending reply.
+  const pending = run.pendingDispatch;
+  if (pending && pending.checkpointId === checkpoint.id) {
+    const incomingRequestId = typeof checkpoint.input_request_id === "string" ? checkpoint.input_request_id : null;
+    const samePending = incomingRequestId !== null &&
+      pending.requestId === incomingRequestId &&
+      pending.seq === checkpoint.seq &&
+      stableStringify(pending.payload) === stableStringify(checkpoint.payload);
+    if (!samePending) {
+      return { ok: false, code: "duplicate_conflicting", message: `Checkpoint ${checkpoint.id} has a pending dispatch with different content; refusing conflicting re-use (at-most-once). No worker spawned and the pending reply is not consumed.` };
+    }
   }
   const maxStoredSeq = run.checkpoints.reduce((max, candidate) => Math.max(max, candidate.seq), -1);
   if ((checkpoint.seq as number) <= Math.max(run.lastAppliedCheckpointSeq, maxStoredSeq)) {
@@ -735,6 +787,26 @@ export function reconcileRunState(run: DelegationRunRecord, isAlive: LivenessPro
     return { run, classification: "terminal", changed: false };
   }
   if (run.state === "needs-input") {
+    // No blind short-circuit: a staged dispatch may have spawned its worker
+    // before a crash without confirming (persisted pid on the queued pending
+    // attempt while the run is still needs-input). Consult PID+starttime
+    // identity (never PID alone) before any retry decision. A live staged
+    // worker classifies live so the retry confirms instead of spawning a
+    // second worker; anything else stays needs-input (pending remains
+    // retryable, finished attempts keep their terminal reading).
+    const latestNeedsInput = run.attempts.at(-1);
+    if (latestNeedsInput?.pid !== undefined && latestNeedsInput.processStartTime !== undefined) {
+      if (isAlive(latestNeedsInput.pid, latestNeedsInput.processStartTime)) {
+        return {
+          run: {
+            ...run,
+            nextAction: "a staged continuation worker is still alive; confirm the pending dispatch instead of spawning a second worker"
+          },
+          classification: "live",
+          changed: false
+        };
+      }
+    }
     const undelivered = run.pendingEvents.some((event) =>
       event.deliveries.some((delivery) => delivery.status === "pending" || delivery.status === "failed")
     );

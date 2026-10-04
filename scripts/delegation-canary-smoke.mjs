@@ -1068,4 +1068,233 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
   console.log('ok: J MCP pending-dispatch (spawn failure leaves retryable pending, same ID retries to success)');
 }
 
+// ---------- Part K: endpoint-level wire proof (POST /mcp reaches the real handlers) ----------
+{
+  const { loadConfig: loadConfigK } = await import(pathToFileUrl(path.join(ROOT, 'dist', 'config.js')));
+  const { createCodexProHttpApp: createAppK } = await import(pathToFileUrl(path.join(ROOT, 'dist', 'http.js')));
+  const wsRootK = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-delegation-endpoint-'));
+  // Trusted loopback-only endpoint proof: explicit opt-in for tokenless HTTP.
+  process.env.CODEXPRO_ALLOW_NO_HTTP_TOKEN = '1';
+  const configK = loadConfigK(['--root', wsRootK]);
+  delete process.env.CODEXPRO_ALLOW_NO_HTTP_TOKEN;
+  const appK = createAppK(configK);
+  const listenerK = await new Promise((resolve, reject) => {
+    const server = appK.listen(0, '127.0.0.1', () => resolve(server));
+    server.once('error', reject);
+  });
+  const baseK = `http://127.0.0.1:${listenerK.address().port}`;
+  const postK = async (body, headers = {}) => {
+    const response = await fetch(`${baseK}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...headers },
+      body: JSON.stringify(body)
+    });
+    return { response, json: await response.json().catch(() => null), text: null };
+  };
+  try {
+    // K1: server/discover through the endpoint (not a direct handler call).
+    // The SDK transport has no such method (would be -32601); the real
+    // handler returns the official resultType + version.
+    const discover = await postK({ jsonrpc: '2.0', id: 1, method: 'server/discover', params: {} });
+    assert(discover.response.status === 200, `endpoint server/discover http status ${discover.response.status}`);
+    assert(discover.json?.result?.resultType === 'complete', `endpoint server/discover must reach the real handler, got ${JSON.stringify(discover.json)}`);
+    assert(Array.isArray(discover.json.result.supportedVersions) && discover.json.result.supportedVersions.includes('2026-07-28'), 'endpoint discover must advertise 2026-07-28');
+    // K2: events/list through the endpoint.
+    const listed = await postK({ jsonrpc: '2.0', id: 2, method: 'events/list', params: {} });
+    assert(listed.response.status === 200 && listed.json?.result?.events?.[0]?.name === 'run-attention', `endpoint events/list must reach the real handler, got ${JSON.stringify(listed.json)}`);
+    // K3: batch of protocol methods through the endpoint.
+    const batch = await postK([
+      { jsonrpc: '2.0', id: 11, method: 'server/discover', params: {} },
+      { jsonrpc: '2.0', id: 12, method: 'events/list', params: {} }
+    ]);
+    assert(batch.response.status === 200 && Array.isArray(batch.json) && batch.json.length === 2, `endpoint batch must dispatch both, got ${JSON.stringify(batch.json)}`);
+    assert(batch.json.some((r) => r.id === 11 && r.result?.resultType === 'complete'), 'batch discover must succeed');
+    assert(batch.json.some((r) => r.id === 12 && r.result?.events?.[0]?.name === 'run-attention'), 'batch list must succeed');
+    // K4: auth-check at the endpoint (bearer gate owns protocol methods too).
+    const authedK = createAppK({ ...configK, authToken: 'k'.repeat(32) });
+    const authedListener = await new Promise((resolve, reject) => {
+      const server = authedK.listen(0, '127.0.0.1', () => resolve(server));
+      server.once('error', reject);
+    });
+    try {
+      const authedBase = `http://127.0.0.1:${authedListener.address().port}`;
+      const noAuth = await fetch(`${authedBase}/mcp`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'server/discover', params: {} })
+      });
+      assert(noAuth.status === 401, `protocol method without bearer must be 401, got ${noAuth.status}`);
+      const withAuth = await fetch(`${authedBase}/mcp`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${'k'.repeat(32)}` },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'server/discover', params: {} })
+      });
+      assert(withAuth.status === 200 && (await withAuth.json()).result?.resultType === 'complete', 'protocol method with bearer must reach the handler');
+    } finally {
+      await new Promise((resolve) => authedListener.close(resolve));
+    }
+    // K5: subscribe + unsubscribe through the endpoint (loopback challenge).
+    process.env.CODEXPRO_EVENTS_ALLOW_PRIVATE = '1';
+    const goodSecretK = `whsec_${Buffer.alloc(32, 41).toString('base64')}`;
+    const loopK = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c) => { b += c; });
+      req.on('end', () => {
+        try {
+          const p = JSON.parse(b);
+          if (p.type === 'verification' && typeof p.challenge === 'string') {
+            res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ challenge: p.challenge }));
+            return;
+          }
+        } catch { /* fallthrough */ }
+        res.writeHead(200).end('ok');
+      });
+    });
+    await new Promise((resolve) => loopK.listen(0, '127.0.0.1', resolve));
+    const hookK = `http://127.0.0.1:${loopK.address().port}/hook`;
+    const subArgs = { delegationGroup: 'hestia-cli-canary' };
+    const sub = await postK({ jsonrpc: '2.0', id: 3, method: 'events/subscribe', params: { name: 'run-attention', arguments: subArgs, delivery: { mode: 'webhook', url: hookK, secret: goodSecretK } } });
+    assert(sub.response.status === 200 && typeof sub.json?.result?.id === 'string' && sub.json.result.id.startsWith('sub_'), `endpoint subscribe must verify + store, got ${JSON.stringify(sub.json)}`);
+    const unsub = await postK({ jsonrpc: '2.0', id: 4, method: 'events/unsubscribe', params: { name: 'run-attention', arguments: subArgs, delivery: { mode: 'webhook', url: hookK } } });
+    assert(unsub.response.status === 200 && unsub.json?.result?.removed === true, `endpoint unsubscribe must remove, got ${JSON.stringify(unsub.json)}`);
+    // K6: challenge failure through the endpoint maps to JSON-RPC -32015.
+    const wrongK = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c) => { b += c; });
+      req.on('end', () => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ challenge: 'wrong' })));
+    });
+    await new Promise((resolve) => wrongK.listen(0, '127.0.0.1', resolve));
+    const wrongHook = `http://127.0.0.1:${wrongK.address().port}/hook`;
+    const badSub = await postK({ jsonrpc: '2.0', id: 5, method: 'events/subscribe', params: { name: 'run-attention', arguments: {}, delivery: { mode: 'webhook', url: wrongHook, secret: goodSecretK } } });
+    assert(badSub.response.status === 200 && badSub.json?.error?.code === -32015, `challenge failure must be JSON-RPC -32015, got ${JSON.stringify(badSub.json)}`);
+    wrongK.close();
+    loopK.close();
+    delete process.env.CODEXPRO_EVENTS_ALLOW_PRIVATE;
+    console.log('ok: K endpoint wire proof (POST /mcp server/discover + events/* reach the real handlers, auth-checked, batch, -32015 mapping)');
+  } finally {
+    await new Promise((resolve) => listenerK.close(resolve));
+    await fsp.rm(wsRootK, { recursive: true, force: true });
+  }
+}
+
+// ---------- Part L: dispatch-recovery regressions (crash/async/conflict, hermetic) ----------
+{
+  const { loadConfig: loadConfigL } = await import(pathToFileUrl(path.join(ROOT, 'dist', 'config.js')));
+  const { createCodexProServer: createServerL } = await import(pathToFileUrl(path.join(ROOT, 'dist', 'server.js')));
+  const { Client: ClientL } = await import(pathToFileUrl(path.join(ROOT, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm', 'client', 'index.js')));
+  const { InMemoryTransport: InMemoryTransportL } = await import(pathToFileUrl(path.join(ROOT, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm', 'inMemory.js')));
+  const wsRootL = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-delegation-recovery-'));
+  const configL = loadConfigL(['--root', wsRootL]);
+  const serverL = createServerL(configL);
+  const [ctL, stL] = InMemoryTransportL.createLinkedPair();
+  const clientL = new ClientL({ name: 'recovery-smoke', version: '1' }, { capabilities: {} });
+  await Promise.all([serverL.connect(stL), clientL.connect(ctL)]);
+  const callL = async (name, args) => clientL.callTool({ name, arguments: args });
+  const openedL = await callL('open_workspace', { root: wsRootL });
+  assert(!openedL.isError, 'open_workspace must succeed');
+  const widL = openedL.structuredContent.workspace_id;
+  const realL = fs.realpathSync.native(wsRootL);
+  const runFileL = (id) => path.join(realL, '.ai-bridge', 'delegation-runs', `${id}.json`);
+  async function awaitStateL(id, pred) {
+    for (let i = 0; i < 200; i += 1) {
+      await new Promise((r) => setTimeout(r, 100));
+      try {
+        const cur = readJson(runFileL(id));
+        if (pred(cur)) return cur;
+      } catch { /* not yet */ }
+    }
+    return null;
+  }
+  const BAD_BIN = '/nonexistent/codexpro-async-fail-bin';
+  // L1 crash-boundary: staged pending survives reload (file) and retries the same attemptN.
+  const crashLaunched = await callL('delegation_launch', { workspace_id: widL, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 'rec-crash', canary: true, request_id: 'req-l-crash', timeout_ms: 60000 });
+  assert(!crashLaunched.isError, `crash launch failed: ${JSON.stringify(crashLaunched.structuredContent)}`);
+  const crashRunId = crashLaunched.structuredContent.run_id;
+  assert((await awaitStateL(crashRunId, (r) => r.state === 'completed'))?.state === 'completed', 'crash run must complete');
+  const crashQ = await callL('delegation_followup', { run_id: crashRunId, checkpoint: { id: 'lq-1', run_id: crashRunId, seq: 0, payload: {}, questions: [{ id: 'q1', question: 'crash confirm?' }] } });
+  assert(!crashQ.isError, 'crash question must reach needs-input');
+  const seqCrashBefore = readJson(runFileL(crashRunId)).seq;
+  process.env.CODEXPRO_CODEX_BIN = BAD_BIN;
+  const crashFail = await callL('delegation_followup', { run_id: crashRunId, checkpoint: { id: 'lr-1', run_id: crashRunId, seq: 1, payload: { answer: 'crash-retry-me' }, input_request_id: 'lq-1' } });
+  assert(crashFail.isError && crashFail.structuredContent.error === 'dispatch_pending', `async spawn failure must stage pending, got ${JSON.stringify(crashFail.structuredContent)}`);
+  assert(crashFail.structuredContent.attempt_n === 2, 'staged pending must reserve attempt 2');
+  // The pending record is durable in the run file (crash boundary): reload reads it back.
+  const crashPersisted = readJson(runFileL(crashRunId));
+  assert(crashPersisted.pendingDispatch?.checkpointId === 'lr-1' && crashPersisted.pendingDispatch?.attemptN === 2, 'persisted pending must survive reload with the same attemptN');
+  assert(!crashPersisted.appliedCheckpointIds.includes('lr-1'), 'reload must show no applied mark without a dispatched attempt');
+  assert(crashPersisted.inputRequests.find((x) => x.id === 'lq-1')?.status === 'open', 'reload must show the request still open');
+  assert(crashPersisted.seq === seqCrashBefore, 'reload must show seq unchanged while pending');
+  delete process.env.CODEXPRO_CODEX_BIN;
+  // Fresh server (restart) retries the IDENTICAL reply id: same attempt number, success.
+  const serverL2 = createServerL(loadConfigL(['--root', wsRootL]));
+  const [ctL2, stL2] = InMemoryTransportL.createLinkedPair();
+  const clientL2 = new ClientL({ name: 'recovery-smoke-restart', version: '1' }, { capabilities: {} });
+  await Promise.all([serverL2.connect(stL2), clientL2.connect(ctL2)]);
+  const callL2 = async (name, args) => clientL2.callTool({ name, arguments: args });
+  const openedL2 = await callL2('open_workspace', { root: wsRootL });
+  assert(!openedL2.isError, 'restarted open_workspace must succeed');
+  const crashRetry = await callL2('delegation_followup', { run_id: crashRunId, checkpoint: { id: 'lr-1', run_id: crashRunId, seq: 1, payload: { answer: 'crash-retry-me' }, input_request_id: 'lq-1' } });
+  assert(!crashRetry.isError && crashRetry.structuredContent.executed === true && crashRetry.structuredContent.attempt_n === 2, `reload retry must dispatch the same attempt 2, got ${JSON.stringify(crashRetry.structuredContent)}`);
+  assert((await awaitStateL(crashRunId, (r) => r.state === 'completed' && r.attempts.length === 2))?.attempts.length === 2, 'reloaded continuation must complete');
+  const crashAfter = readJson(runFileL(crashRunId));
+  assert(!crashAfter.pendingDispatch && crashAfter.appliedCheckpointIds.includes('lr-1'), 'success must clear pending and record applied');
+  await clientL2.close();
+  console.log('ok: L1 crash-boundary (persisted pending survives reload + retries the same attemptN)');
+  // L2 async spawn-error: spawn rejects AFTER staging -> pending retryable (same client).
+  const asyncLaunched = await callL('delegation_launch', { workspace_id: widL, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 'rec-async', canary: true, request_id: 'req-l-async', timeout_ms: 60000 });
+  assert(!asyncLaunched.isError, 'async launch failed');
+  const asyncRunId = asyncLaunched.structuredContent.run_id;
+  assert((await awaitStateL(asyncRunId, (r) => r.state === 'completed'))?.state === 'completed', 'async run must complete');
+  const asyncQ = await callL('delegation_followup', { run_id: asyncRunId, checkpoint: { id: 'aq-1', run_id: asyncRunId, seq: 0, payload: {}, questions: [{ id: 'q1', question: 'async confirm?' }] } });
+  assert(!asyncQ.isError, 'async question must reach needs-input');
+  process.env.CODEXPRO_CODEX_BIN = BAD_BIN;
+  const asyncFail = await callL('delegation_followup', { run_id: asyncRunId, checkpoint: { id: 'ar-1', run_id: asyncRunId, seq: 1, payload: { answer: 'async-retry-me' }, input_request_id: 'aq-1' } });
+  assert(asyncFail.isError && asyncFail.structuredContent.error === 'dispatch_pending' && asyncFail.structuredContent.pending_dispatch === true, `async spawn error must leave retryable pending, got ${JSON.stringify(asyncFail.structuredContent)}`);
+  assert(asyncFail.structuredContent.stored === false && asyncFail.structuredContent.executed === false, 'async failure must not consume the reply');
+  const asyncPersisted = readJson(runFileL(asyncRunId));
+  assert(asyncPersisted.pendingDispatch?.checkpointId === 'ar-1', 'async failure must persist the pending dispatch');
+  assert(asyncPersisted.inputRequests.find((x) => x.id === 'aq-1')?.status === 'open', 'async failure must leave the request open');
+  delete process.env.CODEXPRO_CODEX_BIN;
+  const asyncRetry = await callL('delegation_followup', { run_id: asyncRunId, checkpoint: { id: 'ar-1', run_id: asyncRunId, seq: 1, payload: { answer: 'async-retry-me' }, input_request_id: 'aq-1' } });
+  assert(!asyncRetry.isError && asyncRetry.structuredContent.executed === true && asyncRetry.structuredContent.attempt_n === 2, `async retry must dispatch attempt 2, got ${JSON.stringify(asyncRetry.structuredContent)}`);
+  assert((await awaitStateL(asyncRunId, (r) => r.state === 'completed' && r.attempts.length === 2))?.attempts.length === 2, 'async retried continuation must complete');
+  console.log('ok: L2 async spawn-error (spawn rejects after staging -> pending retryable, same ID succeeds)');
+  // L3 conflicting-retry: same pending ID same payload reuses, different payload rejected.
+  const confLaunched = await callL('delegation_launch', { workspace_id: widL, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 'rec-conf', canary: true, request_id: 'req-l-conf', timeout_ms: 60000 });
+  assert(!confLaunched.isError, 'conflict launch failed');
+  const confRunId = confLaunched.structuredContent.run_id;
+  assert((await awaitStateL(confRunId, (r) => r.state === 'completed'))?.state === 'completed', 'conflict run must complete');
+  const confQ = await callL('delegation_followup', { run_id: confRunId, checkpoint: { id: 'cq-1', run_id: confRunId, seq: 0, payload: {}, questions: [{ id: 'q1', question: 'conflict confirm?' }] } });
+  assert(!confQ.isError, 'conflict question must reach needs-input');
+  process.env.CODEXPRO_CODEX_BIN = BAD_BIN;
+  const confStage = await callL('delegation_followup', { run_id: confRunId, checkpoint: { id: 'cr-1', run_id: confRunId, seq: 1, payload: { answer: 'original' }, input_request_id: 'cq-1' } });
+  assert(confStage.isError && confStage.structuredContent.error === 'dispatch_pending', 'conflict setup must stage pending');
+  const attemptsBeforeConflict = readJson(runFileL(confRunId)).attempts.length;
+  const conflicting = await callL('delegation_followup', { run_id: confRunId, checkpoint: { id: 'cr-1', run_id: confRunId, seq: 1, payload: { answer: 'CHANGED' }, input_request_id: 'cq-1' } });
+  assert(conflicting.isError && conflicting.structuredContent.error === 'duplicate_conflicting', `different payload for the same pending ID must be rejected, got ${JSON.stringify(conflicting.structuredContent)}`);
+  const afterConflict = readJson(runFileL(confRunId));
+  assert(afterConflict.attempts.length === attemptsBeforeConflict, 'conflicting retry must spawn no new worker');
+  assert(afterConflict.pendingDispatch?.checkpointId === 'cr-1' && JSON.stringify(afterConflict.pendingDispatch.payload).includes('original'), 'conflicting retry must not consume or replace the pending reply');
+  assert(afterConflict.inputRequests.find((x) => x.id === 'cq-1')?.status === 'open', 'conflicting retry must leave the request open');
+  delete process.env.CODEXPRO_CODEX_BIN;
+  const confRetry = await callL('delegation_followup', { run_id: confRunId, checkpoint: { id: 'cr-1', run_id: confRunId, seq: 1, payload: { answer: 'original' }, input_request_id: 'cq-1' } });
+  assert(!confRetry.isError && confRetry.structuredContent.executed === true && confRetry.structuredContent.attempt_n === 2, `same-payload retry must reuse attempt 2, got ${JSON.stringify(confRetry.structuredContent)}`);
+  assert((await awaitStateL(confRunId, (r) => r.state === 'completed' && r.attempts.length === 2))?.attempts.length === 2, 'conflict retried continuation must complete');
+  // Launch-level: same request id with different task/group content is rejected, never replayed.
+  const listBefore = await callL('delegation_list', {});
+  const runsBefore = (listBefore.structuredContent.runs ?? []).length;
+  const launchA = await callL('delegation_launch', { workspace_id: widL, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 'rec-conflaunch', task: 'Alpha task content one.', delegation_group: 'e2e-real-1', request_id: 'req-l-conflaunch', timeout_ms: 60000 });
+  assert(!launchA.isError, `conflict-launch A failed: ${JSON.stringify(launchA.structuredContent)}`);
+  const launchConflict = await callL('delegation_launch', { workspace_id: widL, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 'rec-conflaunch', task: 'Beta task content two.', delegation_group: 'e2e-real-1', request_id: 'req-l-conflaunch', timeout_ms: 60000 });
+  assert(launchConflict.isError && launchConflict.structuredContent.error === 'duplicate_conflicting', `same request id with different task must be rejected, got ${JSON.stringify(launchConflict.structuredContent)}`);
+  const listAfter = await callL('delegation_list', {});
+  assert((listAfter.structuredContent.runs ?? []).length === runsBefore + 1, 'conflicting launch must spawn no new worker');
+  // Identical launch content still replays (idempotent, no second worker).
+  const launchReplay = await callL('delegation_launch', { workspace_id: widL, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 'rec-conflaunch', task: 'Alpha task content one.', delegation_group: 'e2e-real-1', request_id: 'req-l-conflaunch', timeout_ms: 60000 });
+  assert(!launchReplay.isError && launchReplay.structuredContent.idempotent_replay === true && launchReplay.structuredContent.run_id === launchA.structuredContent.run_id, 'identical launch content must still replay');
+  await callL('delegation_cancel', { run_id: launchA.structuredContent.run_id });
+  await clientL.close();
+  console.log('ok: L3 conflicting-retry (same pending ID same payload reuses, different payload rejected; launch task/group conflicts rejected)');
+}
+
 console.log('\ndelegation-canary-smoke: PASS (code SUBSCRIBED-loopback OBSERVED; ChatGPT-side subscription pending coordination)');

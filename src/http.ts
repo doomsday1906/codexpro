@@ -25,6 +25,7 @@ import { createResponseCompletionTracker } from "./responseCompletion.js";
 import { createDiagnosticContext, type CodexProDiagnosticContext, type HttpDiagnosticSnapshot, type HttpLifecycleEvent } from "./diagnosticContext.js";
 import type { WorkspaceDiagnosticReader } from "./guard.js";
 import { createCodexProServer } from "./server.js";
+import { tryHandleDelegationProtocolBody } from "./delegationProtocol.js";
 import { defaultGitPushPolicy, normalizeGitPushPolicy, sanitizeGitPushPolicy, summarizeGitPushPolicy, type GitPushPolicy } from "./gitPushPolicy.js";
 import { VerificationManager } from "./verificationOps.js";
 import { PtyRunManager } from "./ptyRunManager.js";
@@ -2250,6 +2251,19 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
 
   const handleStatelessRequest = async (req: express.Request, res: express.Response): Promise<void> => {
     observeHttpRequest(req, res, req.body);
+    // Real MCP-Events wire methods (server/discover, events/*) are routed to
+    // the official protocol handlers BEFORE the SDK transport: the bearer gate
+    // above already auth-checked this request, and non-protocol traffic falls
+    // through untouched. Compat events_* tools delegate to the same handlers.
+    const statelessProtocol = await tryHandleDelegationProtocolBody(req.body, { config });
+    if (statelessProtocol.handled) {
+      if (statelessProtocol.response === undefined) {
+        res.status(statelessProtocol.status).end();
+      } else {
+        res.status(statelessProtocol.status).json(statelessProtocol.response);
+      }
+      return;
+    }
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     const diagnosticContext = createDiagnosticContext({
       transportKind: "http",
@@ -2353,6 +2367,18 @@ export function createCodexProHttpApp(config: CodexProConfig, options: CodexProH
     if (!statelessHttp) observeHttpRequest(req, res, req.body);
     if (statelessHttp) {
       await handleStatelessRequest(req, res);
+      return;
+    }
+    // Retained mode: same real protocol interception before any session
+    // routing or transport.handleRequest (auth already checked by the bearer
+    // gate). Non-protocol traffic falls through untouched.
+    const retainedProtocol = await tryHandleDelegationProtocolBody(req.body, { config });
+    if (retainedProtocol.handled) {
+      if (retainedProtocol.response === undefined) {
+        res.status(retainedProtocol.status).end();
+      } else {
+        res.status(retainedProtocol.status).json(retainedProtocol.response);
+      }
       return;
     }
     try {

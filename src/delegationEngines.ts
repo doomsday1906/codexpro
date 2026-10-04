@@ -19,7 +19,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -823,4 +823,41 @@ export function clampCanaryTimeout(requestedMs: unknown): number {
   const n = Number(requestedMs ?? CANARY_ATTEMPT_TIMEOUT_MS);
   if (!Number.isFinite(n)) return CANARY_ATTEMPT_TIMEOUT_MS;
   return Math.max(CANARY_MIN_TIMEOUT_MS, Math.min(Math.floor(n), CANARY_ATTEMPT_TIMEOUT_MS));
+}
+
+/**
+ * Spawn acknowledgement: resolves when the child reports successful spawn,
+ * rejects on async spawn failure (e.g. ENOENT) or when neither arrives
+ * within the bound. Crash-safe dispatch awaits this BEFORE confirming a
+ * staged reply: a sync throw and an async spawn error both leave the pending
+ * dispatch staged (request open, same reply id retryable with the same
+ * attempt number). Never marks applied/confirmed before spawn success.
+ */
+export function waitForSpawn(child: ChildProcess, timeoutMs = 10_000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const timer = setTimeout(() => fail(new Error("spawn acknowledgement timed out")), Math.max(1, Math.min(timeoutMs, 60_000)));
+    if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
+      (timer as unknown as { unref: () => void }).unref();
+    }
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      child.off("spawn", ok);
+      child.off("error", fail);
+    };
+    const ok = (): void => {
+      if (done) return;
+      done = true;
+      cleanup();
+      resolve();
+    };
+    const fail = (error: unknown): void => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    child.once("spawn", ok);
+    child.once("error", fail);
+  });
 }

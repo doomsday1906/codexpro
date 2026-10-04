@@ -42,6 +42,7 @@ import {
   clearPendingDispatch,
   findRunByRequestId,
   isDelegationGroupId,
+  isLaunchRequestConflict,
   listDelegationRuns,
   loadDelegationRun,
   newRunId,
@@ -90,7 +91,8 @@ import {
   signalOwnedTree,
   verifyLunaProfile,
   verifyOpenCodeModel,
-  verifyOpenCodeSession
+  verifyOpenCodeSession,
+  waitForSpawn
 } from "./delegationEngines.js";
 import {
   deliverEventToSubscription,
@@ -432,7 +434,7 @@ function spawnCanaryChild(
   timeoutMs: number,
   lastMessagePath: string,
   isCanary: boolean
-): void {
+): ChildProcess {
   const runtime = processRuntime();
   // Canary runs hash the read-only fixtures before spawn so completion can
   // prove them unchanged. Real tasks carry no fixtures: nothing to hash.
@@ -532,6 +534,7 @@ function spawnCanaryChild(
     settle({ state: exitCode === 0 ? "completed" : "failed", exitCode, signal, timedOut: false });
   });
   runtime.live.set(run.runId, live);
+  return child;
 }
 
 function launchCodexCanary(
@@ -542,9 +545,9 @@ function launchCodexCanary(
   timeoutMs: number,
   prompt: string,
   isCanary: boolean
-): void {
+): ChildProcess {
   const lastMessagePath = path.join(run.workdir, "codex-last-message.md");
-  spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildCodexCanaryArgv(profile, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary);
+  return spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildCodexCanaryArgv(profile, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary);
 }
 
 function launchOpenCodeCanary(
@@ -556,9 +559,9 @@ function launchOpenCodeCanary(
   prompt: string,
   isCanary: boolean,
   sessionId?: string
-): void {
+): ChildProcess {
   const lastMessagePath = path.join(run.workdir, "opencode-last-message.json");
-  spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(), buildOpenCodeCanaryArgv(model, prompt, sessionId), timeoutMs, lastMessagePath, isCanary);
+  return spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(), buildOpenCodeCanaryArgv(model, prompt, sessionId), timeoutMs, lastMessagePath, isCanary);
 }
 
 function launchCodexResume(
@@ -569,9 +572,9 @@ function launchCodexResume(
   timeoutMs: number,
   prompt: string,
   isCanary: boolean
-): void {
+): ChildProcess {
   const lastMessagePath = path.join(run.workdir, "codex-last-message.md");
-  spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildCodexResumeArgv(sessionId, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary);
+  return spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildCodexResumeArgv(sessionId, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary);
 }
 
 function runSummary(run: DelegationRunRecord): Record<string, unknown> {
@@ -782,6 +785,24 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         const existing = findRunByRequestId(bridgeDir, requestId);
         if (existing) {
           if (!ownerAllowed(deps, existing)) return denyAccess();
+          // Same request id with different worker-input content is a
+          // conflicting re-use, not a replay: refuse without spawning a
+          // second worker and without consuming anything.
+          if (isLaunchRequestConflict(existing, {
+            engine,
+            delegationGroup,
+            isCanary,
+            ...(isCanary ? {} : { task: taskText }),
+            ...(engine === "codex" ? { profile } : { model, ...(sessionId ? { sessionId } : {}) })
+          })) {
+            return failResult(`Conflicting re-use of request ${requestId}: it already owns run ${existing.runId} with different task/group/model content. Relaunch only with a NEW request id. No second worker spawned.`, {
+              error: "duplicate_conflicting",
+              run_id: existing.runId,
+              request_id: requestId,
+              stored: false,
+              executed: false
+            });
+          }
           return okResult(`Idempotent replay: request ${requestId} already owns run ${existing.runId} (state ${existing.state}). No second worker spawned.`, {
             run_id: existing.runId, request_id: requestId, state: existing.state, idempotent_replay: true, next_action: existing.nextAction
           });
@@ -1193,6 +1214,21 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             }
           }
           const n = existingPending ? existingPending.attemptN : run.attempts.length + 1;
+          // Dispatch recovery: reconcile the persisted PID+starttime identity
+          // via isProcessIdentityAlive BEFORE any retry, including
+          // needs-input. A staged dispatch may have spawned its worker before
+          // a crash without confirming (persisted pid on the queued pending
+          // attempt). A live staged worker is confirmed without spawning a
+          // second worker; only a dead/absent worker respawns (same attemptN).
+          let stagedAlivePid: number | undefined;
+          if (existingPending) {
+            const persistedLatest = run.attempts.at(-1);
+            if (persistedLatest?.pid !== undefined && persistedLatest.processStartTime !== undefined &&
+              isProcessIdentityAlive(persistedLatest.pid, persistedLatest.processStartTime)) {
+              stagedAlivePid = persistedLatest.pid;
+            }
+          }
+          const alreadyDispatched = existingPending !== undefined && stagedAlivePid !== undefined;
           // The worker input IS the follow-up: base task plus the actual
           // answer payload, forwarded into the worker prompt/argv (reserved).
           const followupPrompt = existingPending && existingPending.prompt
@@ -1207,16 +1243,21 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             });
           // Crash-safe: stage pending-dispatch BEFORE spawn (request stays
           // open, no applied mark). Only a successful spawn confirms it.
-          run = stagePendingDispatch(run, {
-            checkpoint,
-            requestId: request.id,
-            attemptN: n,
-            continuation: existingPending?.continuation ?? continuationLabel,
-            ...(existingPending?.resumeSessionId ?? resumeSessionId ? { resumeSessionId: (existingPending?.resumeSessionId ?? resumeSessionId) as string } : {}),
-            timeoutMs: existingPending?.timeoutMs ?? timeoutMs,
-            prompt: followupPrompt,
-            sessionEvidence: existingPending?.sessionEvidence ?? sessionEvidence
-          });
+          // A retry of the identical staged reply reuses the persisted
+          // pending (same attempt number); a live staged worker skips
+          // staging and spawning entirely and goes straight to confirm.
+          if (!alreadyDispatched) {
+            run = stagePendingDispatch(run, {
+              checkpoint,
+              requestId: request.id,
+              attemptN: n,
+              continuation: existingPending?.continuation ?? continuationLabel,
+              ...(existingPending?.resumeSessionId ?? resumeSessionId ? { resumeSessionId: (existingPending?.resumeSessionId ?? resumeSessionId) as string } : {}),
+              timeoutMs: existingPending?.timeoutMs ?? timeoutMs,
+              prompt: followupPrompt,
+              sessionEvidence: existingPending?.sessionEvidence ?? sessionEvidence
+            });
+          }
           // Re-resolve effective values from the staged pending (retry reuses).
           const staged = run.pendingDispatch!;
           continuationLabel = staged.continuation;
@@ -1229,36 +1270,69 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               : (run.session?.sessionId
                 ? `opencode session ${run.session.sessionId} unverified (${sessionEvidence}): follow-up runs a new attempt (first-use creation), never a resumed session`
                 : "no opencode session id recorded: follow-up runs a new attempt, never a resumed session");
-          saveDelegationRun(bridgeDir, run);
-          // Dispatch: spawn the continuation. Sync throw leaves the pending
-          // record (retryable with the same reply ID, same attempt number).
-          try {
-            if (run.engine === "codex" && continuationLabel === "resumed" && resumeSessionId) {
-              launchCodexResume(deps, bridgeDir, run, resumeSessionId, staged.timeoutMs, staged.prompt, runIsCanary);
-            } else if (run.engine === "codex") {
-              launchCodexCanary(deps, bridgeDir, run, run.profile ?? "", staged.timeoutMs, staged.prompt, runIsCanary);
-            } else {
-              launchOpenCodeCanary(deps, bridgeDir, run, run.model ?? "", staged.timeoutMs, staged.prompt, runIsCanary, resumeSessionId);
-            }
-          } catch (error) {
-            // Pending stays: not consumed, retryable with the same reply ID.
-            // Reload to preserve the exact persisted pending (spawn may have
-            // partially mutated the in-memory run before throwing).
-            const pending = loadDelegationRun(bridgeDir, run.runId) ?? run;
-            return failResult(`Continuation dispatch failed before attempt start; answer staged as pending-dispatch (not consumed, retryable with the same reply ID): ${error instanceof Error ? error.message : String(error)}`, {
-              error: "dispatch_pending",
-              run_id: pending.runId,
-              checkpoint_id: checkpoint.id,
-              input_request_id: request.id,
-              stored: false,
-              executed: false,
-              pending_dispatch: true,
-              attempt_n: staged.attemptN
-            });
+          if (alreadyDispatched) {
+            spawnNote = `staged continuation worker still alive (pid ${stagedAlivePid}); confirmed without spawning a second worker; ${spawnNote}`;
+          } else {
+            saveDelegationRun(bridgeDir, run);
           }
-          // Spawn succeeded: confirm the staged answer (answered mark +
-          // applied checkpoint) and promote the queued pending attempt to
-          // running. No consumed reply without a dispatched attempt.
+          // Dispatch: spawn the continuation. A sync throw leaves the pending
+          // record (retryable with the same reply ID, same attempt number).
+          // The spawn acknowledgement is then awaited BEFORE confirming: an
+          // async spawn error also leaves pending retryable, never consumed.
+          if (!alreadyDispatched) {
+            let child: ChildProcess;
+            try {
+              if (run.engine === "codex" && continuationLabel === "resumed" && resumeSessionId) {
+                child = launchCodexResume(deps, bridgeDir, run, resumeSessionId, staged.timeoutMs, staged.prompt, runIsCanary);
+              } else if (run.engine === "codex") {
+                child = launchCodexCanary(deps, bridgeDir, run, run.profile ?? "", staged.timeoutMs, staged.prompt, runIsCanary);
+              } else {
+                child = launchOpenCodeCanary(deps, bridgeDir, run, run.model ?? "", staged.timeoutMs, staged.prompt, runIsCanary, resumeSessionId);
+              }
+            } catch (error) {
+              // Pending stays: not consumed, retryable with the same reply ID.
+              // Reload to preserve the exact persisted pending (spawn may have
+              // partially mutated the in-memory run before throwing).
+              const pending = loadDelegationRun(bridgeDir, run.runId) ?? run;
+              return failResult(`Continuation dispatch failed before attempt start; answer staged as pending-dispatch (not consumed, retryable with the same reply ID): ${error instanceof Error ? error.message : String(error)}`, {
+                error: "dispatch_pending",
+                run_id: pending.runId,
+                checkpoint_id: checkpoint.id,
+                input_request_id: request.id,
+                stored: false,
+                executed: false,
+                pending_dispatch: true,
+                attempt_n: staged.attemptN
+              });
+            }
+            try {
+              await waitForSpawn(child);
+            } catch (error) {
+              // Async spawn failure (e.g. missing binary): the staged pending
+              // is untouched (pre-confirm error/close never finalizes while
+              // pending), so the identical reply id stays retryable with the
+              // same attempt number. Drop the dead live handle only.
+              if (processRuntime().live.get(run.runId)?.child === child) {
+                processRuntime().live.delete(run.runId);
+              }
+              const pending = loadDelegationRun(bridgeDir, run.runId) ?? run;
+              return failResult(`Continuation dispatch failed before attempt start; answer staged as pending-dispatch (not consumed, retryable with the same reply ID): ${error instanceof Error ? error.message : String(error)}`, {
+                error: "dispatch_pending",
+                run_id: pending.runId,
+                checkpoint_id: checkpoint.id,
+                input_request_id: request.id,
+                stored: false,
+                executed: false,
+                pending_dispatch: true,
+                attempt_n: staged.attemptN
+              });
+            }
+          }
+          // Spawn succeeded (or the staged worker was already alive):
+          // confirm the staged answer (answered mark + applied checkpoint)
+          // and promote the queued pending attempt to running. No consumed
+          // reply without a dispatched attempt. The promotion preserves the
+          // spawn-captured pid/startTime.
           let confirmed = loadDelegationRun(bridgeDir, run.runId) ?? run;
           let applied;
           try {
@@ -1331,7 +1405,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           }
           saveDelegationRun(bridgeDir, run);
           return okResult(
-            `Answer ${checkpoint.id} for request ${request.id} applied at-most-once; continuation attempt ${staged.attemptN} launched (${staged.continuation}: ${spawnNote}).${approvalNote}`,
+            `Answer ${checkpoint.id} for request ${request.id} applied at-most-once; continuation attempt ${staged.attemptN} ${alreadyDispatched ? "confirmed (staged worker was already alive, no second spawn)" : "launched"} (${staged.continuation}: ${spawnNote}).${approvalNote}`,
             {
               run_id: run.runId,
               checkpoint_id: checkpoint.id,
