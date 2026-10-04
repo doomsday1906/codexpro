@@ -1407,12 +1407,24 @@ function loadSubscriptionRecords(bridgeDir: string): Array<Record<string, unknow
 }
 
 /**
- * Verified completion predicate: a receipt proves completion ONLY when it
- * carries the expected counts + hashes (version 2) AND every legacy run
- * file plus every legacy subscription id verifies in the destination.
- * Anything else (no receipt, version 1 without hashes, count/hash mismatch,
- * missing/differing file, missing subscription id) is interrupted and must
- * be recovered by an incremental retry. Never trusts "any dest file exists".
+ * Final completion predicate: a well-formed v2 receipt for this (from,to)
+ * pair proves migration completion FINALLY. The receipt is published
+ * atomically LAST only after full publish-time verification (counts + hashes
+ * + ids verified in ensureDelegationStorage), so its expected counts/hashes/
+ * ids are bound to that publish-time verification for audit. Reopen finality
+ * does NOT re-compare current dest bytes to legacy bytes: ordinary dest
+ * changes after completion (run updates, checkpoint/delivery history,
+ * unsubscribe, subscription edits) must never trigger re-reconciliation,
+ * and legacy files remain untouched (never deleted/modified).
+ *
+ * Well-formed means: version 2, from/to resolve to this exact pair, and the
+ * expected audit fields are present with the right shapes (runFileHashes
+ * record, subscriptionIds string array, subsHash string|null, runFiles
+ * non-negative integer, subscriptions boolean). Anything else (no receipt,
+ * unparseable, version mismatch, from-to mismatch, missing expected fields)
+ * is interrupted and must be recovered by an incremental retry (copy
+ * missing/differing runs only, merge subs by id, verify, publish receipt
+ * last). Never trusts "any dest file exists".
  */
 export function isMigrationReceiptComplete(
   legacyBridgeDir: string,
@@ -1421,52 +1433,26 @@ export function isMigrationReceiptComplete(
 ): boolean {
   if (!receipt || typeof receipt !== "object") return false;
   if ((receipt as { version?: unknown }).version !== DELEGATION_MIGRATION_RECEIPT_VERSION) return false;
+  if (typeof (receipt as { from?: unknown }).from !== "string") return false;
+  if (typeof (receipt as { to?: unknown }).to !== "string") return false;
   if (path.resolve(receipt.from) !== path.resolve(legacyBridgeDir)) return false;
   if (path.resolve(receipt.to) !== path.resolve(newBridgeDir)) return false;
-  const legacyRuns = runFileNames(legacyBridgeDir);
-  if (receipt.runFiles !== legacyRuns.length) return false;
+  if (typeof (receipt as { runFiles?: unknown }).runFiles !== "number") return false;
+  const runFiles = (receipt as { runFiles: number }).runFiles;
+  if (!Number.isSafeInteger(runFiles) || runFiles < 0) return false;
+  if (typeof (receipt as { subscriptions?: unknown }).subscriptions !== "boolean") return false;
   const expectedHashes = (receipt as { runFileHashes?: unknown }).runFileHashes;
   if (!isRecord(expectedHashes)) return false;
-  for (const name of legacyRuns) {
-    let legacyBytes: Buffer;
-    try {
-      legacyBytes = fs.readFileSync(path.join(delegationRunsDir(legacyBridgeDir), name));
-    } catch {
-      return false;
-    }
-    const legacyHash = sha256HexBytes(legacyBytes);
-    if ((expectedHashes as Record<string, unknown>)[name] !== legacyHash) return false;
-    let destBytes: Buffer;
-    try {
-      destBytes = fs.readFileSync(path.join(delegationRunsDir(newBridgeDir), name));
-    } catch {
-      return false;
-    }
-    if (sha256HexBytes(destBytes) !== legacyHash) return false;
+  for (const value of Object.values(expectedHashes as Record<string, unknown>)) {
+    if (typeof value !== "string") return false;
   }
-  const legacySubsExists = hasSubscriptionsFile(legacyBridgeDir);
-  if (Boolean(receipt.subscriptions) !== legacySubsExists) return false;
-  if (!legacySubsExists) return true;
-  let legacyBytes: Buffer;
-  try {
-    legacyBytes = fs.readFileSync(subscriptionsPath(legacyBridgeDir));
-  } catch {
-    return false;
+  const subscriptionIds = (receipt as { subscriptionIds?: unknown }).subscriptionIds;
+  if (!Array.isArray(subscriptionIds)) return false;
+  for (const id of subscriptionIds) {
+    if (typeof id !== "string") return false;
   }
-  const legacyParsed = parseSubscriptionsBytes(legacyBytes);
-  if (receipt.subsHash !== legacyParsed.hash) return false;
-  const receiptIds = Array.isArray((receipt as { subscriptionIds?: unknown }).subscriptionIds)
-    ? (receipt.subscriptionIds as string[]).slice().sort()
-    : null;
-  if (!receiptIds || stableStringify(receiptIds) !== stableStringify(legacyParsed.ids)) return false;
-  const destRecords = loadSubscriptionRecords(newBridgeDir);
-  const destById = new Map(destRecords.map((r) => [(r as { subId: string }).subId, r]));
-  for (const id of legacyParsed.ids) {
-    const legacyRec = legacyParsed.byId.get(id);
-    const destRec = destById.get(id);
-    if (!destRec) return false;
-    if (stableStringify(destRec) !== stableStringify(legacyRec)) return false;
-  }
+  const subsHash = (receipt as { subsHash?: unknown }).subsHash;
+  if (typeof subsHash !== "string" && subsHash !== null) return false;
   return true;
 }
 
@@ -1474,9 +1460,12 @@ export function isMigrationReceiptComplete(
  * Deliberate one-way migration from a legacy workspace bridge dir to the new
  * user-data authority. Copy-only with count/hash verification: the legacy
  * source is ALWAYS left intact (never deleted, never modified; only read)
- * and a receipt records the move. Completion requires a version-2 receipt
- * with expected counts + hashes AND every run file plus every subscription
- * id verified in the destination; anything else is interrupted.
+ * and a receipt records the move. Completion is FINAL: once a well-formed
+ * v2 receipt for this (from,to) pair was published (atomically, LAST, only
+ * after full publish-time verification), later reopens return null WITHOUT
+ * re-comparing current dest bytes to legacy bytes. Ordinary dest changes
+ * after completion (run updates, checkpoint/delivery history, unsubscribe,
+ * subscription edits) never trigger re-reconciliation.
  *
  * Interrupted copies are recoverable by retry: only missing/differing run
  * files are copied (stable run ids, no event re-queue from rewriting
@@ -1488,12 +1477,15 @@ export function isMigrationReceiptComplete(
  */
 export function ensureDelegationStorage(legacyBridgeDir: string, newBridgeDir: string): DelegationMigration | null {
   if (path.resolve(legacyBridgeDir) === path.resolve(newBridgeDir)) return null;
+  // FINALITY FIRST: a well-formed v2 receipt for this exact pair ends the
+  // migration. No dest-vs-legacy comparison here; post-completion dest edits
+  // stay intact and legacy stays untouched. Check before any dest mutation.
+  const existingReceipt = readDelegationMigrationReceipt(newBridgeDir);
+  if (isMigrationReceiptComplete(legacyBridgeDir, newBridgeDir, existingReceipt)) return null;
   const legacyRuns = runFileNames(legacyBridgeDir);
   const legacySubs = hasSubscriptionsFile(legacyBridgeDir);
   if (legacyRuns.length === 0 && !legacySubs) return null;
   fs.mkdirSync(delegationRunsDir(newBridgeDir), { recursive: true, mode: 0o700 });
-  const existingReceipt = readDelegationMigrationReceipt(newBridgeDir);
-  if (isMigrationReceiptComplete(legacyBridgeDir, newBridgeDir, existingReceipt)) return null;
   // Incremental run copy: missing/differing only. Identical bytes are left
   // untouched so stable run ids are preserved and no event is re-queued by
   // rewriting. Source is only ever read.

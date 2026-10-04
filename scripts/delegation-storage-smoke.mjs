@@ -527,6 +527,228 @@ async function makeReceiver() {
   console.log('ok: S2d interrupt before receipt publication (v1 ignored, differing run healed, v2 published last, source intact)');
 }
 
+// ---------- S2e: post-completion dest run update stays final ----------
+// Migrate → update a run file + checkpoint + delivery history in dest →
+// reopen must NOT re-reconcile: edited dest bytes intact, legacy untouched,
+// second reopen still null/idempotent. Receipt keeps publish-time hashes/ids
+// for audit but reopen finality does NOT re-compare dest to legacy.
+{
+  const legacyRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-storage-mig2e-'));
+  const destRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-storage-mig2e-dest-'));
+  const realLegacy = fs.realpathSync.native(legacyRoot);
+  const legacyBridge = path.join(realLegacy, '.ai-bridge');
+  const destBridge = path.join(fs.realpathSync.native(destRoot), 'dest-bridge');
+  const owner = Store.ownerIdFor(undefined, `${UID}:${realLegacy}`);
+  const now = new Date().toISOString();
+  const seedRun = (runId, requestId) => ({
+    version: 1, runId, requestId, delegationGroup: 'hestia-cli-canary', engine: 'codex', profile: 'CODEX_SCOUT_FAST',
+    isCanary: false, task: 'seeded legacy task s2e',
+    session: { engine: 'codex', resumable: false, observed: false, evidence: 'seed', reason: 'seed' },
+    workspaceId: 'ws_seed_2e', workspaceCanonical: realLegacy, workdir: path.join(realLegacy, 'seed-work'),
+    ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind,
+    state: 'completed', seq: 1,
+    attempts: [{ n: 1, startedAt: now, finishedAt: now, state: 'completed', exitCode: 0, summary: 'completed exit 0' }],
+    result: { exitCode: 0, signal: null, timedOut: false, summary: 'completed exit 0' },
+    pendingEvents: [{ eventId: `evt_seed_${runId.slice(4, 8)}`, seq: 1, state: 'completed', summary: 'completed exit 0', createdAt: now, deliveries: [] }],
+    checkpoints: [], appliedCheckpointIds: [], lastAppliedCheckpointSeq: -1, inputRequests: [],
+    nextAction: 'read the terminal result via delegation_read_result', createdAt: now, updatedAt: now
+  });
+  const seeds = [
+    ['run_c2e0c2e0c2e0c2e0', 'req-mig-2e-1'],
+    ['run_d2e0d2e0d2e0d2e0', 'req-mig-2e-2']
+  ];
+  fs.mkdirSync(path.join(legacyBridge, 'delegation-runs'), { recursive: true, mode: 0o700 });
+  for (const [runId, requestId] of seeds) {
+    fs.writeFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`), `${JSON.stringify(seedRun(runId, requestId), null, 2)}\n`, { mode: 0o600 });
+  }
+  const hashA = createHash('sha256').update('synthetic-sub-2e-alpha').digest('hex');
+  const hashB = createHash('sha256').update('synthetic-sub-2e-beta').digest('hex');
+  const legacySubs = [
+    { subId: 'sub_mig_2e_alpha', eventName: 'run-attention', callbackUrl: 'http://127.0.0.1:9/hook-2e-a', filter: { delegation_group: 'hestia-cli-canary' }, ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind, createdAt: now, secretHash: hashA, note: 'hash-only placeholder, no real secret' },
+    { subId: 'sub_mig_2e_beta', eventName: 'run-attention', callbackUrl: 'http://127.0.0.1:9/hook-2e-b', filter: { delegation_group: 'hestia-cli-canary' }, ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind, createdAt: now, secretHash: hashB, note: 'hash-only placeholder, no real secret' }
+  ];
+  const legacySubsBytes = Buffer.from(`${JSON.stringify({ version: 1, subscriptions: legacySubs })}\n`, 'utf8');
+  fs.writeFileSync(path.join(legacyBridge, 'delegation-subscriptions.json'), legacySubsBytes, { mode: 0o600 });
+  const beforeRunBytes = seeds.map(([runId]) => fs.readFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`)));
+  const mig = Store.ensureDelegationStorage(legacyBridge, destBridge);
+  assert(mig && mig.runFiles === 2, `S2e: initial migration must move 2 runs, got ${JSON.stringify(mig)}`);
+  const receiptBefore = Store.readDelegationMigrationReceipt(destBridge);
+  assert(receiptBefore && receiptBefore.version === 2, 'S2e: v2 receipt must exist after migration');
+  const receiptRawBefore = fs.readFileSync(path.join(destBridge, 'delegation-migration.json'), 'utf8');
+  assert(Store.isMigrationReceiptComplete(legacyBridge, destBridge, receiptBefore) === true, 'S2e: receipt must read complete right after migration');
+  // Ordinary dest change: update a run file + checkpoint + delivery history.
+  const editRunId = seeds[0][0];
+  const editPath = path.join(destBridge, 'delegation-runs', `${editRunId}.json`);
+  const editedRun = JSON.parse(fs.readFileSync(editPath, 'utf8'));
+  editedRun.task = `${editedRun.task} :: user edit e`;
+  editedRun.result = { ...(editedRun.result ?? {}), summary: 'edited summary e' };
+  editedRun.checkpoints = [...(editedRun.checkpoints ?? []), { id: 'ckpt_user_e1', runId: editRunId, seq: 99, payload: { note: 'user checkpoint e' }, storedAt: new Date().toISOString(), applied: true }];
+  editedRun.appliedCheckpointIds = [...(editedRun.appliedCheckpointIds ?? []), 'ckpt_user_e1'];
+  editedRun.lastAppliedCheckpointSeq = 99;
+  editedRun.pendingEvents = [...(editedRun.pendingEvents ?? []), { eventId: 'evt_user_e1', seq: 99, state: 'completed', summary: 'user delivery history e', createdAt: new Date().toISOString(), deliveries: [{ subId: 'sub_mig_2e_alpha', status: 'delivered', attempts: 1 }] }];
+  fs.writeFileSync(editPath, `${JSON.stringify(editedRun, null, 2)}\n`, { mode: 0o600 });
+  const editedBytes = fs.readFileSync(editPath);
+  assert(!editedBytes.equals(beforeRunBytes[0]), 'S2e: dest run must differ from legacy after the user edit');
+  // Reopen must be FINAL: no migration, edited state intact, legacy untouched.
+  assert(Store.ensureDelegationStorage(legacyBridge, destBridge) === null, 'S2e: reopen after dest run edit must be null (final, no re-reconciliation)');
+  assert(fs.readFileSync(editPath).equals(editedBytes), 'S2e: edited dest run bytes must stay intact after reopen');
+  const editedBack = JSON.parse(fs.readFileSync(editPath, 'utf8'));
+  assert(editedBack.task.endsWith(':: user edit e'), 'S2e: edited task text must stay intact');
+  assert(editedBack.checkpoints.some((c) => c.id === 'ckpt_user_e1'), 'S2e: user checkpoint must stay intact');
+  assert(editedBack.pendingEvents.some((e) => e.eventId === 'evt_user_e1'), 'S2e: user delivery history must stay intact');
+  assert(fs.readFileSync(path.join(destBridge, 'delegation-runs', `${seeds[1][0]}.json`)).equals(beforeRunBytes[1]), 'S2e: untouched dest run must still equal legacy');
+  for (const [index, [runId]] of seeds.entries()) {
+    assert(fs.readFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`)).equals(beforeRunBytes[index]), `S2e: legacy source ${runId} must be untouched`);
+  }
+  assert(fs.readFileSync(path.join(legacyBridge, 'delegation-subscriptions.json')).equals(legacySubsBytes), 'S2e: legacy subs source must be untouched');
+  assert(fs.readFileSync(path.join(destBridge, 'delegation-migration.json'), 'utf8') === receiptRawBefore, 'S2e: receipt must not be rewritten on final reopen');
+  assert(Store.isMigrationReceiptComplete(legacyBridge, destBridge, Store.readDelegationMigrationReceipt(destBridge)) === true, 'S2e: well-formed v2 receipt still reads complete after dest edit (finality, no re-compare)');
+  assert(Store.ensureDelegationStorage(legacyBridge, destBridge) === null, 'S2e: second reopen must stay null/idempotent');
+  assert(fs.readFileSync(editPath).equals(editedBytes), 'S2e: edited dest run must stay intact after second reopen');
+  console.log('ok: S2e post-completion dest run/checkpoint/delivery edit stays final (no legacy overwrite, legacy untouched)');
+}
+
+// ---------- S2f: post-completion unsubscribe stays final ----------
+// Migrate → remove one sub in dest (unsubscribe) → reopen must NOT resurrect
+// it: dest stays with the removal, legacy untouched, second reopen null.
+{
+  const legacyRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-storage-mig2f-'));
+  const destRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-storage-mig2f-dest-'));
+  const realLegacy = fs.realpathSync.native(legacyRoot);
+  const legacyBridge = path.join(realLegacy, '.ai-bridge');
+  const destBridge = path.join(fs.realpathSync.native(destRoot), 'dest-bridge');
+  const owner = Store.ownerIdFor(undefined, `${UID}:${realLegacy}`);
+  const now = new Date().toISOString();
+  const seedRun = (runId, requestId) => ({
+    version: 1, runId, requestId, delegationGroup: 'hestia-cli-canary', engine: 'codex', profile: 'CODEX_SCOUT_FAST',
+    isCanary: false, task: 'seeded legacy task s2f',
+    session: { engine: 'codex', resumable: false, observed: false, evidence: 'seed', reason: 'seed' },
+    workspaceId: 'ws_seed_2f', workspaceCanonical: realLegacy, workdir: path.join(realLegacy, 'seed-work'),
+    ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind,
+    state: 'completed', seq: 1,
+    attempts: [{ n: 1, startedAt: now, finishedAt: now, state: 'completed', exitCode: 0, summary: 'completed exit 0' }],
+    result: { exitCode: 0, signal: null, timedOut: false, summary: 'completed exit 0' },
+    pendingEvents: [{ eventId: `evt_seed_${runId.slice(4, 8)}`, seq: 1, state: 'completed', summary: 'completed exit 0', createdAt: now, deliveries: [] }],
+    checkpoints: [], appliedCheckpointIds: [], lastAppliedCheckpointSeq: -1, inputRequests: [],
+    nextAction: 'read the terminal result via delegation_read_result', createdAt: now, updatedAt: now
+  });
+  const seeds = [
+    ['run_c2f0c2f0c2f0c2f0', 'req-mig-2f-1'],
+    ['run_d2f0d2f0d2f0d2f0', 'req-mig-2f-2']
+  ];
+  fs.mkdirSync(path.join(legacyBridge, 'delegation-runs'), { recursive: true, mode: 0o700 });
+  for (const [runId, requestId] of seeds) {
+    fs.writeFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`), `${JSON.stringify(seedRun(runId, requestId), null, 2)}\n`, { mode: 0o600 });
+  }
+  const hashA = createHash('sha256').update('synthetic-sub-2f-alpha').digest('hex');
+  const hashB = createHash('sha256').update('synthetic-sub-2f-beta').digest('hex');
+  const legacySubs = [
+    { subId: 'sub_mig_2f_alpha', eventName: 'run-attention', callbackUrl: 'http://127.0.0.1:9/hook-2f-a', filter: { delegation_group: 'hestia-cli-canary' }, ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind, createdAt: now, secretHash: hashA, note: 'hash-only placeholder, no real secret' },
+    { subId: 'sub_mig_2f_beta', eventName: 'run-attention', callbackUrl: 'http://127.0.0.1:9/hook-2f-b', filter: { delegation_group: 'hestia-cli-canary' }, ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind, createdAt: now, secretHash: hashB, note: 'hash-only placeholder, no real secret' }
+  ];
+  const legacySubsBytes = Buffer.from(`${JSON.stringify({ version: 1, subscriptions: legacySubs })}\n`, 'utf8');
+  fs.writeFileSync(path.join(legacyBridge, 'delegation-subscriptions.json'), legacySubsBytes, { mode: 0o600 });
+  const beforeRunBytes = seeds.map(([runId]) => fs.readFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`)));
+  const mig = Store.ensureDelegationStorage(legacyBridge, destBridge);
+  assert(mig && mig.runFiles === 2, `S2f: initial migration must move 2 runs, got ${JSON.stringify(mig)}`);
+  const receiptRawBefore = fs.readFileSync(path.join(destBridge, 'delegation-migration.json'), 'utf8');
+  // Ordinary dest change: unsubscribe (remove beta in dest only).
+  const destSubsPath = path.join(destBridge, 'delegation-subscriptions.json');
+  const destBefore = JSON.parse(fs.readFileSync(destSubsPath, 'utf8')).subscriptions;
+  assert(destBefore.length === 2, 'S2f: dest must hold both subs right after migration');
+  const keepAlpha = destBefore.find((s) => s.subId === 'sub_mig_2f_alpha');
+  fs.writeFileSync(destSubsPath, `${JSON.stringify({ version: 1, subscriptions: [keepAlpha] }, null, 2)}\n`, { mode: 0o600 });
+  const editedSubsBytes = fs.readFileSync(destSubsPath);
+  const editedIds = JSON.parse(editedSubsBytes.toString('utf8')).subscriptions.map((s) => s.subId);
+  assert(JSON.stringify(editedIds) === JSON.stringify(['sub_mig_2f_alpha']), 'S2f: dest must show the unsubscribe (beta removed)');
+  // Reopen must be FINAL: stays removed, not resurrected, legacy untouched.
+  assert(Store.ensureDelegationStorage(legacyBridge, destBridge) === null, 'S2f: reopen after unsubscribe must be null (final, no resurrection)');
+  const afterIds = JSON.parse(fs.readFileSync(destSubsPath, 'utf8')).subscriptions.map((s) => s.subId);
+  assert(JSON.stringify(afterIds) === JSON.stringify(['sub_mig_2f_alpha']), 'S2f: removed sub must stay removed after reopen');
+  assert(fs.readFileSync(destSubsPath).equals(editedSubsBytes), 'S2f: edited dest subs bytes must stay intact');
+  for (const [index, [runId]] of seeds.entries()) {
+    assert(fs.readFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`)).equals(beforeRunBytes[index]), `S2f: legacy source ${runId} must be untouched`);
+    assert(fs.readFileSync(path.join(destBridge, 'delegation-runs', `${runId}.json`)).equals(beforeRunBytes[index]), `S2f: dest run ${runId} must still equal legacy`);
+  }
+  assert(fs.readFileSync(path.join(legacyBridge, 'delegation-subscriptions.json')).equals(legacySubsBytes), 'S2f: legacy subs source must be untouched (still holds both subs)');
+  assert(fs.readFileSync(path.join(destBridge, 'delegation-migration.json'), 'utf8') === receiptRawBefore, 'S2f: receipt must not be rewritten on final reopen');
+  assert(Store.isMigrationReceiptComplete(legacyBridge, destBridge, Store.readDelegationMigrationReceipt(destBridge)) === true, 'S2f: well-formed v2 receipt still reads complete after unsubscribe (finality)');
+  assert(Store.ensureDelegationStorage(legacyBridge, destBridge) === null, 'S2f: second reopen must stay null/idempotent');
+  assert(JSON.parse(fs.readFileSync(destSubsPath, 'utf8')).subscriptions.map((s) => s.subId).length === 1, 'S2f: dest must still hold the unsubscribe after second reopen');
+  console.log('ok: S2f post-completion unsubscribe stays final (not resurrected, legacy untouched)');
+}
+
+// ---------- S2g: post-completion subscription edit stays final ----------
+// Migrate → modify a subscription record in dest → reopen must NOT overwrite
+// it with the legacy record: modification intact, legacy untouched.
+{
+  const legacyRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-storage-mig2g-'));
+  const destRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-storage-mig2g-dest-'));
+  const realLegacy = fs.realpathSync.native(legacyRoot);
+  const legacyBridge = path.join(realLegacy, '.ai-bridge');
+  const destBridge = path.join(fs.realpathSync.native(destRoot), 'dest-bridge');
+  const owner = Store.ownerIdFor(undefined, `${UID}:${realLegacy}`);
+  const now = new Date().toISOString();
+  const seedRun = (runId, requestId) => ({
+    version: 1, runId, requestId, delegationGroup: 'hestia-cli-canary', engine: 'codex', profile: 'CODEX_SCOUT_FAST',
+    isCanary: false, task: 'seeded legacy task s2g',
+    session: { engine: 'codex', resumable: false, observed: false, evidence: 'seed', reason: 'seed' },
+    workspaceId: 'ws_seed_2g', workspaceCanonical: realLegacy, workdir: path.join(realLegacy, 'seed-work'),
+    ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind,
+    state: 'completed', seq: 1,
+    attempts: [{ n: 1, startedAt: now, finishedAt: now, state: 'completed', exitCode: 0, summary: 'completed exit 0' }],
+    result: { exitCode: 0, signal: null, timedOut: false, summary: 'completed exit 0' },
+    pendingEvents: [{ eventId: `evt_seed_${runId.slice(4, 8)}`, seq: 1, state: 'completed', summary: 'completed exit 0', createdAt: now, deliveries: [] }],
+    checkpoints: [], appliedCheckpointIds: [], lastAppliedCheckpointSeq: -1, inputRequests: [],
+    nextAction: 'read the terminal result via delegation_read_result', createdAt: now, updatedAt: now
+  });
+  const seeds = [
+    ['run_c2a0c2a0c2a0c2a0', 'req-mig-2g-1'],
+    ['run_d2a0d2a0d2a0d2a0', 'req-mig-2g-2']
+  ];
+  fs.mkdirSync(path.join(legacyBridge, 'delegation-runs'), { recursive: true, mode: 0o700 });
+  for (const [runId, requestId] of seeds) {
+    fs.writeFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`), `${JSON.stringify(seedRun(runId, requestId), null, 2)}\n`, { mode: 0o600 });
+  }
+  const hashA = createHash('sha256').update('synthetic-sub-2g-alpha').digest('hex');
+  const hashB = createHash('sha256').update('synthetic-sub-2g-beta').digest('hex');
+  const legacySubs = [
+    { subId: 'sub_mig_2g_alpha', eventName: 'run-attention', callbackUrl: 'http://127.0.0.1:9/hook-2g-a', filter: { delegation_group: 'hestia-cli-canary' }, ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind, createdAt: now, secretHash: hashA, note: 'hash-only placeholder, no real secret' },
+    { subId: 'sub_mig_2g_beta', eventName: 'run-attention', callbackUrl: 'http://127.0.0.1:9/hook-2g-b', filter: { delegation_group: 'hestia-cli-canary' }, ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind, createdAt: now, secretHash: hashB, note: 'hash-only placeholder, no real secret' }
+  ];
+  const legacySubsBytes = Buffer.from(`${JSON.stringify({ version: 1, subscriptions: legacySubs })}\n`, 'utf8');
+  fs.writeFileSync(path.join(legacyBridge, 'delegation-subscriptions.json'), legacySubsBytes, { mode: 0o600 });
+  const beforeRunBytes = seeds.map(([runId]) => fs.readFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`)));
+  const mig = Store.ensureDelegationStorage(legacyBridge, destBridge);
+  assert(mig && mig.runFiles === 2, `S2g: initial migration must move 2 runs, got ${JSON.stringify(mig)}`);
+  const receiptRawBefore = fs.readFileSync(path.join(destBridge, 'delegation-migration.json'), 'utf8');
+  // Ordinary dest change: modify a subscription record in dest only.
+  const destSubsPath = path.join(destBridge, 'delegation-subscriptions.json');
+  const destParsed = JSON.parse(fs.readFileSync(destSubsPath, 'utf8'));
+  const editedList = destParsed.subscriptions.map((s) =>
+    s.subId === 'sub_mig_2g_alpha' ? { ...s, callbackUrl: 'http://127.0.0.1:9/hook-2g-a-edited', note: 'user-edited subscription g' } : s);
+  fs.writeFileSync(destSubsPath, `${JSON.stringify({ version: 1, subscriptions: editedList }, null, 2)}\n`, { mode: 0o600 });
+  const editedSubsBytes = fs.readFileSync(destSubsPath);
+  assert(JSON.parse(editedSubsBytes.toString('utf8')).subscriptions.find((s) => s.subId === 'sub_mig_2g_alpha').callbackUrl === 'http://127.0.0.1:9/hook-2g-a-edited', 'S2g: dest edit must apply');
+  // Reopen must be FINAL: modification intact, legacy untouched.
+  assert(Store.ensureDelegationStorage(legacyBridge, destBridge) === null, 'S2g: reopen after sub edit must be null (final, no overwrite)');
+  const afterEdit = JSON.parse(fs.readFileSync(destSubsPath, 'utf8')).subscriptions.find((s) => s.subId === 'sub_mig_2g_alpha');
+  assert(afterEdit.callbackUrl === 'http://127.0.0.1:9/hook-2g-a-edited' && afterEdit.note === 'user-edited subscription g', 'S2g: dest subscription modification must stay intact after reopen');
+  assert(fs.readFileSync(destSubsPath).equals(editedSubsBytes), 'S2g: edited dest subs bytes must stay intact');
+  for (const [index, [runId]] of seeds.entries()) {
+    assert(fs.readFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`)).equals(beforeRunBytes[index]), `S2g: legacy source ${runId} must be untouched`);
+    assert(fs.readFileSync(path.join(destBridge, 'delegation-runs', `${runId}.json`)).equals(beforeRunBytes[index]), `S2g: dest run ${runId} must still equal legacy`);
+  }
+  const legacyAfter = JSON.parse(fs.readFileSync(path.join(legacyBridge, 'delegation-subscriptions.json'), 'utf8')).subscriptions.find((s) => s.subId === 'sub_mig_2g_alpha');
+  assert(legacyAfter.callbackUrl === 'http://127.0.0.1:9/hook-2g-a', 'S2g: legacy subscription record must be untouched');
+  assert(fs.readFileSync(path.join(legacyBridge, 'delegation-subscriptions.json')).equals(legacySubsBytes), 'S2g: legacy subs bytes must be untouched');
+  assert(fs.readFileSync(path.join(destBridge, 'delegation-migration.json'), 'utf8') === receiptRawBefore, 'S2g: receipt must not be rewritten on final reopen');
+  assert(Store.isMigrationReceiptComplete(legacyBridge, destBridge, Store.readDelegationMigrationReceipt(destBridge)) === true, 'S2g: well-formed v2 receipt still reads complete after sub edit (finality)');
+  assert(Store.ensureDelegationStorage(legacyBridge, destBridge) === null, 'S2g: second reopen must stay null/idempotent');
+  assert(JSON.parse(fs.readFileSync(destSubsPath, 'utf8')).subscriptions.find((s) => s.subId === 'sub_mig_2g_alpha').callbackUrl === 'http://127.0.0.1:9/hook-2g-a-edited', 'S2g: dest modification must stay intact after second reopen');
+  console.log('ok: S2g post-completion subscription edit stays final (modification intact, legacy untouched)');
+}
+
 // ---------- S3: explicit legacy opt-in keeps the workspace .ai-bridge layout ----------
 {
   delete process.env.CODEXPRO_HTTP_TOKEN;
@@ -749,4 +971,4 @@ async function makeReceiver() {
   console.log('ok: S4c MCP retry behavior (uncertain/ambiguous+marker/initial-launch fail closed; proven dispatches once)');
 }
 
-console.log('\ndelegation-storage-smoke: PASS (user-data layout + deliberate migration + S2b/S2c/S2d interruption recovery + legacy opt-in + spawn-failure truth)');
+console.log('\ndelegation-storage-smoke: PASS (user-data layout + deliberate migration + S2b/S2c/S2d interruption recovery + S2e/S2f/S2g post-completion finality + legacy opt-in + spawn-failure truth)');
