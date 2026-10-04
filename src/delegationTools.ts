@@ -36,22 +36,27 @@ import { CODEXPRO_PACKAGE_ROOT } from "./buildIdentity.js";
 import { CodexProError, PathGuard, WorkspaceManager } from "./guard.js";
 import {
   DELEGATION_BOUNDS,
-  DELEGATION_GROUP,
+  DELEGATION_GROUP_DEFAULT,
   activeSessionHolders,
   applyCheckpointReply,
+  clearPendingDispatch,
   findRunByRequestId,
+  isDelegationGroupId,
   listDelegationRuns,
   loadDelegationRun,
   newRunId,
   nextActionFor,
   openInputRequests,
   ownerIdFor,
+  pendingDispatchFor,
   reconcileRunState,
   registerInputRequest,
   runInputRequests,
   sanitizeSummary,
+  sanitizeTaskText,
   saveDelegationRun,
   stableEventId,
+  stagePendingDispatch,
   summarizeTerminal,
   validateCheckpointForRun,
   verifyRunOwner,
@@ -64,11 +69,13 @@ import {
 import {
   buildCodexCanaryArgv,
   buildCodexResumeArgv,
+  buildFollowupPrompt,
   buildOpenCodeCanaryArgv,
   CANARY_FIXTURES,
   canaryPrompt,
   cancelOwnedTree,
   clampCanaryTimeout,
+  clampRealTaskTimeout,
   CODEX_RESUME_CAPABILITY,
   codexHomeDir,
   collectOwnedTree,
@@ -82,12 +89,19 @@ import {
   sha256File,
   signalOwnedTree,
   verifyLunaProfile,
-  verifyOpenCodeModel
+  verifyOpenCodeModel,
+  verifyOpenCodeSession
 } from "./delegationEngines.js";
 import {
   deliverEventToSubscription,
   deterministicSubscriptionId,
   eventsCapability,
+  handleEventsList,
+  handleEventsSubscribe,
+  handleEventsUnsubscribe,
+  handleServerDiscover,
+  isAppEventDeliveryEnabled,
+  isEventsDeliveryEnabled,
   isSubscriptionExpired,
   listRunAttentionEvent,
   loadSubscriptions,
@@ -227,6 +241,11 @@ async function pumpDeliveries(
   bridgeDir: string,
   run: DelegationRunRecord
 ): Promise<DelegationRunRecord> {
+  // Split flags: ONLY app-event POSTs are gated here.
+  // Verification + subscription storage are always allowed (see
+  // events_subscribe -> handleEventsSubscribe). While app delivery is OFF,
+  // pending deliveries stay pending and remain replayable via read_result.
+  if (!isAppEventDeliveryEnabled()) return run;
   const subs = loadSubscriptions(bridgeDir);
   const byId = new Map(subs.map((sub) => [sub.subId, sub]));
   let changed = false;
@@ -276,7 +295,7 @@ async function pumpDeliveries(
         ...(event.inputRequestId ? { inputRequestId: event.inputRequestId } : {}),
         createdAt: event.createdAt
       };
-      const outcome = await deliverEventToSubscription(sub.callbackUrl, secret, runEvent);
+      const outcome = await deliverEventToSubscription(sub.callbackUrl, secret, runEvent, fetch, 10_000, { subId: sub.subId });
       delivery.attempts += 1;
       if (outcome.status === "delivered") {
         delivery.status = "delivered";
@@ -333,7 +352,9 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
   const latest = run.attempts.at(-1);
   const finishedAt = new Date().toISOString();
   let fixturesUnchanged: boolean | undefined;
-  if (live) {
+  // Read-only proof applies to canary runs only (legacy run files predate
+  // isCanary and ARE canary runs). Real tasks carry no fixtures.
+  if (live && run.isCanary !== false && Object.keys(live.fixtureHashes).length > 0) {
     try {
       fixturesUnchanged = CANARY_FIXTURES.every((name) => {
         const current = sha256File(path.join(run.workdir, name));
@@ -345,12 +366,18 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
   }
   if (run.engine === "opencode" && live) {
     const observed = parseOpenCodeSessionId(tailText(live.stdoutChunks, DELEGATION_BOUNDS.maxTailBytes));
-    if (observed && isEngineSessionId(observed)) {
+    // An explicit --session id wins over best-effort output parsing: the
+    // parse tries several key spellings and must never hijack resume to a
+    // misparsed id. Observed ids are adopted only for minted (non-explicit)
+    // runs, where they are the sole session evidence.
+    if (observed && isEngineSessionId(observed) && !run.session?.sessionId) {
       if (latest) latest.sessionId = observed;
       run.session = {
         engine: "opencode",
         sessionId: observed,
         resumable: true,
+        observed: true,
+        evidence: "session id observed in worker --format json stdout (shape best-effort); liveness verified at continuation time via session list/export before any resumed label",
         reason: "session id observed in worker --format json stdout (shape best-effort); resume via opencode run --session"
       };
     } else if (!run.session?.sessionId) {
@@ -403,11 +430,16 @@ function spawnCanaryChild(
   binary: string,
   argv: string[],
   timeoutMs: number,
-  lastMessagePath: string
+  lastMessagePath: string,
+  isCanary: boolean
 ): void {
   const runtime = processRuntime();
+  // Canary runs hash the read-only fixtures before spawn so completion can
+  // prove them unchanged. Real tasks carry no fixtures: nothing to hash.
   const fixtureHashes: Record<string, string> = {};
-  for (const name of CANARY_FIXTURES) fixtureHashes[name] = sha256File(path.join(run.workdir, name));
+  if (isCanary) {
+    for (const name of CANARY_FIXTURES) fixtureHashes[name] = sha256File(path.join(run.workdir, name));
+  }
   const child = spawn(binary, argv, {
     cwd: run.workdir,
     env: { ...process.env, NO_COLOR: "1" },
@@ -507,11 +539,12 @@ function launchCodexCanary(
   bridgeDir: string,
   run: DelegationRunRecord,
   profile: string,
-  timeoutMs: number
+  timeoutMs: number,
+  prompt: string,
+  isCanary: boolean
 ): void {
-  const prompt = canaryPrompt(CANARY_FIXTURES);
   const lastMessagePath = path.join(run.workdir, "codex-last-message.md");
-  spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildCodexCanaryArgv(profile, prompt, lastMessagePath), timeoutMs, lastMessagePath);
+  spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildCodexCanaryArgv(profile, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary);
 }
 
 function launchOpenCodeCanary(
@@ -520,11 +553,12 @@ function launchOpenCodeCanary(
   run: DelegationRunRecord,
   model: string,
   timeoutMs: number,
+  prompt: string,
+  isCanary: boolean,
   sessionId?: string
 ): void {
-  const prompt = canaryPrompt(CANARY_FIXTURES);
   const lastMessagePath = path.join(run.workdir, "opencode-last-message.json");
-  spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(), buildOpenCodeCanaryArgv(model, prompt, sessionId), timeoutMs, lastMessagePath);
+  spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(), buildOpenCodeCanaryArgv(model, prompt, sessionId), timeoutMs, lastMessagePath, isCanary);
 }
 
 function launchCodexResume(
@@ -532,11 +566,12 @@ function launchCodexResume(
   bridgeDir: string,
   run: DelegationRunRecord,
   sessionId: string,
-  timeoutMs: number
+  timeoutMs: number,
+  prompt: string,
+  isCanary: boolean
 ): void {
-  const prompt = canaryPrompt(CANARY_FIXTURES);
   const lastMessagePath = path.join(run.workdir, "codex-last-message.md");
-  spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildCodexResumeArgv(sessionId, prompt, lastMessagePath), timeoutMs, lastMessagePath);
+  spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildCodexResumeArgv(sessionId, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary);
 }
 
 function runSummary(run: DelegationRunRecord): Record<string, unknown> {
@@ -548,6 +583,7 @@ function runSummary(run: DelegationRunRecord): Record<string, unknown> {
   return {
     run_id: run.runId,
     delegation_group: run.delegationGroup,
+    is_canary: run.isCanary !== false,
     engine: run.engine,
     ...(run.profile ? { profile: run.profile } : {}),
     ...(run.model ? { model: run.model } : {}),
@@ -589,11 +625,13 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     engine: z.enum(["codex", "opencode"]).describe("Engine adapter: codex via `codex exec --profile`, opencode via `opencode run --model ... --format json`. Flags are never shared across engines."),
     profile: z.string().max(128).optional().describe("Explicit Codex profile name (required for engine codex; Luna-gated)."),
     model: z.string().max(256).optional().describe("Explicit OpenCode model (required for engine opencode; must equal the host top-level model, never substituted)."),
-    session_id: z.string().max(128).optional().describe("Explicit OpenCode session id to continue-or-create via `run --session`. Omit to let the worker mint one (observed best-effort from --format json stdout)."),
+    session_id: z.string().max(128).optional().describe("Explicit OpenCode session id to continue-or-create via `run --session`. Omit to let the worker mint one (observed best-effort from --format json stdout). First use creates; resumed is claimed only after session list/export verification."),
+    task: z.string().max(9000).optional().describe("Real worker input (bounded to 8000 chars after control-strip, validated, never empty). Omit for the legacy read-only canary slice (requires canary=true)."),
+    delegation_group: z.string().max(64).optional().describe("Delegation group id (bounded, validated /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/; default hestia-cli-canary). Scopes subscription filters and events."),
     workdir: z.string().min(1).max(1024).describe("Explicit workspace-relative working directory for the disposable canary run."),
     request_id: z.string().min(1).max(128).optional().describe("Idempotency key. Repeating it returns the existing run without spawning a second worker."),
-    canary: z.boolean().describe("Must be true: this leaf supports only the read-only canary slice."),
-    timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms. Canary clamps to 5 minutes; never applied to ordinary runs.")
+    canary: z.boolean().optional().describe("Must be true when no task is supplied (legacy read-only canary slice). Ignored when task is present."),
+    timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms. Canary clamps to 5 minutes; real tasks clamp to 30 minutes; 10s minimum. The clamped value is truthfully acked.")
   }).strict();
 
   const listArgs = z.object({
@@ -652,7 +690,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "delegation_launch",
       options: {
         title: "Delegation Launch",
-        description: "Launch one durable read-only canary delegation run (Codex via exec --profile with Luna gate; OpenCode via run --model with host-model gate). Requires an explicit workdir plus profile (codex) or model (opencode); idempotent request ids never spawn a second worker. Subscribe to events before launching or replay via delegation_read_result so fast completion never loses the result.",
+        description: "Launch one durable read-only delegation run (Codex via exec --profile with Luna gate; OpenCode via run --model with host-model gate). Real bounded task + validated delegation_group (default hestia-cli-canary), or the legacy canary slice (fixtures, canary=true). Requires an explicit workdir plus profile (codex) or model (opencode); idempotent request ids never spawn a second worker. Subscribe to events before launching or replay via delegation_read_result so fast completion never loses the result.",
         inputSchema: publicSchemaFrom(launchArgs),
         runtimeInputSchema: launchArgs,
         annotations: DESTRUCTIVE
@@ -661,9 +699,32 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         const workspace = deps.workspaces.getWorkspace(args.workspace_id);
         const bridgeDir = bridgeDirFor(deps.config, workspace.root);
         const engine = args.engine as "codex" | "opencode";
-        if (args.canary !== true) {
-          return failResult("This leaf supports only the read-only canary slice: pass canary=true.", { error: "non_canary_rejected" });
+        // Real task + delegation group (bounded, validated; default
+        // hestia-cli-canary). No hardcoded prompt or group: the worker input
+        // is the sanitized task, or the legacy canary prompt when no task is
+        // supplied (which still requires canary=true).
+        const rawGroup = String(args.delegation_group ?? "").trim();
+        const delegationGroup = rawGroup || DELEGATION_GROUP_DEFAULT;
+        if (!isDelegationGroupId(delegationGroup)) {
+          return failResult(`Invalid delegation_group ${JSON.stringify(rawGroup || delegationGroup)}: must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/ within 64 chars.`, { error: "invalid_delegation_group" });
         }
+        let taskText = "";
+        let isCanary = true;
+        if (args.task !== undefined) {
+          const rawTask = String(args.task ?? "");
+          if (rawTask.length > DELEGATION_BOUNDS.maxTaskChars) {
+            return failResult(`task exceeds ${DELEGATION_BOUNDS.maxTaskChars} chars (${rawTask.length}); narrow the task and retry.`, { error: "task_too_large", task_chars: rawTask.length });
+          }
+          taskText = sanitizeTaskText(rawTask);
+          if (!taskText) {
+            return failResult("task is empty after control-strip; supply real worker input or omit task with canary=true.", { error: "task_empty" });
+          }
+          isCanary = false;
+        }
+        if (isCanary && args.canary !== true) {
+          return failResult("Without a task, this leaf supports only the read-only canary slice: pass canary=true or supply task.", { error: "non_canary_rejected" });
+        }
+        const prompt = isCanary ? canaryPrompt(CANARY_FIXTURES) : taskText;
         let profile = "";
         let model = "";
         let sessionId: string | undefined;
@@ -734,44 +795,61 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         } catch (error) {
           return failResult(`Workdir rejected: ${error instanceof Error ? error.message : String(error)}`, { error: "workdir_rejected" });
         }
-        const timeoutMs = clampCanaryTimeout(args.timeout_ms);
+        const timeoutMs = isCanary ? clampCanaryTimeout(args.timeout_ms) : clampRealTaskTimeout(args.timeout_ms);
         const runId = newRunId();
         const owner = ownerIdFor(deps.config.authToken, localOwnerId(deps.config));
         const now = new Date().toISOString();
         fs.mkdirSync(resolved.absPath, { recursive: true, mode: 0o700 });
-        for (const name of CANARY_FIXTURES) {
-          const source = path.join(fixtureSourceDir(), name);
-          try {
-            fs.copyFileSync(source, path.join(resolved.absPath, name));
-          } catch (error) {
-            return failResult(`Canary fixture unavailable: ${name} (${error instanceof Error ? error.message : String(error)})`, { error: "canary_input_missing" });
+        // Canary runs stage the read-only fixtures; real tasks stage nothing.
+        if (isCanary) {
+          for (const name of CANARY_FIXTURES) {
+            const source = path.join(fixtureSourceDir(), name);
+            try {
+              fs.copyFileSync(source, path.join(resolved.absPath, name));
+            } catch (error) {
+              return failResult(`Canary fixture unavailable: ${name} (${error instanceof Error ? error.message : String(error)})`, { error: "canary_input_missing" });
+            }
           }
         }
         const session: DelegationSessionBinding = engine === "codex"
           ? {
             engine: "codex",
             resumable: false,
-            reason: "codex ephemeral canary persists no session; follow-up starts a labeled new-continuation-attempt"
+            observed: false,
+            evidence: "codex ephemeral run persists no session; follow-up is a new attempt by construction",
+            reason: "codex ephemeral run persists no session; follow-up starts a labeled new-continuation-attempt"
           }
           : sessionId
             ? {
               engine: "opencode",
               sessionId,
-              resumable: true,
+              resumable: false,
+              observed: false,
+              evidence: "explicit --session id only: creation-or-resume unverified at launch; verified at continuation time via session list/export before any resumed label",
               reason: "explicit --session id: continues when known, otherwise creates (installed CLI semantics); first use may be creation"
             }
             : {
               engine: "opencode",
               resumable: false,
+              observed: false,
+              evidence: "no explicit --session id; the worker mints the session, observed best-effort from --format json stdout",
               reason: "no explicit --session id; the worker mints the session, observed best-effort from --format json stdout"
             };
+        const attemptSummary = engine === "codex"
+          ? isCanary
+            ? `canary attempt started via codex exec --profile ${profile}`
+            : `real-task attempt started via codex exec --profile ${profile} (${taskText.length} chars, group ${delegationGroup})`
+          : isCanary
+            ? `canary attempt started via opencode run --model ${model}`
+            : `real-task attempt started via opencode run --model ${model} (${taskText.length} chars, group ${delegationGroup})`;
         let run: DelegationRunRecord = {
           version: 1,
           runId,
           requestId,
-          delegationGroup: DELEGATION_GROUP,
+          delegationGroup,
           engine,
           ...(engine === "codex" ? { profile } : { model }),
+          ...(isCanary ? { isCanary: true } : { isCanary: false, task: taskText }),
           session,
           attemptTimeoutMs: timeoutMs,
           workspaceId: workspace.id,
@@ -785,9 +863,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             n: 1,
             startedAt: now,
             state: "running",
-            summary: sanitizeSummary(engine === "codex"
-              ? `canary attempt started via codex exec --profile ${profile}`
-              : `canary attempt started via opencode run --model ${model}`)
+            summary: sanitizeSummary(attemptSummary)
           }],
           pendingEvents: [],
           checkpoints: [],
@@ -801,9 +877,9 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         saveDelegationRun(bridgeDir, run);
         try {
           if (engine === "codex") {
-            launchCodexCanary(deps, bridgeDir, run, profile, timeoutMs);
+            launchCodexCanary(deps, bridgeDir, run, profile, timeoutMs, prompt, isCanary);
           } else {
-            launchOpenCodeCanary(deps, bridgeDir, run, model, timeoutMs, sessionId);
+            launchOpenCodeCanary(deps, bridgeDir, run, model, timeoutMs, prompt, isCanary, sessionId);
           }
         } catch (error) {
           run = loadDelegationRun(bridgeDir, runId) ?? run;
@@ -821,12 +897,14 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         }
         return okResult(
           engine === "codex"
-            ? `Canary run ${runId} launched (codex --profile ${profile}, Luna verified, timeout ${timeoutMs} ms). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`
-            : `Canary run ${runId} launched (opencode run --model ${model} --format json, host-model verified, timeout ${timeoutMs} ms${sessionId ? `, session ${sessionId}` : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`,
+            ? `${isCanary ? "Canary" : "Real-task"} run ${runId} launched (codex --profile ${profile}, Luna verified, group ${delegationGroup}, timeout ${timeoutMs} ms). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`
+            : `${isCanary ? "Canary" : "Real-task"} run ${runId} launched (opencode run --model ${model} --format json, host-model verified, group ${delegationGroup}, timeout ${timeoutMs} ms${sessionId ? `, session ${sessionId}` : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`,
           {
             run_id: runId,
             request_id: requestId,
-            delegation_group: DELEGATION_GROUP,
+            delegation_group: delegationGroup,
+            is_canary: isCanary,
+            ...(isCanary ? {} : { task_chars: taskText.length }),
             engine,
             ...(engine === "codex" ? { profile } : { model }),
             ...(sessionId ? { session_id: sessionId } : {}),
@@ -870,7 +948,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         }
         await pumpSweep(deps, bridgeDir).catch(() => undefined);
         return okResult(`# Delegation runs (${runs.length} visible to this owner)\n\n${runs.map((run) => `- ${run.runId} ${run.engine}${run.profile ? `:${run.profile}` : ""} ${run.state} seq=${run.seq}`).join("\n") || "- none"}`, {
-          delegation_group: DELEGATION_GROUP,
+          delegation_groups: [...new Set(runs.map((run) => run.delegationGroup))],
           runs: runs.map(runSummary)
         });
       }
@@ -915,6 +993,8 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           {
             run_id: current.runId,
             delegation_group: current.delegationGroup,
+            is_canary: current.isCanary !== false,
+            ...(current.task ? { task: current.task } : {}),
             engine: current.engine,
             ...(current.profile ? { profile: current.profile } : {}),
             state: current.state,
@@ -989,44 +1069,37 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           });
         }
         // Reply path: answer the exact referenced request at most once.
+        // Refusals (attempt budget, engine gate, session busy) NEVER consume
+        // the reply: no answered mark, no attempt, seq unchanged. The request
+        // stays open so the identical checkpoint can be retried after the
+        // cause clears. Crash-safe dispatch (defect 5): the answer is staged
+        // as pending-dispatch BEFORE spawn (request stays open, no applied
+        // mark); only a successful spawn confirms it (answered + running).
+        // On spawn failure the pending record stays and the identical
+        // checkpoint id remains retryable with the same attempt number.
+        // No consumed reply without a dispatched attempt.
         if (verdict.request) {
           const request = verdict.request;
-          let applied;
-          try {
-            applied = applyCheckpointReply(run, checkpoint, request);
-          } catch (error) {
-            const code = error && typeof error === "object" && "code" in error
-              ? String((error as { code?: unknown }).code ?? "reply_rejected")
-              : "reply_rejected";
-            return failResult(error instanceof Error ? error.message : String(error), { error: code, run_id: run.runId });
-          }
-          if (applied.run === run) {
-            return okResult(`Duplicate answer ${checkpoint.id} for request ${request.id}: already applied at-most-once, nothing re-executed.`, {
-              run_id: run.runId, checkpoint_id: checkpoint.id, input_request_id: request.id, duplicate: true, executed: false
-            });
-          }
-          run = applied.run;
-          const approvalNote = request.questions.some((question) => question.kind === "approval")
-            ? " Approval-kind answers are data only and never widen sandbox, profile, or model."
-            : "";
-          if (applied.attemptsExhausted) {
-            saveDelegationRun(bridgeDir, run);
-            return okResult(
-              `Answer ${checkpoint.id} for request ${request.id} stored at-most-once, but no attempt budget remains (max ${DELEGATION_BOUNDS.maxAttemptsPerRun}); relaunch only with a NEW request id.${approvalNote}`,
-              { run_id: run.runId, checkpoint_id: checkpoint.id, input_request_id: request.id, stored: true, executed: false, reason: "attempts_exhausted" }
+          const existingPending = run.pendingDispatch && run.pendingDispatch.checkpointId === checkpoint.id && run.pendingDispatch.requestId === request.id
+            ? run.pendingDispatch
+            : undefined;
+          if (!existingPending && run.attempts.length >= DELEGATION_BOUNDS.maxAttemptsPerRun) {
+            return failResult(
+              `Answer not applied: no attempt budget remains (max ${DELEGATION_BOUNDS.maxAttemptsPerRun}); relaunch only with a NEW request id. Request ${request.id} stays open and the reply was not consumed (no answered mark, no attempt, seq unchanged).`,
+              { error: "attempts_exhausted", run_id: run.runId, checkpoint_id: checkpoint.id, input_request_id: request.id, stored: false, executed: false }
             );
           }
-          // Re-verify the engine gate at continuation time: config may have drifted.
+          // Re-verify the engine gate at continuation time BEFORE applying:
+          // config may have drifted since launch.
           if (run.engine === "codex") {
             const gate = verifyLunaProfile(codexHomeDir(), run.profile ?? "");
             if (!gate.allowed) {
-              saveDelegationRun(bridgeDir, run);
-              return failResult(`Answer stored at-most-once, but the Luna profile gate refused continuation: ${gate.reason}`, {
+              return failResult(`Answer not applied: the Luna profile gate refused continuation: ${gate.reason}. Request ${request.id} stays open and the reply was not consumed.`, {
                 error: "luna_gate_refused",
                 run_id: run.runId,
                 checkpoint_id: checkpoint.id,
                 input_request_id: request.id,
-                stored: true,
+                stored: false,
                 executed: false,
                 configured: gate.configured
               });
@@ -1034,113 +1107,242 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           } else {
             const gate = verifyOpenCodeModel(run.model, describeOpenCodeDiscovery().hostModel);
             if (!gate.allowed) {
-              saveDelegationRun(bridgeDir, run);
-              return failResult(`Answer stored at-most-once, but the OpenCode model gate refused continuation: ${gate.reason}`, {
+              return failResult(`Answer not applied: the OpenCode model gate refused continuation: ${gate.reason}. Request ${request.id} stays open and the reply was not consumed.`, {
                 error: "opencode_model_mismatch",
                 run_id: run.runId,
                 checkpoint_id: checkpoint.id,
                 input_request_id: request.id,
-                stored: true,
+                stored: false,
                 executed: false,
                 host_model: gate.hostModel ?? null
               });
             }
-          }
-          const timeoutMs = clampCanaryTimeout(run.attemptTimeoutMs);
-          let continuationLabel: "resumed" | "new-continuation-attempt" = "new-continuation-attempt";
-          let resumeSessionId: string | undefined;
-          let spawnNote: string;
-          if (run.engine === "codex") {
-            if (run.session?.sessionId && run.session.resumable) {
-              continuationLabel = "resumed";
-              resumeSessionId = run.session.sessionId;
-              spawnNote = `codex session ${resumeSessionId} resumed via exec resume (inherits its recorded profile)`;
-            } else {
-              spawnNote = "codex ephemeral canary persists no session: follow-up runs a new attempt, never a resumed session";
-            }
-          } else {
             const sid = run.session?.sessionId;
             if (sid && isEngineSessionId(sid)) {
               const holders = activeSessionHolders(listDelegationRuns(bridgeDir), sid, run.runId);
               if (holders.length > 0) {
-                saveDelegationRun(bridgeDir, run);
-                return failResult(`Answer stored at-most-once, but session ${sid} has an active turn (${holders[0].runId}); one active turn per session, retry after it settles.`, {
+                return failResult(`Answer not applied: session ${sid} has an active turn (${holders[0].runId}); one active turn per session, retry after it settles. Request ${request.id} stays open and the reply was not consumed.`, {
                   error: "session_busy",
                   run_id: run.runId,
                   checkpoint_id: checkpoint.id,
                   input_request_id: request.id,
-                  stored: true,
+                  stored: false,
                   executed: false,
                   session_id: sid,
                   holder_run_id: holders[0].runId
                 });
               }
-              continuationLabel = "resumed";
-              resumeSessionId = sid;
-              spawnNote = `opencode session ${sid} continued via run --session (true resume)`;
+            }
+          }
+          const approvalNote = request.questions.some((question) => question.kind === "approval")
+            ? " Approval-kind answers are data only and never widen sandbox, profile, or model."
+            : "";
+          // Pre-check reply validity BEFORE staging/spawn (no worker for
+          // closed/invalid replies): mirrors applyCheckpointReply guards
+          // without consuming.
+          {
+            const storedReq = runInputRequests(run).find((c) => c.id === request.id);
+            if (!storedReq) {
+              return failResult(`No input request ${request.id} for run ${run.runId}.`, { error: "unknown_input_request", run_id: run.runId });
+            }
+            if (run.state !== "needs-input") {
+              return failResult(`Run ${run.runId} is ${run.state}: replies require needs-input with an open request.`, { error: "reply_without_open_request", run_id: run.runId });
+            }
+            if (storedReq.status === "expired") {
+              return failResult(`Input request ${request.id} expired; ask a fresh question.`, { error: "input_request_expired", run_id: run.runId });
+            }
+            if (storedReq.status === "answered") {
+              if (storedReq.answerCheckpointId === checkpoint.id) {
+                return okResult(`Duplicate answer ${checkpoint.id} for request ${request.id}: already applied at-most-once, nothing re-executed.`, {
+                  run_id: run.runId, checkpoint_id: checkpoint.id, input_request_id: request.id, duplicate: true, executed: false
+                });
+              }
+              return failResult(`Input request ${request.id} already answered by ${storedReq.answerCheckpointId}; conflicting re-answer refused.`, { error: "input_request_closed", run_id: run.runId });
+            }
+          }
+          const runIsCanary = run.isCanary !== false;
+          const timeoutMs = runIsCanary ? clampCanaryTimeout(run.attemptTimeoutMs) : clampRealTaskTimeout(run.attemptTimeoutMs);
+          let continuationLabel: "resumed" | "new-continuation-attempt" = "new-continuation-attempt";
+          let resumeSessionId: string | undefined;
+          let spawnNote: string;
+          let sessionEvidence = "no session identity recorded: follow-up runs a new attempt, never a resumed session";
+          if (run.engine === "codex") {
+            // Codex runs are ephemeral: they persist no session, so there is
+            // no session evidence to verify. Fail closed to a new attempt by
+            // construction, even if a stale record names a session.
+            spawnNote = "codex ephemeral run persists no session: follow-up runs a new attempt, never a resumed session";
+            sessionEvidence = "codex ephemeral run persists no session; resumed requires observed + verified session evidence, which cannot exist here";
+          } else {
+            const sid = run.session?.sessionId;
+            if (sid && isEngineSessionId(sid)) {
+              // Verified resume only: the id must have been observed AND be
+              // confirmed live by session list/export. First use of an
+              // explicit id creates (installed continue-or-create semantics).
+              const probe = verifyOpenCodeSession(sid, run.workdir);
+              if (probe.verified) {
+                continuationLabel = "resumed";
+                resumeSessionId = sid;
+                spawnNote = `opencode session ${sid} verified live (${probe.evidence}) and continued via run --session (true resume)`;
+                sessionEvidence = probe.evidence;
+              } else {
+                spawnNote = `opencode session ${sid} unverified (${probe.evidence}): follow-up runs a new attempt (first-use creation), never a resumed session`;
+                sessionEvidence = probe.evidence;
+              }
             } else {
               spawnNote = "no opencode session id recorded: follow-up runs a new attempt, never a resumed session";
             }
           }
-          const n = run.attempts.length + 1;
+          const n = existingPending ? existingPending.attemptN : run.attempts.length + 1;
+          // The worker input IS the follow-up: base task plus the actual
+          // answer payload, forwarded into the worker prompt/argv (reserved).
+          const followupPrompt = existingPending && existingPending.prompt
+            ? existingPending.prompt
+            : buildFollowupPrompt({
+              baseTask: run.task,
+              isCanary: runIsCanary,
+              requestId: request.id,
+              questions: request.questions,
+              answerPayload: checkpoint.payload,
+              attemptN: n
+            });
+          // Crash-safe: stage pending-dispatch BEFORE spawn (request stays
+          // open, no applied mark). Only a successful spawn confirms it.
+          run = stagePendingDispatch(run, {
+            checkpoint,
+            requestId: request.id,
+            attemptN: n,
+            continuation: existingPending?.continuation ?? continuationLabel,
+            ...(existingPending?.resumeSessionId ?? resumeSessionId ? { resumeSessionId: (existingPending?.resumeSessionId ?? resumeSessionId) as string } : {}),
+            timeoutMs: existingPending?.timeoutMs ?? timeoutMs,
+            prompt: followupPrompt,
+            sessionEvidence: existingPending?.sessionEvidence ?? sessionEvidence
+          });
+          // Re-resolve effective values from the staged pending (retry reuses).
+          const staged = run.pendingDispatch!;
+          continuationLabel = staged.continuation;
+          resumeSessionId = staged.resumeSessionId;
+          sessionEvidence = staged.sessionEvidence;
+          spawnNote = run.engine === "codex"
+            ? "codex ephemeral run persists no session: follow-up runs a new attempt, never a resumed session"
+            : resumeSessionId && continuationLabel === "resumed"
+              ? `opencode session ${resumeSessionId} verified live (${sessionEvidence}) and continued via run --session (true resume)`
+              : (run.session?.sessionId
+                ? `opencode session ${run.session.sessionId} unverified (${sessionEvidence}): follow-up runs a new attempt (first-use creation), never a resumed session`
+                : "no opencode session id recorded: follow-up runs a new attempt, never a resumed session");
+          saveDelegationRun(bridgeDir, run);
+          // Dispatch: spawn the continuation. Sync throw leaves the pending
+          // record (retryable with the same reply ID, same attempt number).
+          try {
+            if (run.engine === "codex" && continuationLabel === "resumed" && resumeSessionId) {
+              launchCodexResume(deps, bridgeDir, run, resumeSessionId, staged.timeoutMs, staged.prompt, runIsCanary);
+            } else if (run.engine === "codex") {
+              launchCodexCanary(deps, bridgeDir, run, run.profile ?? "", staged.timeoutMs, staged.prompt, runIsCanary);
+            } else {
+              launchOpenCodeCanary(deps, bridgeDir, run, run.model ?? "", staged.timeoutMs, staged.prompt, runIsCanary, resumeSessionId);
+            }
+          } catch (error) {
+            // Pending stays: not consumed, retryable with the same reply ID.
+            // Reload to preserve the exact persisted pending (spawn may have
+            // partially mutated the in-memory run before throwing).
+            const pending = loadDelegationRun(bridgeDir, run.runId) ?? run;
+            return failResult(`Continuation dispatch failed before attempt start; answer staged as pending-dispatch (not consumed, retryable with the same reply ID): ${error instanceof Error ? error.message : String(error)}`, {
+              error: "dispatch_pending",
+              run_id: pending.runId,
+              checkpoint_id: checkpoint.id,
+              input_request_id: request.id,
+              stored: false,
+              executed: false,
+              pending_dispatch: true,
+              attempt_n: staged.attemptN
+            });
+          }
+          // Spawn succeeded: confirm the staged answer (answered mark +
+          // applied checkpoint) and promote the queued pending attempt to
+          // running. No consumed reply without a dispatched attempt.
+          let confirmed = loadDelegationRun(bridgeDir, run.runId) ?? run;
+          let applied;
+          try {
+            applied = applyCheckpointReply(confirmed, checkpoint, request);
+          } catch (error) {
+            const code = error && typeof error === "object" && "code" in error
+              ? String((error as { code?: unknown }).code ?? "reply_rejected")
+              : "reply_rejected";
+            // Apply failure means the reply itself is invalid; drop the
+            // pending reservation so a fresh valid reply can be staged.
+            const withoutPending = clearPendingDispatch(loadDelegationRun(bridgeDir, run.runId) ?? run);
+            saveDelegationRun(bridgeDir, withoutPending);
+            return failResult(error instanceof Error ? error.message : String(error), { error: code, run_id: run.runId });
+          }
+          if (applied.run === confirmed) {
+            return okResult(`Duplicate answer ${checkpoint.id} for request ${request.id}: already applied at-most-once, nothing re-executed.`, {
+              run_id: confirmed.runId, checkpoint_id: checkpoint.id, input_request_id: request.id, duplicate: true, executed: false
+            });
+          }
+          if (applied.attemptsExhausted) {
+            const withoutPending = clearPendingDispatch(applied.run);
+            saveDelegationRun(bridgeDir, withoutPending);
+            return failResult(
+              `Answer not applied: no attempt budget remains (max ${DELEGATION_BOUNDS.maxAttemptsPerRun}); relaunch only with a NEW request id.`,
+              { error: "attempts_exhausted", run_id: confirmed.runId, checkpoint_id: checkpoint.id, input_request_id: request.id, stored: false, executed: false }
+            );
+          }
+          run = applied.run;
+          // Promote the queued pending attempt (n) to running with dispatch identity.
+          // Preserve the spawn-captured pid/startTime (set by spawnCanaryChild
+          // before confirm); never drop process identity.
           const startedAt = new Date().toISOString();
-          run.attempts = [...run.attempts, {
-            n,
-            startedAt,
-            state: "running",
-            ...(resumeSessionId ? { sessionId: resumeSessionId } : {}),
-            continuation: continuationLabel,
-            summary: sanitizeSummary(`follow-up continuation (${continuationLabel}) for request ${request.id}`)
-          }];
+          run.attempts = run.attempts.map((a) => a.n === staged.attemptN && a.state === "queued"
+            ? {
+              ...a,
+              n: staged.attemptN,
+              startedAt: a.startedAt ?? startedAt,
+              state: "running" as DelegationRunState,
+              ...(staged.resumeSessionId ? { sessionId: staged.resumeSessionId } : (a as { sessionId?: string }).sessionId ? { sessionId: (a as { sessionId?: string }).sessionId as string } : {}),
+              continuation: staged.continuation,
+              summary: sanitizeSummary(`follow-up continuation (${staged.continuation}) for request ${request.id}`)
+            }
+            : a);
+          // If the pending attempt was somehow absent (e.g., pruned), append it as running.
+          if (!run.attempts.some((a) => a.n === staged.attemptN)) {
+            run.attempts = [...run.attempts, {
+              n: staged.attemptN,
+              startedAt,
+              state: "running" as DelegationRunState,
+              ...(staged.resumeSessionId ? { sessionId: staged.resumeSessionId } : {}),
+              continuation: staged.continuation,
+              summary: sanitizeSummary(`follow-up continuation (${staged.continuation}) for request ${request.id}`)
+            }].slice(-DELEGATION_BOUNDS.maxAttemptsPerRun);
+          }
           run.state = "running";
           run.session = {
             engine: run.engine,
-            ...(resumeSessionId ?? run.session?.sessionId ? { sessionId: (resumeSessionId ?? run.session?.sessionId) as string } : {}),
-            resumable: run.engine === "opencode" && Boolean(resumeSessionId ?? run.session?.sessionId),
-            continuation: continuationLabel,
+            ...(staged.resumeSessionId ?? run.session?.sessionId ? { sessionId: (staged.resumeSessionId ?? run.session?.sessionId) as string } : {}),
+            resumable: staged.continuation === "resumed",
+            observed: confirmed.session?.observed ?? false,
+            evidence: staged.sessionEvidence,
+            continuation: staged.continuation,
             reason: spawnNote
           };
           run.nextAction = "poll delegation_read_result or await the run-attention event";
-          saveDelegationRun(bridgeDir, run);
-          try {
-            if (run.engine === "codex" && continuationLabel === "resumed" && resumeSessionId) {
-              launchCodexResume(deps, bridgeDir, run, resumeSessionId, timeoutMs);
-            } else if (run.engine === "codex") {
-              launchCodexCanary(deps, bridgeDir, run, run.profile ?? "", timeoutMs);
-            } else {
-              launchOpenCodeCanary(deps, bridgeDir, run, run.model ?? "", timeoutMs, resumeSessionId);
-            }
-          } catch (error) {
-            const current = loadDelegationRun(bridgeDir, run.runId) ?? run;
-            current.state = "failed";
-            const failed = current.attempts.at(-1);
-            if (failed) {
-              failed.state = "failed";
-              failed.finishedAt = new Date().toISOString();
-              failed.summary = sanitizeSummary(`continuation launch failed: ${error instanceof Error ? error.message : String(error)}`);
-            }
-            current.result = { exitCode: 127, signal: null, timedOut: false, summary: sanitizeSummary(error instanceof Error ? error.message : String(error)) };
-            enqueueTerminalEvent(current, loadSubscriptions(bridgeDir));
-            saveDelegationRun(bridgeDir, current);
-            return failResult(`Continuation launch failed: ${error instanceof Error ? error.message : String(error)}`, {
-              error: "launch_failed",
-              run_id: run.runId,
-              stored: true,
-              executed: false
-            });
+          // Clear the pending reservation only after successful dispatch + apply.
+          {
+            const { pendingDispatch: _dropped, ...rest } = run;
+            run = rest as DelegationRunRecord;
           }
+          saveDelegationRun(bridgeDir, run);
           return okResult(
-            `Answer ${checkpoint.id} for request ${request.id} applied at-most-once; continuation attempt ${n} launched (${continuationLabel}: ${spawnNote}).${approvalNote}`,
+            `Answer ${checkpoint.id} for request ${request.id} applied at-most-once; continuation attempt ${staged.attemptN} launched (${staged.continuation}: ${spawnNote}).${approvalNote}`,
             {
               run_id: run.runId,
               checkpoint_id: checkpoint.id,
               input_request_id: request.id,
               stored: true,
               executed: true,
-              attempt_n: n,
-              continuation: continuationLabel,
-              ...(resumeSessionId ? { session_id: resumeSessionId } : {}),
-              timeout_ms: timeoutMs,
+              attempt_n: staged.attemptN,
+              continuation: staged.continuation,
+              session_evidence: staged.sessionEvidence,
+              ...(staged.resumeSessionId ? { session_id: staged.resumeSessionId } : {}),
+              timeout_ms: staged.timeoutMs,
               state: "running",
               next_action: "poll delegation_read_result or await the run-attention event"
             }
@@ -1235,21 +1437,25 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "events_list",
       options: {
         title: "Events List",
-        description: "List the narrow MCP Events surface: exactly one run-attention event (completed/failed/interrupted/timed_out/cancelled/needs-input) with owner plus delegation-group/run id filters and webhook-only delivery.",
+        description: "List the narrow MCP Events surface: exactly one run-attention event (completed/failed/interrupted/timed_out/cancelled/needs-input) with owner plus delegation-group/run id filters and webhook-only delivery. Official events/list handler; compat tools wrap it.",
         inputSchema: publicSchemaFrom(z.object({}).strict()),
         runtimeInputSchema: z.object({}).strict(),
         annotations: READ_ONLY
       },
-      handler: async () => okResult("# Events\n\n- run-attention: delegation wake-up with run id, state, seq/version, and a sanitized summary only.", {
-        capability: eventsCapability(),
-        events: [listRunAttentionEvent()]
-      })
+      handler: async () => {
+        const listed = handleEventsList();
+        return okResult("# Events\n\n- run-attention: delegation wake-up with run id, state, seq/version, and a sanitized summary only.", {
+          capability: eventsCapability(),
+          discover: handleServerDiscover(),
+          ...listed
+        });
+      }
     },
     {
       name: "events_subscribe",
       options: {
         title: "Events Subscribe",
-        description: "Subscribe a webhook to the run-attention event. Validates a whsec_ secret, HTTPS callback, and private/local blocks; verifies the callback with a signed challenge (unique webhook-id, Standard Webhooks). Deterministic subscription ids make repeat calls idempotent. Challenge failure is error -32015.",
+        description: "Subscribe a webhook to the run-attention event (official events/subscribe). Validates a whsec_ secret, HTTPS callback, and private/local blocks; verifies the callback with a signed verification challenge (msg_verification_* webhook-id, Standard Webhooks, X-MCP-Subscription-Id binding). Deterministic subscription ids make repeat calls idempotent. Challenge failure is error -32015 with data.reason. Verification + storage are always allowed; only app-event POSTs are gated by CODEXPRO_EVENTS_DELIVERY_ENABLED.",
         inputSchema: publicSchemaFrom(eventsSubscribeArgs),
         runtimeInputSchema: eventsSubscribeArgs,
         annotations: DESTRUCTIVE
@@ -1257,51 +1463,62 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       handler: async (args) => {
         const workspace = deps.workspaces.getWorkspace(args.workspace_id);
         const bridgeDir = bridgeDirFor(deps.config, workspace.root);
-        let validated;
+        const owner = ownerIdFor(deps.config.authToken, localOwnerId(deps.config));
+        // Compat wrapper -> official params (verification + storage always
+        // allowed; split flags gate only app-event pump, never subscribe).
+        const officialParams = {
+          name: args.event_name ?? RUN_ATTENTION_EVENT,
+          arguments: (() => {
+            const f = (args.filter ?? {}) as Record<string, unknown>;
+            const out: Record<string, unknown> = {};
+            if (f.delegation_group !== undefined) out.delegationGroup = f.delegation_group;
+            if (f.delegationGroup !== undefined) out.delegationGroup = f.delegationGroup;
+            if (f.run_id !== undefined) out.runId = f.run_id;
+            if (f.runId !== undefined) out.runId = f.runId;
+            return out;
+          })(),
+          delivery: { mode: "webhook", url: args.callback_url, secret: args.webhook_secret }
+        };
+        // Owner check before verification (knowing a sub id grants no access).
+        let preId: string | undefined;
         try {
-          validated = validateSubscriptionInput({
-            callbackUrl: args.callback_url,
-            eventName: args.event_name ?? RUN_ATTENTION_EVENT,
-            filter: args.filter,
-            webhookSecret: args.webhook_secret
-          });
+          const translated = (await import("./delegationEvents.js") as typeof import("./delegationEvents.js")).translateSubscribeParams(officialParams as never);
+          preId = (await import("./delegationEvents.js") as typeof import("./delegationEvents.js")).deterministicSubscriptionId(
+            owner.ownerIdHash, translated.validated.callbackUrl, translated.validated.eventName, translated.validated.filter
+          );
+          const preexisting = loadSubscriptions(bridgeDir).find((sub) => sub.subId === preId);
+          if (preexisting && !subscriptionOwnerMatches(deps, preexisting)) return denyAccess();
         } catch (error) {
           return failResult(`Subscription rejected: ${error instanceof Error ? error.message : String(error)}`, { error: "subscription_rejected" });
         }
-        const owner = ownerIdFor(deps.config.authToken, localOwnerId(deps.config));
-        const subId = deterministicSubscriptionId(owner.ownerIdHash, validated.callbackUrl, validated.eventName, validated.filter);
-        const preexisting = loadSubscriptions(bridgeDir).find((sub) => sub.subId === subId);
-        if (preexisting && !subscriptionOwnerMatches(deps, preexisting)) return denyAccess();
         try {
-          const { webhookId } = await verifySubscriptionChallenge(
-            validated.callbackUrl, validated.secretBytes, validated.eventName, validated.filter
-          );
-          const subs = loadSubscriptions(bridgeDir);
-          const index = subs.findIndex((sub) => sub.subId === subId);
-          const record: EventSubscription = {
-            version: 1,
-            subId,
-            eventName: validated.eventName,
-            callbackUrl: validated.callbackUrl,
-            filter: validated.filter,
+          const result = await handleEventsSubscribe(officialParams as never, {
+            bridgeDir,
             ownerIdHash: owner.ownerIdHash,
-            ownerKind: owner.ownerKind,
-            createdAt: index >= 0 ? subs[index].createdAt : new Date().toISOString(),
-            lastWebhookId: webhookId,
-            secret: args.webhook_secret as string
-          };
-          if (index >= 0) subs[index] = record;
-          else subs.push(record);
-          saveSubscriptions(bridgeDir, subs);
-          return okResult(`Subscribed ${subId} to run-attention (challenge verified, webhook ${webhookId}).`, {
-            subscription_id: subId, event_name: RUN_ATTENTION_EVENT, idempotent: index >= 0, filter: validated.filter
+            ownerKind: owner.ownerKind
+          });
+          return okResult(`Subscribed ${result.id} to run-attention (verification challenge verified, refreshBefore ${result.refreshBefore ?? "none"}).`, {
+            subscription_id: result.id,
+            id: result.id,
+            event_name: RUN_ATTENTION_EVENT,
+            idempotent: result.idempotent,
+            refreshBefore: result.refreshBefore,
+            cursor: result.cursor,
+            truncated: result.truncated,
+            filter: (officialParams as { arguments: unknown }).arguments
           });
         } catch (error) {
           const code = error && typeof error === "object" && "code" in error
             ? Number((error as { code?: unknown }).code)
             : SUBSCRIPTION_CHALLENGE_ERROR_CODE;
+          const reason = error && typeof error === "object" && (error as { data?: unknown }).data
+            ? String(((error as { data: { reason?: unknown } }).data.reason ?? "challenge_failed"))
+            : "challenge_failed";
+          const isChallenge = Number.isFinite(code) && code === SUBSCRIPTION_CHALLENGE_ERROR_CODE;
           return failResult(`Subscription challenge failed: ${error instanceof Error ? error.message : String(error)}`, {
-            error: "challenge_failed", code: Number.isFinite(code) ? code : SUBSCRIPTION_CHALLENGE_ERROR_CODE
+            error: isChallenge ? "challenge_failed" : "subscription_rejected",
+            code: Number.isFinite(code) ? code : SUBSCRIPTION_CHALLENGE_ERROR_CODE,
+            data: { reason }
           });
         }
       }

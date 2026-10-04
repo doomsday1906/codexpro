@@ -32,6 +32,8 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const DELEGATION_GROUP = "hestia-cli-canary";
+/** Default group applied when launch omits delegation_group (back-compat). */
+export const DELEGATION_GROUP_DEFAULT = DELEGATION_GROUP;
 export const DELEGATION_STORE_VERSION = 1;
 export const DELEGATION_RUNS_DIRNAME = "delegation-runs";
 export const DELEGATION_SUBSCRIPTIONS_FILENAME = "delegation-subscriptions.json";
@@ -148,6 +150,10 @@ export interface DelegationSessionBinding {
   resumable: boolean;
   continuation?: "resumed" | "new-continuation-attempt";
   reason: string;
+  /** True only when the id was observed in worker output (not explicit-only). */
+  observed?: boolean;
+  /** How the session identity was evidenced. Never a credential. */
+  evidence?: string;
 }
 
 export interface DelegationRunRecord {
@@ -157,6 +163,12 @@ export interface DelegationRunRecord {
   delegationGroup: string;
   engine: DelegationEngine;
   profile?: string;
+  /** Sanitized bounded task text supplied at launch (the real worker input).
+   * Optional: Leaf 1/2 run files predate it and carry the canary prompt only. */
+  task?: string;
+  /** False for real tasks (no fixtures, larger timeout regime). Optional:
+   * Leaf 1/2 run files predate it and are canary runs. */
+  isCanary?: boolean;
   workspaceId: string;
   workspaceCanonical: string;
   workdir: string;
@@ -187,9 +199,33 @@ export interface DelegationRunRecord {
   model?: string;
   /** Clamped canary attempt timeout reused for continuations. Optional. */
   attemptTimeoutMs?: number;
+  /**
+   * Crash-safe pending dispatch: the staged answer persisted BEFORE spawn.
+   * While present the reply is NOT consumed (request stays open, no answered
+   * mark, no applied checkpoint). On spawn success the pending is confirmed
+   * into an applied checkpoint + running attempt; on spawn failure it stays
+   * pending and the identical checkpoint id remains retryable. Optional:
+   * runs without a pending dispatch predate this field.
+   */
+  pendingDispatch?: DelegationPendingDispatch;
   nextAction: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface DelegationPendingDispatch {
+  checkpointId: string;
+  requestId: string;
+  seq: number;
+  payload: Record<string, unknown>;
+  attemptN: number;
+  continuation: "resumed" | "new-continuation-attempt";
+  resumeSessionId?: string;
+  timeoutMs: number;
+  prompt: string;
+  sessionEvidence: string;
+  storedAt: string;
+  state: "pending-dispatch";
 }
 
 /** Storage / output / concurrency / execution bounds for this leaf. */
@@ -207,7 +243,17 @@ export const DELEGATION_BOUNDS = {
   // needs-input event small (id + summary only) with detail via authorized read.
   maxInputRequestsPerRun: 8,
   maxQuestionsPerRequest: 8,
-  maxCheckpointPayloadBytes: 8_192
+  maxCheckpointPayloadBytes: 8_192,
+  // E2E leaf: real task/group inputs are bounded so one run cannot smuggle
+  // unbounded instructions through the task surface; the needs-input event
+  // stays small (id + summary only) with detail via authorized read.
+  maxTaskChars: 8_000,
+  maxDelegationGroupChars: 64,
+  // Timeout regimes: canary keeps the 5-minute default/max; real tasks accept
+  // an explicit bounded timeout up to 30 minutes (clamped + truthfully acked).
+  maxAttemptTimeoutMsCanary: 300_000,
+  maxAttemptTimeoutMsReal: 1_800_000,
+  minAttemptTimeoutMs: 10_000
 } as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -367,6 +413,25 @@ export function openInputRequests(run: DelegationRunRecord): DelegationInputRequ
 /** Checkpoint/question/request ids: bounded, no whitespace or path separators. */
 export function isCheckpointId(value: unknown): boolean {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value);
+}
+
+/**
+ * Delegation group ids: bounded, no whitespace or path separators. The group
+ * scopes subscriptions and events: a subscription only receives runs whose
+ * delegationGroup matches its filter.
+ */
+export function isDelegationGroupId(value: unknown): boolean {
+  return typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= DELEGATION_BOUNDS.maxDelegationGroupChars &&
+    /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(value);
+}
+
+/** Sanitize real task text: control chars stripped, bounded, never empty. */
+export function sanitizeTaskText(value: unknown, maxChars = DELEGATION_BOUNDS.maxTaskChars): string {
+  const text = String(value ?? "").replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+  if (!text) return "";
+  return text.length > maxChars ? `${text.slice(0, maxChars - 20)}...[task truncated]` : text;
 }
 
 /** Local stable stringify (events/canonicalJson equivalent without a cycle). */
@@ -588,7 +653,12 @@ export function applyCheckpointReply(
   const now = new Date().toISOString();
   const answered: DelegationInputRequest = { ...stored, status: "answered", answeredAt: now, answerCheckpointId: checkpoint.id };
   const settled = runInputRequests(run).map((candidate) => candidate.id === answered.id ? answered : candidate);
-  const attemptsExhausted = run.attempts.length >= DELEGATION_BOUNDS.maxAttemptsPerRun;
+  // Budget counts dispatched attempts only; a queued pending-dispatch
+  // reservation (staged before spawn) does not itself exhaust budget.
+  const dispatchedCount = run.attempts.filter(
+    (a) => !(a.state === "queued" && (a.summary ?? "").includes("pending dispatch"))
+  ).length;
+  const attemptsExhausted = dispatchedCount >= DELEGATION_BOUNDS.maxAttemptsPerRun;
   const stillOpen = settled.some((candidate) => candidate.status === "open");
   const next: DelegationRunRecord = {
     ...run,
@@ -719,4 +789,85 @@ export function nextActionFor(state: DelegationRunState, undelivered: boolean): 
   if (undelivered) return "terminal result stored but wake-up delivery is pending; replay via delegation_read_result";
   if (state === "interrupted") return "inspect excerpts via delegation_read_result; relaunch only with a NEW request id";
   return "read the terminal result via delegation_read_result";
+}
+
+/**
+ * Crash-safe pending dispatch helpers (defect 5).
+ *
+ * stagePendingDispatch persists the answer BEFORE spawn without consuming it:
+ * the request stays open, no applied checkpoint is recorded, and a queued
+ * pending attempt reserves the attempt number. confirmPendingDispatch applies
+ * the answer (answered mark + applied checkpoint + running attempt) only
+ * after the spawn succeeds. On spawn failure the pending record stays and the
+ * identical checkpoint id remains retryable (same attempt number, no
+ * duplicate_conflicting). Pending records never count as consumed replies.
+ */
+export function stagePendingDispatch(
+  run: DelegationRunRecord,
+  opts: {
+    checkpoint: CheckpointShape;
+    requestId: string;
+    attemptN: number;
+    continuation: "resumed" | "new-continuation-attempt";
+    resumeSessionId?: string;
+    timeoutMs: number;
+    prompt: string;
+    sessionEvidence: string;
+  }
+): DelegationRunRecord {
+  const now = new Date().toISOString();
+  const pending: DelegationPendingDispatch = {
+    checkpointId: opts.checkpoint.id,
+    requestId: opts.requestId,
+    seq: opts.checkpoint.seq,
+    payload: opts.checkpoint.payload,
+    attemptN: opts.attemptN,
+    continuation: opts.continuation,
+    ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
+    timeoutMs: opts.timeoutMs,
+    prompt: opts.prompt,
+    sessionEvidence: opts.sessionEvidence,
+    storedAt: now,
+    state: "pending-dispatch"
+  };
+  // Reuse the same attempt number when retrying the identical pending id;
+  // otherwise append a fresh queued pending attempt.
+  const existingPending = run.attempts.find(
+    (a) => a.n === opts.attemptN && a.state === "queued" && a.summary?.includes("pending dispatch")
+  );
+  const pendingAttempt = {
+    n: opts.attemptN,
+    startedAt: now,
+    state: "queued" as DelegationRunState,
+    ...(opts.resumeSessionId ? { sessionId: opts.resumeSessionId } : {}),
+    continuation: opts.continuation,
+    summary: sanitizeSummary(`pending dispatch for request ${opts.requestId} (checkpoint ${opts.checkpoint.id})`)
+  };
+  const attempts = existingPending
+    ? run.attempts.map((a) => (a.n === opts.attemptN ? { ...pendingAttempt, startedAt: a.startedAt } : a))
+    : [...run.attempts, pendingAttempt].slice(-DELEGATION_BOUNDS.maxAttemptsPerRun);
+  return {
+    ...run,
+    pendingDispatch: pending,
+    attempts,
+    nextAction: "answer staged as pending-dispatch; dispatching continuation attempt"
+  };
+}
+
+export function clearPendingDispatch(run: DelegationRunRecord): DelegationRunRecord {
+  if (!run.pendingDispatch) return run;
+  const { pendingDispatch: _dropped, ...rest } = run;
+  // Drop the queued pending attempt (it was never dispatched, so it never
+  // consumed budget beyond reservation; retry re-reserves the same number).
+  const pendingN = (run.pendingDispatch as DelegationPendingDispatch).attemptN;
+  const attempts = (rest as DelegationRunRecord).attempts.filter(
+    (a) => !(a.n === pendingN && a.state === "queued" && a.summary?.includes("pending dispatch"))
+  );
+  return { ...(rest as DelegationRunRecord), attempts };
+}
+
+export function pendingDispatchFor(run: DelegationRunRecord, checkpointId: string): DelegationPendingDispatch | undefined {
+  const pending = (run as DelegationRunRecord).pendingDispatch;
+  if (pending && pending.checkpointId === checkpointId) return pending;
+  return undefined;
 }

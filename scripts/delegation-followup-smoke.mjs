@@ -69,12 +69,31 @@ await fsp.chmod(path.join(shimBin, 'codex'), 0o755);
 await fsp.writeFile(path.join(shimBin, 'fake-opencode.mjs'), `
 import fs from 'node:fs';
 const args = process.argv.slice(2);
+if (args[0] === 'session') {
+  const known = String(process.env.CODEXPRO_FAKE_OPENCODE_KNOWN ?? 'ses_fake0000000001,ses_edge0000000001,ses_sleep0000000001,ses_sleep0000000002').split(',').map((s) => s.trim()).filter(Boolean);
+  if (args[1] === 'list') {
+    console.log(JSON.stringify(known.map((id) => ({ id, title: 'fake-session' }))));
+    process.exit(0);
+  }
+  if (args[1] === 'export') {
+    const sid = args[2] ?? '';
+    if (known.includes(sid)) {
+      console.log(JSON.stringify({ id: sid, title: 'fake-session' }));
+      process.exit(0);
+    }
+    console.error('unknown session ' + sid);
+    process.exit(1);
+  }
+  throw new Error('unexpected opencode session subcommand');
+}
 if (args[0] !== 'run') throw new Error('expected opencode run');
 if (process.env.CODEXPRO_FAKE_OPENCODE_MODE === 'sleep') {
   await new Promise((resolve) => setTimeout(resolve, 30000));
   console.log(JSON.stringify({ sessionID: 'ses_sleep0000000002' }));
   process.exit(0);
 }
+const prompt = args.at(-1) ?? '';
+console.log('WORKER-PROMPT::' + String(prompt).slice(0, 500));
 const a = fs.readFileSync('fixture-a.txt', 'utf8');
 console.log(JSON.stringify({ sessionID: 'ses_edge0000000001' }));
 console.log('CANARY-REPORT-A:' + a.trim().split('\\n')[0]);
@@ -150,8 +169,9 @@ const hostModel = Engines.describeOpenCodeDiscovery().hostModel;
   await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
   const url = `http://127.0.0.1:${srv.address().port}/hook`;
   const evt = { event: 'run-attention', eventId: 'evt_dup', runId: 'run_aaaaaaaaaaaaaaaa', engine: 'codex', delegationGroup: 'hestia-cli-canary', state: 'completed', seq: 1, version: 1, createdAt: new Date().toISOString() };
-  const first = await Events.deliverEventToSubscription(url, secret, evt);
-  const second = await Events.deliverEventToSubscription(url, secret, evt);
+  const loopExtra = { lookupHost: async () => [{ address: '127.0.0.1', family: 4 }], allowPrivate: true };
+  const first = await Events.deliverEventToSubscription(url, secret, evt, fetch, 10_000, loopExtra);
+  const second = await Events.deliverEventToSubscription(url, secret, evt, fetch, 10_000, loopExtra);
   srv.close();
   assert(first.status === 'delivered' && second.status === 'delivered', 'both deliveries must succeed');
   assert(seenIds.length === 2 && seenIds[0] === seenIds[1], 'duplicate delivery must carry the identical deterministic webhook id (receiver dedups)');
@@ -191,6 +211,9 @@ const hostModel = Engines.describeOpenCodeDiscovery().hostModel;
 
 // 2d: expired subscription stops delivery without any POST; 2e: revoked likewise.
 {
+  // Delivery state machine under test: opt in explicitly (default is DISABLED).
+  // Expired/revoked guards fire before any POST, so no network is touched.
+  process.env.CODEXPRO_EVENTS_DELIVERY_ENABLED = '1';
   const launched = await call('delegation_launch', { workspace_id: workspaceId, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 'edge-sub', canary: true, request_id: 'req-edge-sub', timeout_ms: 60000 });
   assert(!launched.isError, 'sub-matrix launch failed');
   const runId = launched.structuredContent.run_id;
@@ -234,6 +257,7 @@ const hostModel = Engines.describeOpenCodeDiscovery().hostModel;
   const statuses = reloaded.pendingEvents.flatMap((e) => e.deliveries.map((d) => `${d.subId}:${d.status}:${d.attempts}`));
   assert(statuses.filter((s) => s.startsWith('sub_expired0001')).every((s) => s.endsWith(':1') || s.includes('permanent')), 'expired delivery must not be retried');
   fs.writeFileSync(subscriptionsPath(bridgeDir), JSON.stringify({ version: 1, subscriptions: [] }));
+  delete process.env.CODEXPRO_EVENTS_DELIVERY_ENABLED;
   console.log('ok: 2d/2e expired + revoked subscriptions stop delivery (permanent, exposed, never retried)');
 }
 
@@ -258,10 +282,19 @@ const hostModel = Engines.describeOpenCodeDiscovery().hostModel;
   assert((await awaitRunFile(runFileFor(runId), (r) => r.state === 'completed' && r.attempts.length === 3))?.attempts.length === 3, 'attempt 3 must complete');
   const q3 = await call('delegation_followup', { run_id: runId, checkpoint: { id: 'bq-3', run_id: runId, seq: 4, payload: {}, questions: [{ id: 'q3', question: 'three?' }] } });
   assert(!q3.isError, 'bq-3 must reach needs-input');
+  // Budget exhaustion consumes nothing: the reply is refused (typed error),
+  // the request stays open, attempts/seq are unchanged, and the identical
+  // retry repeats the refusal instead of hitting duplicate_conflicting.
+  const seqBeforeExhausted = readJson(runFileFor(runId)).seq;
   const exhausted = await call('delegation_followup', { run_id: runId, checkpoint: { id: 'br-3', run_id: runId, seq: 5, payload: { a: 3 }, input_request_id: 'bq-3' } });
-  assert(!exhausted.isError && exhausted.structuredContent.stored === true && exhausted.structuredContent.executed === false && exhausted.structuredContent.reason === 'attempts_exhausted', `answer 4 must store without executing, got ${JSON.stringify(exhausted.structuredContent)}`);
-  assert(readJson(runFileFor(runId)).attempts.length === 3, 'exhausted reply must not append attempts');
-  console.log('ok: 2f/2g closed-request rejection + attempt-budget exhaustion (stored, never executed)');
+  assert(exhausted.isError && exhausted.structuredContent.error === 'attempts_exhausted', `budget refusal expected, got ${JSON.stringify(exhausted.structuredContent)}`);
+  assert(exhausted.structuredContent.stored === false && exhausted.structuredContent.executed === false, 'budget refusal must not consume the reply');
+  const afterExhausted = readJson(runFileFor(runId));
+  assert(afterExhausted.attempts.length === 3 && afterExhausted.seq === seqBeforeExhausted, 'exhausted reply must append no attempt and leave seq unchanged');
+  assert(afterExhausted.inputRequests.find((r) => r.id === 'bq-3')?.status === 'open', 'exhausted request must stay open');
+  const exhaustedAgain = await call('delegation_followup', { run_id: runId, checkpoint: { id: 'br-3', run_id: runId, seq: 5, payload: { a: 3 }, input_request_id: 'bq-3' } });
+  assert(exhaustedAgain.isError && exhaustedAgain.structuredContent.error === 'attempts_exhausted', 'retry must repeat the refusal, never duplicate_conflicting');
+  console.log('ok: 2f/2g closed-request rejection + attempt-budget refusal (not consumed, open, retryable)');
 }
 
 // 2h: cancellation is idempotent with a truthful tree ack (codex sleep + opencode sleep).
@@ -336,6 +369,37 @@ const hostModel = Engines.describeOpenCodeDiscovery().hostModel;
   await call('delegation_cancel', { run_id: after.structuredContent.run_id });
   delete process.env.CODEXPRO_FAKE_OPENCODE_MODE;
   console.log('ok: 2k one active turn per session (busy refused, settled re-usable)');
+}
+
+// 2m: session-busy follow-up refusal consumes nothing; an unverified explicit
+// session is creation-labeled (new-continuation-attempt), never resumed.
+{
+  const fast = await call('delegation_launch', { workspace_id: workspaceId, engine: 'opencode', model: hostModel, session_id: 'ses_busy2', workdir: 'edge-ses-b', canary: true, request_id: 'req-edge-ses-b', timeout_ms: 60000 });
+  assert(!fast.isError, `busy-matrix fast launch failed: ${JSON.stringify(fast.structuredContent)}`);
+  const bRunId = fast.structuredContent.run_id;
+  assert((await awaitRunFile(runFileFor(bRunId), (r) => r.state === 'completed'))?.state === 'completed', 'busy-matrix run must complete');
+  process.env.CODEXPRO_FAKE_OPENCODE_MODE = 'sleep';
+  const holder = await call('delegation_launch', { workspace_id: workspaceId, engine: 'opencode', model: hostModel, session_id: 'ses_busy2', workdir: 'edge-ses-a', canary: true, request_id: 'req-edge-ses-a', timeout_ms: 60000 });
+  assert(!holder.isError, 'holder must launch after B settled');
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  delete process.env.CODEXPRO_FAKE_OPENCODE_MODE;
+  const bq = await call('delegation_followup', { run_id: bRunId, checkpoint: { id: 'busy-q1', run_id: bRunId, seq: 0, payload: {}, questions: [{ id: 'q1', question: 'confirm while busy?' }] } });
+  assert(!bq.isError && bq.structuredContent.state === 'needs-input', 'busy-matrix question must reach needs-input');
+  const seqBusyBefore = readJson(runFileFor(bRunId)).seq;
+  const busyReply = await call('delegation_followup', { run_id: bRunId, checkpoint: { id: 'busy-r1', run_id: bRunId, seq: 1, payload: { answer: 'retry after settle' }, input_request_id: 'busy-q1' } });
+  assert(busyReply.isError && busyReply.structuredContent.error === 'session_busy', `busy refusal expected, got ${JSON.stringify(busyReply.structuredContent)}`);
+  assert(busyReply.structuredContent.stored === false && busyReply.structuredContent.executed === false, 'busy refusal must not consume the reply');
+  const busyAfter = readJson(runFileFor(bRunId));
+  assert(busyAfter.attempts.length === 1 && busyAfter.seq === seqBusyBefore, 'busy refusal must append no attempt and leave seq unchanged');
+  assert(busyAfter.inputRequests.find((r) => r.id === 'busy-q1')?.status === 'open', 'busy request must stay open');
+  await call('delegation_cancel', { run_id: holder.structuredContent.run_id });
+  // ses_busy2 is absent from the engine session list: first use creates, so
+  // the retry is a labeled new attempt with creation evidence, never resumed.
+  const retryBusy = await call('delegation_followup', { run_id: bRunId, checkpoint: { id: 'busy-r1', run_id: bRunId, seq: 1, payload: { answer: 'retry after settle' }, input_request_id: 'busy-q1' } });
+  assert(!retryBusy.isError && retryBusy.structuredContent.executed === true && retryBusy.structuredContent.continuation === 'new-continuation-attempt', `unverified session must retry as a labeled new attempt: ${JSON.stringify(retryBusy.structuredContent)}`);
+  assert(String(retryBusy.structuredContent.session_evidence).includes('creates'), 'new attempt must cite first-use creation evidence');
+  assert((await awaitRunFile(runFileFor(bRunId), (r) => r.state === 'completed' && r.attempts.length === 2))?.attempts.length === 2, 'creation-labeled continuation must complete');
+  console.log('ok: 2m session-busy refusal consumes nothing; unverified session is creation-labeled, never resumed');
 }
 
 // 2l: approval-kind questions are data only; question-while-running refused;

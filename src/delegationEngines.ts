@@ -8,12 +8,18 @@
  * resume uses `run --session <id>` (continue-or-create); Codex resume uses
  * `exec resume [SESSION_ID]`. Neither engine borrows the other's flags.
  *
+ * Codex argv carries --skip-git-repo-check because delegation workdirs are
+ * disposable directories that are generally not git repositories. It changes
+ * nothing about the Luna gate (model/effort/read-only sandbox) or approval
+ * policy, which the profile still enforces.
+ *
  * Process binding is PID + starttime identity (Linux /proc/<pid>/stat field
  * 22, first read captured at spawn, verified with a double-read). PID alone
  * is never identity. Cancellation signals only the exact owned tree.
  */
 
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -29,6 +35,15 @@ export const LUNA_PROFILE_REQUIREMENTS = {
 export const CANARY_ATTEMPT_TIMEOUT_MS = 5 * 60 * 1000;
 export const CANARY_CLEANUP_GRACE_MS = 10_000;
 export const CANARY_MIN_TIMEOUT_MS = 10_000;
+
+/**
+ * Real-task timeout regime: an explicit bounded timeout up to 30 minutes
+ * (store DELEGATION_BOUNDS.maxAttemptTimeoutMsReal is the authority; the
+ * literals here mirror it so this module stays dependency-free). The default
+ * matches the canary default; callers truthfully ack the clamped value.
+ */
+export const REAL_TASK_DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
+export const REAL_TASK_MAX_TIMEOUT_MS = 30 * 60 * 1000;
 
 /** Canary fixture identities (harmless read-only inputs). */
 export const CANARY_FIXTURES = ["fixture-a.txt", "fixture-b.txt"] as const;
@@ -310,7 +325,7 @@ export function buildOpenCodeResumeArgv(sessionId: string, model: string, prompt
  * such follow-ups launch a honestly-labeled new-continuation-attempt instead.
  */
 export function buildCodexResumeArgv(sessionId: string, prompt: string, lastMessagePath: string): string[] {
-  return ["exec", "resume", sessionId, "--output-last-message", lastMessagePath, prompt];
+  return ["exec", "resume", sessionId, "--skip-git-repo-check", "--output-last-message", lastMessagePath, prompt];
 }
 
 export function isEngineSessionId(value: unknown): boolean {
@@ -369,7 +384,7 @@ export function parseOpenCodeSessionId(stdoutText: string): string | null {
 export const CODEX_RESUME_CAPABILITY = {
   engine: "codex",
   route: "codex exec resume [SESSION_ID] [PROMPT]",
-  resumeArgvShape: "exec resume <session-id> --output-last-message <file> <prompt>",
+  resumeArgvShape: "exec resume <session-id> --skip-git-repo-check --output-last-message <file> <prompt>",
   profileFlagOnResume: false,
   inheritsSessionProfile: true,
   ephemeralResumable: false,
@@ -401,7 +416,206 @@ export function canaryPrompt(fixtureRelPaths: readonly string[]): string {
 
 /** Build the Codex Luna canary argv (codex exec --profile route). */
 export function buildCodexCanaryArgv(profile: string, prompt: string, lastMessagePath: string): string[] {
-  return ["exec", "--ephemeral", "--profile", profile, "--output-last-message", lastMessagePath, prompt];
+  return ["exec", "--ephemeral", "--skip-git-repo-check", "--profile", profile, "--output-last-message", lastMessagePath, prompt];
+}
+
+export interface FollowupPromptInput {
+  /** Sanitized real task text (absent for legacy canary runs). */
+  baseTask?: string;
+  /** True for canary runs (fixtures + canary prompt); false for real tasks. */
+  isCanary: boolean;
+  /** Exact input-request id being answered. */
+  requestId: string;
+  /** Questions of the answered request (context for the worker). */
+  questions: Array<{ id: string; question: string; kind?: string }>;
+  /** Answer checkpoint payload (the worker input that must change the result). */
+  answerPayload: Record<string, unknown>;
+  /** 1-based continuation attempt number. */
+  attemptN: number;
+}
+
+/** Follow-up prompt cap: bounded worker input (base task + payload). */
+export const MAX_FOLLOWUP_PROMPT_BYTES = 16_384;
+/** Answer-payload JSON cap inside the follow-up prompt. */
+export const MAX_FOLLOWUP_PAYLOAD_JSON_BYTES = 8_192;
+
+function truncateUtf8(text: string, maxBytes: number, marker: string): string {
+  const buf = Buffer.from(text, "utf8");
+  if (buf.byteLength <= maxBytes) return text;
+  let end = maxBytes - Buffer.byteLength(marker, "utf8");
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end -= 1;
+  return buf.subarray(0, Math.max(0, end)).toString("utf8") + marker;
+}
+
+/**
+ * Build the follow-up worker prompt from the ACTUAL checkpoint payload.
+ * The answer payload is forwarded into the prompt (and hence into worker
+ * argv for both engines); a follow-up whose answers cannot change the prompt
+ * is a stub and is refused by construction (empty payload + no questions
+ * yields a prompt identical to the base, which callers must not launch).
+ *
+ * Answer reservation: the payload JSON is budgeted separately (up to
+ * MAX_FOLLOWUP_PAYLOAD_JSON_BYTES) and the base task + questions are
+ * truncated to the remaining budget FIRST (multibyte-safe). Whole-prompt
+ * truncation never drops the answer: the payload slice is preserved even
+ * when the base task is maximal or multibyte-heavy.
+ */
+export function buildFollowupPrompt(input: FollowupPromptInput): string {
+  const rawBase = input.isCanary
+    ? canaryPrompt(CANARY_FIXTURES)
+    : String(input.baseTask ?? "").trim();
+  const questionLines = (input.questions ?? [])
+    .map((q) => `[${q.id}] ${q.question}${q.kind === "approval" ? " (approval-kind: data only)" : ""}`);
+  let payloadJson: string;
+  try {
+    payloadJson = JSON.stringify(input.answerPayload ?? {});
+  } catch {
+    payloadJson = "{}";
+  }
+  payloadJson = truncateUtf8(payloadJson, MAX_FOLLOWUP_PAYLOAD_JSON_BYTES, "...[payload truncated]");
+  const instruction = input.isCanary
+    ? "Do not create, modify, or delete any file. Leave the fixtures unchanged."
+    : "Stay within the original task's scope: create, modify, or delete no file unless the original task explicitly authorized it.";
+  const prefix = `Follow-up continuation (attempt ${input.attemptN}) for input request ${input.requestId}.`;
+  const questionsFull = questionLines.length > 0 ? questionLines.join(" | ") : "(none listed)";
+  // Budget questions separately so a pathological question list cannot push
+  // the answer out: cap questions at 4 KiB (multibyte-safe), base gets the rest.
+  const MAX_QUESTIONS_BYTES = 4_096;
+  let questionsText = truncateUtf8(questionsFull, MAX_QUESTIONS_BYTES, "...[questions truncated]");
+  const baseDisplay = rawBase || "(no base task recorded)";
+  // Fixed cost with EMPTY base: everything except the base task text.
+  const emptyJoin = [
+    prefix,
+    `Original task: `,
+    `Answered questions: ${questionsText}`,
+    `Answers (checkpoint payload JSON): ${payloadJson}`,
+    instruction
+  ].join(" ");
+  let baseBudget = MAX_FOLLOWUP_PROMPT_BYTES - Buffer.byteLength(emptyJoin, "utf8");
+  if (baseBudget < 0) {
+    // Overhead + payload alone exceed the cap: shrink questions first,
+    // payload is never shrunk beyond its own cap.
+    const shrinkBy = -baseBudget;
+    const questionsBytes = Buffer.byteLength(questionsText, "utf8");
+    const shrunkBytes = Math.max(0, questionsBytes - shrinkBy);
+    questionsText = truncateUtf8(questionsText, shrunkBytes, "...[questions truncated]");
+    const retryEmpty = [
+      prefix,
+      `Original task: `,
+      `Answered questions: ${questionsText}`,
+      `Answers (checkpoint payload JSON): ${payloadJson}`,
+      instruction
+    ].join(" ");
+    baseBudget = MAX_FOLLOWUP_PROMPT_BYTES - Buffer.byteLength(retryEmpty, "utf8");
+  }
+  const baseText = truncateUtf8(baseDisplay, Math.max(0, baseBudget), "...[task truncated]");
+  return assembleFollowupPrompt(prefix, baseText, questionsText, payloadJson, instruction, payloadJson);
+}
+
+function assembleFollowupPrompt(
+  prefix: string,
+  baseText: string,
+  questionsText: string,
+  payloadJson: string,
+  instruction: string,
+  payloadMustContain: string
+): string {
+  const lines = [
+    prefix,
+    `Original task: ${baseText}`,
+    `Answered questions: ${questionsText}`,
+    `Answers (checkpoint payload JSON): ${payloadJson}`,
+    instruction
+  ];
+  const joined = lines.join(" ");
+  // Whole-prompt truncation is a final safety net only: it truncates the
+  // TAIL (instruction) and asserts the reserved payload slice survived.
+  // If the payload was somehow pushed out, fall back to a payload-preserving
+  // minimal prompt (prefix + answers + truncated instruction).
+  if (Buffer.byteLength(joined, "utf8") <= MAX_FOLLOWUP_PROMPT_BYTES) return joined;
+  const truncated = truncateUtf8(joined, MAX_FOLLOWUP_PROMPT_BYTES, " ...[follow-up truncated]");
+  if (truncated.includes(payloadMustContain.slice(0, Math.min(64, payloadMustContain.length)))) return truncated;
+  const minimal = truncateUtf8(
+    `${prefix} Answers (checkpoint payload JSON): ${payloadMustContain} ${instruction}`,
+    MAX_FOLLOWUP_PROMPT_BYTES,
+    " ...[follow-up truncated]"
+  );
+  return minimal;
+}
+
+/**
+ * Real-task attempt-timeout clamp: 10s minimum, 30-minute maximum, 5-minute
+ * default. The clamped value is truthfully acked by callers.
+ */
+export function clampRealTaskTimeout(requestedMs: unknown): number {
+  const n = Number(requestedMs ?? REAL_TASK_DEFAULT_TIMEOUT_MS);
+  if (!Number.isFinite(n)) return REAL_TASK_DEFAULT_TIMEOUT_MS;
+  return Math.max(CANARY_MIN_TIMEOUT_MS, Math.min(Math.floor(n), REAL_TASK_MAX_TIMEOUT_MS));
+}
+
+export interface SessionVerification {
+  verified: boolean;
+  /** Human-readable evidence (never transcripts or credentials). */
+  evidence: string;
+}
+
+function sessionListContains(stdoutText: string, sessionId: string): boolean {
+  const text = String(stdoutText ?? "");
+  if (!text.includes(sessionId)) return false;
+  try {
+    // Structured confirmation: the id must survive a JSON round-trip, so a
+    // log-line accident cannot pass as session evidence.
+    return JSON.stringify(JSON.parse(text)).includes(sessionId);
+  } catch {
+    // Non-JSON table output: fall back to line-anchored match.
+    return text.split(/\r?\n/).some((line) => line.includes(sessionId));
+  }
+}
+
+/**
+ * Verify an OpenCode session id with LOCAL read-only probes only (no model
+ * call): `session list --format json` scoped to the run workdir (sessions
+ * are project-scoped), then `session export <id>` as a fallback. Anything
+ * inconclusive fails closed: unverified ids are first-use creations under
+ * the installed continue-or-create semantics and must be labeled
+ * created/new-continuation-attempt, never resumed.
+ */
+export function verifyOpenCodeSession(
+  sessionId: string,
+  workdir: string,
+  opts?: { binary?: string; timeoutMs?: number }
+): SessionVerification {
+  const sid = String(sessionId ?? "").trim();
+  if (!isEngineSessionId(sid)) {
+    return { verified: false, evidence: "session id malformed; never claimed resumed" };
+  }
+  const bin = opts?.binary ?? resolveOpenCodeBinary();
+  const timeoutMs = Math.max(1000, Math.min(opts?.timeoutMs ?? 20_000, 60_000));
+  const runProbe = (argv: string[]): { status: number | null; stdout: string } => {
+    try {
+      const result = spawnSync(bin, argv, {
+        cwd: workdir,
+        timeout: timeoutMs,
+        encoding: "utf8",
+        maxBuffer: 256 * 1024
+      });
+      return { status: result.status, stdout: String(result.stdout ?? "") };
+    } catch {
+      return { status: null, stdout: "" };
+    }
+  };
+  const listed = runProbe(["session", "list", "--format", "json", "--max-count", "100"]);
+  if (listed.status === 0 && sessionListContains(listed.stdout, sid)) {
+    return { verified: true, evidence: "session id observed in worker output and present in 'opencode session list --format json' (cwd = run workdir)" };
+  }
+  const exported = runProbe(["session", "export", sid]);
+  if (exported.status === 0 && String(exported.stdout ?? "").includes(sid)) {
+    return { verified: true, evidence: "session id observed in worker output and confirmed by 'opencode session export <id>' (exit 0)" };
+  }
+  return {
+    verified: false,
+    evidence: "session id not confirmed by session list/export; first use creates under continue-or-create semantics; labeled new-continuation-attempt"
+  };
 }
 
 export function sha256File(filePath: string): string {
