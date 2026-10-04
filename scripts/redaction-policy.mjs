@@ -4,6 +4,7 @@ import {
   isPythonFunctionReturnTypeName,
   isPythonSuiteConditionName,
   ownsPythonCallKeywordReference,
+  approvedPythonAssignEnd,
   approvedPythonCallKeywordEnd,
   ownsPythonCredential,
   pythonAuthorizationAnnotationEnd
@@ -555,6 +556,25 @@ function isCredibleSourceReference(value, text, offset, assignment = '', syntax 
       // Keep regex cursors unchanged so the remaining bytes are also scanned.
       const approvedEnd = approvedPythonCallKeywordEnd({ ...query, entries: syntax.approvedCallKeywordValues });
       if (Number.isInteger(approvedEnd) && valueEnd <= approvedEnd) return true;
+    }
+    // Parser-owned local assignment approval (`AssignStatement Name = RHS`).
+    // Same narrow style as call keywords: only the exact approved RHS bytes
+    // are exempted while every surrounding byte is still scanned by its own
+    // match. The triple binds target name plus enclosing function scope plus
+    // exact RHS bytes; direct credential shapes (private-key/JWT/sk-/
+    // Authorization/URL-password/query-token) and non-Python (.env) routes
+    // never reach this exemption.
+    const assignTarget = assignment.match(/([A-Za-z_][A-Za-z0-9_]*)/u)?.[1];
+    const assignQuery = assignTarget && {
+      provenance: syntax.pythonProvenance,
+      nameStart: offset + assignment.indexOf(assignTarget),
+      nameEnd: offset + assignment.indexOf(assignTarget) + assignTarget.length,
+      valueStart,
+      valueEnd
+    };
+    if (assignQuery) {
+      const assignApprovedEnd = approvedPythonAssignEnd({ ...assignQuery, entries: syntax.approvedCallKeywordValues });
+      if (Number.isInteger(assignApprovedEnd) && valueEnd <= assignApprovedEnd) return true;
     }
   }
   // Only the matched occurrence's code boundary must survive trivia masking.

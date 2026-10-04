@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { collectPythonCallKeywordApprovals, PYTHON_PROVENANCE_MAX_BYTES } from './python-provenance.mjs';
+import { collectPythonAssignApprovals, collectPythonCallKeywordApprovals, PYTHON_PROVENANCE_MAX_BYTES } from './python-provenance.mjs';
 import { hasSecretValue } from './redaction-policy.mjs';
 import { approvalsForRecord, enrollProspectiveApproval, enrollSourceApproval, approvalRegistryPath, readApprovalRegistry } from './source-approvals.mjs';
 
@@ -33,9 +33,20 @@ function readTextSource(canonical, boundMessage, textMessage) {
   return { buffer, source, sha256: createHash('sha256').update(buffer).digest('hex') };
 }
 
+// Reviewed constructs are parser-owned call keyword values plus parser-owned
+// local assignment values (`AssignStatement Name = RHS` bound to the
+// enclosing function scope). Both enroll as hash-only triples; the registry
+// never holds literals.
+function collectReviewedApprovals(sourceText, keywords) {
+  const calls = collectPythonCallKeywordApprovals(sourceText, keywords);
+  const assigns = collectPythonAssignApprovals(sourceText, keywords);
+  return [...new Map([...calls, ...assigns]
+    .map((entry) => [JSON.stringify(entry), entry])).values()];
+}
+
 function main(args) {
   if (args.length === 1 && args[0] === '--help') {
-    console.log(usage + '\nOwner-only enrollment: allows unchanged exact string/None call values, including f-strings with reference interpolations and static format specs; never rewrites source or exempts definite credentials.'
+    console.log(usage + '\nOwner-only enrollment: allows unchanged exact string/None call values and parser-owned local assignment values (AssignStatement Name = RHS bound to file plus enclosing function), including f-strings with reference interpolations and static format specs; never rewrites source or exempts definite credentials.'
       + '\n--prospective-from reviews a distinct proposed file and binds its exact keyword/callee/value hash triples to the current base SHA, so a reviewed nonsecret patch is approvable before it is written. Existing entries are preserved by union; a stale base is refused.');
     return;
   }
@@ -65,8 +76,8 @@ function main(args) {
     'Approval requires UTF-8 text.');
   if (base.sha256 !== expected) throw new Error('Source SHA does not match owner approval.');
   if (prospectiveFrom === undefined) {
-    const entries = collectPythonCallKeywordApprovals(base.source, keywords);
-    if (!entries.length) throw new Error('No eligible string/None call keyword values.');
+    const entries = collectReviewedApprovals(base.source, keywords);
+    if (!entries.length) throw new Error('No eligible string/None call keyword or assignment values.');
     if (hasSecretValue(base.source, { context: 'source', language: 'python', approvedCallKeywordValues: entries })) {
       throw new Error('Independent credential or unapproved source candidate remains; approval refused.');
     }
@@ -83,8 +94,8 @@ function main(args) {
   const proposed = readTextSource(proposedCanonical,
     'Prospective approval source exceeds the parser bound.',
     'Prospective approval requires UTF-8 text.');
-  const proposedEntries = collectPythonCallKeywordApprovals(proposed.source, keywords);
-  if (!proposedEntries.length) throw new Error('No eligible string/None call keyword values.');
+  const proposedEntries = collectReviewedApprovals(proposed.source, keywords);
+  if (!proposedEntries.length) throw new Error('No eligible string/None call keyword or assignment values.');
   // The reviewed result must be nonsecret with exactly the proposed triples
   // exempted. Only bytes within an exact approved RHS are exempted; every
   // surrounding byte is still scanned.

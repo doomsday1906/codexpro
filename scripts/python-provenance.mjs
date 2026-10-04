@@ -183,6 +183,72 @@ function collectCallKeywordLiterals(nodes, source) {
   return literals;
 }
 
+// Reviewed-source assignment approval shares the hash-only triple shape with
+// call keywords: keyword_sha256 carries the assignment target name,
+// callee_sha256 carries the scoped enclosing-function key (prefixed so a
+// function scope never collides with a call callee), and value_sha256 carries
+// the exact RHS bytes. The registry never holds literals.
+export const PYTHON_ASSIGN_SCOPE_PREFIX = 'assign-scope:';
+const pythonAssignScopeKey = (scopeName) => `${PYTHON_ASSIGN_SCOPE_PREFIX}${scopeName ?? ''}`;
+
+function enclosingPythonAssignScope(nodes, source, nodeIndex) {
+  const names = [];
+  const seen = new Set();
+  let current = nodes[nodeIndex]?.parent;
+  while (typeof current === 'number' && current >= 0 && !seen.has(current)) {
+    seen.add(current);
+    const node = nodes[current];
+    if (!node) break;
+    if (node.type === 'FunctionDefinition') {
+      const nameNode = directChildren(nodes, current).find((child) => child.type === 'VariableName');
+      if (nameNode) names.unshift(source.slice(nameNode.from, nameNode.to));
+    }
+    current = node.parent;
+  }
+  return names.join('.');
+}
+
+function collectAssignLiterals(nodes, source) {
+  const literals = [];
+  for (const node of nodes) {
+    if (node.type !== 'AssignStatement') continue;
+    const children = directChildren(nodes, node.index);
+    const assignOps = children.filter((child) => child.type === 'AssignOp'
+      && source.slice(child.from, child.to) === '=');
+    // Only a simple `Name = RHS` (optionally `Name: Type = RHS`). Chained,
+    // tuple, member, and subscript targets stay generic/fail-closed.
+    if (assignOps.length !== 1) continue;
+    const meaningful = meaningfulChildren(nodes, node.index);
+    const opAt = meaningful.findIndex((child) => child.index === assignOps[0].index);
+    if (opAt < 0) continue;
+    const before = meaningful.slice(0, opAt);
+    const after = meaningful.slice(opAt + 1);
+    if (after.length !== 1) continue;
+    if (before.length !== 1 && before.length !== 2) continue;
+    const target = before[0];
+    if (!target || target.type !== 'VariableName') continue;
+    if (meaningful[0].index !== target.index || target.to > assignOps[0].from) continue;
+    if (before.length === 2 && before[1].type !== 'TypeDef') continue;
+    const rhs = after[0];
+    if (rhs.type !== 'None' && !isApprovalString(nodes, rhs, source)) continue;
+    const scope = enclosingPythonAssignScope(nodes, source, node.index);
+    literals.push({ targetFrom: target.from, targetTo: target.to,
+      rhsFrom: rhs.from, rhsTo: rhs.to, scope,
+      entry: { keyword_sha256: approvalDigest(source.slice(target.from, target.to)),
+        callee_sha256: approvalDigest(pythonAssignScopeKey(scope)),
+        value_sha256: approvalDigest(source.slice(rhs.from, rhs.to)) } });
+  }
+  return literals;
+}
+
+export function collectPythonAssignApprovals(source, keywords) {
+  const parsed = parsePythonSegment(source);
+  if (!parsed.valid) throw new Error('Approval requires complete valid Python source within the parser limit.');
+  const allowed = new Set(keywords.map(approvalDigest));
+  return [...new Map(parsed.assignLiterals.filter((literal) => allowed.has(literal.entry.keyword_sha256))
+    .map((literal) => [JSON.stringify(literal.entry), literal.entry])).values()];
+}
+
 export function collectPythonCallKeywordApprovals(source, keywords) {
   const parsed = parsePythonSegment(source);
   if (!parsed.valid) throw new Error('Approval requires complete valid Python source within the parser limit.');
@@ -343,6 +409,7 @@ function parsePythonSegment(source, { completeSource = true } = {}) {
     valid: true, source: text, nodes, annotations, aliases, functionReturnTypeNames,
     callKeywordReferences: collectCallKeywordReferences(nodes, text),
     callKeywordLiterals: collectCallKeywordLiterals(nodes, text),
+    assignLiterals: collectAssignLiterals(nodes, text),
     ...collectSourceFieldSyntax(nodes, text)
   };
 }
@@ -929,6 +996,53 @@ export function approvedPythonCallKeywordEnd({ provenance, entries, nameStart, n
   const valueEnd = ends[0];
   if (!Number.isInteger(valueEnd) || !ends.every((end) => end === valueEnd)) return undefined;
   return ownsApprovedPythonCallKeyword({ provenance, entries, nameStart, nameEnd, valueStart, valueEnd })
+    ? valueEnd : undefined;
+}
+
+// Parser-owned local assignment approval queries. Same narrow style as call
+// keywords: only the exact approved RHS bytes are exempted, and every mapped
+// side must agree on the same (target, scope, RHS) triple.
+export function ownsApprovedPythonAssign({ provenance, entries, nameStart, nameEnd, valueStart, valueEnd }) {
+  if (!provenance?.available || !Array.isArray(entries) || entries.length === 0
+    || ![nameStart, nameEnd, valueStart, valueEnd].every(Number.isInteger)
+    || nameEnd <= nameStart || valueEnd <= valueStart) return false;
+  const matches = [];
+  for (const segment of provenance.segments ?? []) {
+    for (const side of segment.sides ?? [segment]) {
+      if (!side.originalToVirtual.has(nameStart)) continue;
+      const start = side.originalToVirtual.get(nameStart), nameLast = side.originalToVirtual.get(nameEnd - 1);
+      const rhsStart = side.originalToVirtual.get(valueStart), rhsLast = side.originalToVirtual.get(valueEnd - 1);
+      matches.push(Boolean(side.parse?.valid && Number.isInteger(nameLast) && Number.isInteger(rhsStart) && Number.isInteger(rhsLast)
+        && (side.parse.assignLiterals ?? []).some((literal) =>
+          start === literal.targetFrom && nameLast + 1 === literal.targetTo
+          && rhsStart === literal.rhsFrom && rhsLast + 1 === literal.rhsTo
+          && entries.some((entry) => entry.keyword_sha256 === literal.entry.keyword_sha256
+            && entry.callee_sha256 === literal.entry.callee_sha256 && entry.value_sha256 === literal.entry.value_sha256))));
+    }
+  }
+  return matches.length > 0 && matches.every(Boolean);
+}
+
+export function approvedPythonAssignEnd({ provenance, entries, nameStart, nameEnd, valueStart }) {
+  if (!provenance?.available || !Array.isArray(entries) || entries.length === 0
+    || ![nameStart, nameEnd, valueStart].every(Number.isInteger) || nameEnd <= nameStart) return undefined;
+  const ends = [];
+  for (const segment of provenance.segments ?? []) {
+    for (const side of segment.sides ?? [segment]) {
+      if (!side.originalToVirtual.has(nameStart)) continue;
+      const start = side.originalToVirtual.get(nameStart), nameLast = side.originalToVirtual.get(nameEnd - 1);
+      const rhsStart = side.originalToVirtual.get(valueStart);
+      const literal = side.parse?.valid && Number.isInteger(nameLast) && Number.isInteger(rhsStart)
+        ? (side.parse.assignLiterals ?? []).find((item) => start === item.targetFrom
+          && nameLast + 1 === item.targetTo && rhsStart === item.rhsFrom)
+        : undefined;
+      const last = literal && side.originalOffsets[literal.rhsTo - 1];
+      ends.push(Number.isInteger(last) && last >= 0 ? last + 1 : undefined);
+    }
+  }
+  const valueEnd = ends[0];
+  if (!Number.isInteger(valueEnd) || !ends.every((end) => end === valueEnd)) return undefined;
+  return ownsApprovedPythonAssign({ provenance, entries, nameStart, nameEnd, valueStart, valueEnd })
     ? valueEnd : undefined;
 }
 

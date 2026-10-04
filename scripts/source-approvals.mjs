@@ -4,10 +4,15 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
 const MAX_BYTES = 1_048_576;
-// One prospective binding authorizes a single reviewed base -> result
-// transition for one canonical path. The bound keeps the registry small while
-// a stale base (or an unreviewed result) keeps prospective triples out of
-// scans instead of failing closed on registry size.
+// Approved triples share one hash-only shape: keyword_sha256 carries a call
+// keyword name or an assignment target name, callee_sha256 carries a call
+// callee or a prefixed assignment scope key (`assign-scope:<dotted function
+// chain>`, empty for module scope), and value_sha256 carries the exact RHS
+// bytes. The registry never holds literals. One prospective binding
+// authorizes a single reviewed base -> result transition for one canonical
+// path. The bound keeps the registry small while a stale base (or an
+// unreviewed result) keeps prospective triples out of scans instead of
+// failing closed on registry size.
 const MAX_PROSPECTIVE_PER_FILE = 64;
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const digest = /^[a-f0-9]{64}$/u;
