@@ -1225,6 +1225,23 @@ export interface DelegationMigration {
 }
 
 export const DELEGATION_MIGRATION_RECEIPT = "delegation-migration.json";
+/** Current migration receipt version: 2 carries expected counts + hashes. */
+export const DELEGATION_MIGRATION_RECEIPT_VERSION = 2;
+
+export interface DelegationMigrationReceipt {
+  version: number;
+  from: string;
+  to: string;
+  runFiles: number;
+  /** Expected SHA-256 hex per run file name (e.g. run_abc.json -> hex). */
+  runFileHashes: Record<string, string>;
+  subscriptions: boolean;
+  /** Sorted legacy subscription ids expected in the destination authority. */
+  subscriptionIds: string[];
+  /** SHA-256 hex of the canonical legacy subscription list, or null when none. */
+  subsHash: string | null;
+  at: string;
+}
 
 function realDirOrInput(input: string): string {
   try {
@@ -1280,63 +1297,286 @@ function hasSubscriptionsFile(bridgeDir: string): boolean {
   }
 }
 
+function sha256HexBytes(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function atomicWriteBytes(filePath: string, bytes: Buffer): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const tmp = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`);
+  let fd = -1;
+  try {
+    fd = fs.openSync(tmp, "wx", 0o600);
+    fs.writeFileSync(fd, bytes);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = -1;
+    fs.renameSync(tmp, filePath);
+    try { fs.chmodSync(filePath, 0o600); } catch { /* best effort on odd fs */ }
+  } finally {
+    if (fd !== -1) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+    try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+  }
+}
+
+function atomicWriteReceipt(filePath: string, receipt: DelegationMigrationReceipt): void {
+  atomicWriteBytes(filePath, Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`, "utf8"));
+}
+
+/** Read the migration receipt when present, or undefined when absent/unparseable. */
+export function readDelegationMigrationReceipt(newBridgeDir: string): DelegationMigrationReceipt | undefined {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(newBridgeDir, DELEGATION_MIGRATION_RECEIPT), "utf8");
+  } catch {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!isRecord(parsed)) return undefined;
+    return parsed as unknown as DelegationMigrationReceipt;
+  } catch {
+    return undefined;
+  }
+}
+
+interface ParsedSubscriptions {
+  ids: string[];
+  byId: Map<string, Record<string, unknown>>;
+  hash: string | null;
+}
+
+function parseSubscriptionsBytes(bytes: Buffer): ParsedSubscriptions {
+  try {
+    const parsed: unknown = JSON.parse(bytes.toString("utf8"));
+    if (!isRecord(parsed) || !Array.isArray((parsed as { subscriptions?: unknown }).subscriptions)) {
+      return { ids: [], byId: new Map(), hash: sha256HexBytes(bytes) };
+    }
+    const list = (parsed as { subscriptions: Array<Record<string, unknown>> }).subscriptions;
+    const byId = new Map<string, Record<string, unknown>>();
+    for (const entry of list) {
+      if (entry && typeof entry === "object" && typeof (entry as { subId?: unknown }).subId === "string") {
+        byId.set((entry as { subId: string }).subId, entry as Record<string, unknown>);
+      }
+    }
+    const ids = [...byId.keys()].sort();
+    const canonical = stableStringify(ids.map((id) => byId.get(id)));
+    return { ids, byId, hash: createHash("sha256").update(canonical, "utf8").digest("hex") };
+  } catch {
+    return { ids: [], byId: new Map(), hash: sha256HexBytes(bytes) };
+  }
+}
+
+/**
+ * Merge legacy subscriptions into the destination authority by subId.
+ * Legacy entries win on the same subId (source of truth for migrated
+ * records); destination-only entries are preserved (no lost authority).
+ * Secrets stay inside the authority file only: only sub records are merged,
+ * never copied into run files, and the receipt records hashes/ids only
+ * (never secret bytes). Pure apart from the returned list.
+ */
+export function mergeSubscriptionsById(
+  destSubs: Array<Record<string, unknown>>,
+  legacySubs: Array<Record<string, unknown>>
+): Array<Record<string, unknown>> {
+  const byId = new Map<string, Record<string, unknown>>();
+  for (const entry of destSubs) {
+    const id = (entry as { subId?: unknown })?.subId;
+    if (typeof id === "string") byId.set(id, entry);
+  }
+  for (const entry of legacySubs) {
+    const id = (entry as { subId?: unknown })?.subId;
+    if (typeof id === "string") byId.set(id, entry);
+  }
+  return [...byId.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, v]) => v);
+}
+
+function loadSubscriptionRecords(bridgeDir: string): Array<Record<string, unknown>> {
+  try {
+    const bytes = fs.readFileSync(subscriptionsPath(bridgeDir));
+    const parsed: unknown = JSON.parse(bytes.toString("utf8"));
+    if (!isRecord(parsed) || !Array.isArray((parsed as { subscriptions?: unknown }).subscriptions)) return [];
+    return (parsed as { subscriptions: Array<Record<string, unknown>> }).subscriptions.filter(
+      (s) => s && typeof (s as { subId?: unknown }).subId === "string"
+    );
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Verified completion predicate: a receipt proves completion ONLY when it
+ * carries the expected counts + hashes (version 2) AND every legacy run
+ * file plus every legacy subscription id verifies in the destination.
+ * Anything else (no receipt, version 1 without hashes, count/hash mismatch,
+ * missing/differing file, missing subscription id) is interrupted and must
+ * be recovered by an incremental retry. Never trusts "any dest file exists".
+ */
+export function isMigrationReceiptComplete(
+  legacyBridgeDir: string,
+  newBridgeDir: string,
+  receipt: DelegationMigrationReceipt | undefined
+): boolean {
+  if (!receipt || typeof receipt !== "object") return false;
+  if ((receipt as { version?: unknown }).version !== DELEGATION_MIGRATION_RECEIPT_VERSION) return false;
+  if (path.resolve(receipt.from) !== path.resolve(legacyBridgeDir)) return false;
+  if (path.resolve(receipt.to) !== path.resolve(newBridgeDir)) return false;
+  const legacyRuns = runFileNames(legacyBridgeDir);
+  if (receipt.runFiles !== legacyRuns.length) return false;
+  const expectedHashes = (receipt as { runFileHashes?: unknown }).runFileHashes;
+  if (!isRecord(expectedHashes)) return false;
+  for (const name of legacyRuns) {
+    let legacyBytes: Buffer;
+    try {
+      legacyBytes = fs.readFileSync(path.join(delegationRunsDir(legacyBridgeDir), name));
+    } catch {
+      return false;
+    }
+    const legacyHash = sha256HexBytes(legacyBytes);
+    if ((expectedHashes as Record<string, unknown>)[name] !== legacyHash) return false;
+    let destBytes: Buffer;
+    try {
+      destBytes = fs.readFileSync(path.join(delegationRunsDir(newBridgeDir), name));
+    } catch {
+      return false;
+    }
+    if (sha256HexBytes(destBytes) !== legacyHash) return false;
+  }
+  const legacySubsExists = hasSubscriptionsFile(legacyBridgeDir);
+  if (Boolean(receipt.subscriptions) !== legacySubsExists) return false;
+  if (!legacySubsExists) return true;
+  let legacyBytes: Buffer;
+  try {
+    legacyBytes = fs.readFileSync(subscriptionsPath(legacyBridgeDir));
+  } catch {
+    return false;
+  }
+  const legacyParsed = parseSubscriptionsBytes(legacyBytes);
+  if (receipt.subsHash !== legacyParsed.hash) return false;
+  const receiptIds = Array.isArray((receipt as { subscriptionIds?: unknown }).subscriptionIds)
+    ? (receipt.subscriptionIds as string[]).slice().sort()
+    : null;
+  if (!receiptIds || stableStringify(receiptIds) !== stableStringify(legacyParsed.ids)) return false;
+  const destRecords = loadSubscriptionRecords(newBridgeDir);
+  const destById = new Map(destRecords.map((r) => [(r as { subId: string }).subId, r]));
+  for (const id of legacyParsed.ids) {
+    const legacyRec = legacyParsed.byId.get(id);
+    const destRec = destById.get(id);
+    if (!destRec) return false;
+    if (stableStringify(destRec) !== stableStringify(legacyRec)) return false;
+  }
+  return true;
+}
+
 /**
  * Deliberate one-way migration from a legacy workspace bridge dir to the new
- * user-data authority. Copy-only with count/bytes verification: the legacy
- * source is ALWAYS left intact (never deleted, never modified) and a receipt
- * records the move. Returns null when there is nothing to do (same dir, new
- * side already initialized, or legacy side empty). Throws when verification
- * fails so a half-copied authority is never trusted silently.
+ * user-data authority. Copy-only with count/hash verification: the legacy
+ * source is ALWAYS left intact (never deleted, never modified; only read)
+ * and a receipt records the move. Completion requires a version-2 receipt
+ * with expected counts + hashes AND every run file plus every subscription
+ * id verified in the destination; anything else is interrupted.
+ *
+ * Interrupted copies are recoverable by retry: only missing/differing run
+ * files are copied (stable run ids, no event re-queue from rewriting
+ * identical bytes), subscriptions are merged by subId (legacy wins on the
+ * same id, destination-only preserved so no authority is lost, secrets stay
+ * inside the authority file and never enter run files or the receipt), and
+ * the receipt is published LAST (atomically) only after full verification.
+ * A half-copied authority throws instead of being trusted silently.
  */
 export function ensureDelegationStorage(legacyBridgeDir: string, newBridgeDir: string): DelegationMigration | null {
   if (path.resolve(legacyBridgeDir) === path.resolve(newBridgeDir)) return null;
-  if (runFileNames(newBridgeDir).length > 0 || hasSubscriptionsFile(newBridgeDir)) return null;
   const legacyRuns = runFileNames(legacyBridgeDir);
   const legacySubs = hasSubscriptionsFile(legacyBridgeDir);
   if (legacyRuns.length === 0 && !legacySubs) return null;
   fs.mkdirSync(delegationRunsDir(newBridgeDir), { recursive: true, mode: 0o700 });
+  const existingReceipt = readDelegationMigrationReceipt(newBridgeDir);
+  if (isMigrationReceiptComplete(legacyBridgeDir, newBridgeDir, existingReceipt)) return null;
+  // Incremental run copy: missing/differing only. Identical bytes are left
+  // untouched so stable run ids are preserved and no event is re-queued by
+  // rewriting. Source is only ever read.
+  const runFileHashes: Record<string, string> = {};
   for (const name of legacyRuns) {
-    const bytes = fs.readFileSync(path.join(delegationRunsDir(legacyBridgeDir), name));
+    const legacyBytes = fs.readFileSync(path.join(delegationRunsDir(legacyBridgeDir), name));
+    const legacyHash = sha256HexBytes(legacyBytes);
+    runFileHashes[name] = legacyHash;
     const target = path.join(delegationRunsDir(newBridgeDir), name);
-    fs.writeFileSync(target, bytes, { mode: 0o600 });
-    try { fs.chmodSync(target, 0o600); } catch { /* best effort on odd fs */ }
+    let destMatches = false;
+    try {
+      const destBytes = fs.readFileSync(target);
+      destMatches = sha256HexBytes(destBytes) === legacyHash;
+    } catch {
+      destMatches = false;
+    }
+    if (!destMatches) {
+      atomicWriteBytes(target, legacyBytes);
+    }
   }
+  // Subscription merge by id (authority only, secrets never leave it).
+  let subscriptionIds: string[] = [];
+  let subsHash: string | null = null;
   if (legacySubs) {
-    const bytes = fs.readFileSync(subscriptionsPath(legacyBridgeDir));
-    const target = subscriptionsPath(newBridgeDir);
-    fs.writeFileSync(target, bytes, { mode: 0o600 });
-    try { fs.chmodSync(target, 0o600); } catch { /* best effort on odd fs */ }
+    const legacyBytes = fs.readFileSync(subscriptionsPath(legacyBridgeDir));
+    const legacyParsed = parseSubscriptionsBytes(legacyBytes);
+    subscriptionIds = legacyParsed.ids;
+    subsHash = legacyParsed.hash;
+    const legacyRecords = [...legacyParsed.byId.values()];
+    const destRecords = hasSubscriptionsFile(newBridgeDir) ? loadSubscriptionRecords(newBridgeDir) : [];
+    const merged = mergeSubscriptionsById(destRecords, legacyRecords);
+    const destCanonical = stableStringify(destRecords.slice().sort((a, b) =>
+      String((a as { subId?: unknown }).subId) < String((b as { subId?: unknown }).subId) ? -1 : 1));
+    const mergedCanonical = stableStringify(merged);
+    if (destCanonical !== mergedCanonical || !hasSubscriptionsFile(newBridgeDir)) {
+      const payload = { version: 1 as const, subscriptions: merged };
+      atomicWriteBytes(subscriptionsPath(newBridgeDir), Buffer.from(`${JSON.stringify(payload, null, 2)}\n`, "utf8"));
+    }
   }
-  // Verify BEFORE trusting: counts must match and subscription bytes must
-  // be identical. The legacy source is left intact either way.
+  // Verify BEFORE trusting: every run hash plus every legacy subscription id
+  // must verify in the destination. The legacy source is left intact either way.
   const copiedRuns = runFileNames(newBridgeDir);
-  if (copiedRuns.length !== legacyRuns.length) {
+  if (copiedRuns.length < legacyRuns.length) {
     throw new Error(`Delegation migration verification failed: copied ${copiedRuns.length} runs, legacy holds ${legacyRuns.length}. Source left intact at ${legacyBridgeDir}.`);
   }
+  for (const name of legacyRuns) {
+    const expected = runFileHashes[name];
+    const destBytes = fs.readFileSync(path.join(delegationRunsDir(newBridgeDir), name));
+    if (sha256HexBytes(destBytes) !== expected) {
+      throw new Error(`Delegation migration verification failed: run ${name} hash mismatch. Source left intact at ${legacyBridgeDir}.`);
+    }
+  }
   if (legacySubs) {
-    const before = fs.readFileSync(subscriptionsPath(legacyBridgeDir));
-    const after = fs.readFileSync(subscriptionsPath(newBridgeDir));
-    if (!before.equals(after)) {
-      throw new Error(`Delegation migration verification failed: subscription bytes differ. Source left intact at ${legacyBridgeDir}.`);
+    const destRecords = loadSubscriptionRecords(newBridgeDir);
+    const destById = new Map(destRecords.map((r) => [(r as { subId: string }).subId, r]));
+    const legacyBytes = fs.readFileSync(subscriptionsPath(legacyBridgeDir));
+    const legacyParsed = parseSubscriptionsBytes(legacyBytes);
+    for (const id of legacyParsed.ids) {
+      const destRec = destById.get(id);
+      if (!destRec || stableStringify(destRec) !== stableStringify(legacyParsed.byId.get(id))) {
+        throw new Error(`Delegation migration verification failed: subscription ${id} missing or differs. Source left intact at ${legacyBridgeDir}.`);
+      }
     }
   }
   const at = new Date().toISOString();
   const receiptPath = path.join(newBridgeDir, DELEGATION_MIGRATION_RECEIPT);
-  const receipt = {
-    version: 1,
+  const receipt: DelegationMigrationReceipt = {
+    version: DELEGATION_MIGRATION_RECEIPT_VERSION,
     from: legacyBridgeDir,
     to: newBridgeDir,
-    runFiles: copiedRuns.length,
+    runFiles: legacyRuns.length,
+    runFileHashes,
     subscriptions: legacySubs,
+    subscriptionIds,
+    subsHash,
     at
   };
-  fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
-  try { fs.chmodSync(receiptPath, 0o600); } catch { /* best effort on odd fs */ }
+  atomicWriteReceipt(receiptPath, receipt);
   return {
     from: legacyBridgeDir,
     to: newBridgeDir,
     workspaceCanonical: legacyBridgeDir,
-    runFiles: copiedRuns.length,
+    runFiles: legacyRuns.length,
     subscriptions: legacySubs,
     at,
     receipt: receiptPath

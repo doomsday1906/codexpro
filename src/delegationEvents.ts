@@ -178,11 +178,39 @@ export function eventsCapability(): EventsCapability {
   };
 }
 
+/**
+ * Authoritative DiscoverResult shape provenance (2026-07-28 discover):
+ * - Required fields + ttlMs/cacheScope semantics from the base draft schema
+ *   $defs/DiscoverResult (required: cacheScope, capabilities, resultType,
+ *   supportedVersions, ttlMs):
+ *   https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/main/schema/draft/schema.json
+ *   (fetched 2026-10-04; ttlMs = integer >= 0 discovery-response cache hint,
+ *   Cache-Control max-age analog — NOT the subscribe lifetime grant;
+ *   cacheScope enum "private"|"public", "private" = cacheable only within the
+ *   same authorization context).
+ * - 2026-07-28 discover example (resultType/supportedVersions/capabilities):
+ *   https://developers.openai.com/plugins/build/mcp-events
+ * - Subscribe ttlMs suggestion -> refreshBefore grant + principal-bound
+ *   subscription identity (subscribe-level TTL, NOT discover fields):
+ *   https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md
+ *   (draft 2026-02-19).
+ *
+ * Field values: ttlMs reuses DEFAULT_SUBSCRIPTION_TTL_MS (24h) as the numeric
+ * discovery cache hint (static capabilities stay fresh for 24h); cacheScope is
+ * "private" so per-owner discovery is cached separately (owner isolation).
+ * NOTE: packet paraphrase describing ttlMs as "the subscription lifetime" and
+ * cacheScope "e.g. principal" diverges from the authoritative schema — the
+ * schema defines ttlMs as the discover cache hint and allows only
+ * "private"|"public" ("principal" is not a valid enum value). Implementation
+ * follows the authoritative schema; see DISPATCH_SOURCE_CONFLICT note.
+ */
 export function serverDiscoverResult(): Record<string, unknown> {
   return {
     resultType: "complete",
     supportedVersions: [...MCP_EVENTS_SUPPORTED_VERSIONS],
-    capabilities: { tools: {}, events: {} }
+    capabilities: { tools: {}, events: {} },
+    ttlMs: DEFAULT_SUBSCRIPTION_TTL_MS,
+    cacheScope: "private"
   };
 }
 

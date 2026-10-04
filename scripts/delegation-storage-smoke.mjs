@@ -239,9 +239,13 @@ async function makeReceiver() {
       const after = fs.readFileSync(path.join(expectedRunBridge, 'delegation-runs', `${runId}.json`));
       assert(after.equals(beforeRunBytes[index]), `migrated run ${runId} bytes must equal the legacy source`);
     }
-    assert(fs.readFileSync(path.join(expectedAuthBridge, 'delegation-subscriptions.json')).equals(legacySubsBytes), 'migrated subs bytes must equal the legacy source');
+    // Subs are merged by id (whitespace-normalized): compare canonically.
+    const destSubsParsed = JSON.parse(fs.readFileSync(path.join(expectedAuthBridge, 'delegation-subscriptions.json'), 'utf8'));
+    assert(Array.isArray(destSubsParsed.subscriptions) && destSubsParsed.subscriptions.length === 0, 'migrated subs must preserve the (empty) legacy subscription list');
     const receipt = JSON.parse(fs.readFileSync(path.join(expectedRunBridge, 'delegation-migration.json'), 'utf8'));
-    assert(receipt.runFiles === 2 && receipt.from === legacyRunBridge, `migration receipt must record the move, got ${JSON.stringify(receipt)}`);
+    assert(receipt.version === 2 && receipt.runFiles === 2 && receipt.from === legacyRunBridge, `migration receipt must record the move, got ${JSON.stringify(receipt)}`);
+    assert(receipt.runFileHashes && Object.keys(receipt.runFileHashes).length === 2, 'v2 receipt must carry expected per-run hashes');
+    assert(Store.isMigrationReceiptComplete(legacyRunBridge, expectedRunBridge, Store.readDelegationMigrationReceipt(expectedRunBridge)) === true, 'v2 receipt must verify complete');
     // Source left intact: NEVER deleted, NEVER modified.
     for (const [index, [runId]] of seeds.entries()) {
       assert(fs.readFileSync(path.join(legacyRunBridge, 'delegation-runs', `${runId}.json`)).equals(beforeRunBytes[index]), `legacy source ${runId} must be intact`);
@@ -256,6 +260,271 @@ async function makeReceiver() {
     await client.close();
   }
   console.log('ok: S2 deliberate migration (copy-only, counts/bytes verified, source intact, receipt, idempotent)');
+}
+
+// ---------- S2b: interrupt after first run copied ----------
+// Crash leaves: first run copied, second missing, no subs, no receipt.
+// Retry must copy only the missing run (IDs stable, identical bytes
+// untouched so no event re-queue), merge subs, publish a v2 receipt.
+{
+  const legacyRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-storage-mig2b-'));
+  const destRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-storage-mig2b-dest-'));
+  const realLegacy = fs.realpathSync.native(legacyRoot);
+  const legacyBridge = path.join(realLegacy, '.ai-bridge');
+  const destBridge = path.join(fs.realpathSync.native(destRoot), 'dest-bridge');
+  const owner = Store.ownerIdFor(undefined, `${UID}:${realLegacy}`);
+  const now = new Date().toISOString();
+  const seedRun = (runId, requestId) => ({
+    version: 1, runId, requestId, delegationGroup: 'hestia-cli-canary', engine: 'codex', profile: 'CODEX_SCOUT_FAST',
+    isCanary: false, task: 'seeded legacy task s2b',
+    session: { engine: 'codex', resumable: false, observed: false, evidence: 'seed', reason: 'seed' },
+    workspaceId: 'ws_seed_2b', workspaceCanonical: realLegacy, workdir: path.join(realLegacy, 'seed-work'),
+    ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind,
+    state: 'completed', seq: 1,
+    attempts: [{ n: 1, startedAt: now, finishedAt: now, state: 'completed', exitCode: 0, summary: 'completed exit 0' }],
+    result: { exitCode: 0, signal: null, timedOut: false, summary: 'completed exit 0' },
+    pendingEvents: [{ eventId: `evt_seed_${runId.slice(4, 8)}`, seq: 1, state: 'completed', summary: 'completed exit 0', createdAt: now, deliveries: [] }],
+    checkpoints: [], appliedCheckpointIds: [], lastAppliedCheckpointSeq: -1, inputRequests: [],
+    nextAction: 'read the terminal result via delegation_read_result', createdAt: now, updatedAt: now
+  });
+  const seeds = [
+    ['run_c2b0c2b0c2b0c2b0', 'req-mig-2b-1'],
+    ['run_d2b0d2b0d2b0d2b0', 'req-mig-2b-2']
+  ];
+  fs.mkdirSync(path.join(legacyBridge, 'delegation-runs'), { recursive: true, mode: 0o700 });
+  for (const [runId, requestId] of seeds) {
+    fs.writeFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`), `${JSON.stringify(seedRun(runId, requestId), null, 2)}\n`, { mode: 0o600 });
+  }
+  // Nonempty synthetic subscription fixture: hash-only placeholders, NO real secret.
+  const hashA = createHash('sha256').update('synthetic-sub-2b-alpha').digest('hex');
+  const hashB = createHash('sha256').update('synthetic-sub-2b-beta').digest('hex');
+  const legacySubs = [
+    { subId: 'sub_mig_2b_alpha', eventName: 'run-attention', callbackUrl: 'http://127.0.0.1:9/hook-2b-a', filter: { delegation_group: 'hestia-cli-canary' }, ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind, createdAt: now, secretHash: hashA, note: 'hash-only placeholder, no real secret' },
+    { subId: 'sub_mig_2b_beta', eventName: 'run-attention', callbackUrl: 'http://127.0.0.1:9/hook-2b-b', filter: { delegation_group: 'hestia-cli-canary' }, ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind, createdAt: now, secretHash: hashB, note: 'hash-only placeholder, no real secret' }
+  ];
+  const legacySubsBytes = Buffer.from(`${JSON.stringify({ version: 1, subscriptions: legacySubs })}\n`, 'utf8');
+  fs.writeFileSync(path.join(legacyBridge, 'delegation-subscriptions.json'), legacySubsBytes, { mode: 0o600 });
+  const beforeRunBytes = seeds.map(([runId]) => fs.readFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`)));
+  // Simulate the crash: only the first run made it across. No subs, no receipt.
+  fs.mkdirSync(path.join(destBridge, 'delegation-runs'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(destBridge, 'delegation-runs', `${seeds[0][0]}.json`), beforeRunBytes[0], { mode: 0o600 });
+  // A lone dest file is NEVER complete: no receipt, no hash authority.
+  assert(Store.readDelegationMigrationReceipt(destBridge) === undefined, 'S2b: no receipt may exist before retry');
+  assert(Store.isMigrationReceiptComplete(legacyBridge, destBridge, Store.readDelegationMigrationReceipt(destBridge)) === false, 'S2b: dest file alone must NOT read complete');
+  const firstMtimeBefore = fs.statSync(path.join(destBridge, 'delegation-runs', `${seeds[0][0]}.json`)).mtimeMs;
+  // Retry recovers.
+  const mig = Store.ensureDelegationStorage(legacyBridge, destBridge);
+  assert(mig && mig.runFiles === 2, `S2b: retry must migrate 2 runs, got ${JSON.stringify(mig)}`);
+  for (const [index, [runId]] of seeds.entries()) {
+    assert(fs.readFileSync(path.join(destBridge, 'delegation-runs', `${runId}.json`)).equals(beforeRunBytes[index]), `S2b: dest run ${runId} must equal the legacy source`);
+  }
+  assert(fs.statSync(path.join(destBridge, 'delegation-runs', `${seeds[0][0]}.json`)).mtimeMs === firstMtimeBefore, 'S2b: identical run bytes must be left untouched (no rewrite, no re-queue)');
+  const destNames = fs.readdirSync(path.join(destBridge, 'delegation-runs')).filter((e) => e.endsWith('.json')).sort();
+  assert(JSON.stringify(destNames) === JSON.stringify(seeds.map(([id]) => `${id}.json`).sort()), 'S2b: run IDs must stay stable with no extras');
+  for (const [runId] of seeds) {
+    const destRun = JSON.parse(fs.readFileSync(path.join(destBridge, 'delegation-runs', `${runId}.json`), 'utf8'));
+    assert(destRun.state === 'completed' && destRun.attempts.length === 1 && destRun.pendingEvents.length === 1, `S2b: run ${runId} must show no duplicate dispatch (attempts/events unchanged)`);
+  }
+  const destSubs = JSON.parse(fs.readFileSync(path.join(destBridge, 'delegation-subscriptions.json'), 'utf8')).subscriptions;
+  assert(destSubs.length === 2, 'S2b: retry must recover all subscription records');
+  for (const rec of legacySubs) {
+    const found = destSubs.find((s) => s.subId === rec.subId);
+    assert(found && JSON.stringify(found) === JSON.stringify(rec), `S2b: legacy sub ${rec.subId} must verify exactly (no lost authority)`);
+  }
+  const receipt = Store.readDelegationMigrationReceipt(destBridge);
+  assert(receipt && receipt.version === 2 && receipt.runFiles === 2, 'S2b: retry must publish a v2 receipt');
+  assert(path.resolve(receipt.from) === path.resolve(legacyBridge) && path.resolve(receipt.to) === path.resolve(destBridge), 'S2b: receipt must record the exact move');
+  for (const [index, [runId]] of seeds.entries()) {
+    assert(receipt.runFileHashes[`${runId}.json`] === createHash('sha256').update(beforeRunBytes[index]).digest('hex'), `S2b: receipt must carry the expected hash for ${runId}`);
+  }
+  assert(JSON.stringify([...receipt.subscriptionIds].sort()) === JSON.stringify(['sub_mig_2b_alpha', 'sub_mig_2b_beta']), 'S2b: receipt must carry expected subscription ids');
+  assert(typeof receipt.subsHash === 'string' && receipt.subsHash.length === 64, 'S2b: receipt must carry the subs hash');
+  const receiptRaw = fs.readFileSync(path.join(destBridge, 'delegation-migration.json'), 'utf8');
+  assert(!receiptRaw.includes(hashA) && !receiptRaw.includes(hashB) && !receiptRaw.includes('whsec_'), 'S2b: receipt records hashes/ids only, never secret bytes');
+  for (const [runId] of seeds) {
+    const runRaw = fs.readFileSync(path.join(destBridge, 'delegation-runs', `${runId}.json`), 'utf8');
+    assert(!runRaw.includes(hashA) && !runRaw.includes(hashB) && !runRaw.includes('whsec_'), `S2b: run ${runId} must not duplicate subscription secrets`);
+  }
+  assert(Store.isMigrationReceiptComplete(legacyBridge, destBridge, receipt) === true, 'S2b: verified receipt must read complete');
+  for (const [index, [runId]] of seeds.entries()) {
+    assert(fs.readFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`)).equals(beforeRunBytes[index]), `S2b: legacy source ${runId} must be intact`);
+  }
+  assert(fs.readFileSync(path.join(legacyBridge, 'delegation-subscriptions.json')).equals(legacySubsBytes), 'S2b: legacy subs source must be intact');
+  assert(Store.ensureDelegationStorage(legacyBridge, destBridge) === null, 'S2b: retry after completion must be idempotent (no duplication)');
+  console.log('ok: S2b interrupt after first run copied (retry copies missing only, all records verified, source intact)');
+}
+
+// ---------- S2c: interrupt during sub copying ----------
+// Crash leaves: both runs copied, dest subs PARTIAL (stale alpha record,
+// missing beta) plus a dest-only record. Retry must merge by id: legacy
+// wins on the same id, dest-only preserved, nothing lost.
+{
+  const legacyRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-storage-mig2c-'));
+  const destRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-storage-mig2c-dest-'));
+  const realLegacy = fs.realpathSync.native(legacyRoot);
+  const legacyBridge = path.join(realLegacy, '.ai-bridge');
+  const destBridge = path.join(fs.realpathSync.native(destRoot), 'dest-bridge');
+  const owner = Store.ownerIdFor(undefined, `${UID}:${realLegacy}`);
+  const now = new Date().toISOString();
+  const seedRun = (runId, requestId) => ({
+    version: 1, runId, requestId, delegationGroup: 'hestia-cli-canary', engine: 'codex', profile: 'CODEX_SCOUT_FAST',
+    isCanary: false, task: 'seeded legacy task s2c',
+    session: { engine: 'codex', resumable: false, observed: false, evidence: 'seed', reason: 'seed' },
+    workspaceId: 'ws_seed_2c', workspaceCanonical: realLegacy, workdir: path.join(realLegacy, 'seed-work'),
+    ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind,
+    state: 'completed', seq: 1,
+    attempts: [{ n: 1, startedAt: now, finishedAt: now, state: 'completed', exitCode: 0, summary: 'completed exit 0' }],
+    result: { exitCode: 0, signal: null, timedOut: false, summary: 'completed exit 0' },
+    pendingEvents: [{ eventId: `evt_seed_${runId.slice(4, 8)}`, seq: 1, state: 'completed', summary: 'completed exit 0', createdAt: now, deliveries: [] }],
+    checkpoints: [], appliedCheckpointIds: [], lastAppliedCheckpointSeq: -1, inputRequests: [],
+    nextAction: 'read the terminal result via delegation_read_result', createdAt: now, updatedAt: now
+  });
+  const seeds = [
+    ['run_c2c0c2c0c2c0c2c0', 'req-mig-2c-1'],
+    ['run_d2c0d2c0d2c0d2c0', 'req-mig-2c-2']
+  ];
+  fs.mkdirSync(path.join(legacyBridge, 'delegation-runs'), { recursive: true, mode: 0o700 });
+  for (const [runId, requestId] of seeds) {
+    fs.writeFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`), `${JSON.stringify(seedRun(runId, requestId), null, 2)}\n`, { mode: 0o600 });
+  }
+  const hashA = createHash('sha256').update('synthetic-sub-2c-alpha').digest('hex');
+  const hashB = createHash('sha256').update('synthetic-sub-2c-beta').digest('hex');
+  const legacySubs = [
+    { subId: 'sub_mig_2c_alpha', eventName: 'run-attention', callbackUrl: 'http://127.0.0.1:9/hook-2c-a', filter: { delegation_group: 'hestia-cli-canary' }, ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind, createdAt: now, secretHash: hashA, note: 'hash-only placeholder, no real secret' },
+    { subId: 'sub_mig_2c_beta', eventName: 'run-attention', callbackUrl: 'http://127.0.0.1:9/hook-2c-b', filter: { delegation_group: 'hestia-cli-canary' }, ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind, createdAt: now, secretHash: hashB, note: 'hash-only placeholder, no real secret' }
+  ];
+  const legacySubsBytes = Buffer.from(`${JSON.stringify({ version: 1, subscriptions: legacySubs })}\n`, 'utf8');
+  fs.writeFileSync(path.join(legacyBridge, 'delegation-subscriptions.json'), legacySubsBytes, { mode: 0o600 });
+  const beforeRunBytes = seeds.map(([runId]) => fs.readFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`)));
+  // Simulate the crash: runs fully copied, subs half-written (stale alpha,
+  // beta missing) beside a dest-only record. No receipt.
+  fs.mkdirSync(path.join(destBridge, 'delegation-runs'), { recursive: true, mode: 0o700 });
+  for (const [index, [runId]] of seeds.entries()) {
+    fs.writeFileSync(path.join(destBridge, 'delegation-runs', `${runId}.json`), beforeRunBytes[index], { mode: 0o600 });
+  }
+  const staleAlpha = { ...legacySubs[0], callbackUrl: 'http://127.0.0.1:9/stale-before-crash' };
+  const destOnly = { subId: 'sub_mig_2c_destonly', eventName: 'run-attention', callbackUrl: 'http://127.0.0.1:9/hook-2c-dest', filter: { delegation_group: 'hestia-cli-canary' }, ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind, createdAt: now, secretHash: createHash('sha256').update('synthetic-sub-2c-destonly').digest('hex'), note: 'dest-only authority, must survive merge' };
+  fs.writeFileSync(path.join(destBridge, 'delegation-subscriptions.json'), `${JSON.stringify({ version: 1, subscriptions: [staleAlpha, destOnly] }, null, 2)}\n`, { mode: 0o600 });
+  assert(Store.isMigrationReceiptComplete(legacyBridge, destBridge, Store.readDelegationMigrationReceipt(destBridge)) === false, 'S2c: partial subs with no receipt must NOT read complete');
+  const runMtimesBefore = seeds.map(([runId]) => fs.statSync(path.join(destBridge, 'delegation-runs', `${runId}.json`)).mtimeMs);
+  // Retry recovers via merge-by-id.
+  const mig = Store.ensureDelegationStorage(legacyBridge, destBridge);
+  assert(mig && mig.runFiles === 2, `S2c: retry must migrate 2 runs, got ${JSON.stringify(mig)}`);
+  for (const [index, [runId]] of seeds.entries()) {
+    assert(fs.readFileSync(path.join(destBridge, 'delegation-runs', `${runId}.json`)).equals(beforeRunBytes[index]), `S2c: dest run ${runId} must equal the legacy source`);
+    assert(fs.statSync(path.join(destBridge, 'delegation-runs', `${runId}.json`)).mtimeMs === runMtimesBefore[index], `S2c: identical run ${runId} must be left untouched`);
+  }
+  const destSubs = JSON.parse(fs.readFileSync(path.join(destBridge, 'delegation-subscriptions.json'), 'utf8')).subscriptions;
+  const byId = new Map(destSubs.map((s) => [s.subId, s]));
+  assert(JSON.stringify(byId.get('sub_mig_2c_alpha')) === JSON.stringify(legacySubs[0]), 'S2c: legacy record must win on the same sub id');
+  assert(JSON.stringify(byId.get('sub_mig_2c_beta')) === JSON.stringify(legacySubs[1]), 'S2c: missing legacy sub must be recovered (no lost authority)');
+  assert(JSON.stringify(byId.get('sub_mig_2c_destonly')) === JSON.stringify(destOnly), 'S2c: dest-only authority must survive the merge');
+  assert(destSubs.length === 3, 'S2c: merged authority must hold legacy + dest-only records');
+  for (const [runId] of seeds) {
+    const destRun = JSON.parse(fs.readFileSync(path.join(destBridge, 'delegation-runs', `${runId}.json`), 'utf8'));
+    assert(destRun.state === 'completed' && destRun.attempts.length === 1, `S2c: run ${runId} must show no duplicate dispatch`);
+  }
+  const receipt = Store.readDelegationMigrationReceipt(destBridge);
+  assert(receipt && receipt.version === 2, 'S2c: retry must publish a v2 receipt');
+  assert(JSON.stringify([...receipt.subscriptionIds].sort()) === JSON.stringify(['sub_mig_2c_alpha', 'sub_mig_2c_beta']), 'S2c: receipt must carry expected legacy subscription ids');
+  const receiptRaw = fs.readFileSync(path.join(destBridge, 'delegation-migration.json'), 'utf8');
+  assert(!receiptRaw.includes(hashA) && !receiptRaw.includes(hashB) && !receiptRaw.includes('whsec_'), 'S2c: receipt records hashes/ids only, never secret bytes');
+  assert(Store.isMigrationReceiptComplete(legacyBridge, destBridge, receipt) === true, 'S2c: merged + verified state must read complete');
+  for (const [index, [runId]] of seeds.entries()) {
+    assert(fs.readFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`)).equals(beforeRunBytes[index]), `S2c: legacy source ${runId} must be intact`);
+  }
+  assert(fs.readFileSync(path.join(legacyBridge, 'delegation-subscriptions.json')).equals(legacySubsBytes), 'S2c: legacy subs source must be intact');
+  assert(Store.ensureDelegationStorage(legacyBridge, destBridge) === null, 'S2c: retry after completion must be idempotent');
+  console.log('ok: S2c interrupt during sub copying (merge by id: legacy wins, dest-only preserved, source intact)');
+}
+
+// ---------- S2d: interrupt before receipt publication ----------
+// Crash leaves: all runs + subs fully copied but NO receipt (plus a stale
+// v1 receipt proves nothing). Retry must verify, publish v2 last, and heal
+// a corrupted dest run without touching identical bytes.
+{
+  const legacyRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-storage-mig2d-'));
+  const destRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-storage-mig2d-dest-'));
+  const realLegacy = fs.realpathSync.native(legacyRoot);
+  const legacyBridge = path.join(realLegacy, '.ai-bridge');
+  const destBridge = path.join(fs.realpathSync.native(destRoot), 'dest-bridge');
+  const owner = Store.ownerIdFor(undefined, `${UID}:${realLegacy}`);
+  const now = new Date().toISOString();
+  const seedRun = (runId, requestId) => ({
+    version: 1, runId, requestId, delegationGroup: 'hestia-cli-canary', engine: 'codex', profile: 'CODEX_SCOUT_FAST',
+    isCanary: false, task: 'seeded legacy task s2d',
+    session: { engine: 'codex', resumable: false, observed: false, evidence: 'seed', reason: 'seed' },
+    workspaceId: 'ws_seed_2d', workspaceCanonical: realLegacy, workdir: path.join(realLegacy, 'seed-work'),
+    ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind,
+    state: 'completed', seq: 1,
+    attempts: [{ n: 1, startedAt: now, finishedAt: now, state: 'completed', exitCode: 0, summary: 'completed exit 0' }],
+    result: { exitCode: 0, signal: null, timedOut: false, summary: 'completed exit 0' },
+    pendingEvents: [{ eventId: `evt_seed_${runId.slice(4, 8)}`, seq: 1, state: 'completed', summary: 'completed exit 0', createdAt: now, deliveries: [] }],
+    checkpoints: [], appliedCheckpointIds: [], lastAppliedCheckpointSeq: -1, inputRequests: [],
+    nextAction: 'read the terminal result via delegation_read_result', createdAt: now, updatedAt: now
+  });
+  const seeds = [
+    ['run_c2d0c2d0c2d0c2d0', 'req-mig-2d-1'],
+    ['run_d2d0d2d0d2d0d2d0', 'req-mig-2d-2']
+  ];
+  fs.mkdirSync(path.join(legacyBridge, 'delegation-runs'), { recursive: true, mode: 0o700 });
+  for (const [runId, requestId] of seeds) {
+    fs.writeFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`), `${JSON.stringify(seedRun(runId, requestId), null, 2)}\n`, { mode: 0o600 });
+  }
+  const hashA = createHash('sha256').update('synthetic-sub-2d-alpha').digest('hex');
+  const hashB = createHash('sha256').update('synthetic-sub-2d-beta').digest('hex');
+  const legacySubs = [
+    { subId: 'sub_mig_2d_alpha', eventName: 'run-attention', callbackUrl: 'http://127.0.0.1:9/hook-2d-a', filter: { delegation_group: 'hestia-cli-canary' }, ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind, createdAt: now, secretHash: hashA, note: 'hash-only placeholder, no real secret' },
+    { subId: 'sub_mig_2d_beta', eventName: 'run-attention', callbackUrl: 'http://127.0.0.1:9/hook-2d-b', filter: { delegation_group: 'hestia-cli-canary' }, ownerIdHash: owner.ownerIdHash, ownerKind: owner.ownerKind, createdAt: now, secretHash: hashB, note: 'hash-only placeholder, no real secret' }
+  ];
+  const legacySubsBytes = Buffer.from(`${JSON.stringify({ version: 1, subscriptions: legacySubs })}\n`, 'utf8');
+  fs.writeFileSync(path.join(legacyBridge, 'delegation-subscriptions.json'), legacySubsBytes, { mode: 0o600 });
+  const beforeRunBytes = seeds.map(([runId]) => fs.readFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`)));
+  // Simulate the crash: everything copied, receipt never published. The
+  // second dest run is additionally corrupted (differing bytes).
+  fs.mkdirSync(path.join(destBridge, 'delegation-runs'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(destBridge, 'delegation-runs', `${seeds[0][0]}.json`), beforeRunBytes[0], { mode: 0o600 });
+  const corrupted = Buffer.from(beforeRunBytes[1]);
+  corrupted[corrupted.length - 2] = corrupted[corrupted.length - 2] === 0x7d ? 0x20 : 0x7d;
+  fs.writeFileSync(path.join(destBridge, 'delegation-runs', `${seeds[1][0]}.json`), corrupted, { mode: 0o600 });
+  fs.writeFileSync(path.join(destBridge, 'delegation-subscriptions.json'), legacySubsBytes, { mode: 0o600 });
+  // Fully copied but receipt-less is NOT complete; neither is a stale v1 receipt.
+  assert(Store.isMigrationReceiptComplete(legacyBridge, destBridge, Store.readDelegationMigrationReceipt(destBridge)) === false, 'S2d: copied files without a v2 receipt must NOT read complete');
+  fs.writeFileSync(path.join(destBridge, 'delegation-migration.json'), `${JSON.stringify({ version: 1, from: legacyBridge, to: destBridge, runFiles: 2, subscriptions: true, at: now })}\n`, { mode: 0o600 });
+  assert(Store.isMigrationReceiptComplete(legacyBridge, destBridge, Store.readDelegationMigrationReceipt(destBridge)) === false, 'S2d: v1 receipt without hashes must NOT read complete');
+  fs.rmSync(path.join(destBridge, 'delegation-migration.json'), { force: true });
+  const firstMtimeBefore = fs.statSync(path.join(destBridge, 'delegation-runs', `${seeds[0][0]}.json`)).mtimeMs;
+  // Retry heals the differing run, keeps the identical one, publishes v2 last.
+  const mig = Store.ensureDelegationStorage(legacyBridge, destBridge);
+  assert(mig && mig.runFiles === 2, `S2d: retry must migrate 2 runs, got ${JSON.stringify(mig)}`);
+  for (const [index, [runId]] of seeds.entries()) {
+    assert(fs.readFileSync(path.join(destBridge, 'delegation-runs', `${runId}.json`)).equals(beforeRunBytes[index]), `S2d: dest run ${runId} must equal the legacy source after retry`);
+  }
+  assert(fs.statSync(path.join(destBridge, 'delegation-runs', `${seeds[0][0]}.json`)).mtimeMs === firstMtimeBefore, 'S2d: identical run must be left untouched (no rewrite)');
+  const destSubs = JSON.parse(fs.readFileSync(path.join(destBridge, 'delegation-subscriptions.json'), 'utf8')).subscriptions;
+  assert(destSubs.length === 2, 'S2d: retry must recover all subscription records');
+  for (const rec of legacySubs) {
+    const found = destSubs.find((s) => s.subId === rec.subId);
+    assert(found && JSON.stringify(found) === JSON.stringify(rec), `S2d: legacy sub ${rec.subId} must verify exactly`);
+  }
+  for (const [runId] of seeds) {
+    const destRun = JSON.parse(fs.readFileSync(path.join(destBridge, 'delegation-runs', `${runId}.json`), 'utf8'));
+    assert(destRun.state === 'completed' && destRun.attempts.length === 1 && destRun.pendingEvents.length === 1, `S2d: run ${runId} must show no duplicate dispatch`);
+  }
+  const receipt = Store.readDelegationMigrationReceipt(destBridge);
+  assert(receipt && receipt.version === 2 && receipt.runFiles === 2, 'S2d: retry must publish a v2 receipt last');
+  for (const [index, [runId]] of seeds.entries()) {
+    assert(receipt.runFileHashes[`${runId}.json`] === createHash('sha256').update(beforeRunBytes[index]).digest('hex'), `S2d: receipt must carry the expected hash for ${runId}`);
+  }
+  const receiptRaw = fs.readFileSync(path.join(destBridge, 'delegation-migration.json'), 'utf8');
+  assert(!receiptRaw.includes(hashA) && !receiptRaw.includes(hashB) && !receiptRaw.includes('whsec_'), 'S2d: receipt records hashes/ids only, never secret bytes');
+  assert(Store.isMigrationReceiptComplete(legacyBridge, destBridge, receipt) === true, 'S2d: verified v2 receipt must read complete');
+  for (const [index, [runId]] of seeds.entries()) {
+    assert(fs.readFileSync(path.join(legacyBridge, 'delegation-runs', `${runId}.json`)).equals(beforeRunBytes[index]), `S2d: legacy source ${runId} must be intact`);
+  }
+  assert(fs.readFileSync(path.join(legacyBridge, 'delegation-subscriptions.json')).equals(legacySubsBytes), 'S2d: legacy subs source must be intact');
+  assert(Store.ensureDelegationStorage(legacyBridge, destBridge) === null, 'S2d: retry after completion must be idempotent');
+  console.log('ok: S2d interrupt before receipt publication (v1 ignored, differing run healed, v2 published last, source intact)');
 }
 
 // ---------- S3: explicit legacy opt-in keeps the workspace .ai-bridge layout ----------
@@ -480,4 +749,4 @@ async function makeReceiver() {
   console.log('ok: S4c MCP retry behavior (uncertain/ambiguous+marker/initial-launch fail closed; proven dispatches once)');
 }
 
-console.log('\ndelegation-storage-smoke: PASS (user-data layout + deliberate migration + legacy opt-in + spawn-failure truth)');
+console.log('\ndelegation-storage-smoke: PASS (user-data layout + deliberate migration + S2b/S2c/S2d interruption recovery + legacy opt-in + spawn-failure truth)');

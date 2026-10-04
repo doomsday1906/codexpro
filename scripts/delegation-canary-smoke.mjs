@@ -1242,7 +1242,7 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
     // they prove legacy negotiation keeps working, never modern Events
     // compliance. K8m separately validates the ACTUAL advertised 2026-07-28
     // draft contract (server/discover resultType/supportedVersions/
-    // capabilities.events; events/list name/delivery/inputSchema/
+    // capabilities.events/ttlMs/cacheScope; events/list name/delivery/inputSchema/
     // payloadSchema; challenge/event envelopes + headers) as exact shapes.
     {
       const SdkTypes = await import(pathToFileUrl(path.join(ROOT, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm', 'types.js')));
@@ -1285,15 +1285,15 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
       const compatParsed = SdkTypes.CompatibilityCallToolResultSchema.safeParse(callBody);
       assert(callParsed.success || compatParsed.success, `k8 tools/call body must validate against SDK CallToolResult shape: ${JSON.stringify((callParsed.error ?? compatParsed.error)?.issues)?.slice(0, 300)}`);
       // K8m: ACTUAL advertised 2026-07-28 contract, exact shapes.
-      // Provenance: the installed SDK ships NO draft MCP Events schemas
-      // (server/discover and events/* have no SDK natives — the Part G gap
-      // proof), so no authoritative draft schema exists to import offline.
-      // K8m therefore asserts the EXACT advertised shapes field-by-field
-      // against the documented draft contract below (independent literal
-      // transcription, deep-compared — never the server's own builder
-      // output, never a legacy SDK schema). This is exact-shape
-      // conformance to the documented contract, not SDK-validated modern
-      // compliance, and it is reported separately from the K8 legacy proof.
+      // Provenance: the installed SDK ships NO draft MCP Events natives
+      // (server/discover and events/* have no SDK methods — the Part G gap
+      // proof), so K8m transcribes the authoritative draft DiscoverResult
+      // schema field-by-field below (independent literal transcription with
+      // spec URLs, deep-compared — never the server's own builder output,
+      // never a legacy SDK schema) plus presence/type/semantic asserts from
+      // that schema. This is exact-shape conformance to the authoritative
+      // draft contract, not SDK-validated modern compliance, and it is
+      // reported separately from the K8 legacy proof.
       const deepEqualK8m = (actual, expected, label) => {
         const norm = (value) => {
           if (Array.isArray(value)) return `[${value.map(norm).join(',')}]`;
@@ -1304,11 +1304,29 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
         };
         assert(norm(actual) === norm(expected), `${label} must equal the documented contract shape, got ${JSON.stringify(actual)?.slice(0, 400)}`);
       };
-      // Documented draft contract shapes (transcribed, not imported).
+      // Documented draft contract shapes (transcribed from the authoritative
+      // draft schema, not imported, not the server's own builder output).
+      // Provenance:
+      // - DiscoverResult required fields + ttlMs/cacheScope semantics:
+      //   https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/main/schema/draft/schema.json
+      //   ($defs/DiscoverResult; fetched 2026-10-04; required
+      //   [cacheScope, capabilities, resultType, supportedVersions, ttlMs];
+      //   ttlMs integer >= 0 discovery cache hint, Cache-Control max-age
+      //   analog; cacheScope enum "private"|"public", "private" =
+      //   per-authorization-context).
+      // - 2026-07-28 discover example
+      //   (resultType/supportedVersions/capabilities):
+      //   https://developers.openai.com/plugins/build/mcp-events
+      // - Subscribe ttlMs suggestion -> refreshBefore grant + principal-bound
+      //   subscription identity (subscribe-level TTL, NOT discover fields):
+      //   https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md
+      //   (draft 2026-02-19).
       const DOCUMENTED_DISCOVER = {
         resultType: 'complete',
         supportedVersions: ['2026-07-28'],
-        capabilities: { tools: {}, events: {} }
+        capabilities: { tools: {}, events: {} },
+        ttlMs: 86400000,
+        cacheScope: 'private'
       };
       const DOCUMENTED_EVENT = {
         name: 'run-attention',
@@ -1338,10 +1356,30 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
         }
       };
       // K8c: server/discover returns resultType complete + supportedVersions +
-      // capabilities.tools+events matching the documented shape exactly.
+      // capabilities.tools+events + spec-required ttlMs/cacheScope matching
+      // the documented shape exactly.
       const disK8 = await postRawK8({ jsonrpc: '2.0', id: 203, method: 'server/discover', params: {} }, { 'mcp-protocol-version': '2026-07-28' });
       assert(disK8.response.status === 200 && disK8.json?.result?.resultType === 'complete', `k8 discover must be complete, got ${JSON.stringify(disK8.json)}`);
       deepEqualK8m(disK8.json.result, DOCUMENTED_DISCOVER, 'k8m discover');
+      // K8m spec-anchored assertions (presence + types + semantics from the
+      // authoritative draft schema — never the server's own builder output):
+      // ttlMs integer >= 0 (discovery cache hint; value reuses the server's
+      // 24h default subscription lifetime millis granted when subscribe omits
+      // ttlMs); cacheScope "private" (spec enum private/public; private =
+      // per-authorization-context, so per-owner discovery is cached
+      // separately); plus existing resultType/supportedVersions/capabilities.
+      {
+        const disResult = disK8.json.result;
+        assert('ttlMs' in disResult, 'k8m discover must carry required ttlMs (draft DiscoverResult)');
+        assert(typeof disResult.ttlMs === 'number' && Number.isInteger(disResult.ttlMs) && disResult.ttlMs >= 0, `k8m ttlMs must be an integer >= 0 per draft schema, got ${JSON.stringify(disResult.ttlMs)}`);
+        assert(disResult.ttlMs === Events.DEFAULT_SUBSCRIPTION_TTL_MS, `k8m ttlMs must equal the default subscription lifetime millis (24h), got ${disResult.ttlMs}`);
+        assert('cacheScope' in disResult, 'k8m discover must carry required cacheScope (draft DiscoverResult)');
+        assert(typeof disResult.cacheScope === 'string', `k8m cacheScope must be a string per draft schema, got ${JSON.stringify(disResult.cacheScope)}`);
+        assert(disResult.cacheScope === 'private', `k8m cacheScope must be "private" (per-owner/authorization-context caching; "principal" is not a valid draft enum value), got ${JSON.stringify(disResult.cacheScope)}`);
+        assert(disResult.resultType === 'complete', `k8m resultType must be complete, got ${JSON.stringify(disResult.resultType)}`);
+        assert(Array.isArray(disResult.supportedVersions) && disResult.supportedVersions.includes('2026-07-28'), `k8m supportedVersions must include 2026-07-28, got ${JSON.stringify(disResult.supportedVersions)}`);
+        assert(disResult.capabilities && disResult.capabilities.tools && disResult.capabilities.events, `k8m capabilities must carry tools + events, got ${JSON.stringify(disResult.capabilities)}`);
+      }
       // K8d: events/list returns run-attention with delivery/inputSchema/
       // payloadSchema matching the documented shape exactly (description is
       // prose and excluded from the deep comparison, asserted separately).
@@ -1377,7 +1415,7 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
         ['webhook-id', 'webhook-signature', 'webhook-timestamp', 'X-MCP-Subscription-Id'].sort(),
         'k8m challenge signed header set (transport framing such as Host/content-type excluded)');
       console.log('ok: K8 LEGACY-COMPAT wire proof (init downgrade validates against SDK InitializeResultSchema; tools/call body validates against SDK CallToolResult shape — legacy negotiation only, NO modern compliance claimed)');
-      console.log('ok: K8m advertised 2026-07-28 contract shapes (discover resultType/supportedVersions/capabilities.events; list run-attention delivery/inputSchema/payloadSchema; challenge/event envelopes + exact header set — exact-shape conformance to the documented contract; authoritative draft schemas unavailable offline)');
+      console.log('ok: K8m advertised 2026-07-28 contract shapes (discover resultType/supportedVersions/capabilities.events/ttlMs/cacheScope; list run-attention delivery/inputSchema/payloadSchema; challenge/event envelopes + exact header set — exact-shape conformance to the authoritative draft DiscoverResult schema + documented contract)');
     }
     console.log('ok: K endpoint wire proof (POST /mcp server/discover + events/* reach the real handlers, auth-checked, batch, -32015 mapping)');
   } finally {
