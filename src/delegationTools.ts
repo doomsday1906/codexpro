@@ -25,11 +25,16 @@
  * On the HTTP endpoint this rides the existing bearer-token gate; on stdio
  * the owner is the local user + server root.
  *
- * Subscription routing: ONE canonical subscription authority (the server
- * defaultRoot bridge dir) serves every permitted workspace. Subscription
- * storage (events_subscribe, official POST /mcp events/subscribe) AND
- * completion delivery lookup (enqueue, pump, delegation_replay_events) all
- * use the authority dir; run state stays in the run workspace bridge dir.
+ * Subscription routing: ONE canonical subscription authority per
+ * (owner, server root) serves every permitted workspace. Default: the
+ * user-data delegation dir (service storage OUTSIDE consumer repos,
+ * namespaced by owner + canonical workspace); the legacy workspace
+ * `.ai-bridge` layout applies ONLY under the explicit
+ * CODEXPRO_DELEGATION_LEGACY_BRIDGE opt-in (first use migrates legacy
+ * state forward, copy-only, source intact). Subscription storage
+ * (events_subscribe, official POST /mcp events/subscribe) AND completion
+ * delivery lookup (enqueue, pump, delegation_replay_events) all use the
+ * authority dir; run state stays in the per-workspace run bridge dir.
  * Delivery targets are selected by owner identity (hash + kind,
  * constant-time) plus group/run filters. Subscription records (whsec_
  * secrets) are never copied into run workspaces: runs reference subIds only.
@@ -52,7 +57,6 @@ import {
   DELEGATION_TERMINAL_STATES,
   activeSessionHolders,
   applyCheckpointReply,
-  authorityBridgeDirFor,
   clearPendingDispatch,
   findRunByRequestId,
   isDelegationGroupId,
@@ -62,6 +66,8 @@ import {
   isUncertainDispatch,
   listDelegationRuns,
   loadDelegationRun,
+  localOwnerFor,
+  markAmbiguousSpawn,
   markPendingDispatchFailed,
   newRunId,
   nextActionFor,
@@ -70,6 +76,7 @@ import {
   pendingDispatchFor,
   reconcileRunState,
   registerInputRequest,
+  resolveDelegationStorage,
   runInputRequests,
   sanitizeSummary,
   sanitizeTaskText,
@@ -84,7 +91,8 @@ import {
   type DelegationAttempt,
   type DelegationRunRecord,
   type DelegationRunState,
-  type DelegationSessionBinding
+  type DelegationSessionBinding,
+  type DelegationStorageConfig
 } from "./delegationStore.js";
 import {
   buildCodexCanaryArgv,
@@ -166,21 +174,37 @@ function localOwnerId(config: CodexProConfig): string {
   return `${uid}:${config.defaultRoot}`;
 }
 
+function storageConfigFor(config: CodexProConfig): DelegationStorageConfig {
+  return {
+    delegationDir: config.delegationDir,
+    legacyBridge: config.delegationLegacyBridge,
+    contextDir: config.contextDir,
+    ...(config.authToken ? { authToken: config.authToken } : {}),
+    localOwner: localOwnerFor(config.defaultRoot),
+    defaultRoot: config.defaultRoot
+  };
+}
+
 function bridgeDirFor(config: CodexProConfig, workspaceRoot: string): string {
-  return path.join(workspaceRoot, config.contextDir);
+  // Default (legacy OFF): run state lives OUTSIDE the repo under the
+  // user-data delegation dir, namespaced by (owner, workspace). Legacy
+  // workspace .ai-bridge applies ONLY under the explicit opt-in. First use
+  // migrates existing legacy state forward (copy-only, source intact).
+  return resolveDelegationStorage(storageConfigFor(config), workspaceRoot).runBridgeDir;
 }
 
 /**
- * Canonical subscription authority dir (server defaultRoot bridge), shared
- * across ALL permitted workspaces. Subscription storage (events_subscribe /
- * official POST /mcp events/subscribe) AND completion delivery lookup
- * (enqueue + pump + replay) all use this dir; run state stays in the
- * per-workspace run bridge dir. Subscription records (which carry whsec_
- * secrets) are never copied into run workspaces: runs reference targets by
- * subId only.
+ * Canonical subscription authority dir, shared across ALL permitted
+ * workspaces for one (owner, server root). Default: the user-data
+ * delegation dir (never a repo); legacy opt-in: the server defaultRoot
+ * bridge. Subscription storage (events_subscribe / official POST /mcp
+ * events/subscribe) AND completion delivery lookup (enqueue + pump +
+ * replay) all use this dir; run state stays in the per-workspace run
+ * bridge dir. Subscription records (which carry whsec_ secrets) are never
+ * copied into run workspaces: runs reference targets by subId only.
  */
 function subscriptionAuthorityDirFor(config: CodexProConfig): string {
-  return authorityBridgeDirFor(config.defaultRoot, config.contextDir);
+  return resolveDelegationStorage(storageConfigFor(config), config.defaultRoot).authorityDir;
 }
 
 /**
@@ -523,7 +547,41 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
   void pumpDeliveries(deps, bridgeDir, loadDelegationRun(bridgeDir, runId) ?? run).catch(() => undefined);
 }
 
-function spawnCanaryChild(
+/**
+ * Ambiguous post-spawn failure: the child was successfully spawned, but
+ * run-identity (pid) persistence then failed, so the worker may exist as a
+ * pid-less orphan. Callers MUST fail closed on this error (uncertain
+ * dispatch, never auto-spawn a second worker, never a false terminal) even
+ * when persisting the error marker itself succeeds: the marker proves an
+ * error was recorded, never that no child exists. Proven pre-spawn
+ * failures (spawn threw synchronously, no child) propagate as ordinary
+ * errors and stay explicitly retryable.
+ */
+export class AmbiguousSpawnError extends Error {
+  readonly child?: ChildProcess;
+  readonly childPid?: number;
+  constructor(message: string, child?: ChildProcess) {
+    super(message);
+    this.name = "AmbiguousSpawnError";
+    (this as { code?: string }).code = "SPAWN_AMBIGUOUS";
+    this.child = child;
+    this.childPid = child?.pid;
+  }
+}
+
+export function isAmbiguousSpawnError(error: unknown): boolean {
+  if (error instanceof AmbiguousSpawnError) return true;
+  return !!error && typeof error === "object" &&
+    (error as { code?: unknown }).code === "SPAWN_AMBIGUOUS";
+}
+
+/**
+ * Test seam (exported ONLY for the spawn-truth transition proof): spawns one
+ * worker child and persists its pid identity. Throws AmbiguousSpawnError
+ * when the child spawned but identity persistence failed; ordinary errors
+ * propagate for proven pre-spawn failures (spawn threw, no child).
+ */
+export function spawnCanaryChild(
   deps: DelegationToolDeps,
   bridgeDir: string,
   run: DelegationRunRecord,
@@ -562,6 +620,12 @@ function spawnCanaryChild(
     timedOut: false
   };
   clearTimeout(live.timeout);
+  // Provenance boundary: spawn() throwing synchronously means NO child
+  // exists (proven pre-spawn); the raw error propagates untouched and the
+  // caller may record an explicitly retryable failure. EVERYTHING after a
+  // successful spawn() return is ambiguous on persistence failure: the
+  // worker may exist as a pid-less orphan, so identity-save errors throw
+  // AmbiguousSpawnError and the caller must fail closed (never auto-spawn).
   const pid = child.pid;
   const startTime = pid !== undefined ? readProcessStartTime(pid) ?? undefined : undefined;
   const latest = run.attempts.at(-1);
@@ -569,7 +633,24 @@ function spawnCanaryChild(
     latest.pid = pid;
     latest.processStartTime = startTime;
   }
-  saveDelegationRun(bridgeDir, run);
+  try {
+    saveDelegationRun(bridgeDir, run);
+  } catch (error) {
+    if (isAmbiguousSpawnError(error)) throw error;
+    // Best-effort reap of our own just-spawned child (it has no persisted
+    // identity, so leaving it running guarantees an orphan). Guard the error
+    // channel first so a late async spawn error cannot crash the server.
+    child.on("error", () => undefined);
+    if (pid !== undefined) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+    }
+    // Still ambiguous even when the kill seemingly succeeds: the worker ran
+    // (or may have run) with no persisted identity. Never claim pre-spawn.
+    throw new AmbiguousSpawnError(
+      `spawn succeeded but run identity persistence failed: ${error instanceof Error ? error.message : String(error)}`,
+      child
+    );
+  }
   child.stdout?.on("data", (chunk: Buffer) => {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     live.stdoutBytes += buf.byteLength;
@@ -1045,14 +1126,34 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             launchOpenCodeCanary(deps, bridgeDir, run, model, timeoutMs, prompt, isCanary, sessionId);
           }
         } catch (error) {
+          // Ambiguous post-spawn (child spawned OK, then identity-save
+          // failed): NEVER mark terminal failed and NEVER clear the staged
+          // pid-less launch reservation. The persisted record stays
+          // non-terminal and pid-less, so a same-ID retry fails closed as
+          // launch_uncertain (inspect + cancel/replay, never a second
+          // worker). Reload from disk: the in-memory run may carry an
+          // unpersisted pid from the failed save boundary.
+          if (isAmbiguousSpawnError(error)) {
+            const uncertain = loadDelegationRun(bridgeDir, runId) ?? run;
+            return failResult(`Launch dispatch for request ${requestId} is uncertain (run ${runId} holds a pid-less pending launch; spawn succeeded but run identity was not persisted, so a pid-less orphan may exist). No second worker spawned. Inspect via delegation_read_result, cancel any orphan via delegation_cancel, then relaunch only with explicit recover (never auto-spawn).`, {
+              error: "launch_uncertain",
+              run_id: runId,
+              request_id: requestId,
+              stored: false,
+              executed: false,
+              uncertain_dispatch: true,
+              next_action: uncertain.nextAction
+            });
+          }
           run = loadDelegationRun(bridgeDir, runId) ?? run;
           // Observed sync spawn failure after staging (no worker started):
           // drop the launch reservation and mark terminal failed. Retry
           // with the SAME request id replays the failed run (no second
           // worker); a fresh attempt needs a NEW request id. This is
-          // distinct from crash-before-save (pid-less pending, no observed
-          // failure, non-terminal) which stays uncertain and fails closed
-          // as launch_uncertain on retry.
+          // distinct from crash-before-save AND from ambiguous post-spawn
+          // (pid-less pending, no observed pre-spawn failure, non-terminal),
+          // both of which stay uncertain and fail closed as launch_uncertain
+          // on retry.
           if (run.pendingDispatch?.isLaunch) {
             run = clearPendingDispatch(run);
           }
@@ -1504,6 +1605,31 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                 child = launchOpenCodeCanary(deps, bridgeDir, run, run.model ?? "", staged.timeoutMs, staged.prompt, runIsCanary, resumeSessionId);
               }
             } catch (error) {
+              // Ambiguous post-spawn (child spawned OK, then identity-save
+              // failed): NEVER mark retryable. Record the ambiguity (this
+              // marker save succeeding still leaves retry uncertain: the
+              // marker proves an error was recorded, never that no child
+              // exists) and fail closed as dispatch_uncertain. Reload to
+              // preserve the exact persisted pending (spawn may have
+              // partially mutated the in-memory run before throwing).
+              if (isAmbiguousSpawnError(error)) {
+                const toMarkAmbiguous = loadDelegationRun(bridgeDir, run.runId) ?? run;
+                if (toMarkAmbiguous.pendingDispatch && toMarkAmbiguous.pendingDispatch.checkpointId === checkpoint.id) {
+                  saveDelegationRun(bridgeDir, markAmbiguousSpawn(toMarkAmbiguous, error instanceof Error ? error.message : String(error)));
+                }
+                const ambiguous = loadDelegationRun(bridgeDir, run.runId) ?? run;
+                return failResult(`Follow-up dispatch for checkpoint ${checkpoint.id} is uncertain (run ${run.runId}: spawn succeeded but run identity was not persisted, so a pid-less orphan may exist). No second worker spawned. Inspect via delegation_read_result, cancel any orphan via delegation_cancel, then replay only with explicit recover (never auto-spawn a second worker).`, {
+                  error: "dispatch_uncertain",
+                  run_id: ambiguous.runId,
+                  checkpoint_id: checkpoint.id,
+                  input_request_id: request.id,
+                  stored: false,
+                  executed: false,
+                  uncertain_dispatch: true,
+                  attempt_n: staged.attemptN,
+                  next_action: ambiguous.nextAction
+                });
+              }
               // Observed sync spawn failure: mark the staged pending with the
               // failure so the identical reply id stays explicitly retryable
               // (same attempt number). A pid-less pending WITHOUT this marker

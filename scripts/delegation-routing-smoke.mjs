@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Delegation subscription-routing smoke: ONE canonical subscription authority
-// (server defaultRoot bridge) across permitted workspaces.
+// (user-data per-(owner, server-root) authority) across permitted workspaces.
 //
 // Proves the routing-split fix: official subscribe stores under the default
 // authority, and completion in ANY permitted workspace reads that SAME
@@ -33,6 +33,27 @@ const Engines = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationEn
 const Store = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationStore.js')));
 const Events = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationEvents.js')));
 const { loadConfig } = await import(pathToFileUrl(path.join(ROOT, 'dist', 'config.js')));
+
+// Delegation state lives OUTSIDE repos under this smoke-scoped user-data
+// root (legacy bridge OFF): the canonical per-(owner, server-root)
+// authority and per-(owner, workspace) run bridges resolve via the Store
+// helpers below, never as repo .ai-bridge dirs.
+const delegHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-routing-deleghome-'));
+process.env.CODEXPRO_DELEGATION_DIR = delegHome;
+delete process.env.CODEXPRO_DELEGATION_LEGACY_BRIDGE;
+const smokeUid = typeof process.getuid === 'function' ? String(process.getuid()) : 'unknown';
+const delegCfgFor = (defaultRoot) => {
+  const realDefault = fs.realpathSync.native(defaultRoot);
+  return {
+    delegationDir: delegHome, legacyBridge: false, contextDir: '.ai-bridge',
+    ...(process.env.CODEXPRO_HTTP_TOKEN ? { authToken: process.env.CODEXPRO_HTTP_TOKEN } : {}),
+    localOwner: `${smokeUid}:${realDefault}`, defaultRoot: realDefault
+  };
+};
+const runBridgeFor = (defaultRoot, wsRoot) =>
+  Store.resolveDelegationRunBridgeDir(delegCfgFor(defaultRoot), fs.realpathSync.native(wsRoot));
+const authBridgeFor = (defaultRoot) =>
+  Store.resolveDelegationAuthorityDir(delegCfgFor(defaultRoot));
 const { createCodexProServer } = await import(pathToFileUrl(path.join(ROOT, 'dist', 'server.js')));
 const { Client } = await import(pathToFileUrl(path.join(ROOT, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm', 'client', 'index.js')));
 const { InMemoryTransport } = await import(pathToFileUrl(path.join(ROOT, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm', 'inMemory.js')));
@@ -177,22 +198,23 @@ function scanForSecrets(dir) {
     assert(!sub.isError, `subscribe via authority workspace failed: ${JSON.stringify(sub.structuredContent)}`);
     const subId = sub.structuredContent.subscription_id;
     assert(/^sub_/.test(subId), 'must return a subscription id');
-    // Authority storage: subs file ONLY under the defaultRoot bridge.
+    // Authority storage: subs file ONLY under the user-data authority namespace.
     const realAuth = fs.realpathSync.native(authRoot);
     const realRun = fs.realpathSync.native(runWs);
-    assert(fs.existsSync(path.join(realAuth, '.ai-bridge', 'delegation-subscriptions.json')), 'subs must persist under the authority dir');
+    assert(fs.existsSync(path.join(authBridgeFor(authRoot), 'delegation-subscriptions.json')), 'subs must persist under the user-data authority');
     assert(!fs.existsSync(path.join(realRun, '.ai-bridge', 'delegation-subscriptions.json')), 'subs must NOT be copied into the run workspace');
+    assert(!fs.existsSync(path.join(realRun, '.ai-bridge')), 'delegation with legacy bridge OFF must create NO repo .ai-bridge dir');
     // Real task + group hestia-cli-canary in the OTHER workspace.
     const runId = await launchRealTask(call, wsB, 'routing-real-1', 'hestia-cli-canary', 'req-routing-r1');
-    const runFile = path.join(realRun, '.ai-bridge', 'delegation-runs', `${runId}.json`);
+    const runFile = path.join(runBridgeFor(authRoot, runWs), 'delegation-runs', `${runId}.json`);
     const terminal = await awaitRunFile(runFile, (r) => ['completed', 'failed'].includes(r.state));
     assert(terminal?.state === 'completed', `run must complete, got ${terminal?.state}`);
     const evt = terminal.pendingEvents.at(-1);
     assert(evt.deliveries.length === 1 && evt.deliveries[0].subId === subId, `completion must target the authority sub, got ${JSON.stringify(evt.deliveries)}`);
     assert(evt.deliveries[0].status === 'pending' && evt.deliveries[0].attempts === 0, 'delivery stays pending while app delivery is OFF (zero POSTs)');
     // No secrets in the run workspace (subId reference only).
-    assert(scanForSecrets(path.join(realRun, '.ai-bridge')).length === 0, 'run bridge must never carry whsec_ secrets');
-    const subsMode = fs.statSync(path.join(realAuth, '.ai-bridge', 'delegation-subscriptions.json')).mode & 0o777;
+    assert(scanForSecrets(runBridgeFor(authRoot, runWs)).length === 0, 'run bridge must never carry whsec_ secrets');
+    const subsMode = fs.statSync(path.join(authBridgeFor(authRoot), 'delegation-subscriptions.json')).mode & 0o777;
     assert(subsMode === 0o600, `authority subs file must be 0600, got 0o${subsMode.toString(8)}`);
   } finally {
     receiver.close();
@@ -219,7 +241,7 @@ function scanForSecrets(dir) {
     });
     assert(!own.isError, 'own subscribe must succeed');
     const ownId = own.structuredContent.subscription_id;
-    // Foreign owner subscribes the same group + callback into the SAME authority.
+    // Foreign owner subscribes the same group + callback into its OWN authority namespace.
     process.env.CODEXPRO_HTTP_TOKEN = 'f'.repeat(32);
     const pair2 = await makeMcpPair(['--root', authRoot, '--allow-root', runWs]);
     const foreign = await pair2.call('events_subscribe', {
@@ -233,7 +255,7 @@ function scanForSecrets(dir) {
     // Own run completes: only the own sub is targeted.
     const runId = await launchRealTask(pair1.call, wsB, 'routing-iso-1', 'hestia-cli-canary', 'req-routing-r2');
     const realRun = fs.realpathSync.native(runWs);
-    const terminal = await awaitRunFile(path.join(realRun, '.ai-bridge', 'delegation-runs', `${runId}.json`), (r) => ['completed', 'failed'].includes(r.state));
+    const terminal = await awaitRunFile(path.join(runBridgeFor(authRoot, runWs), 'delegation-runs', `${runId}.json`), (r) => ['completed', 'failed'].includes(r.state));
     assert(terminal?.state === 'completed', 'iso run must complete');
     const ids = terminal.pendingEvents.at(-1).deliveries.map((d) => d.subId);
     assert(ids.length === 1 && ids[0] === ownId, `foreign sub must get nothing, got ${JSON.stringify(ids)}`);
@@ -268,7 +290,7 @@ function scanForSecrets(dir) {
     assert(!sub.isError, 'mismatched subscribe must store');
     const runId = await launchRealTask(call, wsB, 'routing-mm-1', 'hestia-cli-canary', 'req-routing-r3');
     const realRun = fs.realpathSync.native(runWs);
-    const terminal = await awaitRunFile(path.join(realRun, '.ai-bridge', 'delegation-runs', `${runId}.json`), (r) => ['completed', 'failed'].includes(r.state));
+    const terminal = await awaitRunFile(path.join(runBridgeFor(authRoot, runWs), 'delegation-runs', `${runId}.json`), (r) => ['completed', 'failed'].includes(r.state));
     assert(terminal?.state === 'completed', 'mismatch run must complete');
     assert(terminal.pendingEvents.at(-1).deliveries.length === 0, 'mismatched group must yield zero targets');
     const read = await call('delegation_read_result', { run_id: runId });
@@ -306,7 +328,7 @@ function scanForSecrets(dir) {
     const subId = sub.structuredContent.subscription_id;
     const runId = await launchRealTask(pair1.call, wsB, 'routing-restart-1', 'hestia-cli-canary', 'req-routing-r4');
     const realRun = fs.realpathSync.native(runWs);
-    const runFile = path.join(realRun, '.ai-bridge', 'delegation-runs', `${runId}.json`);
+    const runFile = path.join(runBridgeFor(authRoot, runWs), 'delegation-runs', `${runId}.json`);
     const terminal = await awaitRunFile(runFile, (r) => ['completed', 'failed'].includes(r.state));
     assert(terminal?.state === 'completed', 'restart run must complete');
     assert(terminal.pendingEvents.at(-1).deliveries[0]?.status === 'pending', 'delivery must hold pending while OFF');
@@ -360,7 +382,7 @@ function scanForSecrets(dir) {
     // Complete with NO subscriptions: explicit no-target state.
     const runId = await launchRealTask(call, wsB, 'routing-replay-1', 'hestia-cli-canary', 'req-routing-r5');
     const realRun = fs.realpathSync.native(runWs);
-    const runFile = path.join(realRun, '.ai-bridge', 'delegation-runs', `${runId}.json`);
+    const runFile = path.join(runBridgeFor(authRoot, runWs), 'delegation-runs', `${runId}.json`);
     const terminal = await awaitRunFile(runFile, (r) => ['completed', 'failed'].includes(r.state));
     assert(terminal?.state === 'completed', 'replay run must complete');
     const eventId = terminal.pendingEvents.at(-1).eventId;
@@ -392,7 +414,7 @@ function scanForSecrets(dir) {
     // Replay is idempotent: second call is a no-op (history preserved).
     const again = await call('delegation_replay_events', { run_id: runId });
     assert(!again.isError && (again.structuredContent.replayed_event_ids ?? []).length === 0, 'second replay must be a no-op');
-    assert(scanForSecrets(path.join(realRun, '.ai-bridge')).length === 0, 'run bridge must never carry secrets');
+    assert(scanForSecrets(runBridgeFor(authRoot, runWs)).length === 0, 'run bridge must never carry secrets');
   } finally {
     matching.close();
     wider.close();
@@ -449,7 +471,7 @@ function scanForSecrets(dir) {
     const subId = sub.json.result.id;
     const realAuth = fs.realpathSync.native(authRoot);
     const realRun = fs.realpathSync.native(runWs);
-    assert(fs.existsSync(path.join(realAuth, '.ai-bridge', 'delegation-subscriptions.json')), 'protocol subscribe must store under the default authority');
+    assert(fs.existsSync(path.join(authBridgeFor(authRoot), 'delegation-subscriptions.json')), 'protocol subscribe must store under the user-data default authority');
     // Real task + group hestia-cli-canary in the different allowed workspace.
     const opened = await postTool('open_workspace', { root: runWs }, 2);
     assert(opened.json?.result && !opened.json?.error, `open_workspace failed: ${JSON.stringify(opened.json)}`);
@@ -462,7 +484,7 @@ function scanForSecrets(dir) {
     assert(!launched.json?.error, `protocol-path launch failed: ${JSON.stringify(launched.json)}`);
     const runId = launched.json.result.structuredContent.run_id;
     assert(/^run_[0-9a-f]{16}$/.test(runId), 'launch must return a run id');
-    const runFile = path.join(realRun, '.ai-bridge', 'delegation-runs', `${runId}.json`);
+    const runFile = path.join(runBridgeFor(authRoot, runWs), 'delegation-runs', `${runId}.json`);
     const terminal = await awaitRunFile(runFile, (r) =>
       ['completed', 'failed'].includes(r.state) &&
       (r.pendingEvents.at(-1)?.deliveries ?? []).some((d) => d.subId === subId && (d.status === 'delivered' || d.status === 'failed')), 30000);
@@ -474,7 +496,7 @@ function scanForSecrets(dir) {
     assert(seen && seen.subId === subId, 'observed delivery must bind the protocol sub id + run id');
     assert(seen.body?.data?.delegationGroup === 'hestia-cli-canary', 'observed delivery must carry the group');
     assert(!fs.existsSync(path.join(realRun, '.ai-bridge', 'delegation-subscriptions.json')), 'run workspace must hold no subscription copy');
-    assert(scanForSecrets(path.join(realRun, '.ai-bridge')).length === 0, 'run bridge must never carry secrets');
+    assert(scanForSecrets(runBridgeFor(authRoot, runWs)).length === 0, 'run bridge must never carry secrets');
   } finally {
     receiver.close();
     await new Promise((resolve) => listener.close(resolve));

@@ -226,10 +226,79 @@ function enclosingPythonAssignScope(nodes, source, nodeIndex) {
 // - `.format()` CallExpression (`"<str>".format(...)`): receiver must be an
 //   approval string, args must be references or approvable (parser-owned
 //   only). Bare `func('a')` and other calls stay fail-closed.
+// - `.replace()` CallExpression, exact-chained (`ref.replace("a", "b")`,
+//   also `str(ref).replace(...)...`): the receiver must be a bare reference,
+//   an exact `str(<reference>)`, or a nested `.replace` chain bottoming out
+//   at one of those (parser-owned Call nodes only); args must be exactly
+//   two plain String literals whose exact bytes join the hashed RHS.
+//   Anything else (kwargs, count, `.strip()` tails, other callees) stays
+//   fail-closed.
 // - ParenthesizedExpression: unwraps to the inner RHS.
 // Bare VariableName/MemberExpression references are allowed ONLY as
 // subcomponents of the computed shapes above (operands/branches/args), never
 // as a whole RHS on their own (which stays String/None/computed only).
+// Parser-owned exact chained `.replace` on a reference base with plain
+// string args (`ref.replace("a", "b").replace("c", "d")`, also
+// `str(ref).replace(...)...`). Parser-owned Call nodes ONLY: the receiver
+// must be a bare call-keyword reference, an exact `str(<reference>)` call,
+// or a nested `.replace` chain bottoming out at one of those — never an
+// attribute/subscript base, never a literal base, never another callee.
+// Args must be exactly two plain String literals (no kwargs, no count):
+// their exact bytes are part of the hashed RHS the owner enrolls, and
+// reference bases reuse the call-keyword reference rule (so opaque
+// uppercase/digit identifiers gain no new exception). Anything else stays
+// fail-closed (notably trailing `.strip()` or other method chains).
+function isPlainReplaceStringArg(nodes, node, source) {
+  void nodes;
+  return !!node && node.type === 'String' && node.children.length === 0 && /^["']/u.test(source.slice(node.from, node.to));
+}
+
+function isReplaceArgList(nodes, argList, source) {
+  const argKids = directChildren(nodes, argList.index)
+    .filter((child) => !['(', ')', ',', 'Comment'].includes(child.type));
+  return argKids.length === 2 && argKids.every((arg) => isPlainReplaceStringArg(nodes, arg, source));
+}
+
+function isReplaceBase(nodes, base, source) {
+  if (isCallKeywordReference(nodes, base, source)) return true;
+  if (base && base.type === 'CallExpression') {
+    const bKids = directChildren(nodes, base.index);
+    if (bKids.length !== 2) return false;
+    const [bCallee, bArgs] = bKids;
+    // Exact str(<reference>) base: single positional reference arg.
+    if (bCallee.type === 'VariableName' && source.slice(bCallee.from, bCallee.to) === 'str'
+      && bArgs.type === 'ArgList') {
+      const bArgKids = directChildren(nodes, bArgs.index)
+        .filter((child) => !['(', ')', ',', 'Comment'].includes(child.type));
+      if (bArgKids.length === 1 && isCallKeywordReference(nodes, bArgKids[0], source)) return true;
+    }
+    // Nested .replace chain (left-nested chaining): recurse parser-owned.
+    if (bCallee.type === 'MemberExpression' && bArgs.type === 'ArgList') {
+      const bMem = directChildren(nodes, bCallee.index);
+      if (bMem.length === 3 && bMem[1].type === '.' && bMem[2].type === 'PropertyName'
+        && source.slice(bMem[2].from, bMem[2].to) === 'replace'
+        && isReplaceArgList(nodes, bArgs, source)) {
+        return isReplaceBase(nodes, bMem[0], source);
+      }
+    }
+  }
+  return false;
+}
+
+function isApprovalReplaceCall(nodes, node, source) {
+  if (!node || node.type !== 'CallExpression') return false;
+  const kids = directChildren(nodes, node.index);
+  if (kids.length !== 2) return false;
+  const [callee, argList] = kids;
+  if (callee.type !== 'MemberExpression' || argList.type !== 'ArgList') return false;
+  const memKids = directChildren(nodes, callee.index);
+  if (memKids.length !== 3) return false;
+  const [receiver, dot, prop] = memKids;
+  if (dot.type !== '.' || prop.type !== 'PropertyName' || source.slice(prop.from, prop.to) !== 'replace') return false;
+  if (!isReplaceArgList(nodes, argList, source)) return false;
+  return isReplaceBase(nodes, receiver, source);
+}
+
 function isApprovalRhs(nodes, node, source) {
   if (!node) return false;
   if (node.type === 'None') return true;
@@ -257,6 +326,8 @@ function isApprovalRhs(nodes, node, source) {
     return operandOk(left) && operandOk(right);
   }
   if (node.type === 'CallExpression') {
+    // Exact chained .replace on a reference base (parser-owned only).
+    if (isApprovalReplaceCall(nodes, node, source)) return true;
     const kids = directChildren(nodes, node.index);
     if (kids.length !== 2) return false;
     const [callee, argList] = kids;

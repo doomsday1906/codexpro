@@ -127,6 +127,12 @@ const { Client } = await import(pathToFileUrl(path.join(ROOT, 'node_modules', '@
 const { InMemoryTransport } = await import(pathToFileUrl(path.join(ROOT, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm', 'inMemory.js')));
 
 const wsRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-followup-mcp-'));
+// Delegation state lives OUTSIDE the repo under this smoke-scoped
+// user-data root (legacy bridge OFF), namespaced by (owner, workspace).
+// Set BEFORE loadConfig, which persists the setting into the config.
+const followupDelegHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-followup-deleghome-'));
+process.env.CODEXPRO_DELEGATION_DIR = followupDelegHome;
+delete process.env.CODEXPRO_DELEGATION_LEGACY_BRIDGE;
 const config = loadConfig(['--root', wsRoot]);
 const server = createCodexProServer(config);
 const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -137,7 +143,12 @@ const opened = await call('open_workspace', { root: wsRoot });
 assert(!opened.isError, 'open_workspace must succeed');
 const workspaceId = opened.structuredContent.workspace_id;
 const realRoot = fs.realpathSync.native(wsRoot);
-const runFileFor = (runId) => path.join(realRoot, '.ai-bridge', 'delegation-runs', `${runId}.json`);
+const followupSmokeUid = typeof process.getuid === 'function' ? String(process.getuid()) : 'unknown';
+const followupRunBridge = Store.resolveDelegationRunBridgeDir({
+  delegationDir: followupDelegHome, legacyBridge: false, contextDir: '.ai-bridge',
+  localOwner: `${followupSmokeUid}:${realRoot}`, defaultRoot: realRoot
+}, realRoot);
+const runFileFor = (runId) => path.join(followupRunBridge, 'delegation-runs', `${runId}.json`);
 process.env.CODEX_HOME = codexHome;
 process.env.PATH = `${shimBin}${path.delimiter}${process.env.PATH ?? ''}`;
 const hostModel = Engines.describeOpenCodeDiscovery().hostModel;
@@ -219,7 +230,7 @@ const hostModel = Engines.describeOpenCodeDiscovery().hostModel;
   const runId = launched.structuredContent.run_id;
   const terminal = await awaitRunFile(runFileFor(runId), (r) => r.state === 'completed');
   assert(terminal?.state === 'completed', 'sub-matrix run must complete');
-  const bridgeDir = path.join(realRoot, '.ai-bridge');
+  const bridgeDir = followupRunBridge;
   const goodSecret = `whsec_${Buffer.alloc(32, 5).toString('base64')}`;
   const expiredSub = {
     version: 1, subId: 'sub_expired0001', eventName: 'run-attention',

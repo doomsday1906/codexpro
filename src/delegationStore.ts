@@ -247,6 +247,22 @@ export interface DelegationPendingDispatch {
    * closed, never auto-spawn a second worker.
    */
   lastDispatchError?: string;
+  /**
+   * Ambiguous post-spawn marker: set ONLY when a child was successfully
+   * spawned but run-identity persistence then failed (the worker may exist
+   * as a pid-less orphan). While pid-less, an ambiguous pending stays
+   * UNCERTAIN (fail closed, never auto-spawn) even when a failure marker
+   * was also persisted afterwards: a persisted error marker cannot prove
+   * a live child does not exist. Never set for a proven pre-spawn failure
+   * (spawn threw, no child), which stays explicitly retryable instead.
+   */
+  spawnAmbiguous?: boolean;
+  /**
+   * Sanitized diagnosis recorded with the ambiguity marker (never a
+   * credential or transcript). Audit only; retry decisions key off
+   * spawnAmbiguous + pid-less state, never this text.
+   */
+  spawnAmbiguousError?: string;
 }
 
 /** Storage / output / concurrency / execution bounds for this leaf. */
@@ -1085,10 +1101,26 @@ export function isRunPidLess(run: DelegationRunRecord): boolean {
  * there is nothing to probe, and a prior spawn may still run as a pid-less
  * orphan. Uncertain retries must fail closed (dispatch_uncertain /
  * launch_uncertain), never auto-spawn a second worker.
+ *
+ * Two refinements keep the predicate truthful after a spawn-failure fix:
+ * - spawnAmbiguous (child spawned OK, then identity persistence failed)
+ *   stays uncertain while pid-less EVEN when a failure marker was also
+ *   persisted afterwards: the marker proves an error was recorded, never
+ *   that no child exists.
+ * - Initial-launch staging (isLaunch) is pid-less + marker = uncertain: a
+ *   non-terminal pid-less launch reservation can never prove pre-spawn
+ *   (the observed-failure path for launches resolves to terminal failed
+ *   with the reservation cleared, never to a marked non-terminal pending),
+ *   so any surviving pid-less launch pending fails closed.
+ * A proven pre-spawn follow-up failure (spawn threw synchronously or the
+ * spawn acknowledgement failed with no child, marker set, no ambiguity)
+ * stays explicitly retryable: same id, same attempt number.
  */
 export function isUncertainDispatch(run: DelegationRunRecord): boolean {
   const pending = run.pendingDispatch;
   if (!pending) return false;
+  if (pending.spawnAmbiguous) return isRunPidLess(run);
+  if (pending.isLaunch) return isRunPidLess(run);
   if (pending.lastDispatchError) return false;
   return isRunPidLess(run);
 }
@@ -1114,6 +1146,29 @@ export function markPendingDispatchFailed(run: DelegationRunRecord, errorMessage
   };
 }
 
+/**
+ * Mark an ambiguous post-spawn outcome on the staged pending: the child was
+ * successfully spawned, but run-identity (pid) persistence then failed, so a
+ * pid-less orphan may exist. The pending stays WITHOUT lastDispatchError
+ * (no proven pre-spawn claim) and gains spawnAmbiguous, which keeps same-id
+ * retry uncertain while pid-less even if a failure marker is persisted
+ * later. Never marks applied or consumed. The caller persists the returned
+ * run before returning dispatch_uncertain.
+ */
+export function markAmbiguousSpawn(run: DelegationRunRecord, errorMessage: string): DelegationRunRecord {
+  const pending = run.pendingDispatch;
+  if (!pending) return run;
+  return {
+    ...run,
+    pendingDispatch: {
+      ...pending,
+      spawnAmbiguous: true as const,
+      spawnAmbiguousError: sanitizeSummary(errorMessage || "spawn succeeded but run identity persistence failed")
+    },
+    nextAction: "dispatch outcome is uncertain (spawn succeeded but run identity was not persisted; a pid-less orphan may exist); inspect via delegation_read_result, cancel any orphan via delegation_cancel, then replay only with explicit recover (never auto-spawn a second worker)"
+  };
+}
+
 export function clearPendingDispatch(run: DelegationRunRecord): DelegationRunRecord {
   if (!run.pendingDispatch) return run;
   const { pendingDispatch: _dropped, ...rest } = run;
@@ -1130,4 +1185,195 @@ export function pendingDispatchFor(run: DelegationRunRecord, checkpointId: strin
   const pending = (run as DelegationRunRecord).pendingDispatch;
   if (pending && pending.checkpointId === checkpointId) return pending;
   return undefined;
+}
+
+/** Storage input for delegation run/subscription dirs (primitives only). */
+export interface DelegationStorageConfig {
+  /** Service user-data root (CODEXPRO_DELEGATION_DIR, default ~/.codexpro/delegation). */
+  delegationDir: string;
+  /** Explicit opt-in to the legacy workspace .ai-bridge layout. Default false. */
+  legacyBridge: boolean;
+  /** Legacy workspace-relative bridge dirname (e.g. .ai-bridge). */
+  contextDir: string;
+  /** Current server bearer token, when set (owner identity input). */
+  authToken?: string;
+  /** Local owner tuple `${uid}:${defaultRoot}` (owner identity input). */
+  localOwner: string;
+  /** Server default root (subscription-authority input). */
+  defaultRoot: string;
+}
+
+export interface DelegationStorageDirs {
+  /** Where run files for this (owner, workspace) persist. */
+  runBridgeDir: string;
+  /** Canonical subscription authority for this (owner, server root). */
+  authorityDir: string;
+  /** True only under the explicit legacy opt-in. */
+  legacy: boolean;
+  /** Migrations performed by this resolution (usually []). */
+  migrations: DelegationMigration[];
+}
+
+export interface DelegationMigration {
+  from: string;
+  to: string;
+  workspaceCanonical: string;
+  runFiles: number;
+  subscriptions: boolean;
+  at: string;
+  receipt: string;
+}
+
+export const DELEGATION_MIGRATION_RECEIPT = "delegation-migration.json";
+
+function realDirOrInput(input: string): string {
+  try {
+    return fs.realpathSync.native(input);
+  } catch {
+    return input;
+  }
+}
+
+/** Local owner tuple for delegation storage identity. */
+export function localOwnerFor(defaultRoot: string): string {
+  const uid = typeof process.getuid === "function" ? String(process.getuid()) : "unknown";
+  return `${uid}:${defaultRoot}`;
+}
+
+function ownerScopeFor(cfg: DelegationStorageConfig): string {
+  const owner = ownerIdFor(cfg.authToken, cfg.localOwner);
+  return `${owner.ownerKind}-${owner.ownerIdHash}`;
+}
+
+function workspaceScopeFor(canonicalRoot: string): string {
+  return createHash("sha256").update(realDirOrInput(canonicalRoot), "utf8").digest("hex").slice(0, 32);
+}
+
+/** Pure run-state dir for one (owner, workspace): no IO, no migration. */
+export function resolveDelegationRunBridgeDir(cfg: DelegationStorageConfig, workspaceCanonical: string): string {
+  if (cfg.legacyBridge) return path.join(realDirOrInput(workspaceCanonical), cfg.contextDir);
+  return path.join(cfg.delegationDir, ownerScopeFor(cfg), "workspaces", workspaceScopeFor(workspaceCanonical));
+}
+
+/** Pure canonical subscription authority dir for one (owner, server root). */
+export function resolveDelegationAuthorityDir(cfg: DelegationStorageConfig): string {
+  if (cfg.legacyBridge) return authorityBridgeDirFor(cfg.defaultRoot, cfg.contextDir);
+  return path.join(cfg.delegationDir, ownerScopeFor(cfg), "workspaces", workspaceScopeFor(cfg.defaultRoot));
+}
+
+function runFileNames(bridgeDir: string): string[] {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(delegationRunsDir(bridgeDir));
+  } catch {
+    return [];
+  }
+  return entries.filter((entry) => entry.endsWith(".json") && !entry.startsWith(".")).sort();
+}
+
+function hasSubscriptionsFile(bridgeDir: string): boolean {
+  try {
+    fs.accessSync(subscriptionsPath(bridgeDir), fs.constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Deliberate one-way migration from a legacy workspace bridge dir to the new
+ * user-data authority. Copy-only with count/bytes verification: the legacy
+ * source is ALWAYS left intact (never deleted, never modified) and a receipt
+ * records the move. Returns null when there is nothing to do (same dir, new
+ * side already initialized, or legacy side empty). Throws when verification
+ * fails so a half-copied authority is never trusted silently.
+ */
+export function ensureDelegationStorage(legacyBridgeDir: string, newBridgeDir: string): DelegationMigration | null {
+  if (path.resolve(legacyBridgeDir) === path.resolve(newBridgeDir)) return null;
+  if (runFileNames(newBridgeDir).length > 0 || hasSubscriptionsFile(newBridgeDir)) return null;
+  const legacyRuns = runFileNames(legacyBridgeDir);
+  const legacySubs = hasSubscriptionsFile(legacyBridgeDir);
+  if (legacyRuns.length === 0 && !legacySubs) return null;
+  fs.mkdirSync(delegationRunsDir(newBridgeDir), { recursive: true, mode: 0o700 });
+  for (const name of legacyRuns) {
+    const bytes = fs.readFileSync(path.join(delegationRunsDir(legacyBridgeDir), name));
+    const target = path.join(delegationRunsDir(newBridgeDir), name);
+    fs.writeFileSync(target, bytes, { mode: 0o600 });
+    try { fs.chmodSync(target, 0o600); } catch { /* best effort on odd fs */ }
+  }
+  if (legacySubs) {
+    const bytes = fs.readFileSync(subscriptionsPath(legacyBridgeDir));
+    const target = subscriptionsPath(newBridgeDir);
+    fs.writeFileSync(target, bytes, { mode: 0o600 });
+    try { fs.chmodSync(target, 0o600); } catch { /* best effort on odd fs */ }
+  }
+  // Verify BEFORE trusting: counts must match and subscription bytes must
+  // be identical. The legacy source is left intact either way.
+  const copiedRuns = runFileNames(newBridgeDir);
+  if (copiedRuns.length !== legacyRuns.length) {
+    throw new Error(`Delegation migration verification failed: copied ${copiedRuns.length} runs, legacy holds ${legacyRuns.length}. Source left intact at ${legacyBridgeDir}.`);
+  }
+  if (legacySubs) {
+    const before = fs.readFileSync(subscriptionsPath(legacyBridgeDir));
+    const after = fs.readFileSync(subscriptionsPath(newBridgeDir));
+    if (!before.equals(after)) {
+      throw new Error(`Delegation migration verification failed: subscription bytes differ. Source left intact at ${legacyBridgeDir}.`);
+    }
+  }
+  const at = new Date().toISOString();
+  const receiptPath = path.join(newBridgeDir, DELEGATION_MIGRATION_RECEIPT);
+  const receipt = {
+    version: 1,
+    from: legacyBridgeDir,
+    to: newBridgeDir,
+    runFiles: copiedRuns.length,
+    subscriptions: legacySubs,
+    at
+  };
+  fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
+  try { fs.chmodSync(receiptPath, 0o600); } catch { /* best effort on odd fs */ }
+  return {
+    from: legacyBridgeDir,
+    to: newBridgeDir,
+    workspaceCanonical: legacyBridgeDir,
+    runFiles: copiedRuns.length,
+    subscriptions: legacySubs,
+    at,
+    receipt: receiptPath
+  };
+}
+
+/**
+ * Resolve effective delegation storage for one (owner, workspace), migrating
+ * legacy bridge state forward on first use. Under the default (legacy OFF)
+ * run state and subscriptions live OUTSIDE consumer repos under
+ * `<delegationDir>/<ownerKind>-<ownerHash>/workspaces/<wsHash>/`; the legacy
+ * workspace `.ai-bridge` layout applies ONLY under the explicit opt-in.
+ */
+export function resolveDelegationStorage(
+  cfg: DelegationStorageConfig,
+  workspaceCanonical: string
+): DelegationStorageDirs {
+  if (cfg.legacyBridge) {
+    return {
+      runBridgeDir: path.join(realDirOrInput(workspaceCanonical), cfg.contextDir),
+      authorityDir: authorityBridgeDirFor(cfg.defaultRoot, cfg.contextDir),
+      legacy: true,
+      migrations: []
+    };
+  }
+  const runBridgeDir = resolveDelegationRunBridgeDir(cfg, workspaceCanonical);
+  const authorityDir = resolveDelegationAuthorityDir(cfg);
+  const migrations: DelegationMigration[] = [];
+  const runMigration = ensureDelegationStorage(
+    path.join(realDirOrInput(workspaceCanonical), cfg.contextDir),
+    runBridgeDir
+  );
+  if (runMigration) migrations.push(runMigration);
+  const authorityMigration = ensureDelegationStorage(
+    authorityBridgeDirFor(cfg.defaultRoot, cfg.contextDir),
+    authorityDir
+  );
+  if (authorityMigration) migrations.push(authorityMigration);
+  return { runBridgeDir, authorityDir, legacy: false, migrations };
 }

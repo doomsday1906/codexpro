@@ -16,14 +16,15 @@
  * Owner/bridge binding matches the compat tools: the owner id is recomputed
  * from the CURRENT server credentials (bearer token or local uid+root) and
  * subscriptions persist under the canonical subscription authority dir
- * (server defaultRoot bridge). Knowing a group, run, or subscription id
- * grants no access. Completion delivery lookup reads this SAME authority dir
- * (never the run workspace bridge), so a subscription is visible to runs in
- * every permitted workspace; run state itself stays in the run workspace.
+ * (user-data delegation dir by default; server defaultRoot bridge ONLY
+ * under the explicit legacy opt-in). Knowing a group, run, or subscription
+ * id grants no access. Completion delivery lookup reads this SAME authority
+ * dir (never the run workspace bridge), so a subscription is visible to runs
+ * in every permitted workspace; run state itself stays in the run workspace.
  */
 
 import type { CodexProConfig } from "./config.js";
-import { authorityBridgeDirFor, ownerIdFor } from "./delegationStore.js";
+import { localOwnerFor, ownerIdFor, resolveDelegationStorage } from "./delegationStore.js";
 import {
   handleEventsList,
   handleEventsSubscribe,
@@ -56,9 +57,21 @@ function localOwnerIdFor(config: CodexProConfig): string {
 }
 
 function bridgeDirFor(config: CodexProConfig): string {
-  // Canonical subscription authority: the server defaultRoot bridge dir,
-  // shared across all permitted workspaces (run state stays per-workspace).
-  return authorityBridgeDirFor(config.defaultRoot, config.contextDir);
+  // Canonical subscription authority per (owner, server root), shared
+  // across all permitted workspaces (run state stays per-workspace).
+  // Default: the user-data delegation dir (never a repo); legacy opt-in:
+  // the server defaultRoot bridge (with first-use forward migration).
+  return resolveDelegationStorage(
+    {
+      delegationDir: config.delegationDir,
+      legacyBridge: config.delegationLegacyBridge,
+      contextDir: config.contextDir,
+      ...(config.authToken ? { authToken: config.authToken } : {}),
+      localOwner: localOwnerFor(config.defaultRoot),
+      defaultRoot: config.defaultRoot
+    },
+    config.defaultRoot
+  ).authorityDir;
 }
 
 function asParamsRecord(params: unknown): Record<string, unknown> {

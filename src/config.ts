@@ -44,6 +44,8 @@ export interface CodexProConfig {
   contextDir: string;
   toolCards: boolean;
   gitPushPolicy: GitPushPolicy;
+  delegationDir: string;
+  delegationLegacyBridge: boolean;
   connectionTest: boolean;
   analysisEnabled: boolean;
   analysisLimits: AnalysisLimits;
@@ -250,6 +252,27 @@ function boolFrom(value: string | undefined, fallback = false): boolean {
   return ["1", "true", "yes", "y", "on"].includes(value.toLowerCase());
 }
 
+/**
+ * Delegation run/subscription storage root (service user-data, OUTSIDE
+ * consumer repos). Default `~/.codexpro/delegation`; per-owner and
+ * per-workspace namespacing is applied by delegationStore, never here.
+ * The directory is created lazily (mode 0700) on first delegation use.
+ */
+function delegationDirFrom(value: string | undefined): string {
+  const raw = (value ?? "").trim() || "~/.codexpro/delegation";
+  return path.resolve(expandHome(raw));
+}
+
+/**
+ * Legacy workspace `.ai-bridge` delegation storage. Explicit opt-in ONLY
+ * (CODEXPRO_DELEGATION_LEGACY_BRIDGE=1 or --delegation-legacy-bridge);
+ * default OFF, in which case delegation state lives under delegationDir
+ * and legacy bridge state is migrated forward (copy-only, source intact).
+ */
+function delegationLegacyBridgeFrom(value: string | undefined): boolean {
+  return boolFrom(value, false);
+}
+
 function aiBridgeEnabledFrom(value: string | undefined, source = "--ai-bridge"): boolean {
   if (value === undefined || value === '') return true;
   const normalized = String(value).trim().toLowerCase();
@@ -326,6 +349,13 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
           ? ((args as Record<string, unknown>).aiBridge ? "on" : "off")
           : undefined;
   const gitPushPolicyArg = typeof args["git-push-policy"] === "string" ? args["git-push-policy"] : undefined;
+  const delegationDirArg = typeof args["delegation-dir"] === "string" ? args["delegation-dir"] : undefined;
+  const delegationLegacyBridgeArg =
+    args["delegation-legacy-bridge"] === true
+      ? "true"
+      : typeof args["delegation-legacy-bridge"] === "string"
+        ? args["delegation-legacy-bridge"]
+        : undefined;
   const containmentWrapperArg =
     typeof args["containment-wrapper"] === "string" ? args["containment-wrapper"] : undefined;
   const containmentWrapper = parseContainmentWrapper(
@@ -389,6 +419,10 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     contextDir: contextDirFrom(process.env.CODEXPRO_CONTEXT_DIR),
     toolCards: boolFrom(toolCardsArg ?? process.env.CODEXPRO_TOOL_CARDS, false),
     gitPushPolicy: parseGitPushPolicy(gitPushPolicyArg ?? process.env.CODEXPRO_GIT_PUSH_POLICY),
+    delegationDir: delegationDirFrom(delegationDirArg ?? process.env.CODEXPRO_DELEGATION_DIR),
+    delegationLegacyBridge: delegationLegacyBridgeFrom(
+      delegationLegacyBridgeArg ?? process.env.CODEXPRO_DELEGATION_LEGACY_BRIDGE
+    ),
     connectionTest: boolFrom(process.env.CODEXPRO_CONNECTION_TEST, false),
     analysisEnabled: boolFrom(process.env.CODEXPRO_ANALYSIS, true),
     analysisLimits: {

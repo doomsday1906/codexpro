@@ -137,6 +137,7 @@
     "delegation-canary:smoke": "npm run build && node scripts/delegation-canary-smoke.mjs",
     "delegation-followup:smoke": "npm run build && node scripts/delegation-followup-smoke.mjs",
     "delegation-routing:smoke": "npm run build && node scripts/delegation-routing-smoke.mjs",
+    "delegation-storage:smoke": "npm run build && node scripts/delegation-storage-smoke.mjs",
     "connect": "node scripts/codexpro.mjs",
     "connect:setup": "node scripts/codexpro.mjs setup",
     "connect:local": "node scripts/codexpro.mjs --tunnel none",

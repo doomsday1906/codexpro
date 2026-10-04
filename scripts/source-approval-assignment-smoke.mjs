@@ -171,16 +171,45 @@ try {
     "    expected_token = 'expected_marker_gamma'",
     ''
   ].join('\n');
+  // (d) pointer_escape.py exact chained .replace shapes mirroring the lane
+  // line-1115 family (JSON-pointer escape on a str(ref) base plus a bare
+  // reference-base chain). Parser-owned Call nodes only; exact RHS bytes
+  // are hashed, never substituted.
+  const fileD = 'pointer_escape.py';
+  const absD = path.join(tmp, fileD);
+  const baseD = [
+    'def collect_refs(key_ref):',
+    '    send(token=key_ref)',
+    '',
+    'def render_label(label_ref):',
+    '    send(token=label_ref)',
+    ''
+  ].join('\n');
+  const proposedD = [
+    'def collect_refs(key_ref):',
+    '    send(token=key_ref)',
+    '    escape_token = str(key_ref).replace("~", "~0").replace("/", "~1")',
+    '',
+    'def render_label(label_ref):',
+    '    send(token=label_ref)',
+    "    label_token = label_ref.replace('_', ' ').replace('-', ' ')",
+    ''
+  ].join('\n');
 
   const keywords = 'token,work_token,payload_token,timing_token,expected_token';
+  const keywordsD = `${keywords},escape_token,label_token`;
   const approvedLiterals = ['profile_process_', 'profile_cursor_seed',
     'successor_pin_primary_1115', 'successor_pin_secondary_1356',
     'payload_marker_alpha', 'timing_marker_beta', 'expected_marker_gamma'];
+  // Exact lane-shape RHS slices: the hash-only registry must never hold them.
+  const approvedRhsD = ['str(key_ref).replace("~", "~0").replace("/", "~1")',
+    "label_ref.replace('_', ' ').replace('-', ' ')"];
   for (const [label, source] of [['baseA', baseA], ['proposedA', proposedA],
-    ['baseB', baseB], ['proposedB', proposedB], ['baseC', baseC], ['proposedC', proposedC]]) {
+    ['baseB', baseB], ['proposedB', proposedB], ['baseC', baseC], ['proposedC', proposedC],
+    ['baseD', baseD], ['proposedD', proposedD]]) {
     assertPythonAstAccepted(source, `assignment fixture ${label}`);
   }
-  for (const [label, source] of [['baseA', baseA], ['baseB', baseB], ['baseC', baseC]]) {
+  for (const [label, source] of [['baseA', baseA], ['baseB', baseB], ['baseC', baseC], ['baseD', baseD]]) {
     assert.equal(hasSecretValue(source, { context: 'source', language: 'python' }), false, `${label} was classified as hostile`);
   }
   for (const [label, source] of [['proposedA', proposedA], ['proposedB', proposedB], ['proposedC', proposedC]]) {
@@ -190,6 +219,7 @@ try {
   await fs.writeFile(absA, baseA, { encoding: 'utf8', flag: 'wx' });
   await fs.writeFile(absB, baseB, { encoding: 'utf8', flag: 'wx' });
   await fs.writeFile(absC, baseC, { encoding: 'utf8', flag: 'wx' });
+  await fs.writeFile(absD, baseD, { encoding: 'utf8', flag: 'wx' });
   gitFixture(tmp);
 
   // Seed a 22-entry retrospective enrollment for file A so every prospective
@@ -197,6 +227,7 @@ try {
   const canonicalA = await fs.realpath(absA);
   const canonicalB = await fs.realpath(absB);
   const canonicalC = await fs.realpath(absC);
+  const canonicalD = await fs.realpath(absD);
   const seedTriples = Array.from({ length: 22 }, (_, index) => ({
     keyword_sha256: sha256(`assignment-seed-key-${index}`),
     callee_sha256: sha256(`assignment-seed-callee-${index}`),
@@ -229,18 +260,21 @@ try {
   const reviewA = path.join(reviewDir, 'world_profiling.proposed.py');
   const reviewB = path.join(reviewDir, 'successor_pin.proposed.py');
   const reviewC = path.join(reviewDir, 'routes_game.proposed.py');
+  const reviewD = path.join(reviewDir, 'pointer_escape.proposed.py');
   await fs.writeFile(reviewA, proposedA, 'utf8');
   await fs.writeFile(reviewB, proposedB, 'utf8');
   await fs.writeFile(reviewC, proposedC, 'utf8');
+  await fs.writeFile(reviewD, proposedD, 'utf8');
 
-  const enrollOne = (absolutePath, baseSha, reviewPath, expectedCount, label) => {
+  const enrollOne = (absolutePath, baseSha, reviewPath, expectedCount, label, keywordSet = keywords) => {
     const before = snapshot(absolutePath);
     return before.then((sourceBefore) => {
-      const enroll = runApprove([absolutePath, '--expected-sha', baseSha, '--keywords', keywords,
+      const enroll = runApprove([absolutePath, '--expected-sha', baseSha, '--keywords', keywordSet,
         '--prospective-from', reviewPath, '--registry', registryPath]);
       assert.equal(enroll.error?.code ?? null, null, `${label} approve-source could not start`);
       assert.equal(enroll.status, 0, `${label} approve-source failed: ${enroll.stderr || enroll.stdout}`);
       expectNoRawLiterals({ stdout: enroll.stdout, stderr: enroll.stderr }, approvedLiterals, `${label} owner approval command`);
+      expectNoRawLiterals({ stdout: enroll.stdout, stderr: enroll.stderr }, approvedRhsD, `${label} owner approval command (replace-chain RHS)`);
       const receipt = JSON.parse(enroll.stdout);
       assert.equal(receipt.status, 'approved', `${label} omitted its approved status`);
       assert.equal(receipt.prospective, true, `${label} omitted its prospective marker`);
@@ -255,10 +289,37 @@ try {
   await enrollOne(absA, baseShaA, reviewA, 2, 'world-profiling');
   await enrollOne(absB, sha256(baseB), reviewB, 2, 'successor-pin');
   await enrollOne(absC, sha256(baseC), reviewC, 3, 'routes-game');
+  // (d) exact chained .replace eligibility: prospective enrollment alone
+  // cannot help an ineligible shape — the parser must accept it. Before the
+  // isApprovalRhs extension this enrolled zero triples ('No eligible...').
+  await enrollOne(absD, sha256(baseD), reviewD, 2, 'pointer-escape', keywordsD);
+
+  // (e) ineligible .replace variants stay fail-closed: kwargs, count arg,
+  // literal base, opaque uppercase/digit base, and trailing .strip() enroll
+  // nothing even prospectively.
+  const fileE = 'replace_rejects.py';
+  const absE = path.join(tmp, fileE);
+  const baseE = ['def bad_shapes(v):', '    send(token=v)', ''].join('\n');
+  const reviewE = path.join(reviewDir, 'replace_rejects.proposed.py');
+  const proposedE = ['def bad_shapes(v):', '    send(token=v)',
+    "    a_token = str(v).replace(':', ' ').replace('_', ' ').strip()",
+    "    b_token = v.replace('a', 'b', 1)",
+    "    c_token = v.replace(old='a', new='b')",
+    "    d_token = 'lit'.replace('a', 'b')",
+    "    e_token = AB12CD34.replace('a', 'b')",
+    ''].join('\n');
+  assertPythonAstAccepted(proposedE, 'reject fixture');
+  await fs.writeFile(absE, baseE, 'utf8');
+  await fs.writeFile(reviewE, proposedE, 'utf8');
+  const rejectE = runApprove([absE, '--expected-sha', sha256(baseE),
+    '--keywords', 'token,a_token,b_token,c_token,d_token,e_token',
+    '--prospective-from', reviewE, '--registry', registryPath]);
+  assert.notEqual(rejectE.status, 0, 'ineligible .replace variants must not enroll');
+  assert.match(rejectE.stderr || rejectE.stdout, /No eligible/, 'ineligible shapes must fail on eligibility, not later');
 
   const registry = JSON.parse((await fs.readFile(registryPath)).toString('utf8'));
   assert.equal(registry.version, 1, 'registry schema version changed');
-  assert.equal(registry.files.length, 3, 'enrollment changed the enrolled file count');
+  assert.equal(registry.files.length, 4, 'enrollment changed the enrolled file count');
   const recordA = registry.files.find((file) => file.path === canonicalA);
   assert.equal(recordA.entries.length, 22, 'enrollment widened retrospective entries instead of only adding a prospective binding');
   const seedKeys = new Set(seedTriples.map((entry) => JSON.stringify(entry)));
@@ -278,18 +339,26 @@ try {
     { keyword: 'timing_token', scope: 'build_payload', value: "'timing_marker_beta'" },
     { keyword: 'expected_token', scope: 'build_payload', value: "'expected_marker_gamma'" }
   ].map((row) => ({ keyword_sha256: sha256(row.keyword), callee_sha256: scopeHash(row.scope), value_sha256: sha256(row.value) }));
+  const expectedD = [
+    { keyword: 'escape_token', scope: 'collect_refs', value: 'str(key_ref).replace("~", "~0").replace("/", "~1")' },
+    { keyword: 'label_token', scope: 'render_label', value: "label_ref.replace('_', ' ').replace('-', ' ')" }
+  ].map((row) => ({ keyword_sha256: sha256(row.keyword), callee_sha256: scopeHash(row.scope), value_sha256: sha256(row.value) }));
   for (const [record, expected, label] of [[recordA, expectedA, 'world-profiling'],
     [registry.files.find((file) => file.path === canonicalB), expectedB, 'successor-pin'],
-    [registry.files.find((file) => file.path === canonicalC), expectedC, 'routes-game']]) {
+    [registry.files.find((file) => file.path === canonicalC), expectedC, 'routes-game'],
+    [registry.files.find((file) => file.path === canonicalD), expectedD, 'pointer-escape']]) {
     assert.equal(record.prospective?.length, 1, `${label} omitted its base/result binding`);
     assert.deepEqual(record.prospective[0].entries.map((entry) => JSON.stringify(entry)).sort(),
       expected.map((entry) => JSON.stringify(entry)).sort(), `${label} enrolled a different (target, function, RHS) triple set`);
   }
   expectNoRawLiterals(registry, approvedLiterals, 'hash-only assignment registry');
+  expectNoRawLiterals(registry, approvedRhsD, 'hash-only replace-chain registry');
   assert.equal(loadCallKeywordApprovals(absA).length, 24, 'file A triples did not apply at the reviewed base');
   assert.equal(loadCallKeywordApprovals(absB).length, 2, 'file B triples did not apply at the reviewed base');
   assert.equal(loadCallKeywordApprovals(absC).length, 3, 'file C triples did not apply at the reviewed base');
+  assert.equal(loadCallKeywordApprovals(absD).length, 2, 'file D triples did not apply at the reviewed base');
   console.log('PASS assignment enrollment binds file plus enclosing function plus target plus exact RHS bytes and preserves the 22-entry union');
+  console.log('PASS exact chained .replace enrollment binds file plus scope plus reference-base RHS bytes (hash-only) and ineligible variants stay fail-closed');
 
   client = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--bash', 'off', '--write', 'workspace', '--tool-mode', 'full'], {
     cwd: path.resolve('.'),
@@ -350,6 +419,16 @@ try {
   assert.equal(await fs.readFile(absC, 'utf8'), proposedC, 'approved apply_patch changed unexpected bytes');
   console.log('PASS ordinary MCP apply_patch applies the reviewed routes-game assignment patch');
 
+  // (d) ordinary MCP write applies the reviewed pointer-escape patch: the
+  // exact chained .replace RHS bytes enrolled above flow through the
+  // ordinary route with file/scope/RHS binding intact.
+  const writeD = assertToolSuccess(await client.request('tools/call', {
+    name: 'write', arguments: { workspace_id: workspaceId, path: fileD, content: proposedD }
+  }), 'approved assignment write (pointer-escape)');
+  assert.equal(await fs.readFile(absD, 'utf8'), proposedD, 'approved write changed unexpected bytes');
+  assert.equal(writeD.structuredContent.sha256, sha256(proposedD), 'approved write returned a different resulting hash');
+  console.log('PASS ordinary MCP write applies the reviewed pointer-escape replace-chain patch');
+
   // Changed/unapproved values are refused with the file unchanged.
   const beforeDrift = await snapshot(absA);
   const driftRefusal = assertToolError(await client.request('tools/call', {
@@ -403,7 +482,7 @@ try {
   assert.deepEqual(await snapshot(absA), staleBefore, 'stale refusal changed bytes, hash, inode, size, or mtime');
   console.log('PASS stale base refuses the reviewed result with the file unchanged');
 
-  console.log('SOURCE_APPROVAL_ASSIGNMENT_MATRIX: owner CLI hash-only enrollment of (target, function, RHS) triples with 22-entry union preservation; approve-then-edit, approve-then-write, and approve-then-apply_patch through the ordinary MCP route; changed-value, real-credential, .env, out-of-scope, and stale-base refusals with unchanged file identity');
+  console.log('SOURCE_APPROVAL_ASSIGNMENT_MATRIX: owner CLI hash-only enrollment of (target, function, RHS) triples with 22-entry union preservation; exact chained .replace eligibility (reference/str(ref) base, plain string args, parser-owned only) with ineligible variants fail-closed; approve-then-edit, approve-then-write, and approve-then-apply_patch through the ordinary MCP route; changed-value, real-credential, .env, out-of-scope, and stale-base refusals with unchanged file identity');
 } finally {
   if (client) {
     let closeTimer;
@@ -426,4 +505,4 @@ try {
   await fs.rm(tmp, { recursive: true, force: true });
 }
 
-console.log('source-approval-assignment-smoke: PASS (approve-then-edit/write/apply_patch through ordinary MCP routes; changed, credential, .env, out-of-scope, and stale refusals unchanged; 22-entry union preserved)');
+console.log('source-approval-assignment-smoke: PASS (approve-then-edit/write/apply_patch through ordinary MCP routes including the replace-chain file; changed, credential, .env, out-of-scope, and stale refusals unchanged; ineligible replace variants fail-closed; 22-entry union preserved)');

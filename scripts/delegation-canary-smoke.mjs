@@ -38,6 +38,24 @@ const Store = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationStor
 const Events = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationEvents.js')));
 function pathToFileUrl(p) { return `file://${p}`; }
 
+// Delegation state lives OUTSIDE repos under this smoke-scoped user-data
+// root (legacy bridge OFF): run/authority bridges resolve per (owner,
+// workspace) via the Store helpers below, never as repo .ai-bridge dirs.
+const delegHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-delegation-deleghome-'));
+process.env.CODEXPRO_DELEGATION_DIR = delegHome;
+delete process.env.CODEXPRO_DELEGATION_LEGACY_BRIDGE;
+const smokeUid = typeof process.getuid === 'function' ? String(process.getuid()) : 'unknown';
+const delegCfgFor = (defaultRoot) => {
+  const realDefault = fs.realpathSync.native(defaultRoot);
+  return {
+    delegationDir: delegHome, legacyBridge: false, contextDir: '.ai-bridge',
+    ...(process.env.CODEXPRO_HTTP_TOKEN ? { authToken: process.env.CODEXPRO_HTTP_TOKEN } : {}),
+    localOwner: `${smokeUid}:${realDefault}`, defaultRoot: realDefault
+  };
+};
+const runBridgeFor = (defaultRoot, wsRoot = defaultRoot) =>
+  Store.resolveDelegationRunBridgeDir(delegCfgFor(defaultRoot), fs.realpathSync.native(wsRoot));
+
 // ---------- fixtures: CODEX_HOME + fake codex ----------
 const codexHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-delegation-codexhome-'));
 await fsp.writeFile(path.join(codexHome, 'CODEX_SCOUT_FAST.config.toml'), [
@@ -455,7 +473,7 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
   const replay = await call('delegation_launch', { workspace_id: workspaceId, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 'canary-run-1', canary: true, request_id: 'req-mcp-1', timeout_ms: 60000 });
   assert(!replay.isError && replay.structuredContent.run_id === runId && replay.structuredContent.idempotent_replay === true, 'repeat request id must replay, never spawn');
   // Await terminal state via the run file (fake codex exits fast).
-  const runFile = path.join(realRoot, '.ai-bridge', 'delegation-runs', `${runId}.json`);
+  const runFile = path.join(runBridgeFor(wsRoot), 'delegation-runs', `${runId}.json`);
   let terminal = null;
   for (let i = 0; i < 200; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -524,7 +542,7 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
   const ocLaunched = await call('delegation_launch', { workspace_id: workspaceId, engine: 'opencode', model: hostModel, workdir: 'canary-oc-1', canary: true, request_id: 'req-mcp-oc-1', timeout_ms: 60000 });
   assert(!ocLaunched.isError, `opencode canary launch failed: ${JSON.stringify(ocLaunched.structuredContent)}`);
   const ocRunId = ocLaunched.structuredContent.run_id;
-  const ocRunFile = path.join(realRoot, '.ai-bridge', 'delegation-runs', `${ocRunId}.json`);
+  const ocRunFile = path.join(runBridgeFor(wsRoot), 'delegation-runs', `${ocRunId}.json`);
   let ocTerminal = null;
   for (let i = 0; i < 200; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -682,7 +700,7 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
   assert(!openedH2.isError, 'open_workspace must succeed');
   const workspaceIdH2 = openedH2.structuredContent.workspace_id;
   const realRootH2 = fs.realpathSync.native(wsRootH2);
-  const runFileH2 = (runId) => path.join(realRootH2, '.ai-bridge', 'delegation-runs', `${runId}.json`);
+  const runFileH2 = (runId) => path.join(runBridgeFor(wsRootH2), 'delegation-runs', `${runId}.json`);
   async function awaitTerminalH2(runId, predicate) {
     for (let i = 0; i < 200; i += 1) {
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -753,7 +771,7 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
   // Split flags (defect 3): app-event POSTs gated, verification + storage allowed.
   // While app delivery is OFF, pending stays pending (zero POSTs), but a
   // loopback subscribe verifies + stores (no delivery_disabled refusal).
-  const ncBridge = path.join(realRootH2, '.ai-bridge');
+  const ncBridge = runBridgeFor(wsRootH2);
   const ncRun = readJson(runFileH2(ncRunId));
   const goodSecretH2 = `whsec_${Buffer.alloc(32, 3).toString('base64')}`;
   fs.writeFileSync(Store.subscriptionsPath(ncBridge), JSON.stringify({ version: 1, subscriptions: [{ version: 1, subId: 'sub_e2e1', eventName: 'run-attention', callbackUrl: 'https://example.com/hook', filter: { delegationGroup: 'hestia-cli-canary' }, ownerIdHash: ncRun.ownerIdHash, ownerKind: ncRun.ownerKind, createdAt: new Date().toISOString(), secret: goodSecretH2 }] }));
@@ -1024,7 +1042,7 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
   assert(!openedJ.isError, 'open_workspace must succeed');
   const widJ = openedJ.structuredContent.workspace_id;
   const realJ = fs.realpathSync.native(wsRootJ);
-  const runFileJ = (id) => path.join(realJ, '.ai-bridge', 'delegation-runs', `${id}.json`);
+  const runFileJ = (id) => path.join(runBridgeFor(wsRootJ), 'delegation-runs', `${id}.json`);
   async function awaitStateJ(id, pred) {
     for (let i = 0; i < 200; i += 1) {
       await new Promise((r) => setTimeout(r, 100));
@@ -1217,11 +1235,15 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
       assert(listKt.response.status === 200 && listKt.json?.result?.events?.[0]?.name === 'run-attention', 'k7 events/list must reach the real handler');
       console.log('ok: K7 transport negotiation (init 2026-07-28 -> 2025-11-25; tools/call runtime_status with draft/older headers; invalid still 400; discover/list with compat header)');
     }
-    // K8: wire contract qualified against actual schemas, not status alone
-    // (hermetic loopback, no live network). Proves the 2026-07-28 draft
-    // interoperates: modern advertise (discover 2026-07-28) with
-    // legacy-compatible bodies (CallToolResult content[] + structuredContent)
-    // that validate against the SDK shapes and are accepted by the client.
+    // K8: LEGACY-COMPAT wire proof (SDK shapes only — NOT modern
+    // compliance) + K8m modern advertised-contract shapes (exact, offline).
+    // K8a/K8b validate the 2026-07-28-downgraded handshake and the
+    // CallToolResult body against the installed legacy SDK schemas only:
+    // they prove legacy negotiation keeps working, never modern Events
+    // compliance. K8m separately validates the ACTUAL advertised 2026-07-28
+    // draft contract (server/discover resultType/supportedVersions/
+    // capabilities.events; events/list name/delivery/inputSchema/
+    // payloadSchema; challenge/event envelopes + headers) as exact shapes.
     {
       const SdkTypes = await import(pathToFileUrl(path.join(ROOT, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm', 'types.js')));
       const parseSseK8 = (text) => {
@@ -1239,8 +1261,10 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
         return { response, json: parseSseK8(text) };
       };
       // K8a: initialize requesting 2026-07-28 negotiates to 2025-11-25 with
-      // the correct version field, validated against the SDK InitializeResult
-      // shape (protocolVersion string + capabilities + serverInfo).
+      // the correct version field, validated against the legacy SDK
+      // InitializeResult shape (protocolVersion string + capabilities +
+      // serverInfo). LEGACY-COMPAT ONLY: this proves the downgraded
+      // handshake still validates, not modern Events compliance.
       const initK8 = await postRawK8({ jsonrpc: '2.0', id: 201, method: 'initialize', params: { protocolVersion: '2026-07-28', capabilities: {}, clientInfo: { name: 'k8', version: '1' } } });
       assert(initK8.response.status === 200, `k8 initialize http status ${initK8.response.status}`);
       assert(initK8.json?.result?.protocolVersion === '2025-11-25', `k8 initialize must downgrade to 2025-11-25, got ${JSON.stringify(initK8.json)}`);
@@ -1248,7 +1272,9 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
       assert(initParsed.success, `k8 initialize result must validate against SDK InitializeResultSchema: ${initParsed.success ? '' : JSON.stringify(initParsed.error?.issues)?.slice(0, 300)}`);
       // K8b: ordinary tools/call (runtime_status) with the 2026-07-28 header
       // returns 200 with a legacy-compatible body (content[] text +
-      // structuredContent) validated against the SDK CallToolResult shape.
+      // structuredContent) validated against the legacy SDK CallToolResult
+      // shape. LEGACY-COMPAT ONLY: modern compliance is NOT claimed from
+      // this SDK test (see K8m for the advertised-contract shapes).
       const callK8 = await postRawK8({ jsonrpc: '2.0', id: 202, method: 'tools/call', params: { name: 'runtime_status', arguments: {} } }, { 'mcp-protocol-version': '2026-07-28' });
       assert(callK8.response.status === 200, `k8 tools/call http status ${callK8.response.status}`);
       assert(callK8.json?.result && !callK8.json?.error, `k8 tools/call must succeed, got ${JSON.stringify(callK8.json)?.slice(0, 200)}`);
@@ -1258,27 +1284,79 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
       const callParsed = SdkTypes.CallToolResultSchema.safeParse(callBody);
       const compatParsed = SdkTypes.CompatibilityCallToolResultSchema.safeParse(callBody);
       assert(callParsed.success || compatParsed.success, `k8 tools/call body must validate against SDK CallToolResult shape: ${JSON.stringify((callParsed.error ?? compatParsed.error)?.issues)?.slice(0, 300)}`);
+      // K8m: ACTUAL advertised 2026-07-28 contract, exact shapes.
+      // Provenance: the installed SDK ships NO draft MCP Events schemas
+      // (server/discover and events/* have no SDK natives — the Part G gap
+      // proof), so no authoritative draft schema exists to import offline.
+      // K8m therefore asserts the EXACT advertised shapes field-by-field
+      // against the documented draft contract below (independent literal
+      // transcription, deep-compared — never the server's own builder
+      // output, never a legacy SDK schema). This is exact-shape
+      // conformance to the documented contract, not SDK-validated modern
+      // compliance, and it is reported separately from the K8 legacy proof.
+      const deepEqualK8m = (actual, expected, label) => {
+        const norm = (value) => {
+          if (Array.isArray(value)) return `[${value.map(norm).join(',')}]`;
+          if (value !== null && typeof value === 'object') {
+            return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${norm(value[k])}`).join(',')}}`;
+          }
+          return JSON.stringify(value) ?? 'null';
+        };
+        assert(norm(actual) === norm(expected), `${label} must equal the documented contract shape, got ${JSON.stringify(actual)?.slice(0, 400)}`);
+      };
+      // Documented draft contract shapes (transcribed, not imported).
+      const DOCUMENTED_DISCOVER = {
+        resultType: 'complete',
+        supportedVersions: ['2026-07-28'],
+        capabilities: { tools: {}, events: {} }
+      };
+      const DOCUMENTED_EVENT = {
+        name: 'run-attention',
+        delivery: ['webhook'],
+        inputSchema: {
+          type: 'object',
+          properties: {
+            delegationGroup: { type: 'string', description: 'Delegation group id scoping delivery (e.g. hestia-cli-canary).' },
+            runId: { type: 'string', description: 'Exact delegation run id (run_ + 16 hex).' }
+          },
+          additionalProperties: false
+        },
+        payloadSchema: {
+          type: 'object',
+          properties: {
+            runId: { type: 'string' },
+            engine: { type: 'string' },
+            delegationGroup: { type: 'string' },
+            state: { type: 'string' },
+            seq: { type: 'number' },
+            version: { type: 'number' },
+            summary: { type: 'string' },
+            inputRequestId: { type: 'string' }
+          },
+          required: ['runId', 'engine', 'delegationGroup', 'state', 'seq', 'version'],
+          additionalProperties: false
+        }
+      };
       // K8c: server/discover returns resultType complete + supportedVersions +
-      // capabilities.tools+events matching the official narrow shape.
+      // capabilities.tools+events matching the documented shape exactly.
       const disK8 = await postRawK8({ jsonrpc: '2.0', id: 203, method: 'server/discover', params: {} }, { 'mcp-protocol-version': '2026-07-28' });
       assert(disK8.response.status === 200 && disK8.json?.result?.resultType === 'complete', `k8 discover must be complete, got ${JSON.stringify(disK8.json)}`);
-      assert(Array.isArray(disK8.json.result.supportedVersions) && disK8.json.result.supportedVersions.includes('2026-07-28'), 'k8 discover must advertise 2026-07-28');
-      assert(disK8.json.result.capabilities && disK8.json.result.capabilities.tools !== undefined && disK8.json.result.capabilities.events !== undefined, 'k8 discover must carry capabilities.tools+events (official)');
+      deepEqualK8m(disK8.json.result, DOCUMENTED_DISCOVER, 'k8m discover');
       // K8d: events/list returns run-attention with delivery/inputSchema/
-      // payloadSchema matching the official narrow shape.
+      // payloadSchema matching the documented shape exactly (description is
+      // prose and excluded from the deep comparison, asserted separately).
       const listK8 = await postRawK8({ jsonrpc: '2.0', id: 204, method: 'events/list', params: {} }, { 'mcp-protocol-version': '2026-07-28' });
       assert(listK8.response.status === 200, `k8 events/list http status ${listK8.response.status}`);
       const evtK8 = listK8.json?.result?.events?.[0];
-      assert(evtK8?.name === 'run-attention', `k8 events/list must return run-attention, got ${JSON.stringify(listK8.json)}`);
-      assert(Array.isArray(evtK8.delivery) && evtK8.delivery.includes('webhook'), 'k8 event delivery must be ["webhook"] (official)');
-      assert(evtK8.inputSchema?.type === 'object' && evtK8.inputSchema?.properties?.delegationGroup && evtK8.inputSchema?.properties?.runId, 'k8 event inputSchema must carry delegationGroup/runId (official)');
-      assert(evtK8.payloadSchema?.type === 'object' && Array.isArray(evtK8.payloadSchema?.required) && evtK8.payloadSchema.required.includes('runId'), 'k8 event payloadSchema must require runId (official)');
-      // K8e: challenge/event envelopes + headers validated (official shapes,
-      // hermetic stubs, no network). Modern advertise (2026-07-28) with
-      // legacy bodies interoperates: the SDK client accepts the
-      // content[]+structuredContent body above (K8b validated + client
-      // callTool in Part F/J/L already accepts it; here the HTTP wire proves
-      // the same body traverses the compat header path).
+      assert(listK8.json?.result?.events?.length === 1, `k8m events/list must advertise exactly one event, got ${JSON.stringify(listK8.json)}`);
+      assert(typeof evtK8?.description === 'string' && evtK8.description.length > 0, 'k8m event must carry a prose description');
+      deepEqualK8m(
+        { name: evtK8?.name, delivery: evtK8?.delivery, inputSchema: evtK8?.inputSchema, payloadSchema: evtK8?.payloadSchema },
+        DOCUMENTED_EVENT,
+        'k8m events/list run-attention'
+      );
+      // K8e: challenge/event envelopes + headers validated (documented
+      // shapes, hermetic stubs, no network).
       const vBodyK8 = JSON.parse(Events.buildVerificationBody('k8challenge'));
       assert(vBodyK8.type === 'verification' && vBodyK8.challenge === 'k8challenge' && Object.keys(vBodyK8).length === 2, 'k8 challenge envelope must be exactly {type, challenge} (official)');
       const sampleK8 = { event: 'run-attention', eventId: 'evt_k8', runId: 'run_aaaaaaaaaaaaaaaa', engine: 'codex', delegationGroup: 'g1', state: 'completed', seq: 1, version: 1, summary: 'completed exit 0', createdAt: '2026-10-01T12:05:00Z' };
@@ -1295,7 +1373,11 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
       const secK8 = Buffer.alloc(32, 77);
       await Events.verifySubscriptionChallenge('https://example.com/hook', secK8, 'run-attention', {}, fetch, 10_000, { lookupHost: publicLookup, subId: 'sub_k8', postImpl: stubK8 });
       assert(seenK8.headers['webhook-id']?.startsWith('msg_verification_') && String(seenK8.headers['webhook-signature']).startsWith('v1,') && seenK8.headers['X-MCP-Subscription-Id'] === 'sub_k8', 'k8 challenge headers must carry webhook-id/timestamp/signature + X-MCP-Subscription-Id (official)');
-      console.log('ok: K8 wire contract schemas (init 2026-07-28->2025-11-25 InitializeResult; tools/call CallToolResult content[]+structuredContent; discover complete+versions+tools/events; list run-attention delivery/schemas; envelopes+headers; modern advertise + legacy body interoperate)');
+      deepEqualK8m(Object.keys(seenK8.headers).filter((h) => h === 'webhook-id' || h === 'webhook-timestamp' || h === 'webhook-signature' || h.toLowerCase().startsWith('x-mcp-')).sort(),
+        ['webhook-id', 'webhook-signature', 'webhook-timestamp', 'X-MCP-Subscription-Id'].sort(),
+        'k8m challenge signed header set (transport framing such as Host/content-type excluded)');
+      console.log('ok: K8 LEGACY-COMPAT wire proof (init downgrade validates against SDK InitializeResultSchema; tools/call body validates against SDK CallToolResult shape — legacy negotiation only, NO modern compliance claimed)');
+      console.log('ok: K8m advertised 2026-07-28 contract shapes (discover resultType/supportedVersions/capabilities.events; list run-attention delivery/inputSchema/payloadSchema; challenge/event envelopes + exact header set — exact-shape conformance to the documented contract; authoritative draft schemas unavailable offline)');
     }
     console.log('ok: K endpoint wire proof (POST /mcp server/discover + events/* reach the real handlers, auth-checked, batch, -32015 mapping)');
   } finally {
@@ -1321,7 +1403,7 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
   assert(!openedL.isError, 'open_workspace must succeed');
   const widL = openedL.structuredContent.workspace_id;
   const realL = fs.realpathSync.native(wsRootL);
-  const runFileL = (id) => path.join(realL, '.ai-bridge', 'delegation-runs', `${id}.json`);
+  const runFileL = (id) => path.join(runBridgeFor(wsRootL), 'delegation-runs', `${id}.json`);
   async function awaitStateL(id, pred) {
     for (let i = 0; i < 200; i += 1) {
       await new Promise((r) => setTimeout(r, 100));
@@ -1452,7 +1534,7 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
   assert(!openedM.isError, 'crashwindow open_workspace must succeed');
   const widM = openedM.structuredContent.workspace_id;
   const realM = fs.realpathSync.native(wsRootM);
-  const bridgeM = path.join(realM, '.ai-bridge');
+  const bridgeM = runBridgeFor(wsRootM);
   const runFileM = (id) => path.join(bridgeM, 'delegation-runs', `${id}.json`);
   async function awaitStateM(id, pred) {
     for (let i = 0; i < 200; i += 1) {
