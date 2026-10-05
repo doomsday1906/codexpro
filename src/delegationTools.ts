@@ -2494,6 +2494,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       seq: z.number().int().min(0),
       payload: z.record(z.any()),
       input_request_id: z.string().min(1).max(128).optional().describe("Reply path: the exact input-request id being answered (applied at most once)."),
+      amended_task: z.string().optional().describe("Reply path, real tasks only: owner-authorized REVISION of the accepted task text (task text ONLY, never engine/profile/agent/model/effort/policy/session/timeout/workdir/group). Bounded like the launch task (<=8000 chars pre-strip, sanitized identically, non-empty after strip); oversize/empty/canary/question-path revisions are refused with typed errors. The accepted revision is recorded in run history and becomes the continuation worker's revised authority with the original task retained for review."),
       questions: z.array(z.object({
         id: z.string().min(1).max(128),
         question: z.string().min(1).max(2000),
@@ -3164,6 +3165,18 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             delegation_group: current.delegationGroup,
             is_canary: current.isCanary !== false,
             ...(current.task ? { task: current.task } : {}),
+            // Owner-authorized task revisions ride ALONGSIDE the original
+            // task (never rewriting history): the full amendment record plus
+            // the current revised-authority pointer for Hestia review.
+            ...(Array.isArray(current.taskAmendments) && current.taskAmendments.length > 0 ? {
+              task_amendments: current.taskAmendments.map((amendment) => ({
+                seq: amendment.seq,
+                checkpoint_id: amendment.checkpointId,
+                amended_task: amendment.amendedTask,
+                stored_at: amendment.storedAt
+              })),
+              ...(current.lastAmendedTask ? { effective_task: current.lastAmendedTask } : {})
+            } : {}),
             engine: current.engine,
             ...(current.profile ? { profile: current.profile } : {}),
             ...(current.agent ? { agent: current.agent } : {}),
@@ -3270,6 +3283,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           seq: Number(raw.seq),
           payload: (raw.payload ?? {}) as Record<string, unknown>,
           ...(typeof raw.input_request_id === "string" ? { input_request_id: raw.input_request_id } : {}),
+          ...(raw.amended_task !== undefined ? { amended_task: raw.amended_task } : {}),
           ...(raw.questions !== undefined ? { questions: raw.questions } : {})
         };
         const verdict = validateCheckpointForRun(run, checkpoint);
@@ -3519,6 +3533,12 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           const alreadyDispatched = existingPending !== undefined && stagedAlivePid !== undefined;
           // The worker input IS the follow-up: base task plus the actual
           // answer payload, forwarded into the worker prompt/argv (reserved).
+          // An accepted amended_task revises ONLY the task-text authority in
+          // that prompt (labeled revision + retained original + revised guard);
+          // launch identity (engine/profile/agent/model/effort/policy/session/
+          // timeout/workdir/group) is never read from it and rides unchanged.
+          const acceptedAmendment = verdict.amendedTask ?? existingPending?.amendedTask;
+          const amendmentRevisionSeq = (run.taskAmendments?.length ?? 0) + 1;
           const followupPrompt = existingPending && existingPending.prompt
             ? existingPending.prompt
             : buildFollowupPrompt({
@@ -3527,7 +3547,12 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               requestId: request.id,
               questions: request.questions,
               answerPayload: checkpoint.payload,
-              attemptN: n
+              attemptN: n,
+              ...(acceptedAmendment ? {
+                amendedTask: acceptedAmendment,
+                amendmentSeq: amendmentRevisionSeq,
+                amendmentCheckpointId: checkpoint.id
+              } : {})
             });
           // Crash-safe: stage pending-dispatch BEFORE spawn (request stays
           // open, no applied mark). Only a successful spawn confirms it.
@@ -3543,7 +3568,8 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               ...(existingPending?.resumeSessionId ?? resumeSessionId ? { resumeSessionId: (existingPending?.resumeSessionId ?? resumeSessionId) as string } : {}),
               timeoutMs: existingPending?.timeoutMs ?? timeoutMs,
               prompt: followupPrompt,
-              sessionEvidence: existingPending?.sessionEvidence ?? sessionEvidence
+              sessionEvidence: existingPending?.sessionEvidence ?? sessionEvidence,
+              ...(acceptedAmendment ? { amendedTask: acceptedAmendment } : {})
             });
           }
           // Re-resolve effective values from the staged pending (retry reuses).
@@ -3727,7 +3753,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           let confirmed = loadDelegationRun(bridgeDir, run.runId) ?? run;
           let applied;
           try {
-            applied = applyCheckpointReply(confirmed, checkpoint, request);
+            applied = applyCheckpointReply(confirmed, checkpoint, request, staged.amendedTask ?? verdict.amendedTask);
           } catch (error) {
             const code = error && typeof error === "object" && "code" in error
               ? String((error as { code?: unknown }).code ?? "reply_rejected")
@@ -3801,8 +3827,12 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             run = rest as DelegationRunRecord;
           }
           saveDelegationRun(bridgeDir, run);
+          const appliedRevision = run.taskAmendments?.at(-1);
+          const revisionAck = appliedRevision && appliedRevision.checkpointId === checkpoint.id
+            ? ` Owner-authorized revision ${run.taskAmendments?.length} of the accepted task recorded (checkpoint ${checkpoint.id}); the continuation prompt carries it as revised authority with the original task retained for review.`
+            : "";
           return okResult(
-            `Answer ${checkpoint.id} for request ${request.id} applied at-most-once; continuation attempt ${staged.attemptN} ${alreadyDispatched ? "confirmed (staged worker was already alive, no second spawn)" : "launched"} (${staged.continuation}: ${spawnNote}).${approvalNote}`,
+            `Answer ${checkpoint.id} for request ${request.id} applied at-most-once; continuation attempt ${staged.attemptN} ${alreadyDispatched ? "confirmed (staged worker was already alive, no second spawn)" : "launched"} (${staged.continuation}: ${spawnNote}).${approvalNote}${revisionAck}`,
             {
               run_id: run.runId,
               checkpoint_id: checkpoint.id,
@@ -3813,6 +3843,10 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               continuation: staged.continuation,
               session_evidence: staged.sessionEvidence,
               ...(staged.resumeSessionId ? { session_id: staged.resumeSessionId } : {}),
+              ...(appliedRevision && appliedRevision.checkpointId === checkpoint.id ? {
+                task_revision: run.taskAmendments?.length ?? null,
+                amended_task: appliedRevision.amendedTask
+              } : {}),
               timeout_ms: staged.timeoutMs,
               state: "running",
               engine_qualification: engineQualification(run.engine),

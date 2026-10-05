@@ -1,0 +1,82 @@
+Delegation leaf evidence manifest — 2026-10-05 — base 0bdc6bc9cd388d5be18fd118019b0ef26c4001f2
+Leaf: follow-up task amendment (owner-authorized revision of the accepted task via amended_task)
+Package codexpro@0.31.0. Build: Built codexpro@0.31.0; source commit 0bdc6bc9cd388d5be18fd118019b0ef26c4001f2 (dirty)
+
+DESIGN DECISIONS (field names + prompt wording):
+  wire field: checkpoint.amended_task (strict-schema sibling of payload/questions; z.string().optional, caps enforced in store with typed errors)
+  record: run.taskAmendments[] {seq, checkpointId, amendedTask, storedAt} + run.lastAmendedTask pointer; launch task never rewritten; cap slice(-maxCheckpointsPerRun) via saveDelegationRun
+  checkpoint/pending provenance: DelegationCheckpoint.amendedTask + DelegationPendingDispatch.amendedTask (duplicate/conflict identity + crash-recovery description)
+  helper: effectiveRunTask(run) = lastAmendedTask ?? task
+  revised authority label: "Owner-authorized revision N of the accepted task (checkpoint <id>): <text>"
+  retained original label: "Original task (superseded for scope purposes, retained for review): <original>"
+  revised guard: "Stay within the revised task's scope: create, modify, or delete no file unless the revised task explicitly authorized it."
+  typed errors: invalid_amendment | amendment_too_large | amendment_empty | amendment_refused_for_canary | amendment_needs_reply (+ existing duplicate_conflicting/stale_checkpoint for id/conflict paths)
+  ack: task_revision + amended_task on the applied reply only; read_result: task (original, untouched) + task_amendments[] + effective_task (amendment fields present only when history exists)
+
+FILES CHANGED (sha256):
+  720fa80848fa9d1824e23e68c7f5c6e8844f25bc096b9143f626c7b6c42a8b37  src/delegationTools.ts  [source (amended_task schema, checkpoint passthrough, revised prompt build/stage/apply, revision ack, read_result surfacing)]
+  e4985750784536230bd119ceffd249e529031f3163fb31f1137ee292580f25bd  src/delegationEngines.ts  [source (FollowupPromptInput amendment fields, revised prompt branch + builder/assembler, canary defensive ignore)]
+  f195cc369be3a8fbce204823f14e5ad4f8fbaeef2e6bf309c01f26efaa0064d1  src/delegationStore.ts  [source (DelegationTaskAmendment, taskAmendments/lastAmendedTask, effectiveRunTask, amendment validation, record in applyCheckpointReply, pending provenance, save cap)]
+  38c06cb5ac467e30d15f8afbea4ad5cec40e67b69ff1642a3664dbdfd8012c35  package.json  [build input + delegation-followup-amendment:smoke registration]
+  80cbc28a3aae9313aa17591c6530879e828f9d65f12b893e768f2ef78c464e8e  scripts/build.mjs  [build input]
+  ac352ab4d2416fee6bab255d15f966be66d8281b461f55751a360f4773799aa0  scripts/build-identity.mjs  [build input]
+  01707d63930e59130eb6169d3c0afe9283ad356b655220b2b0633f22b123f0f4  tsconfig.json  [build input]
+  0cced0995f2f56019be574a94edd195ec1153b01ef2fec21b32c30c33a3210ed  scripts/delegation-followup-amendment-smoke.mjs  [new test (A1-A4 unit + B0-B6 adapter hermetic)]
+
+SERIAL PROOF COMMANDS (all exit 0, run serially after code freeze):
+  exit=0  npm run build
+    log=logs/01-build.log  sha256=264e9c0241f5b70caeb0948f0ff7026471f94f6e4db55a1e60e8c7721f19b7fe
+  exit=0  node scripts/delegation-followup-amendment-smoke.mjs
+    log=logs/02-amendment.log  sha256=220460feb7cd75aa2fafd2b0591ca819634539780c12668823044bbcb35b4742
+  exit=0  node scripts/delegation-followup-smoke.mjs
+    log=logs/03-followup.log  sha256=ac3f8b0d6e84954b9d021fe59e93a9a1690e433791544e786bdfc3d43ff85857
+  exit=0  node scripts/delegation-triengine-smoke.mjs
+    log=logs/04-triengine.log  sha256=33fb5d19c75f9f96c41ff5833124ce392bd64990b71ce5d0245ace27d38d1917
+  exit=0  node scripts/delegation-repair-focus-smoke.mjs
+    log=logs/05-repair-focus.log  sha256=b9a5f5bb3b777ea3d3e1125d4f6f8daa1766ce69d96ccbb58adf23678440f68c
+  exit=0  node scripts/delegation-storage-smoke.mjs
+    log=logs/06-storage.log  sha256=e7b4277306086f137021a03fd31224b3348b87346b00c50c031bffa0f7903b70
+  exit=0  node scripts/delegation-routing-smoke.mjs
+    log=logs/07-routing.log  sha256=c173692d4ad483644de89315b1b4035c18bab9bc97cd2bb5c2322b695a317e26
+  exit=0  node scripts/delegation-canary-smoke.mjs
+    log=logs/08-canary.log  sha256=69f5422df721ab3eb812fa0234be6ce0ece7a5774fed0257831920fd43a844a2
+  exit=0  node scripts/delegation-codex-ownership-smoke.mjs
+    log=logs/09-ownership.log  sha256=186663fff51e1c395cfff6ee7a7832cb3de205b5d8128781ee9e3131de470bea
+  exit=0  node scripts/delegation-artifact-isolation-smoke.mjs
+    log=logs/10-isolation.log  sha256=0284883820766abdb679c324abdd1d4adef8accc9e88702bdeb6b97816280ba2
+  exit=0  node scripts/delegation-terminal-cleanup-smoke.mjs
+    log=logs/11-terminal-cleanup.log  sha256=096815ee8d952b3c7174704ceb81b7f790cfa80116e8556de856d4833ee22227
+  exit=0  node scripts/delegation-cancel-artifact-smoke.mjs
+    log=logs/12-cancel-artifact.log  sha256=e89bcf02f76a86886aaf7716e0fe5d229a2a786dd73fe5382039b5dea6419ea5
+  exit=0  node scripts/delegation-identity-standalone-output-smoke.mjs
+    log=logs/13-identity.log  sha256=4dfefbbf6ada9dc477f00b14f1e09102c4ae0d4f726fa74de882114ec24c043d
+  exit=0  node scripts/delegation-central-artifact-smoke.mjs
+    log=logs/14-central-artifact.log  sha256=dce6885e43a0fc6f09ae5ac83b41244dd096f3f543354d08fb0c39db42f8d813
+  exit=0  node scripts/delegation-steer-smoke.mjs
+    log=logs/15-steer.log  sha256=5990eeea70189fbca25a97b725bc59364f6d9349736ce278054b773ef346b5b8
+
+NEW CASES (scripts/delegation-followup-amendment-smoke.mjs):
+  A1 no-amendment prompt byte-identical to legacy (hardcoded literal)
+  A2 amended prompt: revised authority label + retained original + revised guard; canary defensive ignore
+  A3 typed validation: amendment_too_large / amendment_empty / invalid_amendment / amendment_refused_for_canary / amendment_needs_reply + replay/conflict/stale
+  A4 record: history entry + pointer, history preserved, replay idempotent, question-path refuses
+  B0 installed CLI parity (codex-cli 0.159.0, opencode v2.0.22, claude 2.1.289; --version only, no model calls)
+  B1 amendment accepted (recorded history + pointer, revised prompt with original retained, shim-captured argv)
+  B2 no-amendment control (byte-identical prompt literal, no record, launch-identity argv identical modulo per-run session UUID)
+  B3 same-id replay idempotent (no duplicate entry, no second worker)
+  B4 conflicting amendment content -> duplicate_conflicting
+  B5 typed refusals consume nothing (request stays open, no record, no attempt)
+  B6 canary amendment refused (real tasks only, nothing consumed)
+
+FIXTURE STRAYS (preserved, never touched, never committed):
+  ce299a8defb9e1e8102a58dd1a8251ad2b7f954c9341e6fbce6beab36b90cca7  fixture-a.txt
+  13aafb27a71bb59b8c92d83248746711ddffe2d73fa2f3fbc5299851d0fac6ce  fixture-b.txt
+
+STALE-LEAF DISCLAIMER:
+  This leaf ran on base 0bdc6bc with no prior reservation claim: no lane, current checkout only. No stale leaf is superseded by this manifest beyond the follow-up-amendment surface; all other surfaces keep their prior proof (re-verified above by re-running the affected suites serially against this leaf's code).
+
+REMAINING BLOCKERS / UNPROVEN:
+  - live model/Astra proof of the revised-authority continuation (worker-side acceptance of a requirement-changing follow-up): UNPROVEN here by design - hermetic labeled shims only in this leaf; the new live leaf re-proves unauthorized-expansion refusal vs amended acceptance
+  - none blocking: all hermetic regressions pass; no frozen authoritative test was modified (new test file only)
+
+DELIVERY: uncommitted working tree (orchestrator integrates + runs live qualification separately); fixture strays preserved, never touched, never committed

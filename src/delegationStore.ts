@@ -188,6 +188,29 @@ export interface DelegationCheckpoint {
   applied: boolean;
   /** Exact input request this checkpoint answers, when it is a reply. */
   inputRequestId?: string;
+  /** Sanitized owner-authorized task revision carried by this reply, when one was accepted. */
+  amendedTask?: string;
+}
+
+/**
+ * One owner-authorized revision of the accepted task, recorded when a
+ * follow-up reply carries an accepted amended_task. Task text ONLY: engine,
+ * profile, agent, model, effort, policy, session, timeout, workdir, and group
+ * stay launch identity and are never revised here.
+ */
+export interface DelegationTaskAmendment {
+  /** Checkpoint seq of the reply that carried the amendment. */
+  seq: number;
+  /** Checkpoint id of the reply that carried the amendment. */
+  checkpointId: string;
+  /** Sanitized revised task text (bounded like the launch task). */
+  amendedTask: string;
+  storedAt: string;
+}
+
+/** Current revised authority: the latest accepted amendment, else the launch task. */
+export function effectiveRunTask(run: DelegationRunRecord): string | undefined {
+  return run.lastAmendedTask ?? run.task;
 }
 
 /**
@@ -260,6 +283,19 @@ export interface DelegationRunRecord {
   /** False for real tasks (no fixtures, larger timeout regime). Optional:
    * Leaf 1/2 run files predate it and are canary runs. */
   isCanary?: boolean;
+  /**
+   * Owner-authorized revisions of the accepted task, one entry per accepted
+   * follow-up amendment (checkpoint order). The launch task is never
+   * rewritten: history stays reviewable, and the continuation worker prompt
+   * carries the latest entry as its revised authority. Optional: runs that
+   * never accepted an amendment carry no record.
+   */
+  taskAmendments?: DelegationTaskAmendment[];
+  /**
+   * Pointer to the latest accepted amendment text (the current revised
+   * authority for continuations). Absent when no amendment was accepted.
+   */
+  lastAmendedTask?: string;
   workspaceId: string;
   workspaceCanonical: string;
   workdir: string;
@@ -462,6 +498,13 @@ export interface DelegationPendingDispatch {
   storedAt: string;
   state: "pending-dispatch";
   /**
+   * Sanitized owner-authorized task revision staged with this dispatch, when
+   * the reply carried an accepted amended_task. The staged prompt already
+   * carries it as revised authority; this field keeps the reservation
+   * self-describing across crash recovery. Never launch identity.
+   */
+  amendedTask?: string;
+  /**
    * True for initial-launch staging (checkpointId === launch request id, no
    * input request). Follow-up staging omits this flag.
    */
@@ -652,6 +695,7 @@ export function saveDelegationRun(bridgeDir: string, run: DelegationRunRecord): 
     pendingEvents: run.pendingEvents.slice(-DELEGATION_BOUNDS.maxPendingEventsPerRun),
     checkpoints: run.checkpoints.slice(-DELEGATION_BOUNDS.maxCheckpointsPerRun),
     inputRequests: (run.inputRequests ?? []).slice(-DELEGATION_BOUNDS.maxInputRequestsPerRun),
+    taskAmendments: (run.taskAmendments ?? []).slice(-DELEGATION_BOUNDS.maxCheckpointsPerRun),
     updatedAt: new Date().toISOString()
   };
   atomicWriteJson(delegationRunPath(bridgeDir, run.runId), capped);
@@ -1013,6 +1057,12 @@ export interface CheckpointShape {
   payload: Record<string, unknown>;
   input_request_id?: string;
   questions?: unknown;
+  /**
+   * Raw owner-authorized task revision (reply path only). Validated +
+   * sanitized by validateCheckpointForRun; task text ONLY, never launch
+   * identity. Absent/undefined when the follow-up carries no revision.
+   */
+  amended_task?: unknown;
 }
 
 export interface CheckpointVerdict {
@@ -1022,15 +1072,25 @@ export interface CheckpointVerdict {
   duplicate?: boolean;
   questions?: DelegationInputQuestion[];
   request?: DelegationInputRequest;
+  /** Sanitized accepted amendment text, present only when one validated. */
+  amendedTask?: string;
 }
 
 /**
  * Shared checkpoint validation for delegation_followup. Pure: never mutates.
  * Typed rejections: wrong_run_checkpoint, invalid_checkpoint_id,
- * checkpoint_payload_too_large, duplicate_conflicting,
+ * checkpoint_payload_too_large, invalid_amendment, amendment_too_large,
+ * amendment_empty, amendment_refused_for_canary, amendment_needs_reply,
+ * duplicate_conflicting,
  * checkpoint_needs_questions_or_request_ref, invalid_questions,
  * unknown_input_request. Stale seqs are rejected; identical duplicates are
  * idempotent (duplicate:true) so at-most-once holds without re-execution.
+ *
+ * amended_task (when present) is an owner-authorized REVISION of the accepted
+ * task text only: bounded like the launch task (<= maxTaskChars pre-strip,
+ * sanitized identically, non-empty after strip), reply-path only, real
+ * (non-canary) runs only. It never alters engine/profile/agent/model/effort/
+ * policy/session/timeout/workdir/group.
  */
 export function validateCheckpointForRun(run: DelegationRunRecord, checkpoint: CheckpointShape): CheckpointVerdict {
   if (!checkpoint || typeof checkpoint !== "object") {
@@ -1051,13 +1111,40 @@ export function validateCheckpointForRun(run: DelegationRunRecord, checkpoint: C
   if (Buffer.byteLength(JSON.stringify(checkpoint.payload), "utf8") > DELEGATION_BOUNDS.maxCheckpointPayloadBytes) {
     return { ok: false, code: "checkpoint_payload_too_large", message: `checkpoint payload exceeds ${DELEGATION_BOUNDS.maxCheckpointPayloadBytes} bytes.` };
   }
+  // Owner-authorized task revision: shape-validated here (pure), recorded +
+  // applied only on the reply path by the caller. Attempts to smuggle launch
+  // identity ride as inert task text at most: the value is validated as plain
+  // task text and can never touch engine/profile/agent/model/effort/policy/
+  // session/timeout/workdir/group (those fields are never read from it).
+  let amendedTask: string | undefined;
+  if (checkpoint.amended_task !== undefined) {
+    if (typeof checkpoint.amended_task !== "string") {
+      return { ok: false, code: "invalid_amendment", message: "amended_task must be task text (a string); launch identity cannot be revised through a follow-up." };
+    }
+    if (run.isCanary !== false) {
+      return { ok: false, code: "amendment_refused_for_canary", message: "amended_task is refused for the legacy canary slice (real tasks only)." };
+    }
+    if (typeof checkpoint.input_request_id !== "string" || !checkpoint.input_request_id) {
+      return { ok: false, code: "amendment_needs_reply", message: "amended_task revises the accepted task for a continuation worker, so it rides only on a reply (input_request_id); questions carry no revision." };
+    }
+    const rawAmendment = checkpoint.amended_task as string;
+    if (rawAmendment.length > DELEGATION_BOUNDS.maxTaskChars) {
+      return { ok: false, code: "amendment_too_large", message: `amended_task exceeds ${DELEGATION_BOUNDS.maxTaskChars} chars (${rawAmendment.length}); narrow the revision and retry.` };
+    }
+    const sanitized = sanitizeTaskText(rawAmendment);
+    if (!sanitized) {
+      return { ok: false, code: "amendment_empty", message: "amended_task is empty after control-strip; supply real revised task text or omit the revision." };
+    }
+    amendedTask = sanitized;
+  }
   const stored = run.checkpoints.find((candidate) => candidate.id === checkpoint.id);
   if (stored) {
     const same = stored.runId === checkpoint.run_id &&
       stored.seq === checkpoint.seq &&
       stableStringify(stored.payload) === stableStringify(checkpoint.payload) &&
-      (stored.inputRequestId ?? null) === (typeof checkpoint.input_request_id === "string" ? checkpoint.input_request_id : null);
-    if (same) return { ok: true, duplicate: true };
+      (stored.inputRequestId ?? null) === (typeof checkpoint.input_request_id === "string" ? checkpoint.input_request_id : null) &&
+      (stored.amendedTask ?? null) === (amendedTask ?? null);
+    if (same) return { ok: true, duplicate: true, ...(amendedTask ? { amendedTask } : {}) };
     return { ok: false, code: "duplicate_conflicting", message: `Checkpoint ${checkpoint.id} already stored with different content; refusing conflicting re-use (at-most-once).` };
   }
   // Crash-boundary pending dispatch: the same checkpoint id may be staged as
@@ -1072,7 +1159,8 @@ export function validateCheckpointForRun(run: DelegationRunRecord, checkpoint: C
     const samePending = incomingRequestId !== null &&
       pending.requestId === incomingRequestId &&
       pending.seq === checkpoint.seq &&
-      stableStringify(pending.payload) === stableStringify(checkpoint.payload);
+      stableStringify(pending.payload) === stableStringify(checkpoint.payload) &&
+      (pending.amendedTask ?? null) === (amendedTask ?? null);
     if (!samePending) {
       return { ok: false, code: "duplicate_conflicting", message: `Checkpoint ${checkpoint.id} has a pending dispatch with different content; refusing conflicting re-use (at-most-once). No worker spawned and the pending reply is not consumed.` };
     }
@@ -1116,7 +1204,7 @@ export function validateCheckpointForRun(run: DelegationRunRecord, checkpoint: C
       return { ok: false, code: "unknown_input_request", message: `No input request ${requestRef} for run ${run.runId}.` };
     }
   }
-  return { ok: true, questions, request };
+  return { ok: true, questions, request, ...(amendedTask ? { amendedTask } : {}) };
 }
 
 export interface RegisterQuestionResult {
@@ -1146,6 +1234,9 @@ export function registerInputRequest(
   }
   if (run.state === "running" || run.state === "queued") {
     throw Object.assign(new Error("An attempt is still active; ask follow-up questions after the run-attention event."), { code: "question_while_running_refused" });
+  }
+  if (checkpoint.amended_task !== undefined) {
+    throw Object.assign(new Error("amended_task revises the accepted task for a continuation worker, so it rides only on a reply (input_request_id); questions carry no revision."), { code: "amendment_needs_reply" });
   }
   if (runInputRequests(run).length >= DELEGATION_BOUNDS.maxInputRequestsPerRun) {
     throw Object.assign(new Error("Input-request bound reached for this run."), { code: "input_request_bound" });
@@ -1204,11 +1295,18 @@ export interface ApplyReplyResult {
  * data only: they never widen the engine gate (enforced at continuation
  * launch, which re-verifies the read-only gate). Returns attemptsExhausted
  * when the answer is stored but no attempt budget remains.
+ *
+ * amendedTask (sanitized by validateCheckpointForRun) records one
+ * owner-authorized revision of the accepted task: appended to
+ * run.taskAmendments with the latest pointer in run.lastAmendedTask,
+ * persisted atomically with this save. The launch task is never rewritten.
+ * Already-applied replays return the run unchanged (no duplicate entry).
  */
 export function applyCheckpointReply(
   run: DelegationRunRecord,
   checkpoint: CheckpointShape,
-  request: DelegationInputRequest
+  request: DelegationInputRequest,
+  amendedTask?: string
 ): ApplyReplyResult {
   if (run.state !== "needs-input") {
     throw Object.assign(new Error(`Run ${run.runId} is ${run.state}: replies require needs-input with an open request.`), { code: "reply_without_open_request" });
@@ -1245,11 +1343,21 @@ export function applyCheckpointReply(
       payload: checkpoint.payload,
       inputRequestId: request.id,
       storedAt: now,
-      applied: true
+      applied: true,
+      ...(amendedTask ? { amendedTask } : {})
     }].slice(-DELEGATION_BOUNDS.maxCheckpointsPerRun),
     appliedCheckpointIds: [...run.appliedCheckpointIds, checkpoint.id],
     lastAppliedCheckpointSeq: Math.max(run.lastAppliedCheckpointSeq, checkpoint.seq),
     inputRequests: settled.slice(-DELEGATION_BOUNDS.maxInputRequestsPerRun),
+    ...(amendedTask ? {
+      taskAmendments: [...(run.taskAmendments ?? []), {
+        seq: checkpoint.seq,
+        checkpointId: checkpoint.id,
+        amendedTask,
+        storedAt: now
+      }].slice(-DELEGATION_BOUNDS.maxCheckpointsPerRun),
+      lastAmendedTask: amendedTask
+    } : {}),
     nextAction: attemptsExhausted
       ? "answer stored at-most-once but no attempt budget remains; relaunch only with a NEW request id"
       : stillOpen
@@ -1478,6 +1586,7 @@ export function stagePendingDispatch(
     prompt: string;
     sessionEvidence: string;
     isLaunch?: boolean;
+    amendedTask?: string;
   }
 ): DelegationRunRecord {
   const now = new Date().toISOString();
@@ -1494,7 +1603,8 @@ export function stagePendingDispatch(
     sessionEvidence: opts.sessionEvidence,
     storedAt: now,
     state: "pending-dispatch",
-    ...(opts.isLaunch ? { isLaunch: true as const } : {})
+    ...(opts.isLaunch ? { isLaunch: true as const } : {}),
+    ...(opts.amendedTask ? { amendedTask: opts.amendedTask } : {})
   };
   // Reuse the same attempt number when retrying the identical pending id;
   // otherwise append a fresh queued pending attempt. A restage preserves an

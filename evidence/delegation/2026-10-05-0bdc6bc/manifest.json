@@ -1,0 +1,144 @@
+{
+ "leaf": "follow-up task amendment (owner-authorized revision via amended_task)",
+ "base_commit": "0bdc6bc9cd388d5be18fd118019b0ef26c4001f2",
+ "verified_head": "0bdc6bc9cd388d5be18fd118019b0ef26c4001f2",
+ "date_utc": "2026-10-05",
+ "package_version": "0.31.0",
+ "build_identity": "Built codexpro@0.31.0; source commit 0bdc6bc9cd388d5be18fd118019b0ef26c4001f2 (dirty)",
+ "files": {
+  "src/delegationTools.ts": {
+   "sha256": "720fa80848fa9d1824e23e68c7f5c6e8844f25bc096b9143f626c7b6c42a8b37",
+   "role": "[source (amended_task schema, checkpoint passthrough, revised prompt build/stage/apply, revision ack, read_result surfacing)]"
+  },
+  "src/delegationEngines.ts": {
+   "sha256": "e4985750784536230bd119ceffd249e529031f3163fb31f1137ee292580f25bd",
+   "role": "[source (FollowupPromptInput amendment fields, revised prompt branch + builder/assembler, canary defensive ignore)]"
+  },
+  "src/delegationStore.ts": {
+   "sha256": "f195cc369be3a8fbce204823f14e5ad4f8fbaeef2e6bf309c01f26efaa0064d1",
+   "role": "[source (DelegationTaskAmendment, taskAmendments/lastAmendedTask, effectiveRunTask, amendment validation, record in applyCheckpointReply, pending provenance, save cap)]"
+  },
+  "package.json": {
+   "sha256": "38c06cb5ac467e30d15f8afbea4ad5cec40e67b69ff1642a3664dbdfd8012c35",
+   "role": "[build input + delegation-followup-amendment:smoke registration]"
+  },
+  "scripts/build.mjs": {
+   "sha256": "80cbc28a3aae9313aa17591c6530879e828f9d65f12b893e768f2ef78c464e8e",
+   "role": "[build input]"
+  },
+  "scripts/build-identity.mjs": {
+   "sha256": "ac352ab4d2416fee6bab255d15f966be66d8281b461f55751a360f4773799aa0",
+   "role": "[build input]"
+  },
+  "tsconfig.json": {
+   "sha256": "01707d63930e59130eb6169d3c0afe9283ad356b655220b2b0633f22b123f0f4",
+   "role": "[build input]"
+  },
+  "scripts/delegation-followup-amendment-smoke.mjs": {
+   "sha256": "0cced0995f2f56019be574a94edd195ec1153b01ef2fec21b32c30c33a3210ed",
+   "role": "[new test (A1-A4 unit + B0-B6 adapter hermetic)]"
+  }
+ },
+ "serial_commands": [
+  {
+   "command": "npm run build",
+   "log": "logs/01-build.log",
+   "exit": 0,
+   "log_sha256": "264e9c0241f5b70caeb0948f0ff7026471f94f6e4db55a1e60e8c7721f19b7fe"
+  },
+  {
+   "command": "node scripts/delegation-followup-amendment-smoke.mjs",
+   "log": "logs/02-amendment.log",
+   "exit": 0,
+   "log_sha256": "220460feb7cd75aa2fafd2b0591ca819634539780c12668823044bbcb35b4742"
+  },
+  {
+   "command": "node scripts/delegation-followup-smoke.mjs",
+   "log": "logs/03-followup.log",
+   "exit": 0,
+   "log_sha256": "ac3f8b0d6e84954b9d021fe59e93a9a1690e433791544e786bdfc3d43ff85857"
+  },
+  {
+   "command": "node scripts/delegation-triengine-smoke.mjs",
+   "log": "logs/04-triengine.log",
+   "exit": 0,
+   "log_sha256": "33fb5d19c75f9f96c41ff5833124ce392bd64990b71ce5d0245ace27d38d1917"
+  },
+  {
+   "command": "node scripts/delegation-repair-focus-smoke.mjs",
+   "log": "logs/05-repair-focus.log",
+   "exit": 0,
+   "log_sha256": "b9a5f5bb3b777ea3d3e1125d4f6f8daa1766ce69d96ccbb58adf23678440f68c"
+  },
+  {
+   "command": "node scripts/delegation-storage-smoke.mjs",
+   "log": "logs/06-storage.log",
+   "exit": 0,
+   "log_sha256": "e7b4277306086f137021a03fd31224b3348b87346b00c50c031bffa0f7903b70"
+  },
+  {
+   "command": "node scripts/delegation-routing-smoke.mjs",
+   "log": "logs/07-routing.log",
+   "exit": 0,
+   "log_sha256": "c173692d4ad483644de89315b1b4035c18bab9bc97cd2bb5c2322b695a317e26"
+  },
+  {
+   "command": "node scripts/delegation-canary-smoke.mjs",
+   "log": "logs/08-canary.log",
+   "exit": 0,
+   "log_sha256": "69f5422df721ab3eb812fa0234be6ce0ece7a5774fed0257831920fd43a844a2"
+  },
+  {
+   "command": "node scripts/delegation-codex-ownership-smoke.mjs",
+   "log": "logs/09-ownership.log",
+   "exit": 0,
+   "log_sha256": "186663fff51e1c395cfff6ee7a7832cb3de205b5d8128781ee9e3131de470bea"
+  },
+  {
+   "command": "node scripts/delegation-artifact-isolation-smoke.mjs",
+   "log": "logs/10-isolation.log",
+   "exit": 0,
+   "log_sha256": "0284883820766abdb679c324abdd1d4adef8accc9e88702bdeb6b97816280ba2"
+  },
+  {
+   "command": "node scripts/delegation-terminal-cleanup-smoke.mjs",
+   "log": "logs/11-terminal-cleanup.log",
+   "exit": 0,
+   "log_sha256": "096815ee8d952b3c7174704ceb81b7f790cfa80116e8556de856d4833ee22227"
+  },
+  {
+   "command": "node scripts/delegation-cancel-artifact-smoke.mjs",
+   "log": "logs/12-cancel-artifact.log",
+   "exit": 0,
+   "log_sha256": "e89bcf02f76a86886aaf7716e0fe5d229a2a786dd73fe5382039b5dea6419ea5"
+  },
+  {
+   "command": "node scripts/delegation-identity-standalone-output-smoke.mjs",
+   "log": "logs/13-identity.log",
+   "exit": 0,
+   "log_sha256": "4dfefbbf6ada9dc477f00b14f1e09102c4ae0d4f726fa74de882114ec24c043d"
+  },
+  {
+   "command": "node scripts/delegation-central-artifact-smoke.mjs",
+   "log": "logs/14-central-artifact.log",
+   "exit": 0,
+   "log_sha256": "dce6885e43a0fc6f09ae5ac83b41244dd096f3f543354d08fb0c39db42f8d813"
+  },
+  {
+   "command": "node scripts/delegation-steer-smoke.mjs",
+   "log": "logs/15-steer.log",
+   "exit": 0,
+   "log_sha256": "5990eeea70189fbca25a97b725bc59364f6d9349736ce278054b773ef346b5b8"
+  }
+ ],
+ "fixture_strays_preserved_untouched_uncommitted": [
+  "fixture-a.txt",
+  "fixture-b.txt"
+ ],
+ "live_probes": "none in this leaf (hermetic labeled shims only; live proof is a later leaf)",
+ "stale_leaf_disclaimer": "base 0bdc6bc, no lane; no prior leaf superseded beyond the follow-up-amendment surface",
+ "remaining_blockers_and_unproven": [
+  "live worker-side acceptance of amended follow-up UNPROVEN here by design (later live leaf)"
+ ],
+ "delivery": "uncommitted working tree (orchestrator integrates + runs live qualification separately)"
+}

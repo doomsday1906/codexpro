@@ -671,6 +671,18 @@ export interface FollowupPromptInput {
   answerPayload: Record<string, unknown>;
   /** 1-based continuation attempt number. */
   attemptN: number;
+  /**
+   * Sanitized owner-authorized revision of the accepted task (reply path,
+   * real runs only). When present the continuation prompt carries this text
+   * as its revised authority with the launch task retained for review; the
+   * scope guard references the revised text. Absent means byte-identical
+   * legacy behavior (original task + original guard).
+   */
+  amendedTask?: string;
+  /** 1-based revision number for the authority label (taskAmendments length). */
+  amendmentSeq?: number;
+  /** Checkpoint id that carried the amendment (authority label provenance). */
+  amendmentCheckpointId?: string;
 }
 
 /** Follow-up prompt cap: bounded worker input (base task + payload). */
@@ -703,6 +715,15 @@ export function buildFollowupPrompt(input: FollowupPromptInput): string {
   const rawBase = input.isCanary
     ? canaryPrompt(CANARY_FIXTURES)
     : String(input.baseTask ?? "").trim();
+  // Owner-authorized revision: real runs only, non-empty text only. Canary
+  // runs never carry one (refused at validation); a canary-shaped input here
+  // defensively falls back to the legacy prompt so the canary proof never
+  // changes shape.
+  const revised = !input.isCanary &&
+    typeof input.amendedTask === "string" &&
+    input.amendedTask.trim()
+    ? input.amendedTask.trim()
+    : undefined;
   const questionLines = (input.questions ?? [])
     .map((q) => `[${q.id}] ${q.question}${q.kind === "approval" ? " (approval-kind: data only)" : ""}`);
   let payloadJson: string;
@@ -714,13 +735,27 @@ export function buildFollowupPrompt(input: FollowupPromptInput): string {
   payloadJson = truncateUtf8(payloadJson, MAX_FOLLOWUP_PAYLOAD_JSON_BYTES, "...[payload truncated]");
   const instruction = input.isCanary
     ? "Do not create, modify, or delete any file. Leave the fixtures unchanged."
-    : "Stay within the original task's scope: create, modify, or delete no file unless the original task explicitly authorized it.";
+    : revised
+      ? "Stay within the revised task's scope: create, modify, or delete no file unless the revised task explicitly authorized it."
+      : "Stay within the original task's scope: create, modify, or delete no file unless the original task explicitly authorized it.";
   const prefix = `Follow-up continuation (attempt ${input.attemptN}) for input request ${input.requestId}.`;
   const questionsFull = questionLines.length > 0 ? questionLines.join(" | ") : "(none listed)";
   // Budget questions separately so a pathological question list cannot push
   // the answer out: cap questions at 4 KiB (multibyte-safe), base gets the rest.
   const MAX_QUESTIONS_BYTES = 4_096;
   let questionsText = truncateUtf8(questionsFull, MAX_QUESTIONS_BYTES, "...[questions truncated]");
+  if (revised) {
+    return buildAmendedFollowupPrompt({
+      prefix,
+      revised,
+      revisionSeq: input.amendmentSeq ?? 1,
+      checkpointId: input.amendmentCheckpointId ?? input.requestId,
+      original: rawBase,
+      questionsText,
+      payloadJson,
+      instruction
+    });
+  }
   const baseDisplay = rawBase || "(no base task recorded)";
   // Fixed cost with EMPTY base: everything except the base task text.
   const emptyJoin = [
@@ -776,6 +811,104 @@ function assembleFollowupPrompt(
   if (truncated.includes(payloadMustContain.slice(0, Math.min(64, payloadMustContain.length)))) return truncated;
   const minimal = truncateUtf8(
     `${prefix} Answers (checkpoint payload JSON): ${payloadMustContain} ${instruction}`,
+    MAX_FOLLOWUP_PROMPT_BYTES,
+    " ...[follow-up truncated]"
+  );
+  return minimal;
+}
+
+/**
+ * Amended follow-up prompt: the continuation worker's accepted-task authority
+ * is the owner-authorized revision, explicitly labeled with its revision
+ * number and carrying checkpoint; the launch task is retained verbatim for
+ * review (superseded for scope purposes). The scope guard references the
+ * revised text. Budgeting mirrors the legacy path: questions are capped
+ * separately, the payload slice is reserved, and the revised text takes
+ * budget priority over the retained original.
+ */
+function buildAmendedFollowupPrompt(args: {
+  prefix: string;
+  revised: string;
+  revisionSeq: number;
+  checkpointId: string;
+  original: string;
+  questionsText: string;
+  payloadJson: string;
+  instruction: string;
+}): string {
+  let questionsText = args.questionsText;
+  const revisionLine = `Owner-authorized revision ${args.revisionSeq} of the accepted task (checkpoint ${args.checkpointId}): `;
+  const originalLine = "Original task (superseded for scope purposes, retained for review): ";
+  const revisedFull = args.revised || "(no base task recorded)";
+  const originalFull = args.original || "(no base task recorded)";
+  // Fixed cost with EMPTY task texts: everything except the two task texts.
+  const emptyJoin = [
+    args.prefix,
+    revisionLine,
+    originalLine,
+    `Answered questions: ${questionsText}`,
+    `Answers (checkpoint payload JSON): ${args.payloadJson}`,
+    args.instruction
+  ].join(" ");
+  let baseBudget = MAX_FOLLOWUP_PROMPT_BYTES - Buffer.byteLength(emptyJoin, "utf8");
+  if (baseBudget < 0) {
+    // Overhead + payload alone exceed the cap: shrink questions first,
+    // payload is never shrunk beyond its own cap.
+    const shrinkBy = -baseBudget;
+    const questionsBytes = Buffer.byteLength(questionsText, "utf8");
+    const shrunkBytes = Math.max(0, questionsBytes - shrinkBy);
+    questionsText = truncateUtf8(questionsText, shrunkBytes, "...[questions truncated]");
+    const retryEmpty = [
+      args.prefix,
+      revisionLine,
+      originalLine,
+      `Answered questions: ${questionsText}`,
+      `Answers (checkpoint payload JSON): ${args.payloadJson}`,
+      args.instruction
+    ].join(" ");
+    baseBudget = MAX_FOLLOWUP_PROMPT_BYTES - Buffer.byteLength(retryEmpty, "utf8");
+  }
+  // The revision is the live authority: it takes budget priority, the
+  // retained original gets the remainder.
+  const revisedBytes = Buffer.byteLength(revisedFull, "utf8");
+  const revisedText = truncateUtf8(revisedFull, Math.min(revisedBytes, Math.max(0, baseBudget)), "...[task truncated]");
+  const remaining = Math.max(0, baseBudget - Buffer.byteLength(revisedText, "utf8"));
+  const originalText = truncateUtf8(originalFull, remaining, "...[task truncated]");
+  return assembleAmendedFollowupPrompt(
+    args.prefix, revisionLine, revisedText, originalLine, originalText,
+    questionsText, args.payloadJson, args.instruction, args.payloadJson
+  );
+}
+
+function assembleAmendedFollowupPrompt(
+  prefix: string,
+  revisionLine: string,
+  revisedText: string,
+  originalLine: string,
+  originalText: string,
+  questionsText: string,
+  payloadJson: string,
+  instruction: string,
+  payloadMustContain: string
+): string {
+  const lines = [
+    prefix,
+    `${revisionLine}${revisedText}`,
+    `${originalLine}${originalText}`,
+    `Answered questions: ${questionsText}`,
+    `Answers (checkpoint payload JSON): ${payloadJson}`,
+    instruction
+  ];
+  const joined = lines.join(" ");
+  // Whole-prompt truncation is a final safety net only: it truncates the
+  // TAIL and asserts the reserved payload slice survived. If the payload was
+  // somehow pushed out, fall back to a revision-preserving minimal prompt
+  // (prefix + revision + answers + truncated instruction).
+  if (Buffer.byteLength(joined, "utf8") <= MAX_FOLLOWUP_PROMPT_BYTES) return joined;
+  const truncated = truncateUtf8(joined, MAX_FOLLOWUP_PROMPT_BYTES, " ...[follow-up truncated]");
+  if (truncated.includes(payloadMustContain.slice(0, Math.min(64, payloadMustContain.length)))) return truncated;
+  const minimal = truncateUtf8(
+    `${prefix} ${revisionLine}${revisedText} Answers (checkpoint payload JSON): ${payloadMustContain} ${instruction}`,
     MAX_FOLLOWUP_PROMPT_BYTES,
     " ...[follow-up truncated]"
   );

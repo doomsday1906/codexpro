@@ -136,6 +136,7 @@
     "doctor": "node scripts/codexpro.mjs doctor",
     "delegation-canary:smoke": "npm run build && node scripts/delegation-canary-smoke.mjs",
     "delegation-followup:smoke": "npm run build && node scripts/delegation-followup-smoke.mjs",
+    "delegation-followup-amendment:smoke": "npm run build && node scripts/delegation-followup-amendment-smoke.mjs",
     "delegation-routing:smoke": "npm run build && node scripts/delegation-routing-smoke.mjs",
     "delegation-storage:smoke": "npm run build && node scripts/delegation-storage-smoke.mjs",
     "delegation-triengine:smoke": "npm run build && node scripts/delegation-triengine-smoke.mjs",
