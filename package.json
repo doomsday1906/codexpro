@@ -146,6 +146,7 @@
     "delegation-cancel-artifact:smoke": "npm run build && node scripts/delegation-cancel-artifact-smoke.mjs",
     "delegation-artifact-isolation:smoke": "npm run build && node scripts/delegation-artifact-isolation-smoke.mjs",
     "delegation-terminal-cleanup:smoke": "npm run build && node scripts/delegation-terminal-cleanup-smoke.mjs",
+  "session-helpers:smoke": "npm run build && node scripts/session-helper-retirement-smoke.mjs",
     "connect": "node scripts/codexpro.mjs",
     "connect:setup": "node scripts/codexpro.mjs setup",
     "connect:local": "node scripts/codexpro.mjs --tunnel none",
