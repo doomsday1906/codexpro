@@ -1285,6 +1285,14 @@ export interface ApplyReplyResult {
   run: DelegationRunRecord;
   request: DelegationInputRequest;
   attemptsExhausted: boolean;
+  /**
+   * True when a supplied amendedTask was byte-identical to the current
+   * effective task (reuse, not a new revision): the checkpoint keeps the
+   * text for duplicate identity but no history entry is appended and the
+   * pointer is unchanged. A text matching the ORIGINAL launch task while
+   * the effective task is a later revision is a genuine revert (false).
+   */
+  amendmentReused: boolean;
 }
 
 /**
@@ -1299,7 +1307,7 @@ export interface ApplyReplyResult {
  * amendedTask (sanitized by validateCheckpointForRun) records one
  * owner-authorized revision of the accepted task: appended to
  * run.taskAmendments with the latest pointer in run.lastAmendedTask,
- * persisted atomically with this save. The launch task is never rewritten.
+ * persisted atomically with this save. The launch task is never rewritten. Text byte-identical to the current effective task is reuse, not a new revision: no entry is appended and the pointer is unchanged (reported via amendmentReused).
  * Already-applied replays return the run unchanged (no duplicate entry).
  */
 export function applyCheckpointReply(
@@ -1320,7 +1328,7 @@ export function applyCheckpointReply(
   }
   if (stored.status === "answered") {
     if (stored.answerCheckpointId === checkpoint.id) {
-      return { run, request: stored, attemptsExhausted: false };
+      return { run, request: stored, attemptsExhausted: false, amendmentReused: false };
     }
     throw Object.assign(new Error(`Input request ${request.id} already answered by ${stored.answerCheckpointId}; conflicting re-answer refused.`), { code: "input_request_closed" });
   }
@@ -1334,6 +1342,17 @@ export function applyCheckpointReply(
   ).length;
   const attemptsExhausted = dispatchedCount >= DELEGATION_BOUNDS.maxAttemptsPerRun;
   const stillOpen = settled.some((candidate) => candidate.status === "open");
+  // Reuse is not a new amendment: text byte-identical to the current
+  // effective task proceeds without appending (history count unchanged,
+  // pointer unchanged). The checkpoint record below still carries the text
+  // so same-id+same-content replays keep duplicate:true semantics. A text
+  // matching the ORIGINAL launch task while effective is a later revision
+  // is a genuine revert and appends normally.
+  const currentEffective = effectiveRunTask(run);
+  const amendmentReused = amendedTask !== undefined &&
+    currentEffective !== undefined &&
+    amendedTask === currentEffective;
+  const isNewRevision = amendedTask !== undefined && !amendmentReused;
   const next: DelegationRunRecord = {
     ...run,
     checkpoints: [...run.checkpoints, {
@@ -1349,14 +1368,14 @@ export function applyCheckpointReply(
     appliedCheckpointIds: [...run.appliedCheckpointIds, checkpoint.id],
     lastAppliedCheckpointSeq: Math.max(run.lastAppliedCheckpointSeq, checkpoint.seq),
     inputRequests: settled.slice(-DELEGATION_BOUNDS.maxInputRequestsPerRun),
-    ...(amendedTask ? {
+    ...(isNewRevision ? {
       taskAmendments: [...(run.taskAmendments ?? []), {
         seq: checkpoint.seq,
         checkpointId: checkpoint.id,
-        amendedTask,
+        amendedTask: amendedTask as string,
         storedAt: now
       }].slice(-DELEGATION_BOUNDS.maxCheckpointsPerRun),
-      lastAmendedTask: amendedTask
+      lastAmendedTask: amendedTask as string
     } : {}),
     nextAction: attemptsExhausted
       ? "answer stored at-most-once but no attempt budget remains; relaunch only with a NEW request id"
@@ -1364,7 +1383,7 @@ export function applyCheckpointReply(
         ? "answer applied at-most-once; other input requests remain open; answer via delegation_followup"
         : "answer applied at-most-once; continuation launching"
   };
-  return { run: next, request: answered, attemptsExhausted };
+  return { run: next, request: answered, attemptsExhausted, amendmentReused };
 }
 
 /** Mark one open request expired (owner/hygiene path; expired replies are refused). */

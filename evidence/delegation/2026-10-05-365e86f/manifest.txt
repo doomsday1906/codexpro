@@ -1,0 +1,72 @@
+Delegation leaf evidence manifest — 2026-10-05 — base 365e86f374e0d05a9801e120ef7975b5113c0038
+Leaf: follow-up effective-authority continuation + reuse-vs-revision (V1/V2 prompt-report agreement, no redundant append)
+Package codexpro@0.31.0. Build: Built codexpro@0.31.0; source commit 365e86f374e0d05a9801e120ef7975b5113c0038 (dirty)
+
+DEFECT (fixed): after V2 accepted, a later ordinary follow-up with NO amended_task built its prompt from run.task (V1) while read_result reported effective_task=V2; re-sending V2 text under a NEW checkpoint id appended a redundant second entry.
+FIX:
+  1. continuation base = effectiveRunTask() (lastAmendedTask ?? run.task): plain follow-ups dispatch the effective text so prompt and report agree; new (differing) text keeps the revised-authority branch with original retained, append + pointer advance.
+  2. supplied text byte-identical to effective = reuse: proceeds WITHOUT appending (count one, pointer unchanged, amendment_reused:true in ack, no task_revision); V1 text while effective is V2 = genuine revert revision (appends). Same-id+same-content keeps duplicate:true. Pending preserves incoming text for retry identity.
+  3. persistence untouched (save/load already persist taskAmendments/lastAmendedTask); regression proves it via fresh loadDelegationRun from disk (B7b).
+
+FILES CHANGED (sha256):
+  8e03a339eca362ec0c037dcd51e1eb50d97022c76c6e9dcbb89d1311688db4a8  src/delegationTools.ts  [source (effective-authority continuation base, reuse-vs-revision prompt branch, pending provenance, reuse ack)]
+  57bf66f389256c52ed0e3e8740206de7486bf2d213a9333ba35f899dc766df98  src/delegationStore.ts  [source (reuse-is-not-a-revision in applyCheckpointReply + amendmentReused, doc)]
+  38c06cb5ac467e30d15f8afbea4ad5cec40e67b69ff1642a3664dbdfd8012c35  package.json  [build input]
+  80cbc28a3aae9313aa17591c6530879e828f9d65f12b893e768f2ef78c464e8e  scripts/build.mjs  [build input]
+  ac352ab4d2416fee6bab255d15f966be66d8281b461f55751a360f4773799aa0  scripts/build-identity.mjs  [build input]
+  01707d63930e59130eb6169d3c0afe9283ad356b655220b2b0633f22b123f0f4  tsconfig.json  [build input]
+  e26986c19dee476e090a791acb71c1c2fb39276832b7ccccdeb04c9d9233729f  scripts/delegation-followup-amendment-smoke.mjs  [test (B7a-e effective-authority continuation + disk reload + retry + reuse, B8 revert; A1-A4/B0-B6 unchanged)]
+
+SERIAL PROOF COMMANDS (all exit 0, run serially after code freeze):
+  exit=0  npm run build
+    log=logs/01-build.log  sha256=6f2bc54730c368020857eeb24b52e17ebf0b4ef7921bff8426aa1ad999aab0d7
+  exit=0  node scripts/delegation-followup-amendment-smoke.mjs
+    log=logs/02-amendment.log  sha256=1daab2062df013a8ddcbdc95ff913b67fc17e5e8ccc8eed135b389cbb08a01bc
+  exit=0  node scripts/delegation-followup-smoke.mjs
+    log=logs/03-followup.log  sha256=ac3f8b0d6e84954b9d021fe59e93a9a1690e433791544e786bdfc3d43ff85857
+  exit=0  node scripts/delegation-triengine-smoke.mjs
+    log=logs/04-triengine.log  sha256=33fb5d19c75f9f96c41ff5833124ce392bd64990b71ce5d0245ace27d38d1917
+  exit=0  node scripts/delegation-repair-focus-smoke.mjs
+    log=logs/05-repair-focus.log  sha256=b9a5f5bb3b777ea3d3e1125d4f6f8daa1766ce69d96ccbb58adf23678440f68c
+  exit=0  node scripts/delegation-storage-smoke.mjs
+    log=logs/06-storage.log  sha256=e7b4277306086f137021a03fd31224b3348b87346b00c50c031bffa0f7903b70
+  exit=0  node scripts/delegation-routing-smoke.mjs
+    log=logs/07-routing.log  sha256=c173692d4ad483644de89315b1b4035c18bab9bc97cd2bb5c2322b695a317e26
+  exit=0  node scripts/delegation-canary-smoke.mjs
+    log=logs/08-canary.log  sha256=69f5422df721ab3eb812fa0234be6ce0ece7a5774fed0257831920fd43a844a2
+  exit=0  node scripts/delegation-codex-ownership-smoke.mjs
+    log=logs/09-ownership.log  sha256=186663fff51e1c395cfff6ee7a7832cb3de205b5d8128781ee9e3131de470bea
+  exit=0  node scripts/delegation-artifact-isolation-smoke.mjs
+    log=logs/10-isolation.log  sha256=0284883820766abdb679c324abdd1d4adef8accc9e88702bdeb6b97816280ba2
+  exit=0  node scripts/delegation-terminal-cleanup-smoke.mjs
+    log=logs/11-terminal-cleanup.log  sha256=096815ee8d952b3c7174704ceb81b7f790cfa80116e8556de856d4833ee22227
+  exit=0  node scripts/delegation-cancel-artifact-smoke.mjs
+    log=logs/12-cancel-artifact.log  sha256=e89bcf02f76a86886aaf7716e0fe5d229a2a786dd73fe5382039b5dea6419ea5
+  exit=0  node scripts/delegation-identity-standalone-output-smoke.mjs
+    log=logs/13-identity.log  sha256=4dfefbbf6ada9dc477f00b14f1e09102c4ae0d4f726fa74de882114ec24c043d
+  exit=0  node scripts/delegation-central-artifact-smoke.mjs
+    log=logs/14-central-artifact.log  sha256=dce6885e43a0fc6f09ae5ac83b41244dd096f3f543354d08fb0c39db42f8d813
+  exit=0  node scripts/delegation-steer-smoke.mjs
+    log=logs/15-steer.log  sha256=5990eeea70189fbca25a97b725bc59364f6d9349736ce278054b773ef346b5b8
+
+NEW CASES (scripts/delegation-followup-amendment-smoke.mjs):
+  B7a authorized V2 amendment (revision prompt + effective V2 + count one)
+  B7b fresh loadDelegationRun from disk shows the persisted V2 revision
+  B7c plain continuation dispatches V2 authority (prompt literal with V2 base, no revision claim; read V1 retained + count one + effective V2)
+  B7d identical plain retry idempotent (duplicate:true, no second worker, count one)
+  B7e V2-text resend under a new id is reuse (amendment_reused:true, no task_revision, V2 prompt literal, count still one)
+  B8 V1-text resend is a genuine revert (task_revision 2, revision-2 prompt, history [V2,V1], effective V1)
+  A1-A4/B0-B6 unchanged and green (B2 byte-identity + B3 idempotency preserved)
+
+FIXTURE STRAYS (preserved, never touched, never committed):
+  ce299a8defb9e1e8102a58dd1a8251ad2b7f954c9341e6fbce6beab36b90cca7  fixture-a.txt
+  13aafb27a71bb59b8c92d83248746711ddffe2d73fa2f3fbc5299851d0fac6ce  fixture-b.txt
+
+STALE-LEAF DISCLAIMER:
+  This leaf ran on base 365e86f with no prior reservation claim: no lane, current checkout only. The 0bdc6bc leaf is prior work on the amendment surface, NOT proof for this change; all other surfaces keep their prior proof (re-verified above by re-running the affected suites serially against this leaf’s code).
+
+REMAINING BLOCKERS / UNPROVEN:
+  - live model/Astra proof of effective-authority/reuse continuations: UNPROVEN here by design - hermetic labeled shims only in this leaf
+  - none blocking: all hermetic regressions pass; no frozen authoritative test was modified (amendment smoke extended only: B7/B8 added, nothing weakened)
+
+DELIVERY: uncommitted working tree (orchestrator integrates + runs live qualification separately); fixture strays preserved, never touched, never committed

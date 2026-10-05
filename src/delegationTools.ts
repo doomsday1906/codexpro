@@ -59,6 +59,7 @@ import {
   applyCheckpointReply,
   centralArtifactsDirForRun,
   clearPendingDispatch,
+  effectiveRunTask,
   findRunByRequestId,
   isDelegationGroupId,
   isEventUndelivered,
@@ -3537,12 +3538,25 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           // that prompt (labeled revision + retained original + revised guard);
           // launch identity (engine/profile/agent/model/effort/policy/session/
           // timeout/workdir/group) is never read from it and rides unchanged.
-          const acceptedAmendment = verdict.amendedTask ?? existingPending?.amendedTask;
+          // Continuation authority is the CURRENT effective task
+          // (lastAmendedTask ?? run.task): a plain follow-up with no new
+          // amendment dispatches the effective text (V2 after an accepted
+          // revision) so the prompt and read_result effective_task agree.
+          // A supplied text byte-identical to effective is reuse, not a new
+          // revision: it rides the plain effective prompt (no new revision
+          // label) and appends nothing. A text differing from effective is
+          // a genuine revision (including a revert to the V1 wording): the
+          // revised-authority branch with the original retained for review.
+          const currentEffectiveTask = effectiveRunTask(run) ?? run.task;
+          const incomingAmendment = verdict.amendedTask ?? existingPending?.amendedTask;
+          const acceptedAmendment = incomingAmendment !== undefined && incomingAmendment !== currentEffectiveTask
+            ? incomingAmendment
+            : undefined;
           const amendmentRevisionSeq = (run.taskAmendments?.length ?? 0) + 1;
           const followupPrompt = existingPending && existingPending.prompt
             ? existingPending.prompt
             : buildFollowupPrompt({
-              baseTask: run.task,
+              baseTask: acceptedAmendment ? run.task : currentEffectiveTask,
               isCanary: runIsCanary,
               requestId: request.id,
               questions: request.questions,
@@ -3569,7 +3583,12 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               timeoutMs: existingPending?.timeoutMs ?? timeoutMs,
               prompt: followupPrompt,
               sessionEvidence: existingPending?.sessionEvidence ?? sessionEvidence,
-              ...(acceptedAmendment ? { amendedTask: acceptedAmendment } : {})
+              // The staged pending preserves the INCOMING text (even when it
+              // is reuse): pending identity must match an identical retry
+              // byte-for-byte, or the retry reads as duplicate_conflicting.
+              // Only the prompt branch and the history append distinguish
+              // reuse from a new revision.
+              ...(incomingAmendment ? { amendedTask: incomingAmendment } : {})
             });
           }
           // Re-resolve effective values from the staged pending (retry reuses).
@@ -3831,8 +3850,14 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           const revisionAck = appliedRevision && appliedRevision.checkpointId === checkpoint.id
             ? ` Owner-authorized revision ${run.taskAmendments?.length} of the accepted task recorded (checkpoint ${checkpoint.id}); the continuation prompt carries it as revised authority with the original task retained for review.`
             : "";
+          // Reuse (supplied text identical to the effective task) appends no
+          // history entry: the ack says so explicitly instead of carrying a
+          // task_revision.
+          const reuseAck = applied.amendmentReused
+            ? " Supplied task text matches the current effective task; recorded no new revision (reuse)."
+            : "";
           return okResult(
-            `Answer ${checkpoint.id} for request ${request.id} applied at-most-once; continuation attempt ${staged.attemptN} ${alreadyDispatched ? "confirmed (staged worker was already alive, no second spawn)" : "launched"} (${staged.continuation}: ${spawnNote}).${approvalNote}${revisionAck}`,
+            `Answer ${checkpoint.id} for request ${request.id} applied at-most-once; continuation attempt ${staged.attemptN} ${alreadyDispatched ? "confirmed (staged worker was already alive, no second spawn)" : "launched"} (${staged.continuation}: ${spawnNote}).${approvalNote}${revisionAck}${reuseAck}`,
             {
               run_id: run.runId,
               checkpoint_id: checkpoint.id,
@@ -3847,6 +3872,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                 task_revision: run.taskAmendments?.length ?? null,
                 amended_task: appliedRevision.amendedTask
               } : {}),
+              ...(applied.amendmentReused ? { amendment_reused: true } : {}),
               timeout_ms: staged.timeoutMs,
               state: "running",
               engine_qualification: engineQualification(run.engine),

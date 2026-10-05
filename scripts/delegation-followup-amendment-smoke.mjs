@@ -10,12 +10,15 @@
 //
 // A1-A4 pure unit (no MCP): legacy prompt byte-identity, revised prompt
 // shape/guard, typed amendment validation, record/idempotency.
-// B0-B6 adapter-level hermetic (labeled shims only, no live model calls):
+// B0-B8 adapter-level hermetic (labeled shims only, no live model calls):
 // installed CLI parity (version only), amendment accepted -> recorded +
 // revised prompt with original retained, same-id replay idempotent,
 // conflicting content refused, oversize/empty/question-path/canary refusals,
 // no-amendment control byte-identical with no record, launch-identity argv
-// unchanged, read_result shows original + history.
+// unchanged, read_result shows original + history, post-amendment plain
+// continuation dispatches the effective authority without re-appending,
+// V2-text resend is reuse (no new entry), V1-text resend is a genuine
+// revert revision.
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
@@ -435,6 +438,217 @@ console.log('ok: B2 no-amendment control (byte-identical prompt, no record, iden
   const read = await call('delegation_read_result', { workspace_id: wid, run_id: canaryId });
   assert(read.structuredContent.open_input_requests === 1, 'canary request must stay open after refusal');
   console.log('ok: B6 canary amendment refused (real tasks only, nothing consumed)');
+}
+
+// B7: post-amendment plain continuation dispatches the CURRENT effective
+// authority (V2), never the stale launch text; identical retry is
+// idempotent; re-sending the V2 text under a NEW checkpoint id is reuse
+// (proceeds with V2 authority, count stays one, pointer unchanged).
+{
+  const launched7 = await call('delegation_launch', {
+    workspace_id: wid, engine: 'claude', agent: 'implementer',
+    workdir: 'amend-7', task: ORIGINAL,
+    delegation_group: 'team-amend', request_id: 'req-amend-7', timeout_ms: 60000
+  });
+  assert(!launched7.isError, 'B7 launch failed');
+  const runId7 = launched7.structuredContent.run_id;
+  assert((await waitSettled(runId7)).structuredContent.state === 'completed', 'B7 run must complete');
+  // B7a: authorized V2 amendment (prompt carries revision, count one).
+  const q1 = await call('delegation_followup', { workspace_id: wid, run_id: runId7, checkpoint: { id: 'b7q1', run_id: runId7, seq: 0, payload: {}, questions: [{ id: 'qq', question: 'Proceed?' }] } });
+  assert(!q1.isError && q1.structuredContent.state === 'needs-input', 'B7 question 1 must reach needs-input');
+  const argvBeforeA = claudeArgvLines().length;
+  const a1 = await call('delegation_followup', {
+    workspace_id: wid, run_id: runId7,
+    checkpoint: { id: 'b7a1', run_id: runId7, seq: 1, payload: { answer: 'yes' }, input_request_id: 'b7q1', amended_task: REVISED }
+  });
+  assert(!a1.isError && a1.structuredContent.executed === true
+    && a1.structuredContent.task_revision === 1 && a1.structuredContent.amended_task === REVISED,
+    `B7 amendment must dispatch with revision 1: ${JSON.stringify(a1.structuredContent)}`);
+  assert((await waitSettled(runId7)).structuredContent.state === 'completed', 'B7 amended continuation must complete');
+  assert(claudeArgvLines().length === argvBeforeA + 1, 'B7 amendment must spawn exactly one continuation worker');
+  {
+    const prompt = String(continuationArgv().at(-1));
+    assert(prompt.includes(`Owner-authorized revision 1 of the accepted task (checkpoint b7a1): ${REVISED}`),
+      'B7 amended prompt must carry the revised authority');
+    const read = await call('delegation_read_result', { workspace_id: wid, run_id: runId7 });
+    assert(read.structuredContent.effective_task === REVISED
+      && read.structuredContent.task_amendments?.length === 1
+      && read.structuredContent.task === ORIGINAL,
+      'B7 read must show effective V2, one history entry, V1 retained');
+  }
+  console.log('ok: B7a authorized V2 amendment (revision prompt + effective V2 + count one)');
+  // B7b: fresh loadDelegationRun from disk proves the revision persisted
+  // (save/reload unchanged; the continuation below reads V2 from disk).
+  {
+    const stack = [delegHome];
+    let runFile = undefined;
+    while (stack.length > 0) {
+      const dir = stack.pop();
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) stack.push(full);
+        else if (entry.isFile() && entry.name === `${runId7}.json`) runFile = full;
+      }
+    }
+    assert(runFile !== undefined, 'B7 run file must exist on disk');
+    const bridgeDir7 = path.dirname(path.dirname(runFile));
+    const reloaded = Store.loadDelegationRun(bridgeDir7, runId7);
+    assert(reloaded !== undefined
+      && reloaded.task === ORIGINAL
+      && reloaded.taskAmendments?.length === 1
+      && reloaded.taskAmendments[0].checkpointId === 'b7a1'
+      && reloaded.taskAmendments[0].amendedTask === REVISED
+      && reloaded.lastAmendedTask === REVISED
+      && Store.effectiveRunTask(reloaded) === REVISED,
+      `B7 disk reload must show the persisted revision: ${JSON.stringify(reloaded?.taskAmendments)}`);
+  }
+  console.log('ok: B7b fresh disk reload shows the persisted V2 revision');
+  // B7c: ordinary follow-up with NO amended_task dispatches V2 authority
+  // (prompt and effective_task agree), count stays one, V1 in history.
+  const q2 = await call('delegation_followup', { workspace_id: wid, run_id: runId7, checkpoint: { id: 'b7q2', run_id: runId7, seq: 2, payload: {}, questions: [{ id: 'qq', question: 'Proceed?' }] } });
+  assert(!q2.isError && q2.structuredContent.state === 'needs-input', 'B7 question 2 must reach needs-input');
+  const argvBeforeB = claudeArgvLines().length;
+  const b1 = await call('delegation_followup', {
+    workspace_id: wid, run_id: runId7,
+    checkpoint: { id: 'b7b1', run_id: runId7, seq: 3, payload: { answer: 'plain-yes' }, input_request_id: 'b7q2' }
+  });
+  assert(!b1.isError && b1.structuredContent.executed === true
+    && b1.structuredContent.task_revision === undefined && b1.structuredContent.amendment_reused === undefined,
+    `B7 plain answer must dispatch with no revision ack: ${JSON.stringify(b1.structuredContent)}`);
+  assert((await waitSettled(runId7)).structuredContent.state === 'completed', 'B7 plain continuation must complete');
+  assert(claudeArgvLines().length === argvBeforeB + 1, 'B7 plain answer must spawn exactly one continuation worker');
+  {
+    const prompt = String(continuationArgv().at(-1));
+    const legacyV2 = `Follow-up continuation (attempt 3) for input request b7q2. `
+      + `Original task: ${REVISED} `
+      + `Answered questions: [qq] Proceed? `
+      + `Answers (checkpoint payload JSON): {"answer":"plain-yes"} `
+      + `Stay within the original task's scope: create, modify, or delete no file unless the original task explicitly authorized it.`;
+    assert(prompt === legacyV2, `B7 plain prompt must carry V2 as its task authority, got ${JSON.stringify(prompt)}`);
+    assert(!prompt.includes('Owner-authorized revision'),
+      'B7 plain prompt must claim no new revision');
+    const read = await call('delegation_read_result', { workspace_id: wid, run_id: runId7 });
+    assert(!read.isError && read.structuredContent.task === ORIGINAL
+      && read.structuredContent.task_amendments?.length === 1
+      && read.structuredContent.task_amendments[0].amended_task === REVISED
+      && read.structuredContent.effective_task === REVISED,
+      `B7 read must show V1 retained + one entry + effective V2: ${JSON.stringify(read.structuredContent.task_amendments)}`);
+  }
+  console.log('ok: B7c plain continuation dispatches V2 authority (prompt agrees with effective_task, count one)');
+  // B7d: identical retry of the plain checkpoint is idempotent.
+  {
+    const before = claudeArgvLines().length;
+    const replay = await call('delegation_followup', {
+      workspace_id: wid, run_id: runId7,
+      checkpoint: { id: 'b7b1', run_id: runId7, seq: 3, payload: { answer: 'plain-yes' }, input_request_id: 'b7q2' }
+    });
+    assert(!replay.isError && replay.structuredContent.duplicate === true && replay.structuredContent.executed === false,
+      `B7 plain replay must be idempotent, got ${JSON.stringify(replay.structuredContent)}`);
+    assert(claudeArgvLines().length === before, 'B7 plain replay must spawn no second worker');
+    const read = await call('delegation_read_result', { workspace_id: wid, run_id: runId7 });
+    assert(read.structuredContent.task_amendments?.length === 1 && read.structuredContent.effective_task === REVISED,
+      'B7 plain replay must leave history and pointer untouched');
+  }
+  console.log('ok: B7d identical plain retry idempotent (duplicate:true, no second worker, count one)');
+}
+
+// B7e: re-sending the V2 text under a NEW checkpoint id is reuse, not a
+// new amendment (proceeds with V2 authority, count stays one). A fresh
+// run: the dispatched-attempt budget is 3 (launch + amendment + resend).
+{
+  const launchedR = await call('delegation_launch', {
+    workspace_id: wid, engine: 'claude', agent: 'implementer',
+    workdir: 'amend-7r', task: ORIGINAL,
+    delegation_group: 'team-amend', request_id: 'req-amend-7r', timeout_ms: 60000
+  });
+  assert(!launchedR.isError, 'B7e launch failed');
+  const runIdR = launchedR.structuredContent.run_id;
+  assert((await waitSettled(runIdR)).structuredContent.state === 'completed', 'B7e run must complete');
+  const rq1 = await call('delegation_followup', { workspace_id: wid, run_id: runIdR, checkpoint: { id: 'b7rq1', run_id: runIdR, seq: 0, payload: {}, questions: [{ id: 'qq', question: 'Proceed?' }] } });
+  assert(!rq1.isError && rq1.structuredContent.state === 'needs-input', 'B7e question 1 must reach needs-input');
+  const ra1 = await call('delegation_followup', {
+    workspace_id: wid, run_id: runIdR,
+    checkpoint: { id: 'b7ra1', run_id: runIdR, seq: 1, payload: { answer: 'yes' }, input_request_id: 'b7rq1', amended_task: REVISED }
+  });
+  assert(!ra1.isError && ra1.structuredContent.task_revision === 1, 'B7e amendment must record revision 1');
+  assert((await waitSettled(runIdR)).structuredContent.state === 'completed', 'B7e amended continuation must complete');
+  const rq2 = await call('delegation_followup', { workspace_id: wid, run_id: runIdR, checkpoint: { id: 'b7rq2', run_id: runIdR, seq: 2, payload: {}, questions: [{ id: 'qq', question: 'Proceed?' }] } });
+  assert(!rq2.isError && rq2.structuredContent.state === 'needs-input', 'B7e question 2 must reach needs-input');
+  const argvBeforeC = claudeArgvLines().length;
+  const c1 = await call('delegation_followup', {
+    workspace_id: wid, run_id: runIdR,
+    checkpoint: { id: 'b7rc1', run_id: runIdR, seq: 3, payload: { answer: 'again' }, input_request_id: 'b7rq2', amended_task: REVISED }
+  });
+  assert(!c1.isError && c1.structuredContent.executed === true
+    && c1.structuredContent.amendment_reused === true && c1.structuredContent.task_revision === undefined,
+    `B7 V2 resend must proceed as reuse: ${JSON.stringify(c1.structuredContent)}`);
+  assert((await waitSettled(runIdR)).structuredContent.state === 'completed', 'B7 reuse continuation must complete');
+  assert(claudeArgvLines().length === argvBeforeC + 1, 'B7 reuse must spawn exactly one continuation worker');
+  {
+    const prompt = String(continuationArgv().at(-1));
+    const legacyV2 = `Follow-up continuation (attempt 3) for input request b7rq2. `
+      + `Original task: ${REVISED} `
+      + `Answered questions: [qq] Proceed? `
+      + `Answers (checkpoint payload JSON): {"answer":"again"} `
+      + `Stay within the original task's scope: create, modify, or delete no file unless the original task explicitly authorized it.`;
+    assert(prompt === legacyV2, `B7 reuse prompt must carry V2 authority with no new revision, got ${JSON.stringify(prompt)}`);
+    const read = await call('delegation_read_result', { workspace_id: wid, run_id: runIdR });
+    assert(!read.isError && read.structuredContent.task === ORIGINAL
+      && read.structuredContent.task_amendments?.length === 1
+      && read.structuredContent.effective_task === REVISED,
+      'B7 reuse must append nothing (count one) and leave the pointer on V2');
+  }
+  console.log('ok: B7e V2-text resend under a new id is reuse (V2 authority, count still one)');
+}
+
+// B8: V1 text while effective is V2 is a genuine revert revision (appends,
+// pointer returns to V1, revised prompt with the V1 text as authority).
+// Fresh run (launch + amendment + revert = 3 dispatched attempts).
+{
+  const launched8 = await call('delegation_launch', {
+    workspace_id: wid, engine: 'claude', agent: 'implementer',
+    workdir: 'amend-8', task: ORIGINAL,
+    delegation_group: 'team-amend', request_id: 'req-amend-8', timeout_ms: 60000
+  });
+  assert(!launched8.isError, 'B8 launch failed');
+  const runId8 = launched8.structuredContent.run_id;
+  assert((await waitSettled(runId8)).structuredContent.state === 'completed', 'B8 run must complete');
+  const q1 = await call('delegation_followup', { workspace_id: wid, run_id: runId8, checkpoint: { id: 'b8q1', run_id: runId8, seq: 0, payload: {}, questions: [{ id: 'qq', question: 'Proceed?' }] } });
+  assert(!q1.isError && q1.structuredContent.state === 'needs-input', 'B8 question 1 must reach needs-input');
+  const v2 = await call('delegation_followup', {
+    workspace_id: wid, run_id: runId8,
+    checkpoint: { id: 'b8a1', run_id: runId8, seq: 1, payload: { answer: 'yes' }, input_request_id: 'b8q1', amended_task: REVISED }
+  });
+  assert(!v2.isError && v2.structuredContent.task_revision === 1, 'B8 amendment must record revision 1');
+  assert((await waitSettled(runId8)).structuredContent.state === 'completed', 'B8 amended continuation must complete');
+  const q = await call('delegation_followup', { workspace_id: wid, run_id: runId8, checkpoint: { id: 'b8q2', run_id: runId8, seq: 2, payload: {}, questions: [{ id: 'qq', question: 'Revert?' }] } });
+  assert(!q.isError && q.structuredContent.state === 'needs-input', 'B8 question 2 must reach needs-input');
+  const argvBefore = claudeArgvLines().length;
+  const d = await call('delegation_followup', {
+    workspace_id: wid, run_id: runId8,
+    checkpoint: { id: 'b8d1', run_id: runId8, seq: 3, payload: { answer: 'revert' }, input_request_id: 'b8q2', amended_task: ORIGINAL }
+  });
+  assert(!d.isError && d.structuredContent.executed === true
+    && d.structuredContent.task_revision === 2 && d.structuredContent.amended_task === ORIGINAL
+    && d.structuredContent.amendment_reused === undefined,
+    `B8 V1-text resend must append as revision 2: ${JSON.stringify(d.structuredContent)}`);
+  assert((await waitSettled(runId8)).structuredContent.state === 'completed', 'B8 revert continuation must complete');
+  assert(claudeArgvLines().length === argvBefore + 1, 'B8 revert must spawn exactly one continuation worker');
+  {
+    const prompt = String(continuationArgv().at(-1));
+    assert(prompt.includes(`Owner-authorized revision 2 of the accepted task (checkpoint b8d1): ${ORIGINAL}`),
+      'B8 prompt must carry the V1 text as revision-2 authority');
+    assert(prompt.includes('Stay within the revised task\'s scope:'),
+      'B8 scope guard must reference the revised text');
+    const read = await call('delegation_read_result', { workspace_id: wid, run_id: runId8 });
+    assert(!read.isError && read.structuredContent.task === ORIGINAL
+      && read.structuredContent.task_amendments?.length === 2
+      && read.structuredContent.task_amendments[0].amended_task === REVISED
+      && read.structuredContent.task_amendments[1].amended_task === ORIGINAL
+      && read.structuredContent.effective_task === ORIGINAL,
+      'B8 read must show two entries with the pointer reverted to V1');
+  }
+  console.log('ok: B8 V1-text resend is a genuine revert (revision 2, pointer back on V1)');
 }
 
 await client.close();
