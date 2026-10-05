@@ -44,13 +44,22 @@ and permissions are never silently substituted.
   `--settings` entirely. The choice is stored on the run and preserved
   across follow-ups; no global `~/.claude` change is ever made.
 - **Astra** is never used, never spent, never a fallback, on any engine.
-- **Live steering is deferred for this release** on all engines (codex,
+- **Live steering + steerable launches/previews are deferred for this release** on all engines (codex,
   opencode, claude): `delegation_steer` refuses with `steer_deferred`
   (`Live steering is deferred for this release; use delegation_followup
   for amended/ordinary follow-ups or delegation_cancel + relaunch;
-  follow-up and cancel/relaunch are not live steering.`). The steering
-  implementation remains in Git history; ordinary release use never
-  dispatches steering and creates no steering record.
+  follow-up and cancel/relaunch are not live steering.`).
+  `delegation_launch` / `delegation_preview` with `steerable=true` refuse
+  pre-state with `steer_deferred` (nothing created, nothing spawned —
+  before idempotency lookup, mkdir, run save, per-run server spawn, and
+  preview argv; the shared gate stays pure with no mkdir/run/spawn).
+  Omit `steerable` for normal execution (codex `--ephemeral`, opencode
+  `--standalone`, no server helpers, no `OPENCODE_PASSWORD`); use
+  `delegation_followup` or `delegation_cancel` + relaunch with steerable
+  omitted (standalone/ephemeral) — follow-up and cancel/relaunch are not
+  live steering. The steering implementation remains in Git history;
+  ordinary release use never dispatches steering and creates no steering
+  record.
 - **Per-run reasoning/variant overrides are unavailable**: there is no
   generic reasoning param; protected Codex `-c` keys that would set
   model/effort/sandbox/approval refuse loudly with

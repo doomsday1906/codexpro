@@ -949,17 +949,24 @@ type GateOutcome =
 /**
  * Shared launch gate for delegation_launch AND delegation_preview (dry-run).
  * Pure apart from definition-file reads and the timeout clamp: no workdir
- * creation, no run record, no spawn. Per-engine rules:
+ * creation, no run record, no spawn. Steerable launches/previews refuse
+ * fail-closed here (steer_deferred, nothing created/nothing spawned) BEFORE
+ * engine-specific planning, idempotency lookup, mkdir, run save, per-run
+ * server spawn, and preview argv. Per-engine rules:
  * - codex: legacy canary keeps the Luna read-only gate; real tasks verify
  *   the SELECTED profile (exists, non-Astra, resolvable sandbox) with an
  *   explicit-or-profile execution policy. `model` is an explicit -m override
- *   only; `config_overrides` are explicit -c entries only.
+ *   only; `config_overrides` are explicit -c entries only. Omitted/false
+ *   steerable stays --ephemeral.
  * - opencode: legacy canary keeps the host-model equality gate (agent
  *   optional, preserved for back-compat); real tasks require the SELECTED
  *   agent by real name plus an explicit model. No Codex flag translation.
+ *   Omitted/false steerable stays --standalone (no server helpers, no
+ *   OPENCODE_PASSWORD).
  * - claude: real tasks only (the legacy read-only canary slice is
  *   codex/opencode); the agent must exist by real name; --model/--effort/
  *   --permission-mode/--allowedTools ride ONLY when explicitly passed.
+ *   Steerable stays hard-false.
  * Refusals never substitute another engine, model, or permission.
  */
 function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
@@ -1030,25 +1037,18 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
     engine, isCanary, delegationGroup, taskText, prompt,
     timeoutMs, timeoutClamped
   };
-  // Steerable launches are real-task only: the read-only canary slice takes
-  // no injected messages. Codex uses the non-ephemeral thread route;
-  // opencode uses the per-run server route (worker CLI against an
-  // adapter-owned disposable server). Claude exposes no steer verb in the
-  // qualified CLI, so explicit steerable there refuses (never silently
-  // ignored, never substituted).
+  // Steerable launches/previews are DEFERRED for this release on ALL
+  // engines (codex, opencode, claude), real tasks and canary alike.
+  // Fail-closed BEFORE engine-specific planning and before any state
+  // creation or spawning (idempotency lookup, mkdir, run save,
+  // per-run server spawn, preview argv). Strict ===true; omitted/false
+  // stays standalone/ephemeral. The gate stays pure (no mkdir/run/spawn).
   const steerableRequested = args.steerable === true;
-  if (steerableRequested && engine !== "codex" && engine !== "opencode") {
+  if (steerableRequested) {
     return {
       ok: false,
-      text: `steerable=true is codex/opencode-only (claude exposes no steer verb in the qualified CLI); refusing rather than silently ignoring it.`,
-      structured: { error: "steerable_unsupported_for_engine", engine }
-    };
-  }
-  if (steerableRequested && isCanary) {
-    return {
-      ok: false,
-      text: "steerable=true is refused for the legacy canary slice (read-only; no injected messages). Supply a real task.",
-      structured: { error: "steerable_refused_for_canary" }
+      text: "Steerable launches/previews are deferred for this release; nothing created, nothing spawned. Relaunch with steerable omitted (codex --ephemeral, opencode --standalone) or use delegation_followup / delegation_cancel + relaunch with steerable omitted (standalone/ephemeral); follow-up and cancel/relaunch are not live steering.",
+      structured: { error: "steer_deferred", engine, stored: false, executed: false }
     };
   }
   // Scoped gitkraken-hooks bypass: explicit per-run opt-in, default OFF,
@@ -2661,7 +2661,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     request_id: z.string().min(1).max(128).optional().describe("Idempotency key. Repeating it returns the existing run without spawning a second worker."),
     canary: z.boolean().optional().describe("Must be true when no task is supplied (legacy read-only canary slice, codex/opencode only). Ignored when task is present."),
     timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms. Canary clamps to 5 minutes; real tasks clamp to 30 minutes; 10s minimum. The clamped value is truthfully acked."),
-    steerable: z.boolean().optional().describe("Real tasks only: codex launches without --ephemeral so the session persists; opencode launches server-backed (worker CLI against a per-run adapter-owned disposable server). Profile/execution-policy/model/agent boundaries unchanged; refused for canary and non-codex/opencode engines. Note: live steering via delegation_steer is deferred for this release (steer_deferred); use delegation_followup for amended/ordinary follow-ups or delegation_cancel + relaunch — follow-up and cancel/relaunch are not live steering.")
+    steerable: z.boolean().optional().describe("DEFERRED FOR THIS RELEASE: steerable=true launches are refused pre-state (steer_deferred, nothing created, nothing spawned). Omit steerable for normal execution (codex --ephemeral, opencode --standalone, no server helpers, no OPENCODE_PASSWORD); use delegation_followup or delegation_cancel + relaunch with steerable omitted (standalone/ephemeral) — follow-up and cancel/relaunch are not live steering.")
   }).strict();
 
   const previewArgs = z.object({
@@ -2684,7 +2684,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     workdir: z.string().min(1).max(1024).describe("Explicit workspace-relative working directory that would host the run."),
     canary: z.boolean().optional().describe("Must be true when no task is supplied (legacy read-only canary slice, codex/opencode only)."),
     timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms (clamped + truthfully acked like launch)."),
-    steerable: z.boolean().optional().describe("Real tasks only: preview the codex non-ephemeral session-persisting argv or the opencode server-backed argv (same profile/execution-policy/model/agent boundaries). Refused for canary and non-codex/opencode engines. Note: live steering via delegation_steer is deferred for this release (steer_deferred).")
+    steerable: z.boolean().optional().describe("DEFERRED FOR THIS RELEASE: steerable=true previews are refused pre-state (steer_deferred, nothing created). Omit steerable for normal standalone/ephemeral preview; use delegation_followup or delegation_cancel + relaunch with steerable omitted (standalone/ephemeral) — follow-up and cancel/relaunch are not live steering.")
   }).strict();
 
   const listArgs = z.object({
@@ -2756,16 +2756,18 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "delegation_launch",
       options: {
         title: "Delegation Launch",
-        description: "Launch one durable delegation run (Codex via exec --profile with Luna gate for the legacy canary / selected-profile gate + per-run execution policy for real tasks; OpenCode via run --model/--agent with host-model gate for the legacy canary / selected-agent + explicit model for real tasks, --standalone by default or --server against a per-run adapter-owned disposable server with explicit steerable=true; Claude via -p --output-format json --agent with explicit-flag-only overrides for real tasks only, plus an explicit per-run opt-in disable_gitkraken_hooks (default OFF): when true, every claude argv for the run carries per-invocation --settings '{\"enabledPlugins\":{\"gitkraken-hooks@gitkraken\":false}}' disabling the hanging gitkraken-hooks hook (inert when absent, zero files, never task content); default OFF omits --settings entirely, stored on the run and preserved across follow-ups). Real bounded task + validated delegation_group (default hestia-cli-canary), or the legacy canary slice (fixtures, canary=true; codex/opencode only). Requires an explicit workdir plus profile (codex), model (+ agent for real tasks, opencode), or agent (claude); idempotent request ids never spawn a second worker. Prefer delegation_preview (dry-run) before dispatch. Subscribe to events before launching or replay via delegation_read_result so fast completion never loses the result.",
+        description: "Launch one durable delegation run (Codex via exec --profile with Luna gate for the legacy canary / selected-profile gate + per-run execution policy for real tasks; OpenCode via run --model/--agent with host-model gate for the legacy canary / selected-agent + explicit model for real tasks, --standalone by default (the per-run --server disposable-server route with explicit steerable=true is deferred for this release: steerable=true launches/previews are refused pre-state with steer_deferred, nothing created/nothing spawned); Claude via -p --output-format json --agent with explicit-flag-only overrides for real tasks only, plus an explicit per-run opt-in disable_gitkraken_hooks (default OFF): when true, every claude argv for the run carries per-invocation --settings '{\"enabledPlugins\":{\"gitkraken-hooks@gitkraken\":false}}' disabling the hanging gitkraken-hooks hook (inert when absent, zero files, never task content); default OFF omits --settings entirely, stored on the run and preserved across follow-ups). Real bounded task + validated delegation_group (default hestia-cli-canary), or the legacy canary slice (fixtures, canary=true; codex/opencode only). Requires an explicit workdir plus profile (codex), model (+ agent for real tasks, opencode), or agent (claude); idempotent request ids never spawn a second worker. Prefer delegation_preview (dry-run) before dispatch. Subscribe to events before launching or replay via delegation_read_result so fast completion never loses the result.",
         inputSchema: publicSchemaFrom(launchArgs),
         runtimeInputSchema: launchArgs,
         annotations: DESTRUCTIVE
       },
       handler: async (args) => {
-        const workspace = deps.workspaces.getWorkspace(args.workspace_id);
-        const bridgeDir = bridgeDirFor(deps.config, workspace.root);
+        // Fail-closed steerable gate BEFORE any state lookup/creation or
+        // spawning (shared gate owns the refusal; pure, no mkdir/run/spawn).
         const gated = gateLaunchRequest(args as Record<string, unknown>);
         if (!gated.ok) return failResult(gated.text, gated.structured);
+        const workspace = deps.workspaces.getWorkspace(args.workspace_id);
+        const bridgeDir = bridgeDirFor(deps.config, workspace.root);
         const plan = gated.plan;
         const engine = plan.engine;
         const delegationGroup = plan.delegationGroup;
@@ -3164,6 +3166,10 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         annotations: READ_ONLY
       },
       handler: async (args) => {
+        // Fail-closed steerable gate BEFORE resolve/preview build (shared
+        // gate owns the refusal; pure, no dirs, no argv build, no probe).
+        const gated = gateLaunchRequest(args as Record<string, unknown>);
+        if (!gated.ok) return failResult(gated.text, gated.structured);
         const workspace = deps.workspaces.getWorkspace(args.workspace_id);
         let resolved: { absPath: string; relPath: string };
         try {
@@ -3172,8 +3178,6 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         } catch (error) {
           return failResult(`Workdir rejected: ${error instanceof Error ? error.message : String(error)}`, { error: "workdir_rejected" });
         }
-        const gated = gateLaunchRequest(args as Record<string, unknown>);
-        if (!gated.ok) return failResult(gated.text, gated.structured);
         const plan = gated.plan;
         // Preview display template only (dry-run, never persisted, never
         // spawned): the real artifact name binds (run_id, attempt) at
