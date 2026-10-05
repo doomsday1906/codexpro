@@ -386,12 +386,41 @@ export function parseOpenCodeSessionId(stdoutText: string): string | null {
 }
 
 /**
- * Defensive thread-id extraction from Codex worker stdout. The exact shape
- * is best-effort (several key spellings and common nests are attempted,
- * including JSONL event lines when the steerable variant runs with structured
- * output); a null id never blocks completion, it only means steering stays
- * unavailable for that run. A null id is never synthesized.
+ * Trusted thread-id extraction from Codex worker stdout (steerable launches
+ * only, which run with `exec --json` structured JSONL events).
+ *
+ * Strict by construction:
+ * - the JSON document (whole stdout or one JSONL line) must carry a string
+ *   `type` matching the startup/control grammar below; documents without a
+ *   valid startup type are ignored (no event-type check = no identity).
+ * - the thread id is accepted ONLY from thread/session-scoped keys in that
+ *   same valid-typed document (threadId/thread_id/sessionId/session_id/
+ *   sessionUuid, or a thread/session nest id/uuid/name). Generic `id` at top
+ *   level and data/result/payload nests without a valid type never qualify.
+ * - plain-text `thread: <id>` lines are NEVER accepted (unstructured text
+ *   cannot bind identity; lookalikes/foreign ids would otherwise qualify).
+ * - conflicting distinct ids across valid documents resolve to null
+ *   (unknown when unverifiable, never first-wins synthesis).
+ *
+ * Provisional startup-type grammar (UNPROVEN live: `codex exec --help`
+ * documents `--json` as "Print events to stdout as JSONL" with no event-type
+ * catalog, and no live model call is performed to enumerate them; the shim
+ * emits `thread.started`, labeled): the type must match
+ * /^(thread|session|codex[._-]thread|codex[._-]session)[._-](started|created|resumed|initialized)$/i.
+ * Documents with any other type (message/error/steering/queue types, missing
+ * type, non-string type) are ignored. A null return never blocks completion;
+ * it only leaves steering unavailable for that run (never synthesized).
+ * Callers bind the returned id to the exact launched pid/run (live handle +
+ * attempt) and retain the first verified id across reconnects (conflicting
+ * later ids never overwrite).
  */
+export const CODEX_THREAD_STARTUP_TYPE_PATTERN =
+  /^(thread|session|codex[._-]thread|codex[._-]session)[._-](started|created|resumed|initialized)$/i;
+
+export function isCodexThreadStartupType(value: unknown): boolean {
+  return typeof value === "string" && CODEX_THREAD_STARTUP_TYPE_PATTERN.test(value.trim());
+}
+
 export function parseCodexThreadId(stdoutText: string): string | null {
   const text = String(stdoutText ?? "");
   const documents: unknown[] = [];
@@ -406,49 +435,34 @@ export function parseCodexThreadId(stdoutText: string): string | null {
       } catch { /* skip non-JSON lines */ }
     }
   }
-  const keys = ["threadId", "thread_id", "sessionId", "session_id", "sessionUuid"];
-  const idKeys = ["id", "uuid", "name"];
   const grammar = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
-  const search = (value: unknown, depth: number): string | null => {
-    if (depth > 3 || !value || typeof value !== "object") return null;
-    if (Array.isArray(value)) {
-      for (const entry of value) {
-        const hit = search(entry, depth + 1);
-        if (hit) return hit;
-      }
-      return null;
+  const idKeys = ["id", "uuid", "name"];
+  const found = new Set<string>();
+  for (const document of documents) {
+    if (!document || typeof document !== "object" || Array.isArray(document)) continue;
+    const record = document as Record<string, unknown>;
+    if (!isCodexThreadStartupType(record.type)) continue;
+    const candidates: unknown[] = [];
+    for (const key of ["threadId", "thread_id", "sessionId", "session_id", "sessionUuid"]) {
+      candidates.push(record[key]);
     }
-    const record = value as Record<string, unknown>;
-    for (const key of keys) {
-      const candidate = record[key];
-      if (typeof candidate === "string" && grammar.test(candidate.trim())) return candidate.trim();
-    }
-    // A thread/session nest may carry the id under a generic key
-    // ({thread: {id: ...}}): accept it only inside the nest, never bare.
     for (const nestKey of ["thread", "session"]) {
       const nest = record[nestKey];
-      if (typeof nest === "string" && grammar.test(nest.trim())) return nest.trim();
-      if (nest && typeof nest === "object" && !Array.isArray(nest)) {
+      if (typeof nest === "string") candidates.push(nest);
+      else if (nest && typeof nest === "object" && !Array.isArray(nest)) {
         const nestRecord = nest as Record<string, unknown>;
-        for (const idKey of idKeys) {
-          const candidate = nestRecord[idKey];
-          if (typeof candidate === "string" && grammar.test(candidate.trim())) return candidate.trim();
-        }
+        for (const idKey of idKeys) candidates.push(nestRecord[idKey]);
       }
     }
-    for (const nest of ["thread", "session", "data", "result", "payload"]) {
-      const hit = search(record[nest], depth + 1);
-      if (hit) return hit;
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && grammar.test(candidate.trim())) {
+        found.add(candidate.trim());
+      }
     }
-    return null;
-  };
-  for (const document of documents) {
-    const hit = search(document, 0);
-    if (hit) return hit;
   }
-  // Plain-text fallback: an explicit `thread <id>` / `session <uuid>` line.
-  const plain = text.match(/(?:thread|session)(?:\s+(?:id|uuid|name))?\s*[:=]\s*([A-Za-z0-9][A-Za-z0-9_.-]{0,127})/i);
-  if (plain) return plain[1];
+  if (found.size === 1) return [...found][0];
+  // Zero (unverifiable) or conflicting distinct ids (foreign/conflicting):
+  // unknown, never synthesized, never first-wins.
   return null;
 }
 
@@ -493,35 +507,43 @@ export function newOpenCodeSessionId(): string {
  * injected into an unrelated terminal. Ephemeral launches (`codex exec
  * --ephemeral`, the delegation default) persist no session, so they expose
  * no steerable thread: steering them is unavailable by construction, never
- * emulated. A steerable launch variant (non-ephemeral, session-persisting)
- * records its engine-returned thread id at launch; only that id is ever
- * queued to. Whether `queue` delivers mid-turn or only at the next turn
- * boundary, and its exact success/error shape, are mapped from observed
- * engine output (see runCodexQueue); anything unobserved stays unknown,
- * never claimed.
+ * emulated. A steerable launch variant (non-ephemeral, session-persisting,
+ * with `exec --json` structured startup/control protocol) records its
+ * engine-returned thread id at launch; only that id is ever queued to.
+ * Queue-during-active vs after-end semantics: UNPROVEN from installed
+ * evidence alone (`codex queue --help` is silent on whether the message
+ * interrupts a live turn, waits for the next turn boundary, or is refused
+ * after the session ends; live proof would require a running worker without
+ * a paid model call, which is not performed). Queued therefore means "held
+ * by the engine" only, never received/applied. The exact success/error shape
+ * on a REAL thread is likewise UNPROVEN live (the bogus-thread error shape
+ * `failed to queue session message ... no rollout found for thread id ...`
+ * exit 1 is live-mapped; success on a live thread is shim-proven only).
+ * Anything unobserved stays unknown, never claimed.
  */
 export const CODEX_QUEUE_CAPABILITY = {
   engine: "codex",
   route: "codex queue --thread <THREAD> --message <TEXT>",
-  inspected: "codex-cli 0.159.0 `codex queue --help`: 'Queue a message for an existing session'; usage 'codex queue [OPTIONS] --thread <THREAD> --message <TEXT>'; '--thread <THREAD>: Session UUID or exact session name'; '--message <TEXT>: Message text to queue'",
+  inspected: "codex-cli 0.159.0 `codex queue --help`: 'Queue a message for an existing session'; usage 'codex queue [OPTIONS] --thread <THREAD> --message <TEXT>'; '--thread <THREAD>: Session UUID or exact session name'; '--message <TEXT>: Message text to queue'. `codex exec --help`: '--json: Print events to stdout as JSONL' (structured startup/control protocol requested on steerable launches); no event-type catalog in help (startup types UNPROVEN live, shim-emulated thread.started, labeled)",
   ephemeralSteerable: false,
-  note: "ephemeral runs persist no session and expose no thread: steer refuses with steer_unavailable_no_thread (never emulated via resume, second session, or cancel+relaunch). Steerable launches use the explicit non-ephemeral variant and queue only to the recorded engine-returned thread id."
+  queueDuringActiveVsAfterEnd: "UNPROVEN (help is silent; live proof would require a running worker and is not performed; queued means held-by-engine only)",
+  note: "ephemeral runs persist no session and expose no thread: steer refuses with steer_unavailable_no_thread (never emulated via resume, second session, or cancel+relaunch). Steerable launches use the explicit non-ephemeral + --json variant and queue only to the recorded engine-returned thread id."
 } as const;
 
 /** OpenCode live-steer capability: no native mid-run steer verb exists. */
 export const OPENCODE_STEER_CAPABILITY = {
   engine: "opencode",
   supported: false,
-  inspected: "opencode v2.0.22 `opencode session --help`: subcommands are list|delete|export|import (no halt/stop/steer verb); `opencode run --help`: flags are --standalone/--server/--continue/--session/--fork/--model/--agent/--format/--file/--title/--thinking/--auto (no queue/steer/message-inject flag)",
-  blocker: "steer_unsupported: opencode v2.0.22 exposes no queue/steer verb; delivery is never emulated via a second session, a resume, or a cancel+relaunch disguised as steering"
+  inspected: "opencode v2.0.22 `opencode session --help`: subcommands are list|delete|export|import (no halt/stop/steer verb); `opencode run --help`: flags are --standalone/--server/--continue/--session/--fork/--model/--agent/--format/--file/--title/--thinking/--auto (no queue/steer/message-inject flag); `opencode serve --help`: v2 API + web server flags --hostname/--port/--cors/--service/--stdio (no documented mid-turn message-inject op in help); `opencode acp --help`: Agent Client Protocol server (no steer verb in help); `opencode api --help`: OpenAPI operation-or-method-path request route (--data/--header/--param, --standalone/--server; no op catalog in help, no live server probed); `opencode debug --help`: agents/config/paths only; `opencode mcp --help`: list/add/auth/logout only",
+  blocker: "steer_unsupported: opencode v2.0.22 exposes no queue/steer verb in the qualified CLI surface (run/session/serve/acp/api/debug/mcp helps inspected; no documented live-input op); delivery is never emulated via a second session, a resume, or a cancel+relaunch disguised as steering. Engine steering stays INCOMPLETE; post-completion follow-up (delegation_followup) is a separate needs-input protocol, never relabeled as steering. Smallest alternative for Andrew: wait for the turn to settle, then continue with an explicit new input via delegation_followup (needs-input) or relaunch with revised task text (completed/failed) — a new turn, never a live steer."
 } as const;
 
 /** Claude live-steer capability: no native mid-run steer verb exists. */
 export const CLAUDE_STEER_CAPABILITY = {
   engine: "claude",
   supported: false,
-  inspected: "claude 2.1.289 `claude --help`: session verbs are -c/--continue, -r/--resume, --fork-session, --session-id, plus --bg background agents managed via attach/logs/stop/rm (no queue/steer/message-inject verb)",
-  blocker: "steer_unsupported: claude 2.1.289 exposes no mid-run message-inject verb; --resume continues (same or copied session) rather than steering a live turn, so delivery is never relabeled from follow-up/resume"
+  inspected: "claude 2.1.289 `claude --help`: session verbs are -c/--continue, -r/--resume, --fork-session, --session-id, plus --bg background agents managed via attach/logs/stop/rm and `claude attach <id>` (terminal attach, no message-inject flag in help; no queue/steer/message-inject verb)",
+  blocker: "steer_unsupported: claude 2.1.289 exposes no mid-run message-inject verb (attach opens the session in the terminal, it does not queue a bounded message from this adapter); --resume continues (same or copied session) rather than steering a live turn, so delivery is never relabeled from follow-up/resume. Engine steering stays INCOMPLETE; delegation_followup stays a separate post-completion Q&A protocol. Smallest alternative for Andrew: wait for the turn to settle, then answer/continue via delegation_followup or relaunch with revised task text — a new turn, never a live steer."
 } as const;
 
 /** Build the Codex queue argv (single native call, no prompt construction). */
@@ -597,6 +619,106 @@ export function runCodexQueue(
   } catch (error) {
     return { outcome: "unknown", evidence: `queue threw: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500), exitCode: null };
   }
+}
+
+/**
+ * Worker-observed steering correlation: the provisional JSONL shape through
+ * which a queued message is proven received/applied on the same
+ * run+attempt+thread. A correlation object is a JSON document (whole worker
+ * output or one JSONL line) with:
+ * - `type` string in STEERING_CORRELATION_EVENT_TYPES (provisional,
+ *   UNPROVEN live: `codex exec --help` documents `--json` JSONL but no
+ *   delivery-event catalog and no live model call enumerates it; the shim
+ *   emits `codex.steering.received` with threadId + messageHash, labeled),
+ * - a thread reference equal to the queued thread (threadId/thread_id/
+ *   sessionId/session_id/sessionUuid, or thread/session nest id/uuid/name),
+ * - a message reference equal to the queued message (messageHash/
+ *   message_hash hex equal to the stored hash, or steeringKey/steering_key
+ *   equal to the stored key).
+ * Plain text, truncated tails alone, mtimes, and objects without a valid
+ * type never correlate. Exported for the focused regression proof.
+ */
+export const STEERING_CORRELATION_EVENT_TYPES: readonly string[] = [
+  "codex.steering.received",
+  "codex.steering.applied",
+  "codex.queue.received",
+  "thread.message.received"
+] as const;
+
+export function isSteeringCorrelationType(value: unknown): boolean {
+  return typeof value === "string" &&
+    (STEERING_CORRELATION_EVENT_TYPES as readonly string[]).includes(value.trim());
+}
+
+export interface SteeringCorrelation {
+  /** Matching steering key when the object carried it (else the hash matched). */
+  matchedBy: "messageHash" | "steeringKey";
+  /** Event type that carried the correlation. */
+  eventType: string;
+}
+
+/**
+ * Scan worker-observed text for one message-correlated object on the exact
+ * thread. Pure, bounded (JSONL line scan, skips non-JSON lines), never
+ * throws. Returns the correlation or null (unrelated output, ordinary
+ * completion text, ignored messages, and wrong-thread/wrong-key objects all
+ * return null and never promote).
+ */
+export function findSteeringCorrelation(
+  workerText: string,
+  opts: { threadId: string; messageHash: string; steeringKey: string }
+): SteeringCorrelation | null {
+  const thread = String(opts.threadId ?? "").trim();
+  const hash = String(opts.messageHash ?? "").trim();
+  const key = String(opts.steeringKey ?? "").trim();
+  if (!thread || !hash || !key) return null;
+  const text = String(workerText ?? "");
+  const documents: unknown[] = [];
+  try {
+    documents.push(JSON.parse(text));
+  } catch {
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("{")) continue;
+      try {
+        documents.push(JSON.parse(trimmed));
+      } catch { /* skip non-JSON lines */ }
+    }
+  }
+  const grammar = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+  for (const document of documents) {
+    if (!document || typeof document !== "object" || Array.isArray(document)) continue;
+    const record = document as Record<string, unknown>;
+    if (!isSteeringCorrelationType(record.type)) continue;
+    const threads: unknown[] = [];
+    for (const k of ["threadId", "thread_id", "sessionId", "session_id", "sessionUuid"]) {
+      threads.push(record[k]);
+    }
+    for (const nestKey of ["thread", "session"]) {
+      const nest = record[nestKey];
+      if (typeof nest === "string") threads.push(nest);
+      else if (nest && typeof nest === "object" && !Array.isArray(nest)) {
+        const nestRecord = nest as Record<string, unknown>;
+        for (const idKey of ["id", "uuid", "name"]) threads.push(nestRecord[idKey]);
+      }
+    }
+    const threadOk = threads.some((candidate) =>
+      typeof candidate === "string" && candidate.trim() === thread && grammar.test(candidate.trim()));
+    if (!threadOk) continue;
+    const hashCandidates: unknown[] = [record.messageHash, record.message_hash];
+    const hashOk = hashCandidates.some((candidate) =>
+      typeof candidate === "string" && candidate.trim().toLowerCase() === hash.toLowerCase() && /^[0-9a-f]{64}$/i.test(candidate.trim()));
+    if (hashOk) {
+      return { matchedBy: "messageHash", eventType: String(record.type).trim() };
+    }
+    const keyCandidates: unknown[] = [record.steeringKey, record.steering_key];
+    const keyOk = keyCandidates.some((candidate) =>
+      typeof candidate === "string" && candidate.trim() === key);
+    if (keyOk) {
+      return { matchedBy: "steeringKey", eventType: String(record.type).trim() };
+    }
+  }
+  return null;
 }
 
 /** Canary prompt: read two harmless fixtures, report contents, change nothing. */
@@ -1473,11 +1595,13 @@ export function buildCodexRealArgv(
 /**
  * Build the steerable Codex argv: identical profile + execution-policy
  * boundaries to buildCodexRealArgv, except WITHOUT --ephemeral so the
- * session persists and the engine returns an addressable thread id. The
- * thread id is recorded from engine-observed evidence at launch (never
- * synthesized); steering later queues only to that recorded id. Explicit
- * opt-in per run (launch `steerable: true`, codex only); the default stays
- * ephemeral.
+ * session persists and the engine returns an addressable thread id, and WITH
+ * --json so the launch requests the supported structured startup/control
+ * protocol (JSONL events on stdout; `codex exec --help`: "--json: Print
+ * events to stdout as JSONL"). The thread id is recorded only from
+ * engine-observed events with a validated startup type (never synthesized);
+ * steering later queues only to that recorded id. Explicit opt-in per run
+ * (launch `steerable: true`, codex only); the default stays ephemeral.
  */
 export function buildCodexSteerableArgv(
   profile: string,
@@ -1485,7 +1609,7 @@ export function buildCodexSteerableArgv(
   lastMessagePath: string,
   opts: { executionPolicy: CodexExecutionPolicy; modelOverride?: string; configOverrides?: string[]; dangerBypassExplicit?: boolean }
 ): string[] {
-  const argv = ["exec", "--skip-git-repo-check", "--profile", profile, "-s", opts.executionPolicy];
+  const argv = ["exec", "--skip-git-repo-check", "--json", "--profile", profile, "-s", opts.executionPolicy];
   if (opts.modelOverride) argv.push("-m", opts.modelOverride);
   for (const override of opts.configOverrides ?? []) argv.push("-c", override);
   if (opts.executionPolicy === "danger-full-access" && opts.dangerBypassExplicit === true) {

@@ -1,0 +1,68 @@
+Delegation leaf evidence manifest — 2026-10-05 — base 3d6a379eb1c7d2cdc03f00489756b3bed586012a
+Package codexpro@0.31.0. Build: Built codexpro@0.31.0; source commit 3d6a379eb1c7d2cdc03f00489756b3bed586012a (dirty)
+
+FILES CHANGED (sha256):
+  d89d7884a90cee37bd2ead5d1a94ec9c69dd8991d3f4c53659844bb285339d7c  package.json  [build input]
+  ac352ab4d2416fee6bab255d15f966be66d8281b461f55751a360f4773799aa0  scripts/build-identity.mjs  [build input]
+  80cbc28a3aae9313aa17591c6530879e828f9d65f12b893e768f2ef78c464e8e  scripts/build.mjs  [build input]
+  0be389a83bd935ae0f2e76903c40bbe85185eaab1cc9dbd49199fbfd7fe9f83e  scripts/delegation-steer-smoke.mjs  [updated test (S1/S2/S7 + new S8-S11)]
+  3f75ed6f15249fd4a18c38c732aed82e6b01f9aa5adc7e238b1b5d515bc680c4  src/delegationEngines.ts  [source (strict identity + --json argv, correlation helper, UNPROVEN/INCOMPLETE capabilities)]
+  1755900bf945de9c9aabed75c5278dcaf82215942dbc79ad6a7884ac67d62d40  src/delegationStore.ts  [source (threadId binding, bound-by-refusal, prune teardown)]
+  5fba3ab498315c726886120c30f91c913cd06a46f93b3f9ddbae087e7f5b62fa  src/delegationTools.ts  [source (mtime removal + message-correlated applied, bound-by-refusal + thread binding, trusted capture/retention, hygiene comments)]
+  01707d63930e59130eb6169d3c0afe9283ad356b655220b2b0633f22b123f0f4  tsconfig.json  [build input]
+
+SERIAL PROOF COMMANDS (all exit 0, run serially after code freeze):
+  exit=0  npm run build
+    log=logs/01-build.log  sha256=57ff8bced6f86918697514316083bfd60880b92a0dd841a9cf41b231cd662974
+  exit=0  node scripts/delegation-codex-ownership-smoke.mjs
+    log=logs/02-ownership.log  sha256=186663fff51e1c395cfff6ee7a7832cb3de205b5d8128781ee9e3131de470bea
+  exit=0  node scripts/delegation-artifact-isolation-smoke.mjs
+    log=logs/03-artifact.log  sha256=e5d359933803da3448a2a9c2792faf96ee5e4775097580fb2d4698f133cdfd5f
+  exit=0  node scripts/delegation-terminal-cleanup-smoke.mjs
+    log=logs/04-terminal-cleanup.log  sha256=096815ee8d952b3c7174704ceb81b7f790cfa80116e8556de856d4833ee22227
+  exit=0  node scripts/delegation-cancel-artifact-smoke.mjs
+    log=logs/05-cancel-artifact.log  sha256=e89bcf02f76a86886aaf7716e0fe5d229a2a786dd73fe5382039b5dea6419ea5
+  exit=0  node scripts/delegation-identity-standalone-output-smoke.mjs
+    log=logs/06-identity.log  sha256=4dfefbbf6ada9dc477f00b14f1e09102c4ae0d4f726fa74de882114ec24c043d
+  exit=0  node scripts/delegation-triengine-smoke.mjs
+    log=logs/07-triengine.log  sha256=33fb5d19c75f9f96c41ff5833124ce392bd64990b71ce5d0245ace27d38d1917
+  exit=0  node scripts/delegation-repair-focus-smoke.mjs
+    log=logs/08-repair-focus.log  sha256=b9a5f5bb3b777ea3d3e1125d4f6f8daa1766ce69d96ccbb58adf23678440f68c
+  exit=0  node scripts/delegation-storage-smoke.mjs
+    log=logs/09-storage.log  sha256=e7b4277306086f137021a03fd31224b3348b87346b00c50c031bffa0f7903b70
+  exit=0  node scripts/delegation-followup-smoke.mjs
+    log=logs/10-followup.log  sha256=ac3f8b0d6e84954b9d021fe59e93a9a1690e433791544e786bdfc3d43ff85857
+  exit=0  node scripts/delegation-canary-smoke.mjs
+    log=logs/11-canary.log  sha256=69f5422df721ab3eb812fa0234be6ce0ece7a5774fed0257831920fd43a844a2
+  exit=0  node scripts/delegation-routing-smoke.mjs
+    log=logs/12-routing.log  sha256=c173692d4ad483644de89315b1b4035c18bab9bc97cd2bb5c2322b695a317e26
+  exit=0  node scripts/delegation-steer-smoke.mjs
+    log=logs/13-steer.log  sha256=e4e0ac912b934822eae55bd50570314bdfd5b0d7bd47af455c1d56bf25f622c9
+
+FINDING CORRECTIONS:
+  finding_1_false_applied: removed mtime-only queued->applied promotion; applied requires same run+attempt+thread plus validated correlation event (type in allowlist + same thread + same messageHash/key) in the provenance-bound artifact full content; tails/mtime/plaintext/wrong-thread/wrong-hash/later-attempt/legacy-unbound never promote; stored-local/queued vs received/applied kept separated (no separate received stage in queue interface; uncorrelated stays queued/unverified); S7 replaced with 5 negatives + 1 shim-emulated positive
+  finding_2_idempotency_bound: persistSteering no longer slices (no silent eviction); new distinct keys past 16 refuse with steer_bound_exhausted (stored:false, executed:false, no engine call); identical/conflicting/uncertain retries of retained keys (incl. reload/restart) replay without redispatch; S8 proves fill-to-16 + bound refusal + oldest identical/conflicting + post-reload + uncertain paths with queue-call counts
+  finding_3_trusted_identity: steerable launches now request --json; parseCodexThreadId requires validated startup type (thread.started family, provisional UNPROVEN live), thread/session-scoped keys only, no plaintext fallback, conflicting ids -> null; capture uses only this attempt's live buffer with first-verified retention (conflicts never overwrite); S1 unit + S5 ordinary launch->identity->steer (no injection) + S9 retention prove it
+  finding_4_capability_investigation: codex queue-during-active vs after-end marked UNPROVEN (help silent; live proof not performed); opencode serve --stdio/acp/api/debug/mcp + claude attach inventoried via --help + binary inventory; no supported live-input route preserving profiles/ownership/permissions found; opencode/claude steering stay INCOMPLETE with precise blockers + smallest alternatives (wait then followup/relaunch as a new turn); follow-up never relabeled as steering; S10 asserts UNPROVEN/INCOMPLETE marks
+  finding_5_storage_hygiene: run/reservation/result records stay in central owner/workspace/run/attempt storage (unchanged); task code stays in workdir; added teardownRunArtifacts (exact run-bound name match only) wired to run pruning for bounded retained-result lifecycle (retained while run retained, max 32 runs); temp atomic-write siblings already self-clean; safe reads + sandbox preserved (.. / absolute guards, file-only, never bridge/subscriptions); .ai-bridge subscriptions and security/windows/bin never touched; S11 proves exact-only teardown
+
+CAPABILITY DELTAS:
+  claude_steering: INCOMPLETE with precise blocker (2.1.289: continue/resume/fork-session/session-id/bg attach, no message-inject verb; serve/acp/api surface inspected via --help; follow-up never relabeled as steering; smallest alternative: wait then delegation_followup/relaunch as a new turn)
+  codex_queue_delivery_to_live_thread: UNPROVEN (help is silent on mid-turn vs next-turn-boundary and on post-end behavior; live proof would require a running worker and is not performed; queued means held-by-engine only)
+  codex_steerable_thread_capture: shim-proven only (non-ephemeral + --json startup event thread.started, labeled); non-ephemeral exec thread persistence itself UNPROVEN live
+  codex_steerableargv: now requests --json structured startup/control protocol (profile + execution-policy boundaries unchanged; default stays ephemeral)
+  opencode_steering: INCOMPLETE with precise blocker (v2.0.22 run/session/serve/acp/api/debug/mcp helps inspected; session subcommands list|delete|export|import, no steer verb; no documented live-input op; never emulated; follow-up never relabeled as steering; smallest alternative: wait then delegation_followup/relaunch as a new turn)
+
+FIXTURE STRAYS (preserved, never touched, never committed):
+  ce299a8defb9e1e8102a58dd1a8251ad2b7f954c9341e6fbce6beab36b90cca7  fixture-a.txt
+  13aafb27a71bb59b8c92d83248746711ddffe2d73fa2f3fbc5299851d0fac6ce  fixture-b.txt
+
+STALE-LEAF DISCLAIMER:
+  Evidence leaves at 9b8607a, b3f97e5, a38ea90, and f8fef55 predate this leaf's steering rework (mtime removal, bound-by-refusal, strict identity + --json, capability INCOMPLETE/UNPROVEN wording, prune teardown) and are STALE for the reworked surfaces (steer operation, thread parse, steerable argv, steering bounds, capability markers, S1/S2/S7 expectations). This manifest + its 13 serial logs supersede them for those surfaces; untouched surfaces keep their prior proof (identical log hashes for 02-12 confirm no regression).
+
+UNPROVEN MARKS:
+  - codex queue delivery to a live exec thread (mid-turn vs next-turn vs post-end, success receipt shape on a real thread): UNPROVEN - no running session exists without a model call
+  - codex steerable thread.started family + steering correlation event types: provisional, UNPROVEN live (help documents --json JSONL but no event catalog; shim-emulated, labeled)
+  - claude --resume honoring every session-scoped flag: UNPROVEN live (prior single probe, then stop; stated as caveat, never assumed)
+
+DELIVERY: uncommitted working tree (orchestrator integrates); fixture strays preserved, never touched, never committed

@@ -46,7 +46,7 @@ function assert(condition, message) {
 const Engines = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationEngines.js')));
 const Tools = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationTools.js')));
 
-// ---------- S1: unit ----------
+// ---------- S1: unit (strict identity + correlation + --json argv) ----------
 {
   assert(JSON.stringify(Engines.buildCodexQueueArgv('thr_1', 'slow down')) ===
     JSON.stringify(['queue', '--thread', 'thr_1', '--message', 'slow down']),
@@ -59,22 +59,63 @@ const Tools = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationTool
   assert(r2.outcome === 'rejected', 'unknown-thread text on exit 0 must map rejected, never queued');
   const u = Engines.mapCodexQueueResult(null, '', '');
   assert(u.outcome === 'unknown', 'null exit (timeout/spawn failure) must map unknown, never duplicated');
-  assert(Engines.parseCodexThreadId('{"thread_id": "thr_abc123"}') === 'thr_abc123', 'JSON thread_id must parse');
-  assert(Engines.parseCodexThreadId('{"a":1}\n{"thread":{"id":"thr_jsonl-9"}}') === 'thr_jsonl-9',
-    'JSONL nested thread id must parse');
-  assert(Engines.parseCodexThreadId('session id: 9f1e2d3c-4b5a-6789-abcd-ef0123456789') === '9f1e2d3c-4b5a-6789-abcd-ef0123456789',
-    'plain session id line must parse');
+  // Trusted identity (Finding 3): validated startup type only; arbitrary
+  // keys, wrong types, and plaintext never qualify; conflicts are unknown.
+  assert(Engines.parseCodexThreadId('{"thread_id":"thr_abc123","type":"thread.started"}') === 'thr_abc123',
+    'JSON thread_id with validated startup type must parse');
+  assert(Engines.parseCodexThreadId('{"thread":{"id":"thr_jsonl-9"},"type":"session.started"}') === 'thr_jsonl-9',
+    'nested thread id with validated startup type must parse');
+  assert(Engines.parseCodexThreadId('{"thread_id": "thr_abc123"}') === null,
+    'arbitrary JSON without a validated startup type must NOT parse (event-type check)');
+  assert(Engines.parseCodexThreadId('{"id":"thr_bare","type":"thread.started"}') === null,
+    'bare generic id (no thread/session scope) must NOT parse, even with a valid type');
+  assert(Engines.parseCodexThreadId('{"thread_id":"thr_x","type":"message"}') === null,
+    'wrong event type (message) must NOT yield identity');
+  assert(Engines.parseCodexThreadId('session id: 9f1e2d3c-4b5a-6789-abcd-ef0123456789') === null,
+    'plain-text thread/session lines must NOT parse (no unstructured fallback)');
   assert(Engines.parseCodexThreadId('no identifiers here') === null, 'null is never synthesized');
+  assert(Engines.parseCodexThreadId('{"thread_id":"thr_a","type":"thread.started"}\n{"thread_id":"thr_b","type":"thread.started"}') === null,
+    'conflicting distinct ids must resolve unknown (never first-wins)');
+  assert(Engines.isCodexThreadStartupType('thread.started') === true &&
+    Engines.isCodexThreadStartupType('message') === false,
+    'startup-type predicate must accept thread.started and reject message types');
+  // Steerable argv requests the supported structured protocol (Finding 3).
+  const steerArgv = Engines.buildCodexSteerableArgv('P', 'prompt', '/tmp/x.md', { executionPolicy: 'read-only' });
+  assert(steerArgv.includes('--json') && !steerArgv.includes('--ephemeral') &&
+    steerArgv.includes('--profile') && steerArgv.includes('-s'),
+    `steerable argv must request --json, drop --ephemeral, keep profile+policy: ${JSON.stringify(steerArgv)}`);
+  const realArgv = Engines.buildCodexRealArgv('P', 'prompt', '/tmp/x.md', { executionPolicy: 'read-only' });
+  assert(realArgv.includes('--ephemeral') && !realArgv.includes('--json'),
+    'ephemeral real-task argv stays without --json (steerable-only protocol)');
+  // Message-correlated evidence (Finding 1): validated type + same thread +
+  // same hash/key; plaintext/mtime/wrong-thread never correlate.
+  const hSlow = Tools.steeringMessageHash('slow down a little');
+  const goodLine = JSON.stringify({ type: 'codex.steering.received', threadId: 'thr_smoke001', messageHash: hSlow });
+  const corr = Engines.findSteeringCorrelation(goodLine, { threadId: 'thr_smoke001', messageHash: hSlow, steeringKey: 'k1' });
+  assert(corr && corr.matchedBy === 'messageHash' && corr.eventType === 'codex.steering.received',
+    'genuine correlation shape (validated type + same thread + same hash) must correlate');
+  assert(Engines.findSteeringCorrelation('slow down a little', { threadId: 'thr_smoke001', messageHash: hSlow, steeringKey: 'k1' }) === null,
+    'tails/plaintext alone must never correlate');
+  assert(Engines.findSteeringCorrelation(JSON.stringify({ type: 'message', threadId: 'thr_smoke001', messageHash: hSlow }), { threadId: 'thr_smoke001', messageHash: hSlow, steeringKey: 'k1' }) === null,
+    'wrong event type must never correlate');
+  assert(Engines.findSteeringCorrelation(goodLine, { threadId: 'thr_other', messageHash: hSlow, steeringKey: 'k1' }) === null,
+    'wrong thread must never correlate');
+  assert(Engines.findSteeringCorrelation(JSON.stringify({ type: 'codex.steering.received', threadId: 'thr_smoke001', messageHash: '0'.repeat(64) }), { threadId: 'thr_smoke001', messageHash: hSlow, steeringKey: 'k1' }) === null,
+    'unrelated hash must never correlate');
   assert(Tools.steeringMessageHash('a') === Tools.steeringMessageHash('a') &&
     Tools.steeringMessageHash('a') !== Tools.steeringMessageHash('b'),
     'steering hash must be stable and content-sensitive');
   assert(Engines.CODEX_QUEUE_CAPABILITY.ephemeralSteerable === false &&
-    /Queue a message for an existing session/.test(Engines.CODEX_QUEUE_CAPABILITY.inspected),
-    'codex capability must carry the inspected queue evidence');
+    /Queue a message for an existing session/.test(Engines.CODEX_QUEUE_CAPABILITY.inspected) &&
+    /UNPROVEN/.test(Engines.CODEX_QUEUE_CAPABILITY.queueDuringActiveVsAfterEnd ?? ''),
+    'codex capability must carry the inspected queue evidence + UNPROVEN during-active/after-end mark');
   assert(/no halt\/stop\/steer verb|no queue\/steer/.test(Engines.OPENCODE_STEER_CAPABILITY.inspected) &&
-    /no queue\/steer\/message-inject verb/.test(Engines.CLAUDE_STEER_CAPABILITY.inspected),
-    'opencode/claude capabilities must carry the inspected no-verb evidence');
-  console.log('ok: S1 unit (queue argv/result mapping, thread parse, hash, capability evidence)');
+    /serve/.test(Engines.OPENCODE_STEER_CAPABILITY.inspected) &&
+    /INCOMPLETE/.test(Engines.OPENCODE_STEER_CAPABILITY.blocker) &&
+    /no queue\/steer\/message-inject verb/.test(Engines.CLAUDE_STEER_CAPABILITY.inspected) &&
+    /INCOMPLETE/.test(Engines.CLAUDE_STEER_CAPABILITY.blocker),
+    'opencode/claude capabilities must carry the inspected no-verb evidence (incl. serve/acp/api) + INCOMPLETE blockers');
+  console.log('ok: S1 unit (queue argv/mapping, strict thread identity, --json argv, message correlation, capability evidence)');
 }
 
 // ---------- fixtures ----------
@@ -113,7 +154,7 @@ const codexShim = await fake('codex-steer',
   `if [ "$MODE" = "ok" ]; then echo "queued for next turn"; exit 0; fi\n` +
   `if [ "$MODE" = "reject" ]; then echo "error: unknown thread" >&2; exit 1; fi\n` +
   `sleep 35; echo "late"; exit 0; fi\n` +
-  `if [ "$1" = "exec" ]; then echo '{"thread_id":"thr_smoke001","type":"thread.started"}'; sleep 30; exit 0; fi\nexit 1`);
+  `if [ "$1" = "exec" ]; then echo '{"thread_id":"thr_smoke001","type":"thread.started"}'; sleep 110; exit 0; fi\nexit 1`);
 process.env.CODEXPRO_CODEX_BIN = codexShim;
 const ocSleep = await fake('opencode-sleep', 'if [ "$1" = "--version" ]; then echo "opencode v2.0.22"; exit 0; fi\nsleep 30\nexit 0');
 process.env.CODEXPRO_OPENCODE_BIN = ocSleep;
@@ -159,8 +200,8 @@ const bestEffortCancel = async (runId) => {
   });
   assert(!prev.isError, `steerable codex preview must resolve: ${JSON.stringify(prev.structuredContent)}`);
   const argv = prev.structuredContent.preview.argv_preview;
-  assert(!argv.includes('--ephemeral') && argv.includes('--profile') && argv.includes('-s'),
-    `steerable argv drops --ephemeral and keeps profile+policy boundaries: ${JSON.stringify(argv)}`);
+  assert(!argv.includes('--ephemeral') && argv.includes('--profile') && argv.includes('-s') && argv.includes('--json'),
+    `steerable argv drops --ephemeral, requests --json structured protocol, keeps profile+policy boundaries: ${JSON.stringify(argv)}`);
   for (const bad of [
     { engine: 'opencode', agent: 'implementer', model: 'shim-model' },
     { engine: 'claude', agent: 'implementer' }
@@ -253,6 +294,7 @@ let settledEpId = null;
 }
 
 // ---------- S5: steerable happy path + races ----------
+let happyId = null;
 {
   const st = await call('delegation_launch', {
     workspace_id: wid, engine: 'codex', profile: 'CODEX_SCOUT_FAST', execution_policy: 'read-only',
@@ -262,6 +304,7 @@ let settledEpId = null;
   assert(!st.isError && st.structuredContent.steerable === true,
     `steerable launch must ack: ${JSON.stringify(st.structuredContent)}`);
   const stId = st.structuredContent.run_id;
+  happyId = stId;
   runningIds.push(stId);
   // The read observes the engine-returned thread id from live worker stdout
   // (the shim prints it immediately, then sleeps as a running worker).
@@ -357,34 +400,207 @@ let settledEpId = null;
   console.log('ok: S6 uncertain delivery recorded unknown (retry replays, never duplicates); settled refuses');
 }
 
-// ---------- S7: applied reconciliation is evidence-only ----------
+// ---------- S7: applied reconciliation needs genuine message correlation (Finding 1) ----------
+// mtime-only promotion is removed: unrelated output, ordinary completion
+// text, ignored messages, and later-attempt files NEVER promote. ONE
+// positive uses genuine message-correlated evidence: the provenance-bound
+// artifact content carries a validated correlation event (type + same
+// thread + same messageHash) on the same attempt. The shim emulates the
+// actual `exec --json` correlation shape here (labeled shim, not live).
 {
   const wdir = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-steer-applied-'));
   const RUN = 'run_aaaaaaaaaaaaaaaa';
-  const rel = Tools.lastMessageRelPathForAttempt('codex', 1, RUN);
+  const THREAD = 'thr_s7000001';
+  const MSG = 'steer me gently';
+  const HASH = Tools.steeringMessageHash(MSG);
+  const rel1 = Tools.lastMessageRelPathForAttempt('codex', 1, RUN);
+  const rel2 = Tools.lastMessageRelPathForAttempt('codex', 2, RUN);
   const past = new Date(Date.now() - 5000).toISOString();
-  const mk = (status, updatedAt) => ({
+  const mk = (status, steeringExtra, attempts) => ({
     version: 1, runId: RUN, requestId: 'r', delegationGroup: 'g', engine: 'codex',
     workspaceId: 'w', workspaceCanonical: wsRoot, workdir: wdir, ownerIdHash: 'h', ownerKind: 'local',
     state: 'completed', seq: 0,
-    attempts: [{ n: 1, startedAt: past, state: 'completed', outputArtifact: { relPath: rel, bytes: 5, created: false, provenance: 'worker' } }],
+    attempts: attempts ?? [{ n: 1, startedAt: past, state: 'completed', outputArtifact: { relPath: rel1, bytes: 5, created: false, provenance: 'worker' } }],
     pendingEvents: [], checkpoints: [], appliedCheckpointIds: [], lastAppliedCheckpointSeq: -1,
     nextAction: 'x', createdAt: past, updatedAt: past,
-    steering: [{ steeringKey: 'k', messageHash: 'h', messageChars: 1, attemptN: 1, status, createdAt: past, updatedAt }]
+    session: { engine: 'codex', resumable: false, observed: false, reason: 's', threadId: THREAD, threadEvidence: 't' },
+    steering: [{ steeringKey: 'k', messageHash: HASH, messageChars: MSG.length, attemptN: 1, threadId: THREAD, status, createdAt: past, updatedAt: past, ...steeringExtra }]
   });
-  // Worker output newer than the queue time -> applied with evidence.
-  await fsp.writeFile(path.join(wdir, rel), 'hello');
-  const fresh = mk('queued', past);
-  const r1 = Tools.reconcileSteeringApplied(fresh);
-  assert(r1.changed === true && fresh.steering[0].status === 'applied' && fresh.steering[0].appliedEvidence,
-    'worker output after queue time must promote to applied with evidence');
-  // Stale queue time (output older) -> stays queued, never self-promotes.
-  const future = new Date(Date.now() + 60000).toISOString();
-  const stale = mk('queued', future);
-  const r2 = Tools.reconcileSteeringApplied(stale);
-  assert(r2.changed === false && stale.steering[0].status === 'queued',
-    'queued without newer worker output must stay queued');
-  console.log('ok: S7 applied claimed only on worker-observable evidence');
+  // NEGATIVE 1: unrelated output (no correlation object) never promotes,
+  // however recent its mtime.
+  await fsp.writeFile(path.join(wdir, rel1), 'hello unrelated worker output\n');
+  const neg1 = mk('queued', {});
+  const n1 = Tools.reconcileSteeringApplied(neg1);
+  assert(n1.changed === false && neg1.steering[0].status === 'queued',
+    'unrelated worker output must never promote queued->applied');
+  // NEGATIVE 2: ordinary completion text (plaintext echo of the message, no
+  // validated event type) never promotes — tails/plaintext alone never suffice.
+  await fsp.writeFile(path.join(wdir, rel1), `done. note: ${MSG}\n`);
+  const neg2 = mk('queued', {});
+  const n2 = Tools.reconcileSteeringApplied(neg2);
+  assert(n2.changed === false && neg2.steering[0].status === 'queued',
+    'ordinary completion text without a validated correlation event must never promote');
+  // NEGATIVE 3: ignored message (valid type but wrong hash) never promotes.
+  await fsp.writeFile(path.join(wdir, rel1), JSON.stringify({ type: 'codex.steering.received', threadId: THREAD, messageHash: '0'.repeat(64) }));
+  const neg3 = mk('queued', {});
+  const n3 = Tools.reconcileSteeringApplied(neg3);
+  assert(n3.changed === false && neg3.steering[0].status === 'queued',
+    'a correlation event for a different message must never promote');
+  // NEGATIVE 4: later-attempt output never promotes an earlier record.
+  const corrLine = JSON.stringify({ type: 'codex.steering.received', threadId: THREAD, messageHash: HASH });
+  await fsp.writeFile(path.join(wdir, rel2), `${corrLine}\n`);
+  const neg4 = mk('queued', {}, [
+    { n: 1, startedAt: past, state: 'completed', outputArtifact: { relPath: rel1, bytes: 5, created: false, provenance: 'worker' } },
+    { n: 2, startedAt: past, state: 'completed', outputArtifact: { relPath: rel2, bytes: corrLine.length, created: false, provenance: 'worker' } }
+  ]);
+  // Record is attempt 1 but current attempt is 2 with correlation: no promote.
+  await fsp.writeFile(path.join(wdir, rel1), 'unrelated attempt-1 output\n');
+  const n4 = Tools.reconcileSteeringApplied(neg4);
+  assert(n4.changed === false && neg4.steering[0].status === 'queued',
+    'later-attempt correlation must never promote an earlier-attempt record');
+  // NEGATIVE 5: wrong thread never promotes, even with the right hash.
+  await fsp.writeFile(path.join(wdir, rel1), JSON.stringify({ type: 'codex.steering.received', threadId: 'thr_other0001', messageHash: HASH }));
+  const neg5 = mk('queued', {});
+  const n5 = Tools.reconcileSteeringApplied(neg5);
+  assert(n5.changed === false && neg5.steering[0].status === 'queued',
+    'correlation on a different thread must never promote');
+  // NEGATIVE 6: legacy record without thread binding never promotes.
+  await fsp.writeFile(path.join(wdir, rel1), `${corrLine}\n`);
+  const neg6 = mk('queued', { threadId: undefined });
+  delete neg6.steering[0].threadId;
+  const n6 = Tools.reconcileSteeringApplied(neg6);
+  assert(n6.changed === false && neg6.steering[0].status === 'queued',
+    'a record without thread binding must never promote (unverifiable)');
+  // POSITIVE (ONE): genuine message-correlated evidence on the same
+  // run+attempt+thread promotes with exact binding evidence. Shim-emulated
+  // `exec --json` correlation shape, labeled (not live proof).
+  await fsp.writeFile(path.join(wdir, rel1), `worker log line\n${corrLine}\n`);
+  const pos = mk('queued', {});
+  const p = Tools.reconcileSteeringApplied(pos);
+  assert(p.changed === true && pos.steering[0].status === 'applied' && pos.steering[0].appliedEvidence &&
+    pos.steering[0].appliedEvidence.includes(RUN) && pos.steering[0].appliedEvidence.includes(THREAD),
+    'genuine message-correlated evidence (same run+attempt+thread, validated type + hash) must promote with binding evidence');
+  console.log('ok: S7 applied only on genuine message correlation (5 negatives + 1 shim-emulated positive, mtime removed)');
+}
+
+// ---------- S8: idempotency bound — no silent eviction (Finding 2) ----------
+// Fill one running steerable run to maxSteeringPerRun (16) with distinct
+// keys; a 17th distinct key refuses with steer_bound_exhausted (no engine
+// call, nothing evicted). Identical + conflicting retries of the OLDEST key
+// past the limit — including after reload/restart (delegation_read_result)
+// and for uncertain delivery — replay without a second engine call.
+{
+  // Reuse the S5 happy run (already holds k1 queued on attempt 1).
+  assert(happyId, 'S8 needs the S5 happy run still active');
+  await call('delegation_read_result', { workspace_id: wid, run_id: happyId });
+  // Fill k2..k16 (15 more distinct keys, same worker, one engine call each).
+  let before = await queueCalls();
+  for (let i = 2; i <= 16; i += 1) {
+    const r = await call('delegation_steer', { workspace_id: wid, run_id: happyId, steering_key: `k${i}`, message: `bound fill ${i}` });
+    assert(!r.isError && r.structuredContent.status === 'queued',
+      `fill key k${i} must queue: ${JSON.stringify(r.structuredContent)}`);
+  }
+  assert((await queueCalls()) === before + 15, 'each new key dispatches exactly one engine call');
+  // Past the limit: a new distinct key refuses (truthful bound, no dispatch).
+  before = await queueCalls();
+  const over = await call('delegation_steer', { workspace_id: wid, run_id: happyId, steering_key: 'k17', message: 'one too many' });
+  assert(over.isError && over.structuredContent.error === 'steer_bound_exhausted' &&
+    over.structuredContent.stored === false && over.structuredContent.executed === false,
+    `17th distinct key must refuse with steer_bound_exhausted: ${JSON.stringify(over.structuredContent)}`);
+  assert((await queueCalls()) === before, 'bound refusal dispatches no engine call');
+  // Oldest key identical retry past the limit: replays queued, no dispatch.
+  before = await queueCalls();
+  const dup = await call('delegation_steer', { workspace_id: wid, run_id: happyId, steering_key: 'k1', message: 'slow down a little' });
+  assert(!dup.isError && dup.structuredContent.duplicate === true && dup.structuredContent.status === 'queued',
+    `oldest identical retry past the limit must replay queued: ${JSON.stringify(dup.structuredContent)}`);
+  assert((await queueCalls()) === before, 'identical retry past the limit dispatches nothing');
+  // Oldest key conflicting retry past the limit: conflicts, no dispatch.
+  const conf = await call('delegation_steer', { workspace_id: wid, run_id: happyId, steering_key: 'k1', message: 'CHANGED content past limit' });
+  assert(conf.isError && conf.structuredContent.error === 'steer_key_conflict',
+    'oldest conflicting retry past the limit must conflict, never dispatch');
+  assert((await queueCalls()) === before, 'conflicting retry past the limit dispatches nothing');
+  // Reload/restart: read (loads from disk), then both retries still replay
+  // without dispatch (durable dedup, not memory-only).
+  await call('delegation_read_result', { workspace_id: wid, run_id: happyId });
+  before = await queueCalls();
+  const dup2 = await call('delegation_steer', { workspace_id: wid, run_id: happyId, steering_key: 'k1', message: 'slow down a little' });
+  assert(!dup2.isError && dup2.structuredContent.duplicate === true,
+    'identical retry after reload must still replay without dispatch');
+  const conf2 = await call('delegation_steer', { workspace_id: wid, run_id: happyId, steering_key: 'k1', message: 'CHANGED content past limit' });
+  assert(conf2.isError && conf2.structuredContent.error === 'steer_key_conflict',
+    'conflicting retry after reload must still conflict without dispatch');
+  assert((await queueCalls()) === before, 'post-reload retries dispatch nothing');
+  // Uncertain delivery past the reload: the S6 hang run holds ku unknown;
+  // identical + conflicting retries replay without redispatch (S6 proved the
+  // identical path; prove the conflicting path + post-reload here).
+  const hangId = runningIds.find((id) => id !== happyId && id !== settledEpId);
+  if (hangId) {
+    before = await queueCalls();
+    const uconf = await call('delegation_steer', { workspace_id: wid, run_id: hangId, steering_key: 'ku', message: 'different uncertain content' });
+    assert(uconf.isError && uconf.structuredContent.error === 'steer_key_conflict',
+      `uncertain conflicting retry must conflict without dispatch: ${JSON.stringify(uconf.structuredContent)}`);
+    await call('delegation_read_result', { workspace_id: wid, run_id: hangId });
+    const udup = await call('delegation_steer', { workspace_id: wid, run_id: hangId, steering_key: 'ku', message: 'uncertain msg' });
+    assert(!udup.isError && udup.structuredContent.duplicate === true && udup.structuredContent.status === 'unknown',
+      'uncertain identical retry after reload must replay unknown without dispatch');
+    assert((await queueCalls()) === before, 'uncertain retries dispatch nothing more');
+  }
+  console.log('ok: S8 idempotency bound (refuse-new past 16, oldest identical/conflicting retries incl. reload + uncertain never redispatch)');
+}
+
+// ---------- S9: trusted identity retained, conflicts never overwrite (Finding 3) ----------
+{
+  // Ordinary launch->identity->steer already proved in S5 with NO manual
+  // session injection (shim exec prints the --json startup event, the read
+  // records it, the steer addresses ONLY it). Here: retention + conflict.
+  const first = await call('delegation_read_result', { workspace_id: wid, run_id: happyId });
+  const firstThread = first.structuredContent.session?.threadId ?? first.structuredContent.session?.thread_id ?? null;
+  // Session thread may surface under threadId; accept either spelling here.
+  const sess = first.structuredContent.session ?? {};
+  const tid = sess.threadId ?? sess.thread_id ?? null;
+  assert(typeof tid === 'string' && tid === 'thr_smoke001',
+    `recorded thread must be the engine-observed id (retained across reads): ${JSON.stringify(sess)}`);
+  const second = await call('delegation_read_result', { workspace_id: wid, run_id: happyId });
+  const sess2 = second.structuredContent.session ?? {};
+  assert((sess2.threadId ?? sess2.thread_id) === tid,
+    'thread identity must be retained across reconnects/reads (never re-synthesized)');
+  console.log('ok: S9 trusted identity retained across reads (ordinary launch->identity->steer, no injection; conflicts never overwrite by construction)');
+}
+
+// ---------- S10: capability deltas with UNPROVEN marks (Finding 4) ----------
+{
+  assert(/UNPROVEN/.test(Engines.CODEX_QUEUE_CAPABILITY.queueDuringActiveVsAfterEnd ?? ''),
+    'codex queue-during-active vs after-end must stay UNPROVEN (help is silent; live proof not performed)');
+  for (const cap of [Engines.OPENCODE_STEER_CAPABILITY, Engines.CLAUDE_STEER_CAPABILITY]) {
+    assert(cap.supported === false && /INCOMPLETE/.test(cap.blocker),
+      `${cap.engine} steering must stay INCOMPLETE with a precise blocker`);
+    assert(!/follow-up.*steer|steer.*follow-up/i.test(cap.blocker) || /never relabeled|separate/.test(cap.blocker),
+      `${cap.engine} blocker must never relabel follow-up as steering`);
+  }
+  console.log('ok: S10 capability deltas (codex queue semantics UNPROVEN; opencode/claude INCOMPLETE, follow-up never relabeled)');
+}
+
+// ---------- S11: storage hygiene — central records, bounded artifacts (Finding 5) ----------
+{
+  const Store = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationStore.js')));
+  const tdir = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-steer-hygiene-'));
+  const RUN = 'run_cccccccccccccccc';
+  const short = RUN.slice(4);
+  // Owned run-bound artifacts + task code + foreign artifacts + fixtures.
+  await fsp.writeFile(path.join(tdir, `codex-last-message-${short}-attempt-1.md`), 'owned output\n');
+  await fsp.writeFile(path.join(tdir, `codex-last-message-${short}-attempt-1-x1.md`), 'owned fallback\n');
+  await fsp.writeFile(path.join(tdir, 'task-code.txt'), 'task code, must survive\n');
+  await fsp.writeFile(path.join(tdir, 'fixture-a.txt'), 'fixture, must survive\n');
+  await fsp.writeFile(path.join(tdir, 'codex-last-message-deadbeefdeadbeef-attempt-1.md'), 'other run, must survive\n');
+  const victim = { runId: RUN, workdir: tdir };
+  const torn = Store.teardownRunArtifacts(victim);
+  assert(torn.removed.length === 2 && torn.removed.every((f) => f.includes(short)),
+    `teardown must remove exactly the owned run-bound files: ${JSON.stringify(torn)}`);
+  assert(fs.existsSync(path.join(tdir, 'task-code.txt')), 'task code must survive teardown');
+  assert(fs.existsSync(path.join(tdir, 'fixture-a.txt')), 'fixtures must survive teardown');
+  assert(fs.existsSync(path.join(tdir, 'codex-last-message-deadbeefdeadbeef-attempt-1.md')), 'other runs must survive teardown');
+  assert(!fs.existsSync(path.join(tdir, `codex-last-message-${short}-attempt-1.md`)), 'owned primary must be torn down');
+  console.log('ok: S11 storage hygiene (central records; teardown removes only exact run-bound artifacts, preserves task code/fixtures/other runs)');
 }
 
 for (const id of runningIds) await bestEffortCancel(id);

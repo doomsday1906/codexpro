@@ -124,6 +124,7 @@ import {
   CODEX_RESUME_CAPABILITY,
   engineQualification,
   findPostCancelWrites,
+  findSteeringCorrelation,
   isClaudeSessionId,
   isEngineSessionId,
   isProcessIdentityAlive,
@@ -1354,22 +1355,27 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
       fixturesUnchanged = false;
     }
   }
-  if (run.engine === "codex" && live && run.steerable === true && !run.session?.threadId) {
-    // Steerable (non-ephemeral) launches persist a session: record the
-    // engine-returned thread id when observed in worker output (best-effort
-    // parse, same standard as opencode). Steering later queues ONLY to
-    // this recorded id; an unobserved thread leaves steering unavailable
-    // (never synthesized). Ephemeral runs persist no session and never
-    // gain a thread id here.
+  if (run.engine === "codex" && live && run.steerable === true) {
+    // Steerable (non-ephemeral + --json) launches persist a session: record
+    // the engine-returned thread id ONLY from engine-observed JSONL events
+    // with a validated startup type in THIS attempt's live buffer (exact
+    // run+attempt binding via the live handle; never files, never plaintext,
+    // never a guessed id). The first verified id is retained across
+    // reconnects: a conflicting later id never overwrites (foreign/conflict
+    // stays unknown on the original binding). Ephemeral runs persist no
+    // session and never gain a thread id here.
+    const existing = run.session?.threadId;
     const thread = parseCodexThreadId(tailText(live.stdoutChunks, DELEGATION_BOUNDS.maxTailBytes));
-    if (thread) {
+    if (thread && !existing) {
       run.session = {
         ...(run.session ?? { engine: "codex" as const, resumable: false, observed: false, reason: "" }),
         engine: "codex",
         threadId: thread,
-        threadEvidence: "thread id observed in worker stdout (best-effort parse); steering queues only to this recorded id"
+        threadEvidence: `thread id observed in worker --json startup event while attempt ${live.attemptN} live (validated startup type, bound to this run+attempt live buffer attempt ${live.attemptN}); steering queues only to this recorded id`
       };
     }
+    // Conflicting ids are retained as the original (never overwritten); a
+    // null parse (unverifiable/conflicting) leaves the binding unknown.
   }
   if (run.engine === "opencode" && live) {
     const observed = parseOpenCodeSessionId(tailText(live.stdoutChunks, DELEGATION_BOUNDS.maxTailBytes));
@@ -2135,33 +2141,68 @@ export function steeringMessageHash(message: string): string {
 }
 
 /**
- * Reconcile queued steering records against worker-observable evidence.
- * A queued record becomes applied ONLY when the worker produced output
- * after the queue time: the current attempt's recorded artifact reads
- * present AND its file mtime is newer than the steer queue time. Anything
- * else stays queued (never claimed from queued alone). Returns the
- * applied keys; never throws.
+ * Reconcile queued steering records against genuine message-correlated
+ * worker-observable evidence (Finding 1: mtime-only promotion removed).
+ *
+ * A queued record becomes applied ONLY when ALL hold on the exact
+ * run + attempt + engine thread + steering message:
+ * - the record carries the exact thread queued to (threadId) and the run's
+ *   recorded thread still equals it (same thread; a missing/conflicting
+ *   thread never promotes);
+ * - the record's attemptN equals the current attempt (same attempt;
+ *   later-attempt output never promotes an earlier record);
+ * - the current attempt's provenance-bound artifact reads present AND its
+ *   FULL file content (never truncated tails alone, never mtime alone)
+ *   contains a structured correlation object through the supported protocol
+ *   (`exec --json` JSONL shape: validated event type + same thread +
+ *   same messageHash/steeringKey via findSteeringCorrelation).
+ * Unrelated output, ordinary completion text, ignored messages (no
+ * correlation object), and later-attempt files all leave the record queued
+ * (unverified, never claimed from queued alone). stored-local, unknown, and
+ * rejected records never auto-promote. Returns the applied keys; never
+ * throws. Status vocabulary stays separated: stored-local (recorded, engine
+ * not yet called) vs queued/accepted (engine confirmed held) vs applied
+ * (worker-observed message correlation); there is no separate received stage
+ * in the codex queue interface, so anything without correlation remains
+ * queued/unverified with its engine evidence explaining so.
  */
 export function reconcileSteeringApplied(run: DelegationRunRecord): { changed: boolean; applied: string[] } {
   const applied: string[] = [];
   const records = Array.isArray(run.steering) ? run.steering : [];
   if (!records.some((record) => record?.status === "queued")) return { changed: false, applied };
+  const current = run.attempts.at(-1);
+  const artifact = current?.outputArtifact;
+  const recordedThread = run.session?.threadId;
   for (const record of records) {
     if (!record || record.status !== "queued") continue;
-    const queuedMs = Date.parse(record.updatedAt);
-    if (Number.isNaN(queuedMs)) continue;
-    const current = run.attempts.at(-1);
-    const artifact = current?.outputArtifact;
+    // Exact attempt binding: later-attempt output never promotes.
+    if (!current || record.attemptN !== current.n) continue;
+    // Exact thread binding: the queued thread must still be the recorded one.
+    const queuedThread = typeof record.threadId === "string" ? record.threadId.trim() : "";
+    if (!queuedThread || !recordedThread || queuedThread !== recordedThread) continue;
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(queuedThread)) continue;
     if (!artifact || artifact.provenance === "unavailable") continue;
     const described = describeAttemptArtifact(run.workdir, run.engine, current?.n ?? 1, artifact);
     if (described.status !== "present" || !described.path) continue;
-    let mtimeMs = NaN;
+    if (described.path.includes("..") || path.isAbsolute(described.path)) continue;
+    // Full worker-observed content (bounded full-file read, never tails
+    // alone, never mtime): the artifact file proven to be this attempt's
+    // output must carry the structured message correlation.
+    let content = "";
     try {
-      mtimeMs = fs.statSync(path.join(run.workdir, described.path)).mtimeMs;
+      const abs = path.join(run.workdir, described.path);
+      const stat = fs.statSync(abs);
+      if (!stat.isFile() || stat.size <= 0 || stat.size > 256 * 1024) continue;
+      content = fs.readFileSync(abs, "utf8");
     } catch { continue; }
-    if (!Number.isFinite(mtimeMs) || mtimeMs <= queuedMs) continue;
+    const correlation = findSteeringCorrelation(content, {
+      threadId: queuedThread,
+      messageHash: record.messageHash,
+      steeringKey: record.steeringKey
+    });
+    if (!correlation) continue;
     record.status = "applied";
-    record.appliedEvidence = `worker output observed after the queue time (artifact ${described.path} mtime newer than queued ${record.updatedAt}); queued never implied applied`;
+    record.appliedEvidence = `worker-observed message correlation on run ${run.runId} attempt ${current.n} thread ${queuedThread}: event type ${correlation.eventType} matched by ${correlation.matchedBy} in artifact ${described.path} (same attempt/thread; tails/mtime alone never suffice)`;
     record.updatedAt = new Date().toISOString();
     applied.push(record.steeringKey);
   }
@@ -2788,9 +2829,12 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         let current = reconciled.run;
         if (reconciled.changed) saveDelegationRun(bridgeDir, current);
         // Live thread observation for steerable codex runs: while the
-        // worker runs, engine-observed stdout may already carry the thread
-        // id (recorded here, never synthesized). Ephemeral runs never gain
-        // one; terminal capture stays in finalizeLiveRun.
+        // worker runs, engine-observed --json stdout may already carry the
+        // thread id (recorded here from a validated startup event in THIS
+        // run's live buffer, never synthesized, never plaintext, never a
+        // foreign/conflicting id). Ephemeral runs never gain one; terminal
+        // capture stays in finalizeLiveRun. The first verified id is
+        // retained: conflicting later ids never overwrite.
         if (current.engine === "codex" && current.steerable === true && !current.session?.threadId) {
           const live = processRuntime().live.get(current.runId);
           if (live) {
@@ -2800,7 +2844,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                 ...(current.session ?? { engine: "codex" as const, resumable: false, observed: false, reason: "" }),
                 engine: "codex",
                 threadId: thread,
-                threadEvidence: "thread id observed in live worker stdout (best-effort parse); steering queues only to this recorded id"
+                threadEvidence: `thread id observed in live worker --json startup event while attempt ${live.attemptN} live (validated startup type, bound to this run+attempt live buffer); steering queues only to this recorded id`
               };
               saveDelegationRun(bridgeDir, current);
             }
@@ -2820,8 +2864,11 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         }
         const includeEvents = args.include_events !== false;
         // Live-steering reconciliation: a queued steer becomes applied ONLY
-        // on worker-observable evidence (artifact present + newer than the
-        // queue time). Queued alone is never promoted.
+        // on genuine message-correlated worker evidence (same run+attempt+
+        // thread + validated correlation event carrying the message hash/key
+        // in the provenance-bound artifact content). Queued alone, mtimes,
+        // and tails alone never promote; anything else stays queued
+        // (unverified, never claimed from queued alone).
         const steeringReconciled = reconcileSteeringApplied(current);
         if (steeringReconciled.changed) saveDelegationRun(bridgeDir, current);
         // Truthful: events with zero targets are undelivered (no-targets-
@@ -3679,11 +3726,31 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           });
         }
         const persistSteering = (record: DelegationSteeringRecord): void => {
-          run.steering = [...(Array.isArray(run.steering) ? run.steering : []), record]
-            .slice(-DELEGATION_BOUNDS.maxSteeringPerRun);
+          // Durable dedup for run lifetime: append only, never silently evict.
+          // The bound is enforced by refusal of NEW distinct keys (see below),
+          // so retained keys (identical replay, conflicting re-use, uncertain
+          // reconciliation incl. reload/restart) always resolve against stored
+          // state and never dispatch a second engine call.
+          run.steering = [...(Array.isArray(run.steering) ? run.steering : []), record];
           run.updatedAt = new Date().toISOString();
           saveDelegationRun(bridgeDir, run);
         };
+        const steeringCount = Array.isArray(run.steering) ? run.steering.length : 0;
+        // Bound BEFORE any new record: a new distinct key past
+        // maxSteeringPerRun refuses with a truthful bound error (stored:false,
+        // executed:false, no engine call, nothing evicted). Retries of
+        // retained keys already returned above and never reach here.
+        if (steeringCount >= DELEGATION_BOUNDS.maxSteeringPerRun) {
+          return failResult(`Steering bound reached for run ${run.runId} (${DELEGATION_BOUNDS.maxSteeringPerRun} steering records; new steering_key ${key} refused, nothing dispatched, nothing evicted). Retries of retained keys still replay their stored outcomes without a second dispatch; for further live input wait for the turn to settle and use delegation_followup (a separate post-completion protocol, never relabeled as steering).`, {
+            error: "steer_bound_exhausted",
+            run_id: run.runId,
+            steering_key: key,
+            engine: run.engine,
+            bound: DELEGATION_BOUNDS.maxSteeringPerRun,
+            stored: false,
+            executed: false
+          });
+        }
         // Engine routing: only codex exposes a native live-input route.
         // opencode/claude refuse with the inspected capability blocker —
         // delivery is never emulated via a second session, a resume, or a
@@ -3730,8 +3797,8 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           const ephemeral = run.steerable !== true;
           return failResult(
             ephemeral
-              ? `Steering unavailable for run ${run.runId} (codex ephemeral: no session persists, so no steerable thread exists). Not emulated: no resume, no second session, no cancel+relaunch disguised as steering. Smallest feasible alternative: relaunch with steerable=true (non-ephemeral, same profile + execution-policy boundaries) and steer the recorded thread, or wait and use delegation_followup when the run needs input.`
-              : `Steering unavailable for run ${run.runId} (codex steerable: no engine-returned thread id observed yet). The thread is recorded only from engine-observed evidence, never synthesized; retry once the run reports one, or use delegation_followup when the run needs input.`,
+              ? `Steering unavailable for run ${run.runId} (codex ephemeral: no session persists, so no steerable thread exists). Not emulated: no resume, no second session, no cancel+relaunch disguised as steering. Smallest feasible alternative: relaunch with steerable=true (non-ephemeral + --json, same profile + execution-policy boundaries) and steer the recorded thread, or wait and use delegation_followup when the run needs input (a separate protocol, never live steering).`
+              : `Steering unavailable for run ${run.runId} (codex steerable: no engine-returned thread id observed yet). The thread is recorded only from engine-observed --json startup events with a validated type, never synthesized; retry once the run reports one, or use delegation_followup when the run needs input (a separate protocol, never live steering).`,
             {
               error: "steer_unavailable_no_thread",
               run_id: run.runId,
@@ -3745,11 +3812,13 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         }
         // Durable stored-local BEFORE the engine call: a crash between
         // dispatch and persistence reconciles against this record (retry
-        // with the same key replays, never duplicates).
+        // with the same key replays, never duplicates). The exact queued
+        // thread rides the record for same attempt/thread applied binding.
         persistSteering({
           steeringKey: key, messageHash, messageChars: message.length, attemptN,
+          threadId: thread,
           status: "stored-local",
-          engineEvidence: `stored for codex thread ${thread}; engine call dispatching`,
+          engineEvidence: `stored for codex thread ${thread} attempt ${attemptN}; engine call dispatching`,
           createdAt: now, updatedAt: now
         });
         const queue = runCodexQueue(thread, message, { binary: resolveCodexBinary() });
@@ -3760,11 +3829,11 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         if (queue.outcome === "queued") {
           if (stored) {
             stored.status = "queued";
-            stored.engineEvidence = `codex queue exit ${queue.exitCode}: held by the engine for the worker's next turn (queued never implies applied). Evidence: ${queue.evidence}`.slice(0, 500);
+            stored.engineEvidence = `codex queue exit ${queue.exitCode}: held by the engine for the worker's next turn on thread ${thread} attempt ${attemptN} (queued/accepted never implies received/applied; queue-during-active vs after-end is UNPROVEN from help alone). Evidence: ${queue.evidence}`.slice(0, 500);
             stored.updatedAt = new Date().toISOString();
             saveDelegationRun(bridgeDir, run);
           }
-          return okResult(`Steer ${key} queued by the engine for run ${run.runId} (codex thread ${thread}): held for the worker's next turn. Queued never implies applied: applied is claimed only on worker-observable evidence via delegation_read_result.`, {
+          return okResult(`Steer ${key} queued by the engine for run ${run.runId} (codex thread ${thread} attempt ${attemptN}): held for the worker's next turn. Queued/accepted never implies received/applied: applied is claimed only on genuine message-correlated worker evidence (same run+attempt+thread, validated correlation event carrying the message hash/key) via delegation_read_result; otherwise the record stays queued/unverified.`, {
             run_id: run.runId,
             steering_key: key,
             status: "queued",
@@ -3774,7 +3843,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             executed: true,
             engine_evidence: queue.evidence,
             queue_note: binaryNote,
-            next_action: "poll delegation_read_result: applied is reported only when worker output is observed after the queue time"
+            next_action: "poll delegation_read_result: applied is reported only on genuine message-correlated worker evidence (same attempt/thread, validated event type + message hash/key); mtimes and tails alone never suffice"
           });
         }
         if (queue.outcome === "rejected") {

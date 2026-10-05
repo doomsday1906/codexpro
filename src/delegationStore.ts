@@ -400,6 +400,9 @@ export interface DelegationRunRecord {
  * One durable live-steering request. The message that reached (or failed to
  * reach) ONLY its intended run: run binding is verified at dispatch and the
  * engine call addresses only the run's recorded thread/session id.
+ * threadId binds the exact engine thread queued to (same attempt/thread
+ * correlation for applied); absent on records that predate thread binding
+ * (unverifiable, never promoted to applied).
  */
 export interface DelegationSteeringRecord {
   /** Caller-supplied idempotency key (bounded, per-run unique). */
@@ -410,6 +413,12 @@ export interface DelegationSteeringRecord {
   messageChars: number;
   /** Attempt number live at dispatch (which worker turn was steered). */
   attemptN: number;
+  /**
+   * Exact engine thread id queued to (codex steerable only). Binds applied
+   * correlation to the same attempt/thread; a record without it (legacy or
+   * non-codex) never promotes to applied.
+   */
+  threadId?: string;
   status: "stored-local" | "queued" | "applied" | "rejected" | "unknown";
   /** Engine-observed evidence excerpt for the status (never synthesized). */
   engineEvidence?: string;
@@ -492,6 +501,11 @@ export const DELEGATION_BOUNDS = {
   minAttemptTimeoutMs: 10_000,
   // Live steering: one run cannot accumulate unbounded steering records;
   // 16 cap keeps the run file small (key + hash + status only, never text).
+  // The cap is enforced by REFUSAL (never silent eviction): a new distinct
+  // key past the bound refuses with a truthful bound error, while retries
+  // of retained keys (identical replay, conflicting re-use, uncertain
+  // reconciliation) always resolve against durable state and never dispatch
+  // a second engine call. Run-lifetime dedup is therefore preserved.
   maxSteeringPerRun: 16
 } as const;
 
@@ -782,7 +796,53 @@ function pruneDelegationRuns(bridgeDir: string): void {
   const victims = terminal.slice(0, excess);
   for (const victim of victims) {
     try { fs.rmSync(delegationRunPath(bridgeDir, victim.runId), { force: true }); } catch { /* ignore */ }
+    teardownRunArtifacts(victim);
   }
+}
+
+/**
+ * Bounded lifecycle for retained worker-output artifacts (Finding 5):
+ * run-bound last-message files (`<stem>-<16hex>-attempt-<N>[-x<i>].<ext>`)
+ * are retained only while their run is retained (max 32 runs/workspace).
+ * When a terminal run is pruned from central storage, its OWN exact
+ * run-bound artifacts are torn down from its workdir via exact-name match
+ * only (full 16-hex identity + attempt, never task code, never other runs,
+ * never fixtures, never bridge/subscription state). Temp atomic-write
+ * siblings (`.<name>.<pid>.<ts>.tmp`) are already removed in their finally
+ * paths; empty reservation placeholders for pruned runs are covered here
+ * (they carry the same run-bound name). Never throws; never touches
+ * `.ai-bridge` subscription state, security material, or anything outside
+ * the victim's workdir artifact namespace. Exported for the focused
+ * regression proof.
+ */
+export function teardownRunArtifacts(run: DelegationRunRecord): { removed: string[] } {
+  const removed: string[] = [];
+  const runId = String((run as { runId?: unknown })?.runId ?? "");
+  const workdir = String((run as { workdir?: unknown })?.workdir ?? "");
+  const m = /^run_([0-9a-f]{16})$/.exec(runId);
+  if (!m || !workdir) return { removed };
+  const short = m[1];
+  let entries: string[];
+  try {
+    const stat = fs.statSync(workdir);
+    if (!stat.isDirectory()) return { removed };
+    entries = fs.readdirSync(workdir);
+  } catch {
+    return { removed };
+  }
+  for (const entry of entries) {
+    if (!entry.includes(`-${short}-attempt-`)) continue;
+    if (!/^(codex|opencode|claude)-last-message-[0-9a-f]{16}-attempt-\d+(-x\d+)?\.(md|json)$/.test(entry)) continue;
+    if (entry.includes("..") || path.isAbsolute(entry)) continue;
+    const abs = path.join(workdir, entry);
+    try {
+      const lst = fs.lstatSync(abs);
+      if (!lst.isFile() && !lst.isSymbolicLink()) continue;
+      fs.rmSync(abs, { force: true });
+      removed.push(entry);
+    } catch { /* best effort; never throws */ }
+  }
+  return { removed };
 }
 
 /** Backward-compatible accessor: Leaf 1 run files carry no inputRequests. */
