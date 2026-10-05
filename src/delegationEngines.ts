@@ -2635,8 +2635,11 @@ export function engineQualification(engine: string): Record<string, unknown> {
  * OpenCode cancel capability against the qualified CLI (opencode v2.0.22,
  * `opencode run --help` / `opencode session --help`). New launches and
  * continuations run `--standalone` (a private server for the turn), so the
- * PID+starttime-verified owned tree IS the serving process tree: reaping it
- * stops the owned work. Runs launched before the standalone route stay
+ * PID+starttime-verified tree covers the worker/private server only. Shared
+ * per-project MCP helpers belong to the long-lived service even on this
+ * route and remain outside run ownership. Reaping a worker never proves
+ * those shared resources stopped or that its directory can be retired.
+ * Runs launched before the standalone route stay
  * honestly labeled shared-service (never silently converted). The session
  * subcommands are list/delete/export/import: there is NO session-scoped
  * halt/stop for an in-flight run turn on either route. PID-tree cleanup
@@ -2653,7 +2656,7 @@ export const OPENCODE_CANCEL_CAPABILITY = {
   engine: "opencode",
   pidRoute: "cancelOwnedTree over the PID+starttime-verified owned tree only (--standalone private server for new turns; pre-standalone runs labeled shared-service, never silently converted)",
   sessionScopedHaltSupported: false,
-  sessionRoute: "opencode v2.0.22 session subcommands are list/delete/export/import (no halt/stop of an in-flight run turn on either route); new turns run --standalone (private server) so the owned worker tree is the serving tree for worker processes, pre-standalone runs stay labeled shared-service. PROVEN LIMIT 2026-10-05: per-project `codegraph serve --mcp` helpers are parented to the shared background service even for --standalone turns, persist after turn end AND after `session delete`, and are reused across sessions (at most one per project dir); they live outside every run-owned tree, so cancelOwnedTree provably never covers them — terminal closeout of a deleted workdir must retire its pinned helper first (see sessionHelpers.ts), never by name sweep and never the shared service itself",
+  sessionRoute: "opencode v2.0.22 session subcommands are list/delete/export/import (no halt/stop of an in-flight run turn on either route); new turns run --standalone (private server) so the owned worker tree is the serving tree for worker processes, pre-standalone runs stay labeled shared-service. PROVEN LIMIT 2026-10-05: per-project `codegraph serve --mcp` helpers are parented to the shared background service even for --standalone turns, persist after turn end AND after `session delete`, and are reused across sessions (at most one per project dir); they live outside every run-owned tree, so cancelOwnedTree provably never covers them — workdir closeout is blocked without atomic engine/project lifecycle coordination; delegation_closeout archives and retires only the adapter run, never signals these helpers or the shared service",
   verification: "owned-tree liveness recheck plus a windowed post-cancel workdir quiescence probe (grace + verification window, no further writes after cancel-complete); unverifiable workdirs fail closed; repeated cancel re-verifies live",
   blocker: "no session-scoped halt in the qualified CLI; cancel verification is PID-tree + liveness recheck + windowed quiescence only and is reported as such, never as session-halt proof"
 } as const;

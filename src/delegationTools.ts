@@ -188,6 +188,8 @@ import {
   type RunAttentionEvent
 } from "./delegationEvents.js";
 
+import { archiveRetiredSession, closeoutReceipt, hasCloseoutIntent, readCloseoutExport, OPENCODE_CLOSEOUT_BLOCKER } from "./sessionHelpers.js";
+
 export interface DelegationToolDeps {
   config: CodexProConfig;
   workspaces: WorkspaceManager;
@@ -1936,6 +1938,7 @@ export function spawnCanaryChild(
   attemptN = 1,
   extraEnv?: Record<string, string>
 ): ChildProcess {
+  if (run.engine === "opencode" && hasCloseoutIntent(bridgeDir, run)) throw new CodexProError("Run explicitly retired; dispatch refused.");
   const runtime = processRuntime();
   // Canary runs hash the read-only fixtures before spawn so completion can
   // prove them unchanged. Real tasks carry no fixtures: nothing to hash.
@@ -2718,6 +2721,19 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     }).strict().describe("Durable checkpoint: stable id, owning run id, monotonic seq, bounded payload, plus questions or a request reference.")
   }).strict();
 
+  const closeoutArgs = z.object({
+    run_id: RUN_ID,
+    workspace_id: WORKSPACE_ID.optional(),
+    retire: z.literal(true).describe("Explicitly retire this run from future adapter follow-ups. Does not delete the engine session or authorize workdir removal."),
+    timeout_ms: z.number().int().min(1000).max(20000).optional()
+  }).strict();
+  const closeoutReadArgs = z.object({
+    run_id: RUN_ID,
+    workspace_id: WORKSPACE_ID.optional(),
+    offset: z.number().int().min(0).optional(),
+    max_chars: z.number().int().min(1).max(12000).optional()
+  }).strict();
+
   const cancelArgs = z.object({
     run_id: RUN_ID,
     workspace_id: WORKSPACE_ID.optional()
@@ -2878,6 +2894,8 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         // worker mints (observed best-effort).
         let sessionId: string | undefined;
         if (plan.requestedSessionId) {
+          const retiredHolder = listDelegationRuns(bridgeDir).find((r) => r.engine === engine && r.session?.sessionId === plan.requestedSessionId && hasCloseoutIntent(bridgeDir, r));
+          if (retiredHolder) return failResult("Session belongs to an explicitly retired adapter run; reuse refused. Engine history retained.", { error: "session_retired", run_id: retiredHolder.runId, executed: false });
           const holders = activeSessionHolders(listDelegationRuns(bridgeDir), plan.requestedSessionId);
           if (holders.length > 0) {
             return failResult(`Session ${plan.requestedSessionId} already has an active turn (${holders[0].runId}); one active turn per session.`, {
@@ -3484,6 +3502,10 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             })),
             open_input_requests: openInputRequests(current).length,
             ...(current.session ? { session: current.session } : {}),
+            ...(current.engine === "opencode" && hasCloseoutIntent(bridgeDir, current) ? {
+              closeout: closeoutReceipt(bridgeDir, current),
+              closeout_read_tool: "delegation_read_closeout"
+            } : {}),
             resume_capability: current.engine === "codex" ? CODEX_RESUME_CAPABILITY : current.engine === "opencode" ? OPENCODE_RESUME_CAPABILITY : CLAUDE_RESUME_CAPABILITY,
             ...(includeEvents ? {
               pending_events: current.pendingEvents.map((event) => ({
@@ -3505,6 +3527,67 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       }
     },
     {
+      name: "delegation_closeout",
+      options: {
+        title: "Delegation Closeout",
+        description: "Explicit owner-authorized retirement of a settled OpenCode run from adapter follow-ups. Preserves its session export in central run storage with verified identity and durable readback. Workdir release is BLOCKED: the engine's published disposal operations do not establish atomic exclusion of concurrent project users. Never deletes a session/directory or signals a shared helper/service. Repeated calls retry safe archival; read the archive via delegation_read_closeout.",
+        inputSchema: publicSchemaFrom(closeoutArgs), runtimeInputSchema: closeoutArgs, annotations: { ...DESTRUCTIVE, idempotentHint: true }
+      },
+      handler: async (args) => {
+        const workspace = deps.workspaces.getWorkspace(args.workspace_id);
+        const bridgeDir = bridgeDirFor(deps.config, workspace.root);
+        const loaded = loadDelegationRun(bridgeDir, args.run_id);
+        if (!loaded || !ownerAllowed(deps, loaded)) return denyAccess();
+        if (args.retire !== true) return failResult("Explicit retirement required.", { error: "retirement_required" });
+        if (loaded.engine !== "opencode") return failResult("Closeout currently supports OpenCode archival only.", { error: "closeout_unsupported" });
+        const { run } = reconcileRunState(loaded, isProcessIdentityAlive);
+        // Actual stored run/attempt state owns this gate; input cannot supply
+        // state, terminal sets, PIDs or a service identity. Interrupted/unknown
+        // dispatch and pending input stay resumable; no intent is published.
+        const terminal = ["completed", "failed", "timed_out", "cancelled"].includes(run.state);
+        const attempt = run.attempts.at(-1);
+        if (!terminal || run.pendingDispatch || !attempt?.finishedAt || openInputRequests(run).length > 0) {
+          return failResult("Run is active, resumable or dispatch is uncertain; closeout refused.", { error: "closeout_not_terminal", run_id: run.runId, state: run.state });
+        }
+        for (const member of [...run.attempts.filter((a) => a.pid !== undefined).map((a) => ({ pid: a.pid!, startTime: a.processStartTime })),
+          ...(run.opencodeServer?.pid !== undefined ? [{ pid: run.opencodeServer.pid, startTime: run.opencodeServer.startTime }] : [])]) {
+          const observed = readProcessStartTime(member.pid);
+          let present = true;
+          try { fs.lstatSync(`/proc/${member.pid}`); }
+          catch (error) { present = (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+          if ((observed === null && present) || (observed !== null && (!member.startTime || observed === member.startTime))) {
+            return failResult("Live or unverifiable attempt identity; closeout refused.", { error: "closeout_process_unverified", run_id: run.runId });
+          }
+        }
+        if (run.session?.sessionId && activeSessionHolders(listDelegationRuns(bridgeDir), run.session.sessionId, run.runId).length > 0) {
+          return failResult("Session has another active adapter turn; closeout refused.", { error: "session_busy", run_id: run.runId });
+        }
+        const result = archiveRetiredSession(bridgeDir, run, resolveOpenCodeBinary(), args.timeout_ms ?? 10000);
+        const body = { run_id: run.runId, state: run.state, ...result, closeout_read_tool: "delegation_read_closeout" };
+        return result.exported
+          ? okResult("Run retired and session export durably preserved. Workdir release BLOCKED; engine history, shared helpers and directory retained.", body)
+          : failResult("Closeout archival incomplete; retry delegation_closeout. Workdir release BLOCKED; engine history, shared helpers and directory retained.", { ...body, error: result.reason });
+      }
+    },
+    {
+      name: "delegation_read_closeout",
+      options: {
+        title: "Read Delegation Closeout Export",
+        description: "Owner-authorized bounded page of the centrally retained session export for one retired run. Default 4000 characters, maximum 12000; use next_offset to continue. Reading has no cleanup effect.",
+        inputSchema: publicSchemaFrom(closeoutReadArgs), runtimeInputSchema: closeoutReadArgs, annotations: READ_ONLY
+      },
+      handler: async (args) => {
+        const workspace = deps.workspaces.getWorkspace(args.workspace_id);
+        const bridgeDir = bridgeDirFor(deps.config, workspace.root);
+        const run = loadDelegationRun(bridgeDir, args.run_id);
+        if (!run || !ownerAllowed(deps, run)) return denyAccess();
+        try {
+          const page = readCloseoutExport(bridgeDir, run, args.offset ?? 0, args.max_chars ?? 4000);
+          return okResult("Retained session export page.", page);
+        } catch { return failResult("Closeout export unavailable or unverified.", { error: "closeout_export_unavailable", run_id: run.runId }); }
+      }
+    },
+    {
       name: "delegation_followup",
       options: {
         title: "Delegation Follow-up",
@@ -3521,6 +3604,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         const reconciled = reconcileRunState(loaded, isProcessIdentityAlive);
         let run = reconciled.run;
         if (reconciled.changed) saveDelegationRun(bridgeDir, run);
+        if (hasCloseoutIntent(bridgeDir, run)) return failResult("Run explicitly retired; follow-up refused. Engine session/history retained.", { error: "run_retired", run_id: run.runId, executed: false });
         const raw = (args.checkpoint ?? {}) as Record<string, unknown>;
         const checkpoint: CheckpointShape = {
           id: String(raw.id ?? ""),
@@ -4744,6 +4828,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               ? `Run ${current.runId} is already cancelled; re-verified: owned tree gone, workdir quiet across the verification window.`
               : `Run ${current.runId} is already cancelled; re-verified INCOMPLETE: ${repeatRemaining.length > 0 ? `${repeatRemaining.length} owned descendant(s) still remain (${repeatRemaining.join(",")}). ` : ""}${!ownershipGrounded ? "ownership UNVERIFIED (no live owned-tree enumeration; a missing pid or stale root is never proof of cleanup). " : ""}${repeatBackendUnproven ? "backend cessation UNPROVEN (legacy shared-service route; owned-tree + quiescence alone cannot verify the backend stopped). " : ""}${!repeatQuiescence.checked ? `quiescence UNVERIFIABLE (${repeatQuiescence.reason ?? "workdir unreadable"}).` : repeatQuiescence.continued.length > 0 ? `quiescence FAILED: ${repeatQuiescence.continued.length} post-cancel write(s).` : ""}`,
             {
+              ...(current.engine === "opencode" ? { cleanup_scope: "owned-process-tree-only", shared_project_helpers: { retired: false, blocker: OPENCODE_CLOSEOUT_BLOCKER }, workdir_release: "unverified" } : {}),
               run_id: current.runId, state: current.state, already_terminal: true, cancelled: true,
               cleanup_finished: repeatClean,
               remaining_pids: repeatRemaining,
@@ -4887,6 +4972,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               ? `Run ${current.runId} is already ${current.state}; re-verified: owned tree gone with a grounded enumeration, workdir quiet across the verification window.`
               : `Run ${current.runId} is already ${current.state}; cancel re-verified INCOMPLETE: ${termRemaining.length > 0 ? `${termRemaining.length} owned process(es) still remain (${termRemaining.join(",")}). ` : ""}${!termGrounded ? "ownership UNVERIFIED (no live owned-tree enumeration; a missing pid or stale root is never proof of cleanup). " : ""}${termBackendUnproven ? "backend cessation UNPROVEN (legacy shared-service route; owned-tree + quiescence alone cannot verify the backend stopped). " : ""}${!termQuiescence.checked ? `quiescence UNVERIFIABLE (${termQuiescence.reason ?? "workdir unreadable"}).` : termQuiescence.continued.length > 0 ? `quiescence FAILED: ${termQuiescence.continued.length} post-cancel write(s).` : ""}`,
             {
+              ...(current.engine === "opencode" ? { cleanup_scope: "owned-process-tree-only", shared_project_helpers: { retired: false, blocker: OPENCODE_CLOSEOUT_BLOCKER }, workdir_release: "unverified" } : {}),
               run_id: current.runId, state: current.state, already_terminal: true, cancelled: false,
               cleanup_finished: termClean,
               remaining_pids: termRemaining,
@@ -5103,6 +5189,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                 ? `Run ${current.runId} cancelled; owned tree reaped and rechecked gone, but verification INCOMPLETE: backend cessation UNPROVEN (legacy shared-service route). ${quiescenceText}.${routeText}${sessionText}${backendText}`
                 : `Run ${current.runId} cancelled; cleanup UNVERIFIED: no live owned-tree identity to recheck (a missing pid or stale root is never proof of cleanup). ${quiescenceText}.${routeText}${sessionText}`,
           {
+            ...(current.engine === "opencode" ? { cleanup_scope: "owned-process-tree-only", shared_project_helpers: { retired: false, blocker: OPENCODE_CLOSEOUT_BLOCKER }, workdir_release: "unverified" } : {}),
             run_id: current.runId, state: "cancelled", cancelled: true,
             cleanup_finished: cleanupFinished,
             remaining_pids: remainingPids,
@@ -5301,4 +5388,3 @@ async function pumpSweep(deps: DelegationToolDeps, bridgeDir: string): Promise<v
     if (due) await pumpDeliveries(deps, bridgeDir, loadDelegationRun(bridgeDir, run.runId) ?? run);
   }
 }
-
