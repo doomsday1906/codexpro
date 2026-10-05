@@ -403,12 +403,19 @@ process.env.CODEXPRO_CLAUDE_PROJECTS_DIR = clProjects;
     Engines.OPENCODE_ENGINE_QUALIFICATION.qualified === true,
     'Codex/OpenCode qualification must be independent of the Claude deferral');
   const resumeArgv = Engines.buildClaudeResumeArgv('123e4567-e89b-42d3-a456-426614174000', 'hi', { agent: 'implementer', permissionMode: 'acceptEdits', model: 'opus', effort: 'high', allowedTools: 'Read', disallowedTools: 'Bash' });
+  // Changed 2026-10-05 (scoped bypass): resume argv now also carries exactly
+  // one `--settings '{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}'`
+  // element immediately before the prompt (was: prompt directly after the
+  // last explicit flag). Full byte shape is pinned in
+  // delegation-claude-bypass-smoke.
   assert(resumeArgv.includes('--resume') && resumeArgv.includes('--model') && resumeArgv.includes('opus') &&
-    resumeArgv.includes('--effort') && resumeArgv.includes('--allowedTools') && resumeArgv.includes('--disallowedTools'),
-    `resume argv must carry the full explicit-flag set (no override dropped): ${JSON.stringify(resumeArgv)}`);
+    resumeArgv.includes('--effort') && resumeArgv.includes('--allowedTools') && resumeArgv.includes('--disallowedTools') &&
+    resumeArgv.includes('--settings') && resumeArgv.includes('{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}'),
+    `resume argv must carry the full explicit-flag set (no override dropped) + the scoped bypass: ${JSON.stringify(resumeArgv)}`);
   const resumeBare = Engines.buildClaudeResumeArgv('123e4567-e89b-42d3-a456-426614174000', 'hi', { agent: 'implementer' });
-  assert(resumeBare.includes('--resume') && !resumeBare.includes('--model') && !resumeBare.includes('--effort'),
-    `resume argv without explicit flags must not invent any: ${JSON.stringify(resumeBare)}`);
+  assert(resumeBare.includes('--resume') && !resumeBare.includes('--model') && !resumeBare.includes('--effort') &&
+    resumeBare.includes('--settings') && resumeBare.at(-3) === '--settings' && resumeBare.at(-1) === 'hi',
+    `resume argv without explicit flags must not invent any (bypass still rides): ${JSON.stringify(resumeBare)}`);
   const prevClaude = await call('delegation_preview', {
     workspace_id: wid, engine: 'claude', agent: 'implementer', workdir: 'focus-claude-1',
     task: 'Do the thing.', delegation_group: 'team-focus'

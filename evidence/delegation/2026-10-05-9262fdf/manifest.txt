@@ -1,0 +1,174 @@
+CLAUDE SCOPED-BYPASS LEAF MANIFEST — 2026-10-05, base 9262fdf
+codexpro claude scoped-bypass leaf: every claude argv gains exactly one
+per-invocation `--settings '{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}'`
+element (initial launch, stable --session-id creation, verified --resume
+continuation), surfaced in preview / provenance / launch prose. UNCOMMITTED.
+No live MODEL calls in this leaf (read-only `claude --help` excerpts +
+labeled shims only; no credential contents read; ~/.claude untouched).
+
+1) BASE / WORKING TREE
+- HEAD: 9262fdf4a0c51663182b2b68a08047a1a4c36e17 (verified via git rev-parse)
+- Tracked modifications (uncommitted): package.json,
+  scripts/delegation-triengine-smoke.mjs,
+  scripts/delegation-repair-focus-smoke.mjs, src/delegationEngines.ts,
+  src/delegationTools.ts
+- New untracked (leaf-owned): scripts/delegation-claude-bypass-smoke.mjs,
+  evidence/delegation/2026-10-05-9262fdf/ (manifest.txt+json tracked types
+  only; logs/*.log recorded by hash, ignored by *.log rule like prior leaves)
+- Untouched strays (preserved, never committed): fixture-a.txt,
+  fixture-b.txt, evidence/delegation/2026-10-05-42f8fa6/offline/ (left alone)
+- Current checkout only, no lanes. Never silently substituted
+  profile/model/session/policy; everything accepted preserved (ownership,
+  reservation, cancel guards, workdir identity, replay-before-busy,
+  standalone+legacy labels, coverage, Codex policy gates,
+  approval/redaction, crash-recovery, storage, notifications, isolation,
+  amendment persistence, steering transport + negatives,
+  unauthorized-expansion fate, permission checks).
+
+2) CHANGED-FILE SHA256 (post-proof)
+e01267ad474f2f781e28cc78d3b7f642addde045efcaecb8782f10c4bcee1488  src/delegationEngines.ts
+9d5eb72eec8a730437a28a2ebf45e230b0f82b474acc686d9b4491ecafef6723  src/delegationTools.ts
+a3d22b16ca14afaee87c32685153bfc3ce8a6931eb3a79cc6855fb209ec34fcf  scripts/delegation-triengine-smoke.mjs
+d7175e3fc2806d453a9dd145bd3c20e3d17ce5870b9c1a1a0626059b27747ee4  scripts/delegation-repair-focus-smoke.mjs
+0e46270fd0c50d3d2c0a5da73db26c341155ee005d8cf4c7599effcf8d66bc23  scripts/delegation-claude-bypass-smoke.mjs (new)
+b0829b1aba2c50a513a219afa7a0f01ff71d2e5fe132bb94befb09b6790bb833  package.json
+
+3) BUILD INPUTS + IDENTITY
+- Build inputs sha256:
+01707d63930e59130eb6169d3c0afe9283ad356b655220b2b0633f22b123f0f4  tsconfig.json
+80cbc28a3aae9313aa17591c6530879e828f9d65f12b893e768f2ef78c464e8e  scripts/build.mjs
+ac352ab4d2416fee6bab255d15f966be66d8281b461f55751a360f4773799aa0  scripts/build-identity.mjs
+- codexpro@0.31.0; `npm run build` -> exit 0
+- Build log line: "Built codexpro@0.31.0; source commit
+  9262fdf4a0c51663182b2b68a08047a1a4c36e17 (dirty)."
+- dist/build-identity.json: {schema_version 1, codexpro 0.31.0,
+  source_commit 9262fdf4a0c51663182b2b68a08047a1a4c36e17,
+  source_state dirty}
+- No src change after the build (only two test-script assertion index fixes,
+  §5); the build identity covers all proof runs.
+
+4) DESIGN (exact argv element + surfacing fields)
+- Exact element (constant, stable key order, stable JSON):
+  `--settings '{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}'`
+  (src/delegationEngines.ts: CLAUDE_SCOPED_BYPASS_PLUGIN_ID,
+  CLAUDE_SCOPED_BYPASS_SETTINGS_JSON, CLAUDE_SCOPED_BYPASS_NOTICE).
+- buildClaudeArgv pushes the pair immediately before the trailing prompt:
+  covers initial launch AND stable --session-id creation AND the unverified
+  --session-id first-use creation continuation (all funnel through this one
+  builder via buildPlannedArgv / followup).
+- buildClaudeResumeArgv pushes the identical pair immediately before the
+  trailing prompt: covers verified --resume continuation (full explicit-flag
+  set preserved, --resume only, never --session-id alongside).
+- Code comment on both builders states: orthogonal + always present, never
+  task content, never a model/effort/permission substitution; NOT --safe-mode
+  (disables custom agents incl. the required implementer agent), NOT --bare
+  (auth collateral per --help: CLAUDE_CODE_SIMPLE=1, ANTHROPIC_API_KEY-only).
+- Surfacing (Hestia-visible without reading source):
+  (a) preview argv_preview carries the element (via buildPlannedArgv) PLUS a
+      named `scoped_bypass` field (plugin id + reason + zero-files +
+      inert-when-absent + orthogonality), claude engine only; non-claude
+      previews omit it; claude engine_note prose names it in one sentence.
+  (b) read_result `execution_provenance.scoped_bypass` (same notice object;
+      claude runs only).
+  (c) launch ack prose: "... + per-invocation --settings scoped bypass
+      disabling gitkraken-hooks@gitkraken (inert when absent, zero files) ..."
+      (one clause).
+  (d) delegation_launch tool description + CLAUDE_RESUME_CAPABILITY
+      resumeArgvShape carry the same statement (minimal clauses).
+- Boundaries held: task-text sanitization untouched (prompt still rides once,
+  trailing; bypass is constant bytes); approval-kind semantics unchanged;
+  model/effort/permission explicitness rules unchanged.
+
+5) SERIAL PROOF MATRIX (serial, stop-at-first-red)
+[01] build: npm run build -> exit 0
+  log 01-build.log sha256 1d2964f8ca506123cc87e58a7148cfe234fd4438ae943e3422aaf572cb1d4e57
+[02] bypass (new): node scripts/delegation-claude-bypass-smoke.mjs -> exit 0
+  log 02-bypass.log sha256 20c5c43b45abecbd201aec32102d08bbe1021633e953a72db80339d619268e01
+  tail: delegation-claude-bypass-smoke: PASS (no live model calls; labeled shims only)
+[03] triengine: node scripts/delegation-triengine-smoke.mjs -> exit 0
+  log 03-triengine.log sha256 94c313a084c378f3122dce69b543cc57d70faf7f540ea387bd6c6f36de73d68e
+  tail: delegation-triengine-smoke: PASS (no live model calls)
+[04] followup: node scripts/delegation-followup-smoke.mjs -> exit 0
+  log 04-followup.log sha256 0be232192cc88878d21c291e613ed7a17d59049230f69a47282e4546fe844dde
+  tail: delegation-followup-smoke: PASS (edge matrix hermetic; model calls: none; loopback: delivery-identity only)
+[05] amendment: node scripts/delegation-followup-amendment-smoke.mjs -> exit 0
+  log 05-amendment.log sha256 de684e493b97a2c68547db79dd72ca3afbf41343dd411d09f934990996886aa1
+  tail: delegation-followup-amendment-smoke: PASS (labeled shims only; model calls: none)
+[06] identity: node scripts/delegation-identity-standalone-output-smoke.mjs -> exit 0
+  log 06-identity.log sha256 6fda2685fd8fd038562d0755619ca3332b7b40f346464a8b7830e45ea443ab4b
+  tail: delegation-identity-standalone-output-smoke: PASS (no live model calls; fake-binary results labeled shim)
+[07] routing: node scripts/delegation-routing-smoke.mjs -> exit 0
+  log 07-routing.log sha256 ae02cecaaa44993aaa95e89619d9a5ed48f2c6fb5e8ceb897a167e7a878a8b5c
+  tail: delegation-routing-smoke: PASS (one authority; owner+filter selection; truthful no-target; explicit replay; real-protocol cross-workspace delivery)
+[08] canary: node scripts/delegation-canary-smoke.mjs -> exit 0
+  log 08-canary.log sha256 432b6541c65982966227ddd54a2f83c494733f35c3ed008d88f39aba73b259d1
+  tail: delegation-canary-smoke: PASS (code SUBSCRIBED-loopback OBSERVED; ChatGPT-side subscription pending coordination)
+[09] steer: node scripts/delegation-steer-smoke.mjs -> exit 0
+  log 09-steer.log sha256 c84349ca6d1a16f4b76406eba9a69532a820cc1c253b8daa9e095b81581b95c3
+  tail: delegation-steer-smoke: PASS (no live model calls; fake-binary results labeled shim)
+[10] steer-server: node scripts/delegation-steer-server-smoke.mjs -> exit 0
+  log 10-steer-server.log sha256 c4bd1f3601ebd16e2db3aed2cebc0ede8878273076ca5fa5d937e30bb0337568
+  tail: delegation-steer-server-smoke: PASS (no live model calls; fake-binary results labeled shim)
+[11] repair-focus: node scripts/delegation-repair-focus-smoke.mjs -> exit 0
+  log 11-repair-focus.log sha256 0dc0fd0aa02773018674b51dd98bbc94db5706cf94d9b85f3ee276262dbb9b43
+  tail: delegation-repair-focus-smoke: PASS (no live model calls; fake-binary results labeled shim)
+One red occurred mid-matrix and was repaired by TEST FIX ONLY (no source
+change): first triengine run failed on the leaf's own new assertion
+(`argv.at(-2) === '--settings'`; the pair sits third-from-last, prompt is
+last). Fixed the assertion index in triengine + the mirrored repair-focus
+assertion, then re-ran the matrix serially: all 11 green. The [02] bypass
+log above is the post-fix re-run. No src edit after the build.
+
+6) NEW / UPDATED CASES
+- New suite scripts/delegation-claude-bypass-smoke.mjs (registered as
+  delegation-claude-bypass:smoke in package.json): C1 initial-launch argv
+  byte-exact; C2 stable-session-id creation argv byte-exact (inherits, bypass
+  present); C3 resume argv byte-exact (full flag set + bypass, --resume
+  only); C4 constant parses with stable key order (invalid JSON impossible
+  by construction); C5 plugin-absent identical argv (no drift), bypass
+  carries no task content, no --safe-mode/--bare; C6 preview notice
+  (argv_preview + named scoped_bypass, claude-only); C7-C8 MCP wiring via
+  labeled shims (preview notice, launch + verified-resume wire argv,
+  execution_provenance.scoped_bypass, launch ack prose).
+- Updated T5 in scripts/delegation-triengine-smoke.mjs: launch + resume argv
+  carry the exact bypass element before the prompt. Quoted change: was
+  "prompt directly after --session-id / last explicit flag", now "exactly
+  one `--settings '{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}'`
+  element immediately before the prompt"; full byte shape pinned in the new
+  bypass suite.
+- Updated R5 in scripts/delegation-repair-focus-smoke.mjs: resume argv
+  assertions extended the same way (full explicit-flag set + bypass; bare
+  resume invents nothing, bypass still rides).
+
+7) READ-ONLY CLI EXCERPTS (no global change; per-invocation scoping)
+(a) `claude --help` documents the scoped route (exit 0):
+    "--settings <file-or-json>             Path to a settings JSON file or a
+    JSON string to load additional settings from"
+(b) `claude --help` confirms no --disable-hooks flag exists (grep for
+    "disable-hooks" returns nothing) and that --bare is NOT an acceptable
+    substitute (auth collateral quoted from help):
+    "--bare  Minimal mode: skip hooks ... apiKeyHelper via --settings
+    (OAuth and keychain are never read) ... CLAUDE_CODE_SIMPLE=1 ...
+    --settings, --agents, --plugin-dir."
+(c) No global change: this leaf ran no settings mutation (no `claude
+    config`, no writes under ~/.claude; credential contents never read;
+    `git status` shows no settings-file modifications — only the source,
+    test, package.json, and evidence paths listed in §1).
+
+8) STRAYS (preserved untouched, never committed)
+ce299a8defb9e1e8102a58dd1a8251ad2b7f954c9341e6fbce6beab36b90cca7  fixture-a.txt
+13aafb27a71bb59b8c92d83248746711ddffe2d73fa2f3fbc5299851d0fac6ce  fixture-b.txt
+857e7a2b061ae46ed6aedea6a5fddd3a6ce14f0334bf7eafaf10d4cbe68ec78b  evidence/delegation/2026-10-05-42f8fa6/offline/TurnSteerParams.json
+08af127bf88d9a6ab8d7a994eab15843a2fceeb04011a854616d4cf52eed43da  evidence/delegation/2026-10-05-42f8fa6/offline/disposable-serve.log
+b20580b10d5f44054977e83a47b87f55e42db34f5433f8cf6e8f0dc9c4a7503c  evidence/delegation/2026-10-05-42f8fa6/offline/disposable-server-transcript.md
+957ec86e51ff8532cd5d83a2549e4c93bf05cc6536227090d5034a6588cc30b4  evidence/delegation/2026-10-05-42f8fa6/offline/opencode-delivery-steer-binary-lines.txt
+
+9) STALE-LEAF DISCLAIMER
+This leaf proves hermetic argv/surfacing mechanics only (byte assertions +
+labeled shims + read-only --help). The BYPASS BEHAVIOR ITSELF (a tool-using
+claude worker completing while the GitKraken blocking hook is disabled by
+this per-invocation layer) remains BEHAVIOR-UNPROVEN for orchestrator
+live-proof: no live model call was made here. The blocker receipt
+(evidence/delegation/2026-10-05-live-claude-75e1a15.md) is referenced, not
+renewed. Evidence dir evidence/delegation/2026-10-05-9262fdf/ is fresh for
+this leaf; prior receipts belong to earlier leaves/bases.

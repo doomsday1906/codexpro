@@ -2470,6 +2470,36 @@ export interface ClaudeArgvOpts {
 }
 
 /**
+ * Scoped per-invocation bypass for the user-scope gitkraken-hooks@gitkraken
+ * PermissionRequest blocking hook (observed 2026-10-05: `gk ai hook run
+ * --host claude-code --blocking`, timeout 86400, hangs every tool-using run;
+ * no-tool probe exits 0). `claude --settings <file-or-json>` loads additional
+ * settings for ONE invocation (binary-verified); a loaded layer with
+ * `"enabledPlugins":{"<id>":false}` disables that plugin (Jr() mechanism,
+ * binary-verified). No --disable-hooks flag exists; no global (~/.claude)
+ * change is acceptable, and this route makes none.
+ *
+ * The bypass is INERT when the plugin is absent/disabled (disabling a
+ * non-enabled plugin is a no-op) and touches zero files (the JSON rides argv;
+ * no settings file is read or written). It is ORTHOGONAL and ALWAYS present:
+ * it never carries task content (constant bytes, prompt rides separately),
+ * and it is never a model/effort/permission substitution (explicitness rules
+ * unchanged). Do NOT replace it with --safe-mode (disables custom agents
+ * including the required implementer agent) or --bare (auth collateral).
+ */
+export const CLAUDE_SCOPED_BYPASS_PLUGIN_ID = "gitkraken-hooks@gitkraken";
+export const CLAUDE_SCOPED_BYPASS_SETTINGS_JSON =
+  '{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}';
+export const CLAUDE_SCOPED_BYPASS_NOTICE = {
+  plugin: CLAUDE_SCOPED_BYPASS_PLUGIN_ID,
+  argv_element: ["--settings", CLAUDE_SCOPED_BYPASS_SETTINGS_JSON],
+  reason: "user-scope gitkraken-hooks@gitkraken v3.1.74 PermissionRequest `gk ai hook run --host claude-code --blocking` (timeout 86400) hangs every tool-using run (observed 2026-10-05; no-tool probe exit 0)",
+  zero_files: "per-invocation only: the JSON rides argv, no settings file is read or written, nothing persists",
+  inert_when_absent: "disabling a non-enabled plugin is a no-op: identical argv with or without the plugin installed",
+  orthogonality: "always present and orthogonal: never carries task content; not a model/effort/permission substitution (explicitness rules unchanged)"
+} as const;
+
+/**
  * Build the Claude argv (-p --output-format json, non-interactive). Only
  * explicitly-passed model/effort/permission/tool flags appear; otherwise the
  * agent/settings default governs. Resume uses --resume ONLY after
@@ -2486,6 +2516,12 @@ export function buildClaudeArgv(opts: ClaudeArgvOpts): string[] {
   for (const dir of opts.addDirs ?? []) argv.push("--add-dir", dir);
   if (opts.resume && opts.sessionId) argv.push("--resume", opts.sessionId);
   else if (opts.sessionId) argv.push("--session-id", opts.sessionId);
+  // Scoped bypass (CLAUDE_SCOPED_BYPASS_NOTICE): exactly one --settings
+  // element, constant bytes, immediately before the prompt. Orthogonal and
+  // always present on initial launch, stable --session-id creation, and the
+  // --session-id first-use creation continuation below: never task content,
+  // never a model/permission substitution.
+  argv.push("--settings", CLAUDE_SCOPED_BYPASS_SETTINGS_JSON);
   argv.push(opts.prompt);
   return argv;
 }
@@ -2517,6 +2553,10 @@ export function buildClaudeResumeArgv(
   if (opts?.permissionMode) argv.push("--permission-mode", opts.permissionMode);
   if (opts?.allowedTools) argv.push("--allowedTools", opts.allowedTools);
   if (opts?.disallowedTools) argv.push("--disallowedTools", opts.disallowedTools);
+  // Scoped bypass (CLAUDE_SCOPED_BYPASS_NOTICE): exactly one --settings
+  // element, constant bytes, immediately before the prompt. Identical to the
+  // launch builder: orthogonal, always present, never task content.
+  argv.push("--settings", CLAUDE_SCOPED_BYPASS_SETTINGS_JSON);
   argv.push(prompt);
   return argv;
 }
@@ -2525,7 +2565,7 @@ export function buildClaudeResumeArgv(
 export const CLAUDE_RESUME_CAPABILITY = {
   engine: "claude",
   route: "claude --resume <session-uuid> -p --output-format json / --session-id <uuid> for first-use creation",
-  resumeArgvShape: "--resume <session-uuid> -p --output-format json [--agent <name>] [--model <m>] [--effort <e>] [--permission-mode <p>] [--allowedTools/--disallowedTools <t>] <prompt>",
+  resumeArgvShape: "--resume <session-uuid> -p --output-format json [--agent <name>] [--model <m>] [--effort <e>] [--permission-mode <p>] [--allowedTools/--disallowedTools <t>] --settings '{\"enabledPlugins\":{\"gitkraken-hooks@gitkraken\":false}}' <prompt>",
   sessionIdGrammar: "uuid (verified by --session-id contract)",
   createsIfMissing: true,
   overridesRideResume: true,
@@ -2843,7 +2883,7 @@ export function buildLaunchPreview(input: LaunchPreviewInput): Record<string, un
     ? "codex launches via `codex exec --ephemeral --profile <real-name> -s <execution-policy>`; approval behavior inherits the selected profile; -s danger-full-access never implies --dangerously-bypass-approvals-and-sandbox (sandbox != bypass: the bypass flag rides only with a separate explicit bypass_approvals opt-in plus explicit danger); ephemeral runs persist no session so resume inherits nothing and follow-up is a labeled new attempt"
     : input.engine === "opencode"
       ? "opencode launches via `opencode run --standalone --model <explicit> --agent <real-name> --format json` (private server per turn; pre-standalone shared-service runs stay labeled, never silently converted); --session continues when the id is known and creates otherwise (first use of a minted id is creation); resume is verified via session list/export before any resumed label"
-      : "claude launches via `claude -p --output-format json --agent <real-name>` with a stable --session-id (minted when omitted); only explicitly-passed --model/--effort/--permission-mode/--allowedTools appear, otherwise the agent/settings default governs; resume via --resume (full explicit-flag set) only after the session file is verified; Claude launch qualified by a bounded live probe (execution success 2026-10-05); the live --resume flag-honoring caveat stays stated, never assumed";
+      : "claude launches via `claude -p --output-format json --agent <real-name>` with a stable --session-id (minted when omitted); only explicitly-passed --model/--effort/--permission-mode/--allowedTools appear, otherwise the agent/settings default governs; every claude argv also carries per-invocation `--settings '{\"enabledPlugins\":{\"gitkraken-hooks@gitkraken\":false}}'` (scoped bypass for the hanging user-scope PermissionRequest hook; inert when the plugin is absent/disabled, zero files touched, never task content, never a model/permission substitution); resume via --resume (full explicit-flag set) only after the session file is verified; Claude launch qualified by a bounded live probe (execution success 2026-10-05); the live --resume flag-honoring caveat stays stated, never assumed";
   return {
     engine: input.engine,
     executable: input.executable,
@@ -2869,6 +2909,7 @@ export function buildLaunchPreview(input: LaunchPreviewInput): Record<string, un
     gate_reason: input.gateReason,
     configured_vs_observed: "CONFIGURED (above) comes from the real profile/agent definition files. RUNTIME-OBSERVED evidence (exit state, tails, session identity, changed files) is null before launch and appears only in delegation_read_result after dispatch.",
     engine_note: engineNote,
+    ...(input.engine === "claude" ? { scoped_bypass: { ...CLAUDE_SCOPED_BYPASS_NOTICE } } : {}),
     capability: {
       ready: input.capability.ready,
       binary: input.capability.binary.binary,

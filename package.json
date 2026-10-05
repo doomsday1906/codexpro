@@ -135,6 +135,7 @@
     "reviewer-surface:smoke": "node scripts/reviewer-surface-smoke.mjs",
     "doctor": "node scripts/codexpro.mjs doctor",
     "delegation-canary:smoke": "npm run build && node scripts/delegation-canary-smoke.mjs",
+    "delegation-claude-bypass:smoke": "npm run build && node scripts/delegation-claude-bypass-smoke.mjs",
     "delegation-followup:smoke": "npm run build && node scripts/delegation-followup-smoke.mjs",
     "delegation-followup-amendment:smoke": "npm run build && node scripts/delegation-followup-amendment-smoke.mjs",
     "delegation-routing:smoke": "npm run build && node scripts/delegation-routing-smoke.mjs",

@@ -125,6 +125,7 @@ import {
   clampCanaryTimeout,
   clampRealTaskTimeout,
   CLAUDE_RESUME_CAPABILITY,
+  CLAUDE_SCOPED_BYPASS_NOTICE,
   CLAUDE_STEER_CAPABILITY,
   classifyCodexFailure,
   CODEX_QUEUE_CAPABILITY,
@@ -2718,7 +2719,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "delegation_launch",
       options: {
         title: "Delegation Launch",
-        description: "Launch one durable delegation run (Codex via exec --profile with Luna gate for the legacy canary / selected-profile gate + per-run execution policy for real tasks; OpenCode via run --model/--agent with host-model gate for the legacy canary / selected-agent + explicit model for real tasks, --standalone by default or --server against a per-run adapter-owned disposable server with explicit steerable=true; Claude via -p --output-format json --agent with explicit-flag-only overrides for real tasks only). Real bounded task + validated delegation_group (default hestia-cli-canary), or the legacy canary slice (fixtures, canary=true; codex/opencode only). Requires an explicit workdir plus profile (codex), model (+ agent for real tasks, opencode), or agent (claude); idempotent request ids never spawn a second worker. Prefer delegation_preview (dry-run) before dispatch. Subscribe to events before launching or replay via delegation_read_result so fast completion never loses the result.",
+        description: "Launch one durable delegation run (Codex via exec --profile with Luna gate for the legacy canary / selected-profile gate + per-run execution policy for real tasks; OpenCode via run --model/--agent with host-model gate for the legacy canary / selected-agent + explicit model for real tasks, --standalone by default or --server against a per-run adapter-owned disposable server with explicit steerable=true; Claude via -p --output-format json --agent with explicit-flag-only overrides for real tasks only, plus a per-invocation --settings scoped bypass disabling gitkraken-hooks@gitkraken (inert when absent, zero files)). Real bounded task + validated delegation_group (default hestia-cli-canary), or the legacy canary slice (fixtures, canary=true; codex/opencode only). Requires an explicit workdir plus profile (codex), model (+ agent for real tasks, opencode), or agent (claude); idempotent request ids never spawn a second worker. Prefer delegation_preview (dry-run) before dispatch. Subscribe to events before launching or replay via delegation_read_result so fast completion never loses the result.",
         inputSchema: publicSchemaFrom(launchArgs),
         runtimeInputSchema: launchArgs,
         annotations: DESTRUCTIVE
@@ -3090,7 +3091,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               ? plan.steerable
                 ? `${isCanary ? "Canary" : "Real-task"} run ${runId} launched (opencode run --server <per-run server> --model ${model}${agent ? ` --agent ${agent}` : ""} --format json, steerable server-backed route, ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}${sessionId ? `, session ${sessionId}` : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`
                 : `${isCanary ? "Canary" : "Real-task"} run ${runId} launched (opencode run --standalone --model ${model}${agent ? ` --agent ${agent}` : ""} --format json, ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}${sessionId ? `, session ${sessionId}` : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`
-              : `Real-task run ${runId} launched (claude --agent ${agent} --session-id ${sessionId}, ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`,
+              : `Real-task run ${runId} launched (claude --agent ${agent} --session-id ${sessionId} + per-invocation --settings scoped bypass disabling gitkraken-hooks@gitkraken (inert when absent, zero files), ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`,
           {
             run_id: runId,
             request_id: requestId,
@@ -3337,6 +3338,9 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         });
         // Execution provenance: which binary ran this worker. Override-route
         // runs (test shims) are labeled as such and are never live proof.
+        // Claude runs always carry the per-invocation --settings scoped
+        // bypass (CLAUDE_SCOPED_BYPASS_NOTICE): surfaced here so Hestia can
+        // see it without reading source.
         const provenance = {
           executable: current.executable ?? null,
           binary_overridden: current.binaryOverridden ?? null,
@@ -3344,7 +3348,8 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             ? { note: "a CODEXPRO_*_BIN override selected the worker executable at launch (test shims ride this route): shim results are never live proof" }
             : current.executable
               ? { note: "default PATH binary at launch (no CODEXPRO_*_BIN override); no shim marker" }
-              : { note: "executable provenance unrecorded (legacy run); shim vs live cannot be judged from this record" })
+              : { note: "executable provenance unrecorded (legacy run); shim vs live cannot be judged from this record" }),
+          ...(current.engine === "claude" ? { scoped_bypass: { ...CLAUDE_SCOPED_BYPASS_NOTICE } } : {})
         };
         // Classify codex failures BEFORE any permission change is proposed:
         // only a real tool-execution denial warrants proposing one (still
