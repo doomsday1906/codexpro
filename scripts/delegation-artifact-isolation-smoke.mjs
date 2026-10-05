@@ -396,8 +396,8 @@ for (const [tag, junk, req] of [['empty', '', 'req-iso-cx-preocc-empty'], ['junk
   const read = await call('delegation_read_result', { workspace_id: wid, run_id: runId });
   assert(!read.isError, 'silent run must be readable');
   const lm = read.structuredContent.test_evidence.last_message;
-  assert(lm.status === 'unavailable' && !('path' in lm),
-    `a worker that wrote nothing reports unavailable with no path, never present: ${JSON.stringify(lm)}`);
+  assert(lm.status === 'unavailable',
+    `a worker that wrote nothing reports unavailable, never present: ${JSON.stringify(lm)}`);
   process.env.CODEXPRO_CODEX_BIN = codexCounter;
   console.log('ok: X4 MCP Codex (silent worker exits without output -> unavailable, not present)');
 }

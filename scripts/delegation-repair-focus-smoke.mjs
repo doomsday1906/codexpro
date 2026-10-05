@@ -13,9 +13,12 @@
 // R4 opencode cancel: session-scoped halt unsupported in v2.0.22 (fail
 //   closed with blocker); cancel verified by PID-tree + workdir quiescence.
 //   Shim workers are labeled shim, never live proof.
-// R5 claude deferred: Claude stays UNQUALIFIED (resume drops stored
-//   model/effort/tool settings); verified-resume withheld where settings
-//   would drop; Codex/OpenCode qualification independent.
+// R5 claude qualified by live probe: bounded economical probe classified
+//   execution success (exit 0, PROBE-OK, session file observed; one call,
+//   then stop). Launch AND verified-resume both carry the run's full
+//   explicit-flag set (no stored override dropped); verified-resume only
+//   after the session-file check, with the live --resume flag-honoring
+//   caveat stated. Codex/OpenCode qualification independent.
 //
 // No live model calls. Deterministic containment: mkdtemp roots, fixture
 // CODEX_HOME / agent dirs / projects dir, fake binaries via CODEXPRO_*_BIN
@@ -262,7 +265,10 @@ process.env.CODEXPRO_CLAUDE_PROJECTS_DIR = clProjects;
 
   // MCP wiring for R1-gate, R4-shim-cancel, R5-deferred.
   const heartbeat = await fake('codex-heartbeat', 'if [ "$1" = "--version" ]; then echo "codex-heartbeat-shim 0.0.0"; exit 0; fi\nwhile true; do date +%s%N >> heartbeat.txt; sleep 0.2; done');
-  const instant = await fake('claude-instant', 'echo "{\\"type\\":\\"result\\"}"\nexit 0');
+  const instant = await fake('claude-instant', 'echo "{\\"type\\":\\"result\\"}"\necho "$@" >> "${CLAUDE_ARGV_LOG:-/dev/null}"\nexit 0');
+  const claudeArgvLog = path.join(shimBin, 'claude-argv.log');
+  await fsp.writeFile(claudeArgvLog, '');
+  process.env.CLAUDE_ARGV_LOG = claudeArgvLog;
   const ocFake = await fake('opencode', 'echo "opencode v2.0.22"\nexit 0');
   process.env.CODEXPRO_CODEX_BIN = heartbeat;
   process.env.CODEXPRO_CLAUDE_BIN = instant;
@@ -385,32 +391,39 @@ process.env.CODEXPRO_CLAUDE_PROJECTS_DIR = clProjects;
     await bestEffortCancel(runBId);
   }
 
-  // R5 deferred: Claude UNQUALIFIED; withhold verified-resume where settings drop.
-  assert(Engines.CLAUDE_ENGINE_QUALIFICATION.qualified === false &&
-    Engines.CLAUDE_ENGINE_QUALIFICATION.status === 'deferred' &&
-    Engines.CLAUDE_ENGINE_QUALIFICATION.blocker.length > 0,
-    'Claude must stay UNQUALIFIED with a deferred blocker');
+  // R5 qualified: Claude launch qualified by the bounded live probe
+  // (execution success); overrides ride every continuation argv
+  // (verified-resume only after session-file check).
+  assert(Engines.CLAUDE_ENGINE_QUALIFICATION.qualified === true &&
+    Engines.CLAUDE_ENGINE_QUALIFICATION.status === 'qualified-live-probe' &&
+    (Engines.CLAUDE_ENGINE_QUALIFICATION.probe ?? '').length > 0 &&
+    (Engines.CLAUDE_ENGINE_QUALIFICATION.resumeCaveat ?? '').length > 0,
+    'Claude must be launch-qualified by the live probe with the resume caveat stated');
   assert(Engines.CODEX_ENGINE_QUALIFICATION.qualified === true &&
     Engines.OPENCODE_ENGINE_QUALIFICATION.qualified === true,
     'Codex/OpenCode qualification must be independent of the Claude deferral');
-  const resumeArgv = Engines.buildClaudeResumeArgv('123e4567-e89b-42d3-a456-426614174000', 'hi', { agent: 'implementer', permissionMode: 'acceptEdits' });
-  assert(resumeArgv.includes('--resume') && !resumeArgv.includes('--model') && !resumeArgv.includes('--effort') &&
-    !resumeArgv.includes('--allowedTools') && !resumeArgv.includes('--disallowedTools'),
-    `resume argv must visibly drop model/effort/tool settings: ${JSON.stringify(resumeArgv)}`);
+  const resumeArgv = Engines.buildClaudeResumeArgv('123e4567-e89b-42d3-a456-426614174000', 'hi', { agent: 'implementer', permissionMode: 'acceptEdits', model: 'opus', effort: 'high', allowedTools: 'Read', disallowedTools: 'Bash' });
+  assert(resumeArgv.includes('--resume') && resumeArgv.includes('--model') && resumeArgv.includes('opus') &&
+    resumeArgv.includes('--effort') && resumeArgv.includes('--allowedTools') && resumeArgv.includes('--disallowedTools'),
+    `resume argv must carry the full explicit-flag set (no override dropped): ${JSON.stringify(resumeArgv)}`);
+  const resumeBare = Engines.buildClaudeResumeArgv('123e4567-e89b-42d3-a456-426614174000', 'hi', { agent: 'implementer' });
+  assert(resumeBare.includes('--resume') && !resumeBare.includes('--model') && !resumeBare.includes('--effort'),
+    `resume argv without explicit flags must not invent any: ${JSON.stringify(resumeBare)}`);
   const prevClaude = await call('delegation_preview', {
     workspace_id: wid, engine: 'claude', agent: 'implementer', workdir: 'focus-claude-1',
     task: 'Do the thing.', delegation_group: 'team-focus'
   });
-  assert(!prevClaude.isError && prevClaude.structuredContent.preview.qualification.qualified === false,
-    'shim: claude preview must carry the deferred qualification marker');
+  assert(!prevClaude.isError && prevClaude.structuredContent.preview.qualification.qualified === true,
+    'shim: claude preview must carry the live-probe qualification marker');
   const launchClaudeModel = await call('delegation_launch', {
-    workspace_id: wid, engine: 'claude', agent: 'implementer', model: 'opus',
+    workspace_id: wid, engine: 'claude', agent: 'implementer', model: 'opus', effort: 'high',
+    allowed_tools: 'Read', disallowed_tools: 'Bash',
     workdir: 'focus-claude-model', task: 'List files. Change nothing.',
     delegation_group: 'team-focus', request_id: 'req-focus-claude-model', timeout_ms: 60000
   });
   assert(!launchClaudeModel.isError, `shim claude launch must work: ${JSON.stringify(launchClaudeModel.structuredContent)}`);
-  assert(launchClaudeModel.structuredContent.engine_qualification.qualified === false,
-    'shim: claude launch ack must carry the deferred marker');
+  assert(launchClaudeModel.structuredContent.engine_qualification.qualified === true,
+    'shim: claude launch ack must carry the live-probe qualification marker');
   const mintedModel = launchClaudeModel.structuredContent.session_id;
   await fsp.writeFile(path.join(clProjects, 'slug', `${mintedModel}.jsonl`), '{"type":"session"}\n');
   const claudeRunId = launchClaudeModel.structuredContent.run_id;
@@ -421,9 +434,17 @@ process.env.CODEXPRO_CLAUDE_PROJECTS_DIR = clProjects;
   assert(!q1.isError && q1.structuredContent.state === 'needs-input', 'shim: question must move to needs-input');
   const a1 = await call('delegation_followup', { workspace_id: wid, run_id: claudeRunId, checkpoint: { id: 'fa1', run_id: claudeRunId, seq: 1, payload: { answer: 'yes' }, input_request_id: 'fq1' } });
   assert(!a1.isError && a1.structuredContent.executed === true, `shim: answer must dispatch: ${JSON.stringify(a1.structuredContent)}`);
-  assert(a1.structuredContent.continuation === 'new-continuation-attempt' &&
-    /resume withheld/.test(a1.structuredContent.session_evidence ?? ''),
-    `shim: verified session with stored explicit model must withhold resume (never papered over): ${JSON.stringify(a1.structuredContent)}`);
+  assert(a1.structuredContent.continuation === 'resumed',
+    `shim: verified session with stored explicit model/effort/tool settings must resume with overrides riding (never dropped): ${JSON.stringify(a1.structuredContent)}`);
+  // Adapter proof: the actual continuation argv carried --resume AND every
+  // stored explicit flag (the fixed drop: overrides ride every continuation).
+  const argvLines = (await fsp.readFile(claudeArgvLog, 'utf8')).split('\n').filter(Boolean);
+  const resumeLine = argvLines.find((line) => line.includes('--resume'));
+  assert(resumeLine && resumeLine.includes('--model') && resumeLine.includes('opus') &&
+    resumeLine.includes('--effort') && resumeLine.includes('high') &&
+    resumeLine.includes('--allowedTools') && resumeLine.includes('Read') &&
+    resumeLine.includes('--disallowedTools') && resumeLine.includes('Bash'),
+    `continuation argv must carry --resume with the full explicit-flag set: ${JSON.stringify(argvLines)}`);
   // Negative control: no stored explicit settings -> true verified resume.
   const launchClaudeBare = await call('delegation_launch', {
     workspace_id: wid, engine: 'claude', agent: 'implementer',
@@ -442,7 +463,42 @@ process.env.CODEXPRO_CLAUDE_PROJECTS_DIR = clProjects;
   const ba = await call('delegation_followup', { workspace_id: wid, run_id: bareRunId, checkpoint: { id: 'ba1', run_id: bareRunId, seq: 1, payload: { answer: 'yes' }, input_request_id: 'bq1' } });
   assert(!ba.isError && ba.structuredContent.continuation === 'resumed',
     `shim: verified session with no stored explicit settings resumes precisely: ${JSON.stringify(ba.structuredContent)}`);
-  console.log('ok: R5 deferred (Claude UNQUALIFIED; resume withheld only where settings would drop; Codex/OpenCode independent)');
+  // R5b claude cancel (same owned-tree + quiescence standard) + result
+  // evidence (bounded tails + run-bound artifact + coverage fields).
+  const claudeSleep = await fake('claude-sleep-r5', 'sleep 30\nexit 0');
+  process.env.CODEXPRO_CLAUDE_BIN = claudeSleep;
+  const launchClaudeSleep = await call('delegation_launch', {
+    workspace_id: wid, engine: 'claude', agent: 'implementer',
+    workdir: 'focus-claude-sleep', task: 'Sleep probe. Change nothing.',
+    delegation_group: 'team-focus', request_id: 'req-focus-claude-sleep', timeout_ms: 120000
+  });
+  assert(!launchClaudeSleep.isError, 'shim claude sleep launch must work');
+  const sleepRunId = launchClaudeSleep.structuredContent.run_id;
+  for (let i = 0; i < 100; i += 1) {
+    const r = await call('delegation_read_result', { workspace_id: wid, run_id: sleepRunId });
+    if (r.structuredContent.state === 'running') break;
+    await new Promise((r2) => setTimeout(r2, 100));
+  }
+  const cancelSleep = await call('delegation_cancel', { workspace_id: wid, run_id: sleepRunId });
+  assert(!cancelSleep.isError && cancelSleep.structuredContent.cancelled === true,
+    `shim: claude cancel must cancel: ${JSON.stringify(cancelSleep.structuredContent)}`);
+  assert(cancelSleep.structuredContent.cleanup_finished === true &&
+    cancelSleep.structuredContent.cancel_verification.verification_complete === true,
+    `shim: claude cancel must verify owned-tree + quiescence like every engine: ${JSON.stringify(cancelSleep.structuredContent.cancel_verification)}`);
+  process.env.CODEXPRO_CLAUDE_BIN = instant;
+  const readBare = await call('delegation_read_result', { workspace_id: wid, run_id: bareRunId });
+  const bareEvidence = readBare.structuredContent.test_evidence;
+  assert(bareEvidence.stdout.status === 'present' && bareEvidence.tests.status === 'unavailable',
+    `shim: claude tails prove output presence only, tests never parsed: ${JSON.stringify(bareEvidence.stdout)}`);
+  assert(bareEvidence.last_message.status === 'present' &&
+    /claude-last-message-[0-9a-f]{16}-attempt-\d+\.json/.test(bareEvidence.last_message.path ?? ''),
+    `shim: claude result binds the run-bound artifact: ${JSON.stringify(bareEvidence.last_message)}`);
+  assert(bareEvidence.diff.status === 'present' || bareEvidence.diff.status === 'unavailable',
+    'shim: claude coverage fields must report explicitly');
+  assert(readBare.structuredContent.execution_provenance.binary_overridden === true,
+    'shim: claude fake-binary results must be labeled shim, never live proof');
+  console.log('ok: R5 qualified (Claude launch qualified by live probe; overrides ride every continuation argv; Codex/OpenCode independent)');
+  console.log('ok: R5b claude cancel (owned-tree + quiescence, same standard) + evidence (tails + run-bound artifact + coverage, shim-labeled)');
 }
 
 console.log('delegation-repair-focus-smoke: PASS (no live model calls; fake-binary results labeled shim)');

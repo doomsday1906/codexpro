@@ -385,6 +385,73 @@ export function parseOpenCodeSessionId(stdoutText: string): string | null {
   return null;
 }
 
+/**
+ * Defensive thread-id extraction from Codex worker stdout. The exact shape
+ * is best-effort (several key spellings and common nests are attempted,
+ * including JSONL event lines when the steerable variant runs with structured
+ * output); a null id never blocks completion, it only means steering stays
+ * unavailable for that run. A null id is never synthesized.
+ */
+export function parseCodexThreadId(stdoutText: string): string | null {
+  const text = String(stdoutText ?? "");
+  const documents: unknown[] = [];
+  try {
+    documents.push(JSON.parse(text));
+  } catch {
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("{")) continue;
+      try {
+        documents.push(JSON.parse(trimmed));
+      } catch { /* skip non-JSON lines */ }
+    }
+  }
+  const keys = ["threadId", "thread_id", "sessionId", "session_id", "sessionUuid"];
+  const idKeys = ["id", "uuid", "name"];
+  const grammar = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+  const search = (value: unknown, depth: number): string | null => {
+    if (depth > 3 || !value || typeof value !== "object") return null;
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        const hit = search(entry, depth + 1);
+        if (hit) return hit;
+      }
+      return null;
+    }
+    const record = value as Record<string, unknown>;
+    for (const key of keys) {
+      const candidate = record[key];
+      if (typeof candidate === "string" && grammar.test(candidate.trim())) return candidate.trim();
+    }
+    // A thread/session nest may carry the id under a generic key
+    // ({thread: {id: ...}}): accept it only inside the nest, never bare.
+    for (const nestKey of ["thread", "session"]) {
+      const nest = record[nestKey];
+      if (typeof nest === "string" && grammar.test(nest.trim())) return nest.trim();
+      if (nest && typeof nest === "object" && !Array.isArray(nest)) {
+        const nestRecord = nest as Record<string, unknown>;
+        for (const idKey of idKeys) {
+          const candidate = nestRecord[idKey];
+          if (typeof candidate === "string" && grammar.test(candidate.trim())) return candidate.trim();
+        }
+      }
+    }
+    for (const nest of ["thread", "session", "data", "result", "payload"]) {
+      const hit = search(record[nest], depth + 1);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  for (const document of documents) {
+    const hit = search(document, 0);
+    if (hit) return hit;
+  }
+  // Plain-text fallback: an explicit `thread <id>` / `session <uuid>` line.
+  const plain = text.match(/(?:thread|session)(?:\s+(?:id|uuid|name))?\s*[:=]\s*([A-Za-z0-9][A-Za-z0-9_.-]{0,127})/i);
+  if (plain) return plain[1];
+  return null;
+}
+
 /** Per-engine session-resume capability, qualified independently. */
 export const CODEX_RESUME_CAPABILITY = {
   engine: "codex",
@@ -407,6 +474,129 @@ export const OPENCODE_RESUME_CAPABILITY = {
 
 export function newOpenCodeSessionId(): string {
   return `ses_${createHash("sha256").update(`${Date.now()}:${process.pid}:${Math.random()}`).digest("hex").slice(0, 16)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Live steering: engine-native mid-turn message routes (bounded operation,
+// distinct from follow-up question/reply and from cancel/relaunch).
+// Inspected against the installed CLIs (codex-cli 0.159.0,
+// opencode v2.0.22, claude 2.1.289); nothing is inferred beyond the help
+// text quoted in the evidence fields below.
+// ---------------------------------------------------------------------------
+
+/**
+ * Codex live-steer route: `codex queue --thread <THREAD> --message <TEXT>`
+ * (inspected: `codex queue --help` prints "Queue a message for an existing
+ * session", usage `codex queue [OPTIONS] --thread <THREAD> --message
+ * <TEXT>`, where THREAD is a "Session UUID or exact session name"). One
+ * native call, no prompt construction, no resume, no relaunch, never
+ * injected into an unrelated terminal. Ephemeral launches (`codex exec
+ * --ephemeral`, the delegation default) persist no session, so they expose
+ * no steerable thread: steering them is unavailable by construction, never
+ * emulated. A steerable launch variant (non-ephemeral, session-persisting)
+ * records its engine-returned thread id at launch; only that id is ever
+ * queued to. Whether `queue` delivers mid-turn or only at the next turn
+ * boundary, and its exact success/error shape, are mapped from observed
+ * engine output (see runCodexQueue); anything unobserved stays unknown,
+ * never claimed.
+ */
+export const CODEX_QUEUE_CAPABILITY = {
+  engine: "codex",
+  route: "codex queue --thread <THREAD> --message <TEXT>",
+  inspected: "codex-cli 0.159.0 `codex queue --help`: 'Queue a message for an existing session'; usage 'codex queue [OPTIONS] --thread <THREAD> --message <TEXT>'; '--thread <THREAD>: Session UUID or exact session name'; '--message <TEXT>: Message text to queue'",
+  ephemeralSteerable: false,
+  note: "ephemeral runs persist no session and expose no thread: steer refuses with steer_unavailable_no_thread (never emulated via resume, second session, or cancel+relaunch). Steerable launches use the explicit non-ephemeral variant and queue only to the recorded engine-returned thread id."
+} as const;
+
+/** OpenCode live-steer capability: no native mid-run steer verb exists. */
+export const OPENCODE_STEER_CAPABILITY = {
+  engine: "opencode",
+  supported: false,
+  inspected: "opencode v2.0.22 `opencode session --help`: subcommands are list|delete|export|import (no halt/stop/steer verb); `opencode run --help`: flags are --standalone/--server/--continue/--session/--fork/--model/--agent/--format/--file/--title/--thinking/--auto (no queue/steer/message-inject flag)",
+  blocker: "steer_unsupported: opencode v2.0.22 exposes no queue/steer verb; delivery is never emulated via a second session, a resume, or a cancel+relaunch disguised as steering"
+} as const;
+
+/** Claude live-steer capability: no native mid-run steer verb exists. */
+export const CLAUDE_STEER_CAPABILITY = {
+  engine: "claude",
+  supported: false,
+  inspected: "claude 2.1.289 `claude --help`: session verbs are -c/--continue, -r/--resume, --fork-session, --session-id, plus --bg background agents managed via attach/logs/stop/rm (no queue/steer/message-inject verb)",
+  blocker: "steer_unsupported: claude 2.1.289 exposes no mid-run message-inject verb; --resume continues (same or copied session) rather than steering a live turn, so delivery is never relabeled from follow-up/resume"
+} as const;
+
+/** Build the Codex queue argv (single native call, no prompt construction). */
+export function buildCodexQueueArgv(thread: string, message: string): string[] {
+  return ["queue", "--thread", thread, "--message", message];
+}
+
+export type CodexQueueOutcome = "queued" | "rejected" | "unknown";
+
+export interface CodexQueueResult {
+  outcome: CodexQueueOutcome;
+  /** Bounded engine evidence excerpt (never the full stream). */
+  evidence: string;
+  exitCode: number | null;
+}
+
+/**
+ * Map one observed `codex queue` call to queued/rejected/unknown. Exit 0
+ * with no unknown-thread text is queued ONLY as "held by the engine"
+ * (never applied: applied requires worker-observable evidence). A nonzero
+ * exit, or engine text naming an unknown/invalid thread, is rejected.
+ * Timeouts, spawn failures, and ambiguous output are unknown (never
+ * duplicated on retry: callers reconcile against the stored steering
+ * record first). Never throws.
+ */
+export function mapCodexQueueResult(exitCode: number | null, stdout: string, stderr: string): CodexQueueResult {
+  const combined = `${stdout}\n${stderr}`.slice(0, 2000);
+  const lower = combined.toLowerCase();
+  // No exit code observed (timeout kill, spawn failure, lost reply):
+  // the dispatch may or may not have landed — unknown, never duplicated.
+  if (exitCode === null || exitCode === undefined) {
+    return { outcome: "unknown", evidence: combined.slice(0, 500) || "queue returned no exit code (timeout, spawn failure, or lost reply)", exitCode };
+  }
+  // Unknown-thread shapes observed against codex-cli 0.159.0 (live probe,
+  // bogus thread, no worker): `failed to queue session message:
+  // thread/queue/add failed: failed to read thread: invalid thread-store
+  // request: no rollout found for thread id <uuid> (code -32603)`, exit 1.
+  const unknownThread = /unknown|no such|not found|invalid|no session|no rollout/.test(lower) &&
+    /thread|session|rollout|unknown|no such|not found|invalid/.test(lower);
+  if (exitCode === 0 && !unknownThread) {
+    return { outcome: "queued", evidence: combined.slice(0, 500), exitCode };
+  }
+  return { outcome: "rejected", evidence: combined.slice(0, 500) || `queue exited ${exitCode}`, exitCode };
+}
+
+/**
+ * Run one bounded `codex queue` call (spawnSync, no worker spawned, no
+ * prompt construction). Message text is passed as a single argv element
+ * (never a shell). Never throws: spawn failures map to unknown.
+ */
+export function runCodexQueue(
+  thread: string,
+  message: string,
+  opts?: { binary?: string; timeoutMs?: number }
+): CodexQueueResult {
+  const bin = opts?.binary ?? resolveCodexBinary();
+  const timeoutMs = Math.max(1000, Math.min(opts?.timeoutMs ?? 30_000, 120_000));
+  try {
+    const result = spawnSync(bin, buildCodexQueueArgv(thread, message), {
+      timeout: timeoutMs,
+      encoding: "utf8",
+      maxBuffer: 256 * 1024
+    });
+    const error = (result as { error?: Error }).error;
+    if (error) {
+      return { outcome: "unknown", evidence: `queue spawn failed: ${error.message}`.slice(0, 500), exitCode: null };
+    }
+    return mapCodexQueueResult(
+      result.status,
+      String(result.stdout ?? ""),
+      String(result.stderr ?? "")
+    );
+  } catch (error) {
+    return { outcome: "unknown", evidence: `queue threw: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500), exitCode: null };
+  }
 }
 
 /** Canary prompt: read two harmless fixtures, report contents, change nothing. */
@@ -1280,6 +1470,31 @@ export function buildCodexRealArgv(
   return argv;
 }
 
+/**
+ * Build the steerable Codex argv: identical profile + execution-policy
+ * boundaries to buildCodexRealArgv, except WITHOUT --ephemeral so the
+ * session persists and the engine returns an addressable thread id. The
+ * thread id is recorded from engine-observed evidence at launch (never
+ * synthesized); steering later queues only to that recorded id. Explicit
+ * opt-in per run (launch `steerable: true`, codex only); the default stays
+ * ephemeral.
+ */
+export function buildCodexSteerableArgv(
+  profile: string,
+  prompt: string,
+  lastMessagePath: string,
+  opts: { executionPolicy: CodexExecutionPolicy; modelOverride?: string; configOverrides?: string[]; dangerBypassExplicit?: boolean }
+): string[] {
+  const argv = ["exec", "--skip-git-repo-check", "--profile", profile, "-s", opts.executionPolicy];
+  if (opts.modelOverride) argv.push("-m", opts.modelOverride);
+  for (const override of opts.configOverrides ?? []) argv.push("-c", override);
+  if (opts.executionPolicy === "danger-full-access" && opts.dangerBypassExplicit === true) {
+    argv.push("--dangerously-bypass-approvals-and-sandbox");
+  }
+  argv.push("--output-last-message", lastMessagePath, prompt);
+  return argv;
+}
+
 export type CodexFailureClass =
   | "execution-denial"
   | "missing-executable"
@@ -1767,20 +1982,33 @@ export function buildClaudeArgv(opts: ClaudeArgvOpts): string[] {
   return argv;
 }
 
-/** Build the Claude true-resume argv (verified session only). Carries agent +
- * permission-mode only: model/effort/tool settings are DROPPED by this shape
- * (whether `--resume` would honor them is UNPROVEN without a live call, so
- * Claude stays UNQUALIFIED). Callers must withhold verified-resume wherever
- * the stored run carries explicit model/effort/tool settings and run the
- * full explicit-flag argv as a labeled new attempt instead. */
+/** Build the Claude true-resume argv (verified session only). Carries the
+ * run's full explicit-flag set: agent + permission-mode AND the explicit
+ * model/effort/tool filters, so a verified resume never drops stored
+ * overrides. Every flag rides only when explicitly passed at launch (the
+ * stored run fields already encode explicit-only); otherwise the
+ * agent/settings default governs. Verified-resume is used only after
+ * verifyClaudeSession confirms the session file; unverified ids ride
+ * --session-id as first-use creation instead. */
 export function buildClaudeResumeArgv(
   sessionId: string,
   prompt: string,
-  opts?: { agent?: string; permissionMode?: string }
+  opts?: {
+    agent?: string;
+    permissionMode?: string;
+    model?: string;
+    effort?: string;
+    allowedTools?: string;
+    disallowedTools?: string;
+  }
 ): string[] {
   const argv = ["--resume", sessionId, "-p", "--output-format", "json"];
   if (opts?.agent) argv.push("--agent", opts.agent);
+  if (opts?.model) argv.push("--model", opts.model);
+  if (opts?.effort) argv.push("--effort", opts.effort);
   if (opts?.permissionMode) argv.push("--permission-mode", opts.permissionMode);
+  if (opts?.allowedTools) argv.push("--allowedTools", opts.allowedTools);
+  if (opts?.disallowedTools) argv.push("--disallowedTools", opts.disallowedTools);
   argv.push(prompt);
   return argv;
 }
@@ -1789,47 +2017,52 @@ export function buildClaudeResumeArgv(
 export const CLAUDE_RESUME_CAPABILITY = {
   engine: "claude",
   route: "claude --resume <session-uuid> -p --output-format json / --session-id <uuid> for first-use creation",
-  resumeArgvShape: "--resume <session-uuid> -p --output-format json <prompt>",
+  resumeArgvShape: "--resume <session-uuid> -p --output-format json [--agent <name>] [--model <m>] [--effort <e>] [--permission-mode <p>] [--allowedTools/--disallowedTools <t>] <prompt>",
   sessionIdGrammar: "uuid (verified by --session-id contract)",
   createsIfMissing: true,
-  note: "The delegation run always passes a stable --session-id (minted when the caller omits one): first use creates the session, later uses with a verified session file are true resume via --resume. Unverified ids are labeled new-continuation-attempt, never resumed."
+  overridesRideResume: true,
+  note: "The delegation run always passes a stable --session-id (minted when the caller omits one): first use creates the session, later uses with a verified session file are true resume via --resume carrying the run's full explicit-flag set (agent + permission-mode + explicit model/effort/tool filters; installed `claude --help` states no exclusion of session-scoped flags under --resume). Unverified ids are labeled new-continuation-attempt, never resumed."
 } as const;
 
 /**
  * Per-engine qualification, adjudicated INDEPENDENTLY (no engine's proof
  * depends on another's). Codex (codex-cli 0.159.0) and OpenCode (v2.0.22)
  * are qualified on their profile/agent-driven routes. Claude (2.1.289)
- * stays UNQUALIFIED while its resume path drops stored model/effort/tool
- * settings: the verified-resume argv carries agent + permission-mode only,
- * and whether `--resume` honors `--model/--effort/--allowedTools` is
- * UNPROVEN without a live call. Claude paths therefore carry this deferred
- * marker and verified-resume is withheld wherever stored explicit settings
- * would be dropped (the full explicit-flag argv runs as a labeled new
- * attempt instead); the deferral never blocks Codex/OpenCode proof.
+ * launch and verified-resume both carry the run's full explicit-flag set
+ * (agent + permission-mode + explicit model/effort/tool filters ride every
+ * continuation argv; verified-resume only after the session-file check), so
+ * no stored override is dropped on continuation. Claude is qualified by a
+ * bounded live probe on the launch route (quota/auth/config vs execution
+ * classified from observed evidence: execution success); verified-resume
+ * dispatches only after the session-file check, with the live --resume
+ * flag-honoring caveat stated, never assumed. No engine's proof gates
+ * another's.
  */
 export const CODEX_ENGINE_QUALIFICATION = {
   engine: "codex",
   qualified: true,
   qualifiedCli: "codex-cli 0.159.0",
-  note: "qualified on the selected-profile route with per-run execution policy; independent of the deferred Claude path"
+  note: "qualified on the selected-profile route with per-run execution policy; independent of the Claude path"
 } as const;
 
 export const OPENCODE_ENGINE_QUALIFICATION = {
   engine: "opencode",
   qualified: true,
   qualifiedCli: "opencode v2.0.22",
-  note: "qualified on the selected-agent + explicit-model route via `opencode run --standalone` (private server per turn); pre-standalone shared-service runs stay labeled and are never silently converted; independent of the deferred Claude path"
+  note: "qualified on the selected-agent + explicit-model route via `opencode run --standalone` (private server per turn); pre-standalone shared-service runs stay labeled and are never silently converted; independent of the Claude path"
 } as const;
 
 export const CLAUDE_ENGINE_QUALIFICATION = {
   engine: "claude",
-  qualified: false,
-  status: "deferred",
+  qualified: true,
+  status: "qualified-live-probe",
   qualifiedCli: "claude 2.1.289",
-  blocker: "claude resume (--resume) drops stored model/effort/tool settings (the resume argv carries agent + permission-mode only); whether --resume honors --model/--effort/--allowedTools is UNPROVEN without a live call, so Claude stays UNQUALIFIED: verified-resume is withheld where stored explicit settings would drop, and Claude proof never gates Codex/OpenCode proof"
+  probe: "bounded live probe 2026-10-05 (one economical call, then stop): `claude -p --output-format json --agent scout-fast --session-id <uuid>` exited 0 with subtype success and the exact worker reply PROBE-OK (cost $0.057025); the stable session file was observed under the claude projects dir (first-use creation); classification = execution success (no quota/rate-limit, no authentication, no configuration block; `claude doctor` exit 0 with no issues, credentials present, settings keys inspected without reading values)",
+  resumeCaveat: "verified-resume (--resume carrying the run's full explicit-flag set) dispatches only after the session-file check; whether the engine honors every session-scoped flag under --resume is UNPROVEN live (one probe, then stop) and stays stated here, never assumed",
+  note: "qualified on the selected-agent + explicit-flag route via `claude -p --output-format json --agent <real-name>` with a stable --session-id (minted when omitted); only explicitly-passed --model/--effort/--permission-mode/--allowedTools ride argv, otherwise the agent/settings default governs. Claude proof never gates Codex/OpenCode proof"
 } as const;
 
-/** Qualification marker for one engine (qualified codex/opencode, deferred claude). */
+/** Qualification marker for one engine (qualified codex/opencode/claude, each adjudicated independently). */
 export function engineQualification(engine: string): Record<string, unknown> {
   if (engine === "codex") return { ...CODEX_ENGINE_QUALIFICATION };
   if (engine === "opencode") return { ...OPENCODE_ENGINE_QUALIFICATION };
@@ -2083,7 +2316,7 @@ export interface LaunchPreviewInput {
   timeoutMs: number;
   gateReason: string;
   capability: EngineCapability;
-  /** Per-engine qualification marker (qualified codex/opencode, deferred claude). */
+  /** Per-engine qualification marker (qualified codex/opencode/claude, each adjudicated independently). */
   qualification?: Record<string, unknown>;
 }
 
@@ -2102,7 +2335,7 @@ export function buildLaunchPreview(input: LaunchPreviewInput): Record<string, un
     ? "codex launches via `codex exec --ephemeral --profile <real-name> -s <execution-policy>`; approval behavior inherits the selected profile; -s danger-full-access never implies --dangerously-bypass-approvals-and-sandbox (sandbox != bypass: the bypass flag rides only with a separate explicit bypass_approvals opt-in plus explicit danger); ephemeral runs persist no session so resume inherits nothing and follow-up is a labeled new attempt"
     : input.engine === "opencode"
       ? "opencode launches via `opencode run --standalone --model <explicit> --agent <real-name> --format json` (private server per turn; pre-standalone shared-service runs stay labeled, never silently converted); --session continues when the id is known and creates otherwise (first use of a minted id is creation); resume is verified via session list/export before any resumed label"
-      : "claude launches via `claude -p --output-format json --agent <real-name>` with a stable --session-id (minted when omitted); only explicitly-passed --model/--effort/--permission-mode/--allowedTools appear, otherwise the agent/settings default governs; resume via --resume only after the session file is verified; Claude qualification is DEFERRED (resume drops stored model/effort/tool settings)";
+      : "claude launches via `claude -p --output-format json --agent <real-name>` with a stable --session-id (minted when omitted); only explicitly-passed --model/--effort/--permission-mode/--allowedTools appear, otherwise the agent/settings default governs; resume via --resume (full explicit-flag set) only after the session file is verified; Claude launch qualified by a bounded live probe (execution success 2026-10-05); the live --resume flag-honoring caveat stays stated, never assumed";
   return {
     engine: input.engine,
     executable: input.executable,

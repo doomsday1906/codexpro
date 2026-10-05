@@ -91,6 +91,17 @@ export interface DelegationAttempt {
     absentAtReserve: boolean;
     /** ISO timestamp of the reservation (temporal baseline, not proof alone). */
     reservedAt: string;
+    /**
+     * Exclusive-claim proof: device + inode + creation time of the empty
+     * placeholder this reservation exclusively created (O_EXCL + O_NOFOLLOW)
+     * at the reserved path. Finalize binds a worker verdict ONLY when the
+     * observed file still carries this identity (delete + recreate, even
+     * with inode reuse, changes the creation time: replacement = foreign,
+     * never claimed). Absent on reservations that predate claims: without
+     * a claim the reservation proves absence at probe time only, never
+     * ownership.
+     */
+    claim?: { dev: number; ino: number; birthtimeMs?: number };
   };
   /** Sanitized one-line outcome only. Never transcripts, prompts, or credentials. */
   summary?: string;
@@ -204,6 +215,16 @@ export interface DelegationSessionBinding {
   observed?: boolean;
   /** How the session identity was evidenced. Never a credential. */
   evidence?: string;
+  /**
+   * Engine-returned live-steer thread id (codex steerable launches only:
+   * the session UUID/name the engine persisted for a non-ephemeral run).
+   * Ephemeral codex runs carry none (no steerable thread by construction);
+   * opencode/claude runs carry none (no steer verb in the qualified CLI).
+   * Steering queues only to this recorded id, never a synthesized one.
+   */
+  threadId?: string;
+  /** How the thread id was evidenced (never synthesized). */
+  threadEvidence?: string;
 }
 
 export interface DelegationRunRecord {
@@ -302,6 +323,14 @@ export interface DelegationRunRecord {
    */
   opencodeRoute?: "standalone" | "shared-service";
   /**
+   * Explicit steerable opt-in (codex real tasks only): the launch ran
+   * without --ephemeral so the session persists and the engine may return
+   * an addressable thread id (recorded on session.threadId when observed).
+   * Profile + execution-policy boundaries are unchanged; the default stays
+   * ephemeral. Absent/false on runs that predate this field (ephemeral).
+   */
+  steerable?: boolean;
+  /**
    * Last cancel verification for this run (persisted so an incomplete or
    * uncertain cancel stays incomplete until a later cancel re-verifies live;
    * a repeated cancel never converts it into success from cache). Optional:
@@ -348,7 +377,44 @@ export interface DelegationRunRecord {
    * relaunch. Optional: runs without a pending dispatch predate this field.
    */
   pendingDispatch?: DelegationPendingDispatch;
+  /**
+   * Durable live-steering record: one entry per accepted steering_key.
+   * Idempotency: the same key with the same content replays the stored
+   * outcome (no second dispatch); the same key with changed content is a
+   * conflict (never dispatched); an uncertain dispatch stays uncertain
+   * until reconciled (a retry reuses the same key and never duplicates).
+   * Status vocabulary: stored-local (recorded, engine not yet called) >
+   * queued (the engine confirmed the message is held for the worker) |
+   * rejected (the engine refused) | unknown (timeout/lost reply/ambiguous
+   * output). applied is claimed ONLY on worker-observable evidence (worker
+   * output observed after the queue time), never from queued alone.
+   * Optional: runs that were never steered carry no record.
+   */
+  steering?: DelegationSteeringRecord[];
   nextAction: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * One durable live-steering request. The message that reached (or failed to
+ * reach) ONLY its intended run: run binding is verified at dispatch and the
+ * engine call addresses only the run's recorded thread/session id.
+ */
+export interface DelegationSteeringRecord {
+  /** Caller-supplied idempotency key (bounded, per-run unique). */
+  steeringKey: string;
+  /** SHA-256 hex of the exact message text (conflict detection, never the text). */
+  messageHash: string;
+  /** Message length in chars (bounded; the text itself is not persisted). */
+  messageChars: number;
+  /** Attempt number live at dispatch (which worker turn was steered). */
+  attemptN: number;
+  status: "stored-local" | "queued" | "applied" | "rejected" | "unknown";
+  /** Engine-observed evidence excerpt for the status (never synthesized). */
+  engineEvidence?: string;
+  /** Worker-observable evidence for applied (never claimed without it). */
+  appliedEvidence?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -423,7 +489,10 @@ export const DELEGATION_BOUNDS = {
   // an explicit bounded timeout up to 30 minutes (clamped + truthfully acked).
   maxAttemptTimeoutMsCanary: 300_000,
   maxAttemptTimeoutMsReal: 1_800_000,
-  minAttemptTimeoutMs: 10_000
+  minAttemptTimeoutMs: 10_000,
+  // Live steering: one run cannot accumulate unbounded steering records;
+  // 16 cap keeps the run file small (key + hash + status only, never text).
+  maxSteeringPerRun: 16
 } as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {

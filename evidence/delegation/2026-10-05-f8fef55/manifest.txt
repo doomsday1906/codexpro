@@ -1,0 +1,72 @@
+Delegation leaf evidence manifest — 2026-10-05 — base f8fef55399cb6760acb00893b453a5dd1d4e0b65
+Package codexpro@0.31.0. Build: Built codexpro@0.31.0; source commit f8fef55399cb6760acb00893b453a5dd1d4e0b65 (dirty)
+
+FILES CHANGED (sha256):
+  594df301042fa31281cc2e404127fc38e4adb72322ff69175235dc54163b73a7  src/delegationTools.ts  [source (ownership reservation, claim, steer op, claude resume, read reconcile)]
+  08f24affdcce9454beee9bdd67b3d6f889d82d9eaa91265cb6e387044acf86a9  src/delegationEngines.ts  [source (claude resume argv, queue route, steerable argv, thread parse, qualification)]
+  5641bb0615ce3e64cb9c0cc8e6c2f237a1b4a6bb383942381397d5599e8d4a5e  src/delegationStore.ts  [source (claim, threadId, steering records, bounds)]
+  d2d82fc5116eeb5adcecd7e7c73b9f4ad7ddf98338e35c1e491bc5e26b118f2b  src/server.ts  [source (delegation_steer registration in STANDARD/FULL/hidden lists)]
+  d89d7884a90cee37bd2ead5d1a94ec9c69dd8991d3f4c53659844bb285339d7c  package.json  [build input + smoke script registration]
+  80cbc28a3aae9313aa17591c6530879e828f9d65f12b893e768f2ef78c464e8e  scripts/build.mjs  [build input]
+  ac352ab4d2416fee6bab255d15f966be66d8281b461f55751a360f4773799aa0  scripts/build-identity.mjs  [build input]
+  01707d63930e59130eb6169d3c0afe9283ad356b655220b2b0633f22b123f0f4  tsconfig.json  [build input]
+  3a306470bb9586dcdb0920f9a483688b79a07096d8f15a9a4c29e8a587f6957f  scripts/delegation-codex-ownership-smoke.mjs  [new test (Finding 1 O1-O9)]
+  b31179fba46b9929d60027a2ad401be47af18f54377b000864d04dfb26548a68  scripts/delegation-steer-smoke.mjs  [new test (Finding 3 S1-S7)]
+  8536c1d3ff46b3a56cef97b8af4cb036c576bbefc1d564861e7c1921e95e9c80  scripts/delegation-artifact-isolation-smoke.mjs  [updated test (X4 unavailable-with-path)]
+  6a0fb57d39a67f0179f5f733c673eb2bfb86bb720c44d84f91a52fdb5638c9f4  scripts/delegation-repair-focus-smoke.mjs  [updated test (R5 qualified + R5b claude cancel/evidence)]
+
+SERIAL PROOF COMMANDS (all exit 0, run serially after code freeze):
+  exit=0  npm run build
+    log=logs/01-build.log  sha256=460604ba8e7e1982b369aeff16b6f63e1a002ee9406b3831e6dbf2c69cb2062a
+  exit=0  node scripts/delegation-codex-ownership-smoke.mjs
+    log=logs/02-ownership.log  sha256=186663fff51e1c395cfff6ee7a7832cb3de205b5d8128781ee9e3131de470bea
+  exit=0  node scripts/delegation-artifact-isolation-smoke.mjs
+    log=logs/03-artifact.log  sha256=e5d359933803da3448a2a9c2792faf96ee5e4775097580fb2d4698f133cdfd5f
+  exit=0  node scripts/delegation-terminal-cleanup-smoke.mjs
+    log=logs/04-terminal-cleanup.log  sha256=096815ee8d952b3c7174704ceb81b7f790cfa80116e8556de856d4833ee22227
+  exit=0  node scripts/delegation-cancel-artifact-smoke.mjs
+    log=logs/05-cancel-artifact.log  sha256=e89bcf02f76a86886aaf7716e0fe5d229a2a786dd73fe5382039b5dea6419ea5
+  exit=0  node scripts/delegation-identity-standalone-output-smoke.mjs
+    log=logs/06-identity.log  sha256=4dfefbbf6ada9dc477f00b14f1e09102c4ae0d4f726fa74de882114ec24c043d
+  exit=0  node scripts/delegation-triengine-smoke.mjs
+    log=logs/07-triengine.log  sha256=33fb5d19c75f9f96c41ff5833124ce392bd64990b71ce5d0245ace27d38d1917
+  exit=0  node scripts/delegation-repair-focus-smoke.mjs
+    log=logs/08-repair-focus.log  sha256=b9a5f5bb3b777ea3d3e1125d4f6f8daa1766ce69d96ccbb58adf23678440f68c
+  exit=0  node scripts/delegation-storage-smoke.mjs
+    log=logs/09-storage.log  sha256=e7b4277306086f137021a03fd31224b3348b87346b00c50c031bffa0f7903b70
+  exit=0  node scripts/delegation-followup-smoke.mjs
+    log=logs/10-followup.log  sha256=ac3f8b0d6e84954b9d021fe59e93a9a1690e433791544e786bdfc3d43ff85857
+  exit=0  node scripts/delegation-canary-smoke.mjs
+    log=logs/11-canary.log  sha256=69f5422df721ab3eb812fa0234be6ce0ece7a5774fed0257831920fd43a844a2
+  exit=0  node scripts/delegation-routing-smoke.mjs
+    log=logs/12-routing.log  sha256=c173692d4ad483644de89315b1b4035c18bab9bc97cd2bb5c2322b695a317e26
+  exit=0  node scripts/delegation-steer-smoke.mjs
+    log=logs/13-steer.log  sha256=2aac30abc21ba8d1d91a02aca315edf18e8de79b6b8e3c53ca27541ff0cd4221
+
+LIVE PROBES (bounded allowances only; everything else labeled shims):
+  claude: claude -p --output-format json --agent scout-fast --session-id <uuid> 'Reply with exactly: PROBE-OK. Do nothing else.'
+    exit=0 result=PROBE-OK subtype=success cost=$0.057025; execution success (no quota/rate-limit, no authentication, no configuration block; claude doctor exit 0, credentials present, settings keys inspected without reading values)
+    session file: /home/andrew/.claude/projects/-tmp-opencode-claude-probe/2dfd4d6d-d86e-409b-8ceb-c5a670b4e6fa.jsonl
+  codex queue: codex queue --thread 00000000-0000-4000-8000-000000000000 --message 'probe-only (no worker)'
+    exit=1 stderr: Error: failed to queue session message: thread/queue/add failed: failed to read thread: invalid thread-store request: no rollout found for thread id 00000000-0000-4000-8000-000000000000 (code -32603)
+
+ENGINE CAPABILITY DELTAS:
+  claude: deferred -> qualified-live-probe on the selected-agent + explicit-flag launch route (bounded probe 2026-10-05: execution success); verified-resume carries the full explicit-flag set; live --resume flag-honoring stays stated as UNPROVEN (one probe, then stop)
+  codex_steering: implemented behind delegation_steer (queue route inspected + error shape live-mapped + shim happy-path/duplicate/conflict/uncertain regressions); delivery to a live exec thread stays UNPROVEN (no running session exists without a model call); ephemeral runs refuse steer_unavailable_no_thread; steerable non-ephemeral launch variant added with profile+policy boundaries preserved
+  opencode_steering: INCOMPLETE with precise blocker (steer_unsupported; v2.0.22 session subcommands are list|delete|export|import, no steer verb); never emulated
+  claude_steering: INCOMPLETE with precise blocker (steer_unsupported; 2.1.289 has continue/resume/fork-session/session-id/bg agents, no message-inject verb); follow-up/resume never relabeled as steering
+
+FIXTURE STRAYS (preserved, never touched, never committed):
+  ce299a8defb9e1e8102a58dd1a8251ad2b7f954c9341e6fbce6beab36b90cca7  fixture-a.txt
+  13aafb27a71bb59b8c92d83248746711ddffe2d73fa2f3fbc5299851d0fac6ce  fixture-b.txt
+
+STALE-LEAF DISCLAIMER:
+  Evidence leaves at 9b8607a, b3f97e5, and a38ea90 predate this leaf's reservation-claim, claude-resume, and steering changes and are STALE for the reworked surfaces (artifact reservation/claim semantics, claude continuation argv, steer operation, qualification markers, X4/R5 expectations). This manifest + its 13 serial logs supersede them for those surfaces; untouched surfaces keep their prior proof.
+
+REMAINING BLOCKERS / UNPROVEN:
+  - codex queue delivery to a live exec-session thread (mid-turn vs next-turn-boundary, success receipt shape on a real thread): UNPROVEN - no running session exists without a model call; route implemented + error shape mapped + shim-proven, delivery unclaimed
+  - codex steerable thread capture: best-effort stdout parse (same standard as opencode session parse); non-ephemeral exec thread persistence itself UNPROVEN live
+  - claude --resume honoring every session-scoped flag under resume: UNPROVEN live (one probe, then stop); stated as resumeCaveat, never assumed
+  - same-tick delete+recreate and in-place overwrite by a same-host writer are indistinguishable from worker output (same trust domain as the worker); documented in the ownership smoke
+
+DELIVERY: uncommitted working tree (orchestrator integrates); fixture strays preserved, never touched, never committed

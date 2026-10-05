@@ -93,12 +93,14 @@ import {
   type DelegationEngine,
   type DelegationRunState,
   type DelegationSessionBinding,
+  type DelegationSteeringRecord,
   type DelegationStorageConfig
 } from "./delegationStore.js";
 import {
   buildCodexCanaryArgv,
   buildCodexRealArgv,
   buildCodexResumeArgv,
+  buildCodexSteerableArgv,
   buildClaudeArgv,
   buildClaudeResumeArgv,
   buildFollowupPrompt,
@@ -113,7 +115,9 @@ import {
   clampCanaryTimeout,
   clampRealTaskTimeout,
   CLAUDE_RESUME_CAPABILITY,
+  CLAUDE_STEER_CAPABILITY,
   classifyCodexFailure,
+  CODEX_QUEUE_CAPABILITY,
   codexHomeDir,
   collectOwnedTree,
   collectWorkdirEvidence,
@@ -126,11 +130,14 @@ import {
   newClaudeSessionId,
   OPENCODE_CANCEL_CAPABILITY,
   OPENCODE_RESUME_CAPABILITY,
+  OPENCODE_STEER_CAPABILITY,
+  parseCodexThreadId,
   parseOpenCodeSessionId,
   probeEngineCapability,
   readProcessStartTime,
   resolveClaudeBinary,
   resolveOpenCodeBinary,
+  runCodexQueue,
   sha256File,
   signalOwnedTree,
   snapshotWorkdirMtimes,
@@ -303,29 +310,105 @@ export function isValidRunIdForArtifact(runId: unknown): runId is string {
 export function shortRunId(runId: string): string {
   const m = /^run_([0-9a-f]{16})$/.exec(String(runId ?? ""));
   if (m) return m[1];
-  const clean = String(runId ?? "").replace(/[^A-Za-z0-9]/g, "").slice(-8);
-  return clean || "unknown";
+  // No truncation fallback: an invalid id binds no namespace. The legacy
+  // read-only shape (no valid run id) never calls this for new writes, and
+  // diagnostics use "unknown" rather than a colliding truncated suffix.
+  return "unknown";
 }
 
 /**
  * Pre-launch artifact ownership reservation for worker-owned output paths
- * (codex --output-last-message). Computes the exact run+attempt-bound
- * destination BEFORE the worker spawns and observes whether it already
- * exists: the first absent candidate (primary, else the attempt's own
- * run-bound fallbacks, else an extended run-bound sibling) wins with
- * absentAtReserve:true; when every bounded candidate is preoccupied the
- * primary is returned with absentAtReserve:false (finalize then reports
- * unavailable — a pre-existing foreign file is never overwritten and never
- * attributed). The caller persists the returned reservation on the attempt
- * BEFORE spawn and passes relPath as the worker output file (never a shared
- * name). A timestamp alone is never proof: only absentAtReserve:true plus
- * the run-bound namespace lets finalize bind a worker verdict. Exported for
- * the focused regression proof.
+ * (codex --output-last-message). For the exact run+attempt-bound
+ * destination, probe AND exclusively claim BEFORE the worker spawns: the
+ * first candidate whose name is confirmed absent (lstat ENOENT, never a
+ * catch-all-false; symlinks — dangling or not — never count as absent) is
+ * claimed with an O_EXCL + O_NOFOLLOW empty placeholder, closing the
+ * probe-to-supply race (a competing creation fails EEXIST and the
+ * candidate is skipped, never overwritten). Filesystem-error candidates
+ * are skipped, never supplied. When every bounded candidate is
+ * preoccupied the primary is returned with absentAtReserve:false (the
+ * caller must stop before spawn — finalize then reports unavailable, and
+ * a pre-existing foreign file is never overwritten and never attributed).
+ * The caller persists the returned reservation on the attempt BEFORE spawn
+ * and passes relPath as the worker output file (never a shared name). A
+ * timestamp alone is never proof: only absentAtReserve:true plus the claim
+ * identity plus the run-bound namespace lets finalize bind a worker
+ * verdict. Exported for the focused regression proof.
  */
 export interface ArtifactReservation {
   relPath: string;
   absentAtReserve: boolean;
   reservedAt: string;
+  /**
+   * Exclusive-claim proof: device + inode of the empty placeholder this
+   * reservation exclusively created (O_EXCL + O_NOFOLLOW) at the reserved
+   * path. Present only when absentAtReserve is true. Finalize binds a
+   * worker verdict ONLY when the observed file still carries this identity.
+   */
+  claim?: { dev: number; ino: number; birthtimeMs?: number };
+}
+
+type ArtifactExistence = "absent" | "occupied" | "error";
+
+/**
+ * Tri-state existence probe for artifact candidates. lstat (never
+ * stat-through) decides: a symlink — including a dangling one — is
+ * OCCUPIED (an O_EXCL create would follow it and forge the target, so the
+ * path is never supplied as a clean slot). ENOENT is confirmed ABSENT.
+ * Any other filesystem error (EACCES, ENOTDIR, I/O, ...) is ERROR:
+ * distinguished from confirmed absence, never supplied as a clean slot,
+ * and the caller tries the next candidate. A catch-all-false would hand a
+ * worker an unproven path; this split never does.
+ */
+function probeArtifactExistence(workdir: string, rel: string): ArtifactExistence {
+  if (rel.includes("..") || path.isAbsolute(rel)) return "occupied";
+  const abs = path.join(workdir, rel);
+  let lst: fs.Stats;
+  try {
+    lst = fs.lstatSync(abs);
+  } catch (error) {
+    const code = (error as { code?: unknown })?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return "absent";
+    return "error";
+  }
+  // Anything present — file, dir, symlink (dangling or not), socket,
+  // fifo — occupies the name. Symlinks are never followed here.
+  void lst;
+  return "occupied";
+}
+
+/**
+ * Exclusively claim one artifact path: O_EXCL + O_NOFOLLOW create of an
+ * empty placeholder (mode 0600). Succeeds ONLY when the name is truly
+ * free: an existing file fails EEXIST, and a symlink (even dangling, whose
+ * target O_EXCL would otherwise create) fails ELOOP. Returns the claim
+ * identity (dev + inode + creation time: a delete + recreate carries a new
+ * creation time even when the inode number is reused) or null when the
+ * name is preoccupied. Never follows a symlink, never overwrites, never
+ * throws.
+ */
+function exclusivelyClaimArtifact(workdir: string, relPath: string): { dev: number; ino: number; birthtimeMs: number } | null {
+  if (relPath.includes("..") || path.isAbsolute(relPath)) return null;
+  const abs = path.join(workdir, relPath);
+  let fd = -1;
+  try {
+    fs.mkdirSync(path.dirname(abs), { recursive: true, mode: 0o700 });
+    fd = fs.openSync(
+      abs,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      0o600
+    );
+    const stat = fs.fstatSync(fd);
+    fs.closeSync(fd);
+    fd = -1;
+    return { dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== -1) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
 }
 
 export function reserveAttemptArtifactPath(
@@ -339,17 +422,21 @@ export function reserveAttemptArtifactPath(
   if (!isValidRunIdForArtifact(runId)) {
     return { relPath: primaryRel, absentAtReserve: false, reservedAt };
   }
-  const exists = (rel: string): boolean => {
-    if (rel.includes("..") || path.isAbsolute(rel)) return true;
-    try {
-      return fs.statSync(path.join(workdir, rel)).isFile() || true;
-    } catch {
-      return false;
-    }
+  // Probe + claim in one step per candidate: the O_EXCL claim closes the
+  // probe-to-supply race (a competing creation between probe and claim
+  // fails EEXIST and the candidate is skipped, never overwritten). Error
+  // candidates are skipped, never supplied as clean slots.
+  const tryClaim = (rel: string): ArtifactReservation | null => {
+    if (probeArtifactExistence(workdir, rel) !== "absent") return null;
+    const claim = exclusivelyClaimArtifact(workdir, rel);
+    if (!claim) return null;
+    return { relPath: rel, absentAtReserve: true, reservedAt, claim };
   };
-  if (!exists(primaryRel)) return { relPath: primaryRel, absentAtReserve: true, reservedAt };
+  const primary = tryClaim(primaryRel);
+  if (primary) return primary;
   for (const rel of attemptArtifactFallbackPaths(engine, attemptN, runId)) {
-    if (!exists(rel)) return { relPath: rel, absentAtReserve: true, reservedAt };
+    const claimed = tryClaim(rel);
+    if (claimed) return claimed;
   }
   // Bounded candidates all preoccupied (adversarial forging): extend within
   // the same run+attempt namespace rather than overwriting a foreign file.
@@ -357,8 +444,8 @@ export function reserveAttemptArtifactPath(
   const pstem = dot >= 0 ? primaryRel.slice(0, dot) : primaryRel;
   const pext = dot >= 0 ? primaryRel.slice(dot) : "";
   for (let i = 4; i <= 9; i += 1) {
-    const rel = `${pstem}-x${i}${pext}`;
-    if (!exists(rel)) return { relPath: rel, absentAtReserve: true, reservedAt };
+    const claimed = tryClaim(`${pstem}-x${i}${pext}`);
+    if (claimed) return claimed;
   }
   return { relPath: primaryRel, absentAtReserve: false, reservedAt };
 }
@@ -401,17 +488,24 @@ export function persistAttemptArtifact(
   if (retained === null) {
     // No finalize write for this engine: bind only what the reservation
     // proves this worker produced. The reservation (persisted BEFORE spawn)
-    // is the ownership record; the attempt start timestamp alone is never
-    // sufficient proof.
+    // is the ownership record: absence proof PLUS the exclusive O_EXCL
+    // claim identity. The attempt start timestamp alone is never sufficient
+    // proof, and a reservation without a claim proves absence at probe time
+    // only — never ownership (a recent-timestamp foreign file with no
+    // claim is unclaimed).
     const reserved = reservation && typeof reservation.relPath === "string" && reservation.relPath
       ? reservation
       : undefined;
-    if (!reserved || !reserved.absentAtReserve || !reserved.reservedAt || Number.isNaN(Date.parse(reserved.reservedAt))) {
+    const claim = reserved?.claim;
+    const claimOk = !!claim && Number.isSafeInteger(claim.dev) && Number.isSafeInteger(claim.ino);
+    if (!reserved || !reserved.absentAtReserve || !reserved.reservedAt || Number.isNaN(Date.parse(reserved.reservedAt)) || !claimOk) {
       const missReason = !reserved
         ? "no pre-launch ownership reservation for this attempt (ownership unprovable; a timestamp alone is never proof)"
         : !reserved.absentAtReserve
           ? `reserved output destination ${reserved.relPath} was already preoccupied before launch; left untouched, never claimed as this run's output`
-          : "pre-launch ownership reservation is uncertain (missing timestamp); ownership unprovable";
+          : !claimOk
+            ? `reserved output destination ${reserved.relPath} carries no exclusive-claim proof (absence was probed but the name was never exclusively claimed); a recent-timestamp foreign file here is unclaimed, never attributed`
+            : "pre-launch ownership reservation is uncertain (missing timestamp); ownership unprovable";
       let preoccupiedBytes = 0;
       try {
         const stat = fs.statSync(path.join(workdir, reserved?.relPath ?? primaryRel));
@@ -425,11 +519,17 @@ export function persistAttemptArtifact(
     const rel = reserved.relPath;
     let existingSize: number | null = null;
     let existingMtimeMs: number | null = null;
+    let existingDev: number | null = null;
+    let existingIno: number | null = null;
+    let existingBirthtimeMs: number | null = null;
     try {
       const stat = fs.statSync(path.join(workdir, rel));
       if (stat.isFile()) {
         existingSize = stat.size;
         existingMtimeMs = stat.mtimeMs;
+        existingDev = stat.dev;
+        existingIno = stat.ino;
+        existingBirthtimeMs = stat.birthtimeMs;
       }
     } catch { /* absent */ }
     if (existingSize === null) {
@@ -442,6 +542,23 @@ export function persistAttemptArtifact(
       return {
         relPath: rel, bytes: 0, created: false, provenance: "unavailable" as const,
         reason: `worker left an empty file at ${rel} (empty = unavailable, never a slot to fill)`
+      };
+    }
+    // The file must still be OUR claimed placeholder identity: a competing
+    // creation between reserve and supply (delete + recreate, or symlink
+    // swap) carries a different identity and is foreign — left untouched,
+    // never claimed, however recent its mtime. Device + inode must match,
+    // and where both sides report a real creation time it must match too
+    // (inode reuse across delete + recreate still changes the creation
+    // time; a plain worker truncate-write preserves it).
+    const proven = claim as { dev: number; ino: number; birthtimeMs?: number };
+    const birthtimeComparable = Number.isFinite(proven.birthtimeMs) && (proven.birthtimeMs as number) > 0 &&
+      Number.isFinite(existingBirthtimeMs) && (existingBirthtimeMs as number) > 0;
+    if (existingDev !== proven.dev || existingIno !== proven.ino ||
+      (birthtimeComparable && existingBirthtimeMs !== proven.birthtimeMs)) {
+      return {
+        relPath: rel, bytes: existingSize, created: false, provenance: "unavailable" as const,
+        reason: `reserved artifact ${rel} no longer carries this attempt's exclusive-claim identity (replaced by a foreign file after reservation); left untouched, never claimed as this run's output`
       };
     }
     // Reserved-absent file, now nonempty: the worker created it after the
@@ -588,6 +705,13 @@ interface GatedLaunchPlan {
    * never implies it).
    */
   bypassApprovals: boolean;
+  /**
+   * Explicit steerable opt-in (codex real tasks only): launch without
+   * --ephemeral so the session persists and the engine returns an
+   * addressable thread id. Profile + execution-policy boundaries are
+   * unchanged; the default stays ephemeral.
+   */
+  steerable: boolean;
   timeoutMs: number;
   timeoutClamped: boolean;
   gateReason: string;
@@ -682,12 +806,31 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
   const base: Omit<GatedLaunchPlan,
     "profile" | "model" | "agent" | "requestedSessionId" | "executionPolicy" |
     "permissionMode" | "effort" | "allowedTools" | "disallowedTools" | "configOverrides" |
-    "bypassApprovals" |
+    "bypassApprovals" | "steerable" |
     "gateReason" | "gateEvidence" | "configuredModel" | "configuredEffort" |
     "modelExplicit" | "effortExplicit" | "permissionExplicit" | "executable"> = {
     engine, isCanary, delegationGroup, taskText, prompt,
     timeoutMs, timeoutClamped
   };
+  // Steerable launches are codex real-task only: opencode/claude expose no
+  // steer verb in the qualified CLI, and the read-only canary slice takes
+  // no injected messages. Explicit steerable anywhere else refuses (never
+  // silently ignored, never substituted).
+  const steerableRequested = args.steerable === true;
+  if (steerableRequested && engine !== "codex") {
+    return {
+      ok: false,
+      text: `steerable=true is codex-only (opencode/claude expose no steer verb in the qualified CLI); refusing rather than silently ignoring it.`,
+      structured: { error: "steerable_unsupported_for_engine", engine }
+    };
+  }
+  if (steerableRequested && isCanary) {
+    return {
+      ok: false,
+      text: "steerable=true is refused for the legacy canary slice (read-only; no injected messages). Supply a real task.",
+      structured: { error: "steerable_refused_for_canary" }
+    };
+  }
   if (engine === "codex") {
     const gate = verifyCodexLaunch(codexHomeDir(), String(args.profile ?? ""), {
       isCanary,
@@ -739,6 +882,7 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
         disallowedTools: "",
         configOverrides: gate.configOverrides ?? [],
         bypassApprovals,
+        steerable: steerableRequested,
         gateReason: gate.reason,
         gateEvidence: {
           model_configured: gate.configured.model,
@@ -802,6 +946,7 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
         disallowedTools: "",
         configOverrides: [],
         bypassApprovals: false,
+        steerable: false,
         gateReason: gate.reason,
         gateEvidence: {
           model_verified: gate.requestedModel,
@@ -859,6 +1004,7 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
       disallowedTools: typeof args.disallowed_tools === "string" ? args.disallowed_tools.trim() : "",
       configOverrides: [],
       bypassApprovals: false,
+      steerable: false,
       gateReason: gate.reason,
       gateEvidence: {
         agent: gate.agent?.name,
@@ -889,12 +1035,17 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
 function buildPlannedArgv(plan: GatedLaunchPlan, prompt: string, lastMessagePath: string, sessionId?: string): string[] {
   if (plan.engine === "codex") {
     if (plan.isCanary) return buildCodexCanaryArgv(plan.profile, prompt, lastMessagePath);
-    return buildCodexRealArgv(plan.profile, prompt, lastMessagePath, {
+    const codexOpts = {
       executionPolicy: plan.executionPolicy as "read-only" | "workspace-write" | "danger-full-access",
       ...(plan.model ? { modelOverride: plan.model } : {}),
       ...(plan.configOverrides.length > 0 ? { configOverrides: plan.configOverrides } : {}),
       ...(plan.bypassApprovals ? { dangerBypassExplicit: true as const } : {})
-    });
+    };
+    // Steerable launches drop --ephemeral so the session persists and the
+    // engine returns an addressable thread id. Profile, sandbox, model
+    // override, config overrides, and the bypass separation are identical.
+    if (plan.steerable) return buildCodexSteerableArgv(plan.profile, prompt, lastMessagePath, codexOpts);
+    return buildCodexRealArgv(plan.profile, prompt, lastMessagePath, codexOpts);
   }
   if (plan.engine === "opencode") {
     if (!plan.agent) return buildOpenCodeCanaryArgv(plan.model, prompt, sessionId);
@@ -1203,6 +1354,23 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
       fixturesUnchanged = false;
     }
   }
+  if (run.engine === "codex" && live && run.steerable === true && !run.session?.threadId) {
+    // Steerable (non-ephemeral) launches persist a session: record the
+    // engine-returned thread id when observed in worker output (best-effort
+    // parse, same standard as opencode). Steering later queues ONLY to
+    // this recorded id; an unobserved thread leaves steering unavailable
+    // (never synthesized). Ephemeral runs persist no session and never
+    // gain a thread id here.
+    const thread = parseCodexThreadId(tailText(live.stdoutChunks, DELEGATION_BOUNDS.maxTailBytes));
+    if (thread) {
+      run.session = {
+        ...(run.session ?? { engine: "codex" as const, resumable: false, observed: false, reason: "" }),
+        engine: "codex",
+        threadId: thread,
+        threadEvidence: "thread id observed in worker stdout (best-effort parse); steering queues only to this recorded id"
+      };
+    }
+  }
   if (run.engine === "opencode" && live) {
     const observed = parseOpenCodeSessionId(tailText(live.stdoutChunks, DELEGATION_BOUNDS.maxTailBytes));
     // An explicit --session id wins over best-effort output parsing: the
@@ -1471,17 +1639,62 @@ export function spawnCanaryChild(
 }
 
 /**
+ * Reservation failure: the pre-launch exclusive reservation could not
+ * supply a clean worker-owned destination (every bounded candidate
+ * preoccupied), or the reservation could not be persisted. The caller must
+ * stop BEFORE spawning: zero launches, truthful retry state, no duplicate
+ * dispatch. Never a second worker, never a shared name.
+ */
+export class ReservationFailedError extends Error {
+  readonly reservation: ArtifactReservation;
+  constructor(message: string, reservation: ArtifactReservation) {
+    super(message);
+    this.name = "ReservationFailedError";
+    (this as { code?: string }).code = "RESERVATION_FAILED";
+    this.reservation = reservation;
+  }
+}
+
+export function isReservationFailedError(error: unknown): boolean {
+  if (error instanceof ReservationFailedError) return true;
+  return !!error && typeof error === "object" &&
+    (error as { code?: unknown }).code === "RESERVATION_FAILED";
+}
+
+/**
+ * Proof-only export: the pre-launch reservation step used by every Codex
+ * launch path. Never spawns (construction: reservation + persist only), so
+ * save-failure injection proves zero-launch behavior structurally. Throws
+ * ReservationFailedError when no bounded candidate is free; propagates
+ * persistence-save failures (never swallowed).
+ */
+export function reserveCodexOutputForProof(bridgeDir: string, run: DelegationRunRecord, attemptN: number): string {
+  return reserveCodexOutputBeforeLaunch(bridgeDir, run, attemptN);
+}
+
+/**
  * Reserve and persist the exact run+attempt-bound Codex output destination
- * BEFORE the worker spawns. The reservation lands on the staged attempt and
- * is saved to disk prior to spawn; the returned absolute path is the ONLY
- * path the worker may write (it rides --output-last-message). Never a
- * shared name; never an overwrite of a foreign file. Best-effort persist:
- * if the save itself fails the finalize still fails closed (unavailable).
+ * BEFORE the worker spawns. The reservation (exclusive O_EXCL claim) lands
+ * on the staged attempt and is saved to disk prior to spawn; the returned
+ * absolute path is the ONLY path the worker may write (it rides
+ * --output-last-message). Never a shared name; never an overwrite of a
+ * foreign file. When no bounded candidate is free the call THROWS
+ * ReservationFailedError (the caller stops before spawn: zero launches,
+ * no duplicate dispatch, truthful retry state). A persistence-save
+ * failure also throws (propagated, never swallowed): without the persisted
+ * reservation the finalize cannot prove ownership, so the launch must not
+ * proceed.
  */
 function reserveCodexOutputBeforeLaunch(bridgeDir: string, run: DelegationRunRecord, attemptN: number): string {
   const n = Number.isSafeInteger(attemptN) && attemptN >= 1 ? attemptN : 1;
   const reservation = reserveAttemptArtifactPath(run.workdir, "codex", n, run.runId);
-  const record = { relPath: reservation.relPath, absentAtReserve: reservation.absentAtReserve, reservedAt: reservation.reservedAt };
+  if (!reservation.absentAtReserve) {
+    throw new ReservationFailedError(
+      `codex output reservation failed: primary artifact ${reservation.relPath} and every run-bound fallback is preoccupied (foreign files left untouched); refusing to spawn rather than overwriting or misattributing`,
+      reservation
+    );
+  }
+  const record = { relPath: reservation.relPath, absentAtReserve: reservation.absentAtReserve, reservedAt: reservation.reservedAt, ...(reservation.claim ? { claim: reservation.claim } : {}) };
   const latest = run.attempts.at(-1);
   if (latest && latest.n === n) {
     latest.artifactReservation = record;
@@ -1490,9 +1703,9 @@ function reserveCodexOutputBeforeLaunch(bridgeDir: string, run: DelegationRunRec
   } else {
     run.attempts = [...run.attempts, { n, startedAt: reservation.reservedAt, state: "queued" as DelegationRunState, artifactReservation: record }];
   }
-  try {
-    saveDelegationRun(bridgeDir, run);
-  } catch { /* reservation persist best-effort; finalize fails closed without it */ }
+  // Persisted BEFORE spawn: a save failure propagates (never swallowed) so
+  // the caller stops before spawn. Finalize fails closed without it.
+  saveDelegationRun(bridgeDir, run);
   return path.join(run.workdir, reservation.relPath);
 }
 
@@ -1719,10 +1932,12 @@ export function attemptArtifactFallbackPaths(engine: DelegationEngine, attemptN:
 }
 
 /**
- * Exclusively create one artifact file (O_EXCL): succeeds ONLY when the
- * path does not exist yet. An existing file — including an existing EMPTY
- * file (empty = unavailable, never a slot to fill) — is never overwritten,
- * never truncated, never filled. Returns the created relative path, or null
+ * Exclusively create one artifact file (O_EXCL + O_NOFOLLOW): succeeds ONLY
+ * when the path does not exist yet. An existing file — including an
+ * existing EMPTY file (empty = unavailable, never a slot to fill) — is
+ * never overwritten, never truncated, never filled. A symlink (even
+ * dangling, whose target a following O_EXCL would otherwise create) fails
+ * ELOOP and is never followed. Returns the created relative path, or null
  * when the path is preoccupied. Never throws.
  */
 export function exclusivelyCreateArtifact(workdir: string, relPath: string, text: string): string | null {
@@ -1731,7 +1946,11 @@ export function exclusivelyCreateArtifact(workdir: string, relPath: string, text
   let fd = -1;
   try {
     fs.mkdirSync(path.dirname(abs), { recursive: true, mode: 0o700 });
-    fd = fs.openSync(abs, "wx", 0o600);
+    fd = fs.openSync(
+      abs,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      0o600
+    );
     fs.writeFileSync(fd, text, "utf8");
     fs.fsyncSync(fd);
     fs.closeSync(fd);
@@ -1906,6 +2125,49 @@ export function buildTestEvidence(input: {
   };
 }
 
+/**
+ * SHA-256 hex of one steering message (conflict detection without
+ * persisting the text). The message text itself is never stored on the
+ * run record: only its hash + length.
+ */
+export function steeringMessageHash(message: string): string {
+  return createHash("sha256").update(String(message), "utf8").digest("hex");
+}
+
+/**
+ * Reconcile queued steering records against worker-observable evidence.
+ * A queued record becomes applied ONLY when the worker produced output
+ * after the queue time: the current attempt's recorded artifact reads
+ * present AND its file mtime is newer than the steer queue time. Anything
+ * else stays queued (never claimed from queued alone). Returns the
+ * applied keys; never throws.
+ */
+export function reconcileSteeringApplied(run: DelegationRunRecord): { changed: boolean; applied: string[] } {
+  const applied: string[] = [];
+  const records = Array.isArray(run.steering) ? run.steering : [];
+  if (!records.some((record) => record?.status === "queued")) return { changed: false, applied };
+  for (const record of records) {
+    if (!record || record.status !== "queued") continue;
+    const queuedMs = Date.parse(record.updatedAt);
+    if (Number.isNaN(queuedMs)) continue;
+    const current = run.attempts.at(-1);
+    const artifact = current?.outputArtifact;
+    if (!artifact || artifact.provenance === "unavailable") continue;
+    const described = describeAttemptArtifact(run.workdir, run.engine, current?.n ?? 1, artifact);
+    if (described.status !== "present" || !described.path) continue;
+    let mtimeMs = NaN;
+    try {
+      mtimeMs = fs.statSync(path.join(run.workdir, described.path)).mtimeMs;
+    } catch { continue; }
+    if (!Number.isFinite(mtimeMs) || mtimeMs <= queuedMs) continue;
+    record.status = "applied";
+    record.appliedEvidence = `worker output observed after the queue time (artifact ${described.path} mtime newer than queued ${record.updatedAt}); queued never implied applied`;
+    record.updatedAt = new Date().toISOString();
+    applied.push(record.steeringKey);
+  }
+  return { changed: applied.length > 0, applied };
+}
+
 export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[] {
   const launchArgs = z.object({
     workspace_id: WORKSPACE_ID.optional().describe("Workspace id. Omit to use the session-selected workspace."),
@@ -1926,7 +2188,8 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     workdir: z.string().min(1).max(1024).describe("Explicit workspace-relative working directory for the disposable canary run."),
     request_id: z.string().min(1).max(128).optional().describe("Idempotency key. Repeating it returns the existing run without spawning a second worker."),
     canary: z.boolean().optional().describe("Must be true when no task is supplied (legacy read-only canary slice, codex/opencode only). Ignored when task is present."),
-    timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms. Canary clamps to 5 minutes; real tasks clamp to 30 minutes; 10s minimum. The clamped value is truthfully acked.")
+    timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms. Canary clamps to 5 minutes; real tasks clamp to 30 minutes; 10s minimum. The clamped value is truthfully acked."),
+    steerable: z.boolean().optional().describe("Codex real tasks only: launch without --ephemeral so the session persists and the engine may return an addressable thread id for delegation_steer. Profile + execution-policy boundaries unchanged; refused for canary and non-codex engines.")
   }).strict();
 
   const previewArgs = z.object({
@@ -1947,7 +2210,8 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     delegation_group: z.string().max(64).optional().describe("Delegation group id (default hestia-cli-canary)."),
     workdir: z.string().min(1).max(1024).describe("Explicit workspace-relative working directory that would host the run."),
     canary: z.boolean().optional().describe("Must be true when no task is supplied (legacy read-only canary slice, codex/opencode only)."),
-    timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms (clamped + truthfully acked like launch).")
+    timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms (clamped + truthfully acked like launch)."),
+    steerable: z.boolean().optional().describe("Codex real tasks only: preview the non-ephemeral session-persisting argv (same profile + execution-policy boundaries). Refused for canary and non-codex engines.")
   }).strict();
 
   const listArgs = z.object({
@@ -1983,6 +2247,13 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
   const cancelArgs = z.object({
     run_id: RUN_ID,
     workspace_id: WORKSPACE_ID.optional()
+  }).strict();
+
+  const steerArgs = z.object({
+    run_id: RUN_ID,
+    workspace_id: WORKSPACE_ID.optional(),
+    steering_key: z.string().min(1).max(128).describe("Idempotency key for this steering message (per-run unique). Same key + same message replays the stored outcome without a second dispatch; same key + changed message is a conflict."),
+    message: z.string().min(1).max(2000).describe("Live-worker message text (bounded to 2000 chars). Reaches ONLY the named run via its recorded engine thread/session id; never another run, never an unrelated terminal.")
   }).strict();
 
   const replayArgs = z.object({
@@ -2184,8 +2455,12 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             engine: "codex",
             resumable: false,
             observed: false,
-            evidence: "codex ephemeral run persists no session; follow-up is a new attempt by construction",
-            reason: "codex ephemeral run persists no session; follow-up starts a labeled new-continuation-attempt"
+            evidence: plan.steerable
+              ? "codex steerable launch runs without --ephemeral (session persists; profile + execution-policy boundaries unchanged): the engine-returned thread id is recorded on this binding when observed in worker output, and steering queues only to that recorded id"
+              : "codex ephemeral run persists no session; follow-up is a new attempt by construction",
+            reason: plan.steerable
+              ? "codex steerable run persists a session; follow-up stays a labeled new-continuation-attempt, live steering queues only to the recorded thread id when observed"
+              : "codex ephemeral run persists no session; follow-up starts a labeled new-continuation-attempt"
           }
           : engine === "opencode"
             ? sessionId
@@ -2229,7 +2504,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           requestId,
           delegationGroup,
           engine,
-          ...(engine === "codex" ? { profile, executionPolicy: plan.executionPolicy, ...(plan.model ? { modelOverride: plan.model } : {}), ...(plan.configOverrides.length > 0 ? { configOverrides: plan.configOverrides } : {}), ...(plan.bypassApprovals ? { bypassApprovals: true as const } : {}) } : {}),
+          ...(engine === "codex" ? { profile, executionPolicy: plan.executionPolicy, ...(plan.model ? { modelOverride: plan.model } : {}), ...(plan.configOverrides.length > 0 ? { configOverrides: plan.configOverrides } : {}), ...(plan.bypassApprovals ? { bypassApprovals: true as const } : {}), ...(plan.steerable ? { steerable: true as const } : {}) } : {}),
           ...(engine === "opencode" ? { model, ...(agent ? { agent } : {}), requestedSessionId: plan.requestedSessionId, opencodeRoute: "standalone" as const } : {}),
           ...(engine === "claude" ? { agent, ...(model ? { model } : {}), ...(plan.permissionMode ? { permissionMode: plan.permissionMode } : {}), ...(plan.effort ? { effort: plan.effort } : {}), ...(plan.allowedTools ? { allowedTools: plan.allowedTools } : {}), ...(plan.disallowedTools ? { disallowedTools: plan.disallowedTools } : {}), requestedSessionId: plan.requestedSessionId } : {}),
           ...(isCanary ? { isCanary: true } : { isCanary: false, task: taskText }),
@@ -2329,7 +2604,11 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           run.result = { exitCode: 127, signal: null, timedOut: false, summary: sanitizeSummary(error instanceof Error ? error.message : String(error)) };
           enqueueTerminalEvent(run, loadSubscriptions(subscriptionAuthorityDirFor(deps.config)));
           saveDelegationRun(bridgeDir, run);
-          return failResult(`Launch failed: ${error instanceof Error ? error.message : String(error)}`, { error: "launch_failed", run_id: runId });
+          // A failed exclusive reservation stops the launch BEFORE any
+          // spawn (zero launches, foreign files untouched): the code keeps
+          // its distinct truthful state instead of a generic failure.
+          const launchError = isReservationFailedError(error) ? "launch_preoccupied" : "launch_failed";
+          return failResult(`Launch failed: ${error instanceof Error ? error.message : String(error)}`, { error: launchError, run_id: runId });
         }
         // Spawn returned synchronously (no throw): confirm the staged launch
         // in the SAME pid-save boundary. spawnCanaryChild already persisted
@@ -2367,7 +2646,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             is_canary: isCanary,
             ...(isCanary ? {} : { task_chars: taskText.length }),
             engine,
-            ...(engine === "codex" ? { profile, execution_policy: plan.executionPolicy } : {}),
+            ...(engine === "codex" ? { profile, execution_policy: plan.executionPolicy, ...(plan.steerable ? { steerable: true as const } : {}) } : {}),
             ...(engine === "opencode" ? { model, ...(agent ? { agent } : {}), execution_route: "standalone" } : {}),
             ...(engine === "claude" ? { agent, ...(model ? { model } : {}), ...(plan.permissionMode ? { permission_mode: plan.permissionMode } : {}), ...(plan.effort ? { effort: plan.effort } : {}) } : {}),
             ...(sessionId ? { session_id: sessionId } : {}),
@@ -2508,6 +2787,25 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         const reconciled = reconcileRunState(run, isProcessIdentityAlive);
         let current = reconciled.run;
         if (reconciled.changed) saveDelegationRun(bridgeDir, current);
+        // Live thread observation for steerable codex runs: while the
+        // worker runs, engine-observed stdout may already carry the thread
+        // id (recorded here, never synthesized). Ephemeral runs never gain
+        // one; terminal capture stays in finalizeLiveRun.
+        if (current.engine === "codex" && current.steerable === true && !current.session?.threadId) {
+          const live = processRuntime().live.get(current.runId);
+          if (live) {
+            const thread = parseCodexThreadId(tailText(live.stdoutChunks, DELEGATION_BOUNDS.maxTailBytes));
+            if (thread) {
+              current.session = {
+                ...(current.session ?? { engine: "codex" as const, resumable: false, observed: false, reason: "" }),
+                engine: "codex",
+                threadId: thread,
+                threadEvidence: "thread id observed in live worker stdout (best-effort parse); steering queues only to this recorded id"
+              };
+              saveDelegationRun(bridgeDir, current);
+            }
+          }
+        }
         current = await pumpDeliveries(deps, bridgeDir, loadDelegationRun(bridgeDir, current.runId) ?? current);
         const acked: string[] = [];
         if (Array.isArray(args.ack_event_ids) && args.ack_event_ids.length > 0) {
@@ -2521,6 +2819,11 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           if (acked.length > 0) saveDelegationRun(bridgeDir, current);
         }
         const includeEvents = args.include_events !== false;
+        // Live-steering reconciliation: a queued steer becomes applied ONLY
+        // on worker-observable evidence (artifact present + newer than the
+        // queue time). Queued alone is never promoted.
+        const steeringReconciled = reconcileSteeringApplied(current);
+        if (steeringReconciled.changed) saveDelegationRun(bridgeDir, current);
         // Truthful: events with zero targets are undelivered (no-targets-
         // pending), never silent 0. Per-event no_targets marks the explicit
         // no-target state; delegation_replay_events attaches current matches.
@@ -2635,6 +2938,18 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             execution_provenance: provenance,
             engine_qualification: engineQualification(current.engine),
             ...(current.lastCancelVerification ? { last_cancel_verification: current.lastCancelVerification } : {}),
+            ...(Array.isArray(current.steering) && current.steering.length > 0
+              ? {
+                steering: current.steering.map((record) => ({
+                  steering_key: record.steeringKey,
+                  status: record.status,
+                  attempt_n: record.attemptN,
+                  ...(record.engineEvidence ? { engine_evidence: record.engineEvidence } : {}),
+                  ...(record.appliedEvidence ? { applied_evidence: record.appliedEvidence } : {}),
+                  updated_at: record.updatedAt
+                }))
+              }
+              : {}),
             ...(failureClassification ? { failure_classification: failureClassification } : {}),
             ...(failureClassification ? { failure_classification: failureClassification } : {}),
             review_note: "A completed process or green canary NEVER establishes task success: review the raw evidence above (tails, workdir changes, test evidence) against the original task and repo rules before accepting. Nonempty tails prove output presence only, never that tests ran. Larger evidence rides the run workdir (including the last-message file) through the ordinary read route.",
@@ -2878,26 +3193,19 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             }
           } else {
             // Claude runs carry a stable --session-id UUID (minted at launch
-            // when omitted). Verified session file => true resume via
-            // --resume, EXCEPT when the stored run carries explicit
-            // model/effort/tool settings: the resume argv drops them (agent +
-            // permission-mode only; Claude qualification deferred), so resume
-            // is withheld and the full explicit-flag argv runs as a labeled
-            // new attempt instead. Otherwise the same id rides --session-id
-            // as first-use creation, labeled new-continuation-attempt.
+            // when omitted). A verified session file means true resume via
+            // --resume carrying the run's FULL explicit-flag set (agent +
+            // permission-mode + explicit model/effort/tool filters ride
+            // every continuation argv, so no stored override is dropped).
+            // An unverified id rides --session-id as first-use creation,
+            // labeled new-continuation-attempt, never resumed.
             const sid = run.session?.sessionId;
-            const dropsStoredSettings = Boolean(run.model || run.effort || run.allowedTools || run.disallowedTools);
             if (sid && isClaudeSessionId(sid)) {
               const probe = verifyClaudeSession(sid);
-              if (probe.verified && dropsStoredSettings) {
-                continuationLabel = "new-continuation-attempt";
-                resumeSessionId = sid;
-                spawnNote = `claude session ${sid} verified (${probe.evidence}) BUT resume withheld: stored explicit model/effort/tool settings would be dropped by --resume (resume argv carries agent + permission-mode only; Claude qualification deferred) — follow-up reuses the full explicit-flag argv as a new attempt, never labeled resumed`;
-                sessionEvidence = `session verified (${probe.evidence}); resume withheld (stored explicit model/effort/tool settings would drop under --resume; Claude qualification deferred)`;
-              } else if (probe.verified) {
+              if (probe.verified) {
                 continuationLabel = "resumed";
                 resumeSessionId = sid;
-                spawnNote = `claude session ${sid} verified (${probe.evidence}) and continued via --resume (true resume)`;
+                spawnNote = `claude session ${sid} verified (${probe.evidence}) and continued via --resume carrying the full explicit-flag set (true resume, no override dropped)`;
                 sessionEvidence = probe.evidence;
               } else {
                 resumeSessionId = sid;
@@ -2989,11 +3297,9 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                   ? `opencode session ${run.session.sessionId} unverified (${sessionEvidence}): follow-up runs a new attempt (first-use creation), never a resumed session`
                   : "no opencode session id recorded: follow-up runs a new attempt, never a resumed session"))
               : (resumeSessionId && continuationLabel === "resumed"
-                ? `claude session ${resumeSessionId} verified (${sessionEvidence}) and continued via --resume (true resume)`
+                ? `claude session ${resumeSessionId} verified (${sessionEvidence}) and continued via --resume carrying the full explicit-flag set (true resume, no override dropped)`
                 : (resumeSessionId ?? run.session?.sessionId
-                  ? ((staged.sessionEvidence ?? "").includes("resume withheld")
-                    ? `claude session ${resumeSessionId ?? run.session?.sessionId} verified but resume withheld (${sessionEvidence}): follow-up reuses the full explicit-flag argv as a new attempt, never labeled resumed`
-                    : `claude session ${resumeSessionId ?? run.session?.sessionId} unverified (${sessionEvidence}): follow-up reuses the stable --session-id (first-use creation), never a resumed session`)
+                  ? `claude session ${resumeSessionId ?? run.session?.sessionId} unverified (${sessionEvidence}): follow-up reuses the stable --session-id (first-use creation), never a resumed session`
                   : "no claude session UUID recorded: follow-up runs a new attempt, never a resumed session"));
           if (alreadyDispatched) {
             spawnNote = `staged continuation worker still alive (pid ${stagedAlivePid}); confirmed without spawning a second worker; ${spawnNote}`;
@@ -3017,9 +3323,12 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             // their computed run-bound path (O_EXCL at finalize).
             let lastMessagePath = path.join(run.workdir,
               lastMessageRelPathForAttempt(run.engine, staged.attemptN, run.runId));
-            if (run.engine === "codex" && !alreadyDispatched) {
-              lastMessagePath = reserveCodexOutputBeforeLaunch(bridgeDir, run, staged.attemptN);
-            }
+            // Codex claims its output path inside the launch functions
+            // below (exactly one exclusive claim per attempt): an outer
+            // claim here would preoccupy the primary with our own
+            // placeholder and divert the real claim to a fallback, leaving
+            // an empty file behind. Other engines carry their computed
+            // run-bound path (O_EXCL at finalize).
             try {
               if (run.engine === "codex" && continuationLabel === "resumed" && resumeSessionId) {
                 child = launchCodexResume(deps, bridgeDir, run, resumeSessionId, staged.timeoutMs, staged.prompt, runIsCanary, staged.attemptN);
@@ -3052,7 +3361,11 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                 child = launchClaudeChild(deps, bridgeDir, run,
                   buildClaudeResumeArgv(resumeSessionId, staged.prompt, {
                     ...(run.agent ? { agent: run.agent } : {}),
-                    ...(run.permissionMode ? { permissionMode: run.permissionMode } : {})
+                    ...(run.model ? { model: run.model } : {}),
+                    ...(run.effort ? { effort: run.effort } : {}),
+                    ...(run.permissionMode ? { permissionMode: run.permissionMode } : {}),
+                    ...(run.allowedTools ? { allowedTools: run.allowedTools } : {}),
+                    ...(run.disallowedTools ? { disallowedTools: run.disallowedTools } : {})
                   }), staged.timeoutMs, staged.prompt, runIsCanary, staged.attemptN);
               } else {
                 const claudeSession = resumeSessionId ?? run.session?.sessionId;
@@ -3275,6 +3588,227 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           state: "needs-input",
           engine_qualification: engineQualification(run.engine),
           next_action: "answer via delegation_followup with the matching input-request id"
+        });
+      }
+    },
+    {
+      name: "delegation_steer",
+      options: {
+        title: "Delegation Steer",
+        description: "Send one bounded live message to a RUNNING worker (mid-turn steering, distinct from needs-input follow-up and from cancel/relaunch). Codex only, via one native `codex queue --thread` call to the run's recorded engine-returned thread id; opencode/claude expose no steer verb and refuse with steer_unsupported (never emulated). Idempotent per steering_key; settled/cancelled runs refuse; applied is claimed only on worker-observable evidence.",
+        inputSchema: publicSchemaFrom(steerArgs),
+        runtimeInputSchema: steerArgs,
+        annotations: DESTRUCTIVE
+      },
+      handler: async (args) => {
+        const workspace = deps.workspaces.getWorkspace(args.workspace_id);
+        const bridgeDir = bridgeDirFor(deps.config, workspace.root);
+        const run = loadDelegationRun(bridgeDir, args.run_id);
+        if (!run || !ownerAllowed(deps, run)) return denyAccess();
+        const key = String(args.steering_key ?? "").trim();
+        if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(key)) {
+          return failResult("steering_key must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/ (per-run unique idempotency key).", {
+            error: "invalid_steering_key", run_id: run.runId
+          });
+        }
+        const message = String(args.message ?? "");
+        if (!message.trim() || message.length > 2000) {
+          return failResult("message must be 1..2000 chars of live-worker input.", {
+            error: "invalid_steer_message", run_id: run.runId
+          });
+        }
+        const messageHash = steeringMessageHash(message);
+        const now = new Date().toISOString();
+        const attemptN = run.attempts.at(-1)?.n ?? 1;
+        const existing = (Array.isArray(run.steering) ? run.steering : []).find((record) => record?.steeringKey === key);
+        if (existing) {
+          // Idempotency: same key + same content replays the stored outcome
+          // (no second dispatch, even on lost responses/retries); same key
+          // + changed content is a conflict (never dispatched). Uncertain
+          // stays uncertain: a retry reuses the same key and reconciles
+          // against this record first, never duplicates.
+          if (existing.messageHash !== messageHash) {
+            return failResult(`Steering key ${key} already steered run ${run.runId} with different content (status ${existing.status}); conflicting re-use refused, nothing dispatched. Use a NEW key for a new message.`, {
+              error: "steer_key_conflict",
+              run_id: run.runId,
+              steering_key: key,
+              stored_status: existing.status,
+              stored: true,
+              executed: false
+            });
+          }
+          return okResult(`Duplicate steer ${key} for run ${run.runId}: replaying the stored outcome (${existing.status}), no second dispatch.`, {
+            run_id: run.runId,
+            steering_key: key,
+            status: existing.status,
+            duplicate: true,
+            executed: false,
+            ...(existing.engineEvidence ? { engine_evidence: existing.engineEvidence } : {}),
+            ...(existing.appliedEvidence ? { applied_evidence: existing.appliedEvidence } : {})
+          });
+        }
+        // Settled/cancelled/completed runs refuse with truthful state: a
+        // message to a dead worker is never accepted, never silently
+        // dropped. needs-input runs are not steered: answer via
+        // delegation_followup (steering is not a reply path).
+        if (DELEGATION_TERMINAL_STATES.has(run.state)) {
+          return failResult(`Run ${run.runId} is ${run.state}: settled runs refuse steering (truthful state, nothing dispatched, nothing queued).`, {
+            error: "steer_refused_settled",
+            run_id: run.runId,
+            state: run.state,
+            stored: false,
+            executed: false
+          });
+        }
+        if (run.state === "needs-input") {
+          return failResult(`Run ${run.runId} is needs-input: steering is not a reply path — answer via delegation_followup with the matching input-request id. Nothing dispatched.`, {
+            error: "steer_refused_needs_input",
+            run_id: run.runId,
+            state: run.state,
+            stored: false,
+            executed: false
+          });
+        }
+        if (run.state !== "running" && run.state !== "queued") {
+          return failResult(`Run ${run.runId} is ${run.state}: only running/queued workers accept steering. Nothing dispatched.`, {
+            error: "steer_refused_state",
+            run_id: run.runId,
+            state: run.state,
+            stored: false,
+            executed: false
+          });
+        }
+        const persistSteering = (record: DelegationSteeringRecord): void => {
+          run.steering = [...(Array.isArray(run.steering) ? run.steering : []), record]
+            .slice(-DELEGATION_BOUNDS.maxSteeringPerRun);
+          run.updatedAt = new Date().toISOString();
+          saveDelegationRun(bridgeDir, run);
+        };
+        // Engine routing: only codex exposes a native live-input route.
+        // opencode/claude refuse with the inspected capability blocker —
+        // delivery is never emulated via a second session, a resume, or a
+        // cancel+relaunch disguised as steering.
+        if (run.engine === "opencode") {
+          const record: DelegationSteeringRecord = {
+            steeringKey: key, messageHash, messageChars: message.length, attemptN,
+            status: "rejected", engineEvidence: OPENCODE_STEER_CAPABILITY.blocker,
+            createdAt: now, updatedAt: now
+          };
+          persistSteering(record);
+          return failResult(`Steering refused for run ${run.runId} (opencode): ${OPENCODE_STEER_CAPABILITY.blocker}.`, {
+            error: "steer_unsupported",
+            run_id: run.runId,
+            steering_key: key,
+            engine: "opencode",
+            stored: true,
+            executed: false
+          });
+        }
+        if (run.engine === "claude") {
+          const record: DelegationSteeringRecord = {
+            steeringKey: key, messageHash, messageChars: message.length, attemptN,
+            status: "rejected", engineEvidence: CLAUDE_STEER_CAPABILITY.blocker,
+            createdAt: now, updatedAt: now
+          };
+          persistSteering(record);
+          return failResult(`Steering refused for run ${run.runId} (claude): ${CLAUDE_STEER_CAPABILITY.blocker}.`, {
+            error: "steer_unsupported",
+            run_id: run.runId,
+            steering_key: key,
+            engine: "claude",
+            stored: true,
+            executed: false
+          });
+        }
+        // Codex: the message reaches ONLY its intended run via the recorded
+        // engine-returned thread id. Ephemeral runs persist no session and
+        // expose no thread: steering is unavailable by construction (never
+        // emulated, never a guessed id). A foreign or malformed thread is
+        // never addressed.
+        const thread = run.session?.threadId;
+        if (!thread || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(thread)) {
+          const ephemeral = run.steerable !== true;
+          return failResult(
+            ephemeral
+              ? `Steering unavailable for run ${run.runId} (codex ephemeral: no session persists, so no steerable thread exists). Not emulated: no resume, no second session, no cancel+relaunch disguised as steering. Smallest feasible alternative: relaunch with steerable=true (non-ephemeral, same profile + execution-policy boundaries) and steer the recorded thread, or wait and use delegation_followup when the run needs input.`
+              : `Steering unavailable for run ${run.runId} (codex steerable: no engine-returned thread id observed yet). The thread is recorded only from engine-observed evidence, never synthesized; retry once the run reports one, or use delegation_followup when the run needs input.`,
+            {
+              error: "steer_unavailable_no_thread",
+              run_id: run.runId,
+              steering_key: key,
+              engine: "codex",
+              steerable_launch: run.steerable === true,
+              stored: false,
+              executed: false
+            }
+          );
+        }
+        // Durable stored-local BEFORE the engine call: a crash between
+        // dispatch and persistence reconciles against this record (retry
+        // with the same key replays, never duplicates).
+        persistSteering({
+          steeringKey: key, messageHash, messageChars: message.length, attemptN,
+          status: "stored-local",
+          engineEvidence: `stored for codex thread ${thread}; engine call dispatching`,
+          createdAt: now, updatedAt: now
+        });
+        const queue = runCodexQueue(thread, message, { binary: resolveCodexBinary() });
+        const stored = (Array.isArray(run.steering) ? run.steering : []).find((record) => record?.steeringKey === key);
+        const binaryNote = run.binaryOverridden
+          ? "a CODEXPRO_*_BIN override selected the queue executable (test shims ride this route): shim results are never live proof"
+          : "default PATH codex binary (no CODEXPRO_CODEX_BIN override); no shim marker";
+        if (queue.outcome === "queued") {
+          if (stored) {
+            stored.status = "queued";
+            stored.engineEvidence = `codex queue exit ${queue.exitCode}: held by the engine for the worker's next turn (queued never implies applied). Evidence: ${queue.evidence}`.slice(0, 500);
+            stored.updatedAt = new Date().toISOString();
+            saveDelegationRun(bridgeDir, run);
+          }
+          return okResult(`Steer ${key} queued by the engine for run ${run.runId} (codex thread ${thread}): held for the worker's next turn. Queued never implies applied: applied is claimed only on worker-observable evidence via delegation_read_result.`, {
+            run_id: run.runId,
+            steering_key: key,
+            status: "queued",
+            attempt_n: attemptN,
+            engine: "codex",
+            stored: true,
+            executed: true,
+            engine_evidence: queue.evidence,
+            queue_note: binaryNote,
+            next_action: "poll delegation_read_result: applied is reported only when worker output is observed after the queue time"
+          });
+        }
+        if (queue.outcome === "rejected") {
+          if (stored) {
+            stored.status = "rejected";
+            stored.engineEvidence = `codex queue refused (exit ${queue.exitCode}): ${queue.evidence}`.slice(0, 500);
+            stored.updatedAt = new Date().toISOString();
+            saveDelegationRun(bridgeDir, run);
+          }
+          return failResult(`Steering rejected by the engine for run ${run.runId} (codex thread ${thread}): ${queue.evidence}`, {
+            error: "steer_rejected",
+            run_id: run.runId,
+            steering_key: key,
+            engine: "codex",
+            stored: true,
+            executed: false,
+            engine_evidence: queue.evidence
+          });
+        }
+        if (stored) {
+          stored.status = "unknown";
+          stored.engineEvidence = `codex queue outcome uncertain (timeout/lost reply/ambiguous output): ${queue.evidence}. Retry reuses the same key and reconciles against this record first, never duplicates.`.slice(0, 500);
+          stored.updatedAt = new Date().toISOString();
+          saveDelegationRun(bridgeDir, run);
+        }
+        return failResult(`Steering dispatch for run ${run.runId} is uncertain (codex thread ${thread}): ${queue.evidence}. Recorded as unknown; retry with the SAME steering key reconciles first and never duplicates.`, {
+          error: "steer_uncertain",
+          run_id: run.runId,
+          steering_key: key,
+          engine: "codex",
+          stored: true,
+          executed: false,
+          uncertain_delivery: true,
+          engine_evidence: queue.evidence
         });
       }
     },
