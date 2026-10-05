@@ -117,8 +117,16 @@ export interface DelegationAttempt {
    * record.
    */
   outputArtifact?: {
-    /** Workdir-relative artifact path recorded at finalize. */
+    /**
+     * Artifact path recorded at finalize, relative to its base dir:
+     * - base "central" (current): relative to this run's central artifact
+     *   dir (`centralArtifactsDirForRun`, under the run bridge dir) — the
+     *   single source of truth after finalize-relocate;
+     * - base absent/"workdir" (legacy records): relative to run.workdir.
+     */
     relPath: string;
+    /** Which dir relPath resolves against (absent = legacy workdir). */
+    base?: "workdir" | "central";
     /** Byte size observed at finalize (0 = empty/unavailable, never a slot). */
     bytes: number;
     /** True when this attempt exclusively created the file (O_EXCL). */
@@ -135,6 +143,18 @@ export interface DelegationAttempt {
      * a worker verdict reads unavailable under the current standard).
      */
     provenance?: "created" | "worker" | "unavailable";
+    /** SHA-256 hex of the artifact bytes observed at finalize (central records). */
+    sha256?: string;
+    /**
+     * Workdir-relative source path the bytes were relocated from (codex
+     * worker-owned path only): the policy-admitted `--output-last-message`
+     * destination the worker wrote, moved centrally at finalize so the
+     * workdir keeps only task code. Single source of truth afterwards is
+     * the central file; this names the retired source for provenance.
+     */
+    relocatedFrom?: string;
+    /** How the bytes reached central storage (same-device rename preferred). */
+    relocatedVia?: "rename" | "copy-unlink";
   };
 }
 
@@ -522,6 +542,24 @@ export function delegationRunPath(bridgeDir: string, runId: string): string {
   return path.join(delegationRunsDir(bridgeDir), `${runId}.json`);
 }
 
+/**
+ * Central artifact storage dirname inside a run bridge dir: worker-result
+ * artifacts and reservation records live under the owner/workspace/run
+ * bridge (durable, harness-owned), never durably in project workdirs.
+ */
+export const DELEGATION_ARTIFACTS_DIRNAME = "delegation-artifacts";
+
+/**
+ * Pure central artifact dir for one run: `<bridgeDir>/delegation-artifacts/
+ * <runId>/`. Run-scoped (full run identity in the dir name) with per-attempt
+ * files inside. Throws on an invalid run id (fail closed, never a shared
+ * fallback dir). No IO.
+ */
+export function centralArtifactsDirForRun(bridgeDir: string, runId: string): string {
+  if (!/^run_[0-9a-f]{16}$/.test(String(runId ?? ""))) throw new Error("Invalid delegation run id.");
+  return path.join(bridgeDir, DELEGATION_ARTIFACTS_DIRNAME, String(runId));
+}
+
 export function subscriptionsPath(bridgeDir: string): string {
   return path.join(bridgeDir, DELEGATION_SUBSCRIPTIONS_FILENAME);
 }
@@ -796,51 +834,128 @@ function pruneDelegationRuns(bridgeDir: string): void {
   const victims = terminal.slice(0, excess);
   for (const victim of victims) {
     try { fs.rmSync(delegationRunPath(bridgeDir, victim.runId), { force: true }); } catch { /* ignore */ }
-    teardownRunArtifacts(victim);
+    teardownRunArtifacts(bridgeDir, victim);
   }
 }
 
 /**
- * Bounded lifecycle for retained worker-output artifacts (Finding 5):
- * run-bound last-message files (`<stem>-<16hex>-attempt-<N>[-x<i>].<ext>`)
+ * Bounded lifecycle for retained worker-output artifacts (central storage):
+ * run-scoped central artifact files
+ * (`<bridgeDir>/delegation-artifacts/<runId>/attempt-<N>-<engine>-...`)
  * are retained only while their run is retained (max 32 runs/workspace).
- * When a terminal run is pruned from central storage, its OWN exact
- * run-bound artifacts are torn down from its workdir via exact-name match
- * only (full 16-hex identity + attempt, never task code, never other runs,
- * never fixtures, never bridge/subscription state). Temp atomic-write
- * siblings (`.<name>.<pid>.<ts>.tmp`) are already removed in their finally
- * paths; empty reservation placeholders for pruned runs are covered here
- * (they carry the same run-bound name). Never throws; never touches
- * `.ai-bridge` subscription state, security material, or anything outside
- * the victim's workdir artifact namespace. Exported for the focused
- * regression proof.
+ * When a terminal run is pruned, ONLY its RECORDED artifacts are torn down:
+ * the victim run record's per-attempt entries (outputArtifact with a
+ * creation/ownership verdict, plus the transient reservation placeholder
+ * when it still carries this run's exclusive-claim identity). Filename
+ * resemblance alone NEVER authorizes deletion: a corrupt record, a missing
+ * record, or a record without ownership proof fails closed to no-delete
+ * with an explicit reason. Containment + run-bound shape are secondary
+ * guards (the record is the authority): central paths must stay inside
+ * this run's central dir, workdir paths must stay inside the run workdir
+ * and match this run's bound shape — anything else is skipped, never
+ * deleted. Never touches `.ai-bridge` subscription state, security
+ * material, task code, fixtures, other runs, or foreign files. Never
+ * throws. Exported for the focused regression proof.
  */
-export function teardownRunArtifacts(run: DelegationRunRecord): { removed: string[] } {
-  const removed: string[] = [];
-  const runId = String((run as { runId?: unknown })?.runId ?? "");
-  const workdir = String((run as { workdir?: unknown })?.workdir ?? "");
-  const m = /^run_([0-9a-f]{16})$/.exec(runId);
-  if (!m || !workdir) return { removed };
-  const short = m[1];
-  let entries: string[];
-  try {
-    const stat = fs.statSync(workdir);
-    if (!stat.isDirectory()) return { removed };
-    entries = fs.readdirSync(workdir);
-  } catch {
-    return { removed };
+export function teardownRunArtifacts(bridgeDir: string, run: DelegationRunRecord): { removed: string[]; reason?: string } {
+  const failClosed = (reason: string): { removed: string[]; reason?: string } => ({ removed: [], reason });
+  const runRecord = (run ?? null) as DelegationRunRecord | null;
+  const runId = String((runRecord as { runId?: unknown })?.runId ?? "");
+  if (!runRecord || typeof runRecord !== "object" || !/^run_[0-9a-f]{16}$/.test(runId)) {
+    return failClosed("run record missing or invalid (no valid run id): failing closed, nothing deleted");
   }
-  for (const entry of entries) {
-    if (!entry.includes(`-${short}-attempt-`)) continue;
-    if (!/^(codex|opencode|claude)-last-message-[0-9a-f]{16}-attempt-\d+(-x\d+)?\.(md|json)$/.test(entry)) continue;
-    if (entry.includes("..") || path.isAbsolute(entry)) continue;
-    const abs = path.join(workdir, entry);
+  if (typeof bridgeDir !== "string" || !bridgeDir) {
+    return failClosed("bridge dir missing: central artifact dir unresolvable, nothing deleted");
+  }
+  const workdir = String((runRecord as { workdir?: unknown })?.workdir ?? "");
+  const attempts = Array.isArray((runRecord as { attempts?: unknown })?.attempts)
+    ? (runRecord as { attempts: DelegationAttempt[] }).attempts : null;
+  if (!attempts) {
+    return failClosed(`run ${runId} record has no attempts array (missing/corrupt): failing closed, nothing deleted`);
+  }
+  let centralDir: string | null = null;
+  try {
+    centralDir = centralArtifactsDirForRun(bridgeDir, runId);
+  } catch {
+    return failClosed(`run ${runId} central artifact dir unresolvable: failing closed, nothing deleted`);
+  }
+  const removed: string[] = [];
+  const removeFile = (abs: string, label: string, insideDir: string): void => {
+    if (abs.includes("..")) return;
+    const norm = path.normalize(abs);
+    const dirNorm = path.normalize(insideDir);
+    if (norm !== path.join(dirNorm, path.basename(norm))) return;
+    if (!norm.startsWith(dirNorm + path.sep)) return;
     try {
-      const lst = fs.lstatSync(abs);
-      if (!lst.isFile() && !lst.isSymbolicLink()) continue;
-      fs.rmSync(abs, { force: true });
-      removed.push(entry);
-    } catch { /* best effort; never throws */ }
+      const lst = fs.lstatSync(norm);
+      if (!lst.isFile()) return;
+      fs.rmSync(norm, { force: true });
+      removed.push(label);
+    } catch { /* absent/racy: best effort; never throws */ }
+  };
+  for (const attempt of attempts) {
+    if (!attempt || typeof attempt !== "object") continue;
+    const artifact = (attempt as DelegationAttempt).outputArtifact;
+    if (artifact && typeof artifact.relPath === "string" && artifact.relPath &&
+      !artifact.relPath.includes("..") && !path.isAbsolute(artifact.relPath)) {
+      const owned = artifact.created === true || artifact.provenance === "created" || artifact.provenance === "worker";
+      if (owned && centralDir) {
+        const isCentral = (artifact as { base?: unknown }).base === "central";
+        if (isCentral) {
+          // Central record: the run's own central dir is the authority.
+          // Secondary shape guard: per-attempt artifact file shape.
+          if (/^attempt-\d+-(codex|opencode|claude)-last-message\.(md|json)$/.test(path.basename(artifact.relPath))) {
+            removeFile(path.join(centralDir, artifact.relPath), `central:${artifact.relPath}`, centralDir);
+          }
+        } else if (workdir) {
+          // Legacy workdir record with ownership proof: secondary shape
+          // guard binds this run's namespace (never task code).
+          if (artifact.relPath.includes(`-${runId.slice(4)}-attempt-`) &&
+            /^(codex|opencode|claude)-last-message-[0-9a-f]{16}-attempt-\d+(-x\d+)?\.(md|json)$/.test(artifact.relPath)) {
+            try {
+              const st = fs.statSync(workdir);
+              if (st.isDirectory()) removeFile(path.join(workdir, artifact.relPath), `workdir:${artifact.relPath}`, workdir);
+            } catch { /* workdir gone: nothing to do */ }
+          }
+        }
+      }
+    }
+    // Transient reservation placeholder: harness-created (O_EXCL claim) at
+    // the policy-admitted workdir path, retired at finalize-relocate. A
+    // crash between reserve and finalize may leave it behind: remove ONLY
+    // when the file still carries this reservation's exclusive-claim
+    // identity (dev + inode; never a name match alone) and is still empty
+    // (an unfilled placeholder; worker-written content is never torn down
+    // through this path — it is either relocated at finalize or left for
+    // the recorded-artifact path above).
+    const reservation = (attempt as DelegationAttempt).artifactReservation;
+    if (reservation && reservation.absentAtReserve === true && typeof reservation.relPath === "string" &&
+      reservation.relPath && !reservation.relPath.includes("..") && !path.isAbsolute(reservation.relPath) &&
+      reservation.claim && Number.isSafeInteger(reservation.claim.dev) && Number.isSafeInteger(reservation.claim.ino) && workdir) {
+      try {
+        const abs = path.join(workdir, reservation.relPath);
+        const norm = path.normalize(abs);
+        const dirNorm = path.normalize(workdir);
+        if (norm.startsWith(dirNorm + path.sep) && reservation.relPath.includes(`-${runId.slice(4)}-attempt-`)) {
+          const lst = fs.lstatSync(norm);
+          if (lst.isFile() && (lst as fs.Stats).size === 0) {
+            const st = fs.statSync(norm);
+            if (st.dev === reservation.claim.dev && st.ino === reservation.claim.ino) {
+              fs.rmSync(norm, { force: true });
+              removed.push(`reservation:${reservation.relPath}`);
+            }
+          }
+        }
+      } catch { /* absent/identity-changed: leave alone */ }
+    }
+  }
+  // Best-effort removal of the run's own central dir when left empty
+  // (keeps central storage bounded; never touches other runs).
+  if (centralDir) {
+    try { fs.rmdirSync(centralDir); } catch { /* non-empty or absent: keep */ }
+  }
+  if (removed.length === 0) {
+    return { removed, reason: `run ${runId}: no recorded owned artifacts to tear down (nothing deleted)` };
   }
   return { removed };
 }

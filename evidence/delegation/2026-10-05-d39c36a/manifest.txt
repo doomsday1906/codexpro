@@ -1,0 +1,117 @@
+Delegation leaf evidence manifest — 2026-10-05 — base d39c36a4828f05baefce9d5b0471e7d6bdf82637
+Package codexpro@0.31.0. Build: Built codexpro@0.31.0; source commit d39c36a4828f05baefce9d5b0471e7d6bdf82637 (dirty)
+
+TASK A — ACTUAL PROTOCOL VIA ISOLATED CANDIDATE SERVER + BOUNDED REAL RUNS
+Server: `CODEXPRO_ALLOW_NO_HTTP_TOKEN=1 node dist/http.js --root /tmp/opencode/deleg-probe-20261005/work --port 39131 --delegation-dir /tmp/opencode/deleg-probe-20261005/deleg --allow-root /tmp/opencode/deleg-probe-20261005/work` (disposable port + delegation dir; scratch admitted via --allow-root; never :8787; SIGTERM at end).
+Engines: codex-cli 0.159.0, opencode v2.0.22, claude 2.1.289. Profiles: real CODEX_* only (probe profile CODEX_SCOUT_FAST = gpt-6-luna/low/read-only, cheapest Luna).
+
+P1 codex steerable launch, trivial Luna task (direct CLI, steerable argv shape):
+  cmd: `timeout 280 codex exec --skip-git-repo-check --json --profile CODEX_SCOUT_FAST -s read-only --output-last-message <scratch>/out.md "Reply with exactly the word PONG and nothing else. No tools, no file reads."`
+  exit=0. out.md=`PONG`. stdout 347 bytes, 4 JSONL lines (verbatim):
+    {"type":"thread.started","thread_id":"01a10c11-9903-76e2-834f-ddb8577e45d4"}
+    {"type":"turn.started"}
+    {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"PONG"}}
+    {"type":"turn.completed","usage":{"input_tokens":20403,"cached_input_tokens":16128,"cache_write_input_tokens":0,"output_tokens":6,"reasoning_output_tokens":0}}
+P2 queue AFTER END (same thread; queue itself is local-only, no model cost):
+  cmd: `timeout 60 codex queue --thread 01a10c11-9903-76e2-834f-ddb8577e45d4 --message "PING-ack: reply with exactly OK"`
+  exit=0. stdout: `Queued message 01a10c11-f67d-75a2-aa7a-5abe7b4dbcbd for thread 01a10c11-9903-76e2-834f-ddb8577e45d4.`
+  Session rollout afterwards byte-identical (15 lines, ends task_complete; mtime pre-queue): NO new turn executed while observed.
+P3 delegation-server steerable run + MID-TURN steer (MCP run_6fde645c5d90f689, CODEX_SCOUT_FAST read-only, 6-file read task):
+  preview ok -> launch ok -> +8s read_result=`running` -> delegation_steer(midturn-1, "Also include the word SABLE in your final reply.") -> `queued`, engine_evidence=`Queued message 01a10c13-6659-7a62-b6d8-d131b3768691 for thread 01a10c13-2f77-7f82-9237-8fc6ed004103.` (exit 0; thread recorded from this run's own live --json startup buffer)
+  Turn completed exit 0. Final artifact (5 bytes): `,,,,,` — SABLE ABSENT. Rollout (45 lines) ends task_complete, NO second turn.
+  usage: input_tokens=144823 cached_input_tokens=128256 output_tokens=336 reasoning_output_tokens=0.
+P4 steer AFTER SETTLED (same run, no model involvement): delegation_steer(after-end-1) -> `steer_refused_settled` (truthful state, nothing dispatched).
+P5 run_a3134ed7acc4e70d (3-file read task; completed <12s, too fast to steer; token accounting only):
+  usage: input_tokens=82078 cached_input_tokens=64512 output_tokens=93. Final: `alpha-delta-golf`.
+P6 opencode read-only listings (no model call, no paid call):
+  `opencode session list` exit=0, empty output (no live session to address).
+  `opencode models` exit=0 (model list incl. lmstudio/huihui-qwen3.8-27b-abliterated, opencode/big-pickle, ...).
+  No genuine local input route to a live turn exists (help verbs confirm no queue/steer/message-inject); no bounded input attempt made — precise inspected negative.
+P7 claude: NO live call (quota unconfirmed from the prior $0.057 probe state; never retry paid calls). Precise inspected negative from help: attach/bg manage sessions via terminal attach (no message inject); --resume/--continue start new turns; --print --input-format stream-json starts a NEW single-shot process (not mid-turn injection). Zero Claude spend.
+
+LIVE SPEND TOTAL (tokens observed; provider $ pricing not computed here):
+  P1: in=20403 (cached 16128) out=6 | P5: in=82078 (cached 64512) out=93 | P3: in=144823 (cached 128256) out=336.
+  queue ops local-only, no model cost; the after-end queue triggered NO follow-up turn (rollout byte-identical). Stops honored: trivial tasks only, Luna-cheap profile, no Astra, no retries, Claude skipped (quota unconfirmed).
+
+PROTOCOL VERDICTS (prior hypothetical -> disposition):
+  [CONFIRMED] thread.started startup type (P1 bytes) — now the ONLY accepted type.
+  [CONFIRMED] thread_id key (P1 bytes; rollout files independently agree) — now the ONLY accepted key.
+  [CONFIRMED] steerable thread capture from the run's own live --json buffer + first-verified retention (P3: run recorded 01a10c13-... live; steer addressed only it).
+  [CONFIRMED] settled-run steer refusal with truthful state (P4).
+  [CORRECTED] queue mid-turn vs post-end was UNPROVEN -> OBSERVED held-only (P2/P3: exit 0 + `Queued message <msg> for thread <thread>.` in both cases; no in-turn incorporation; no post-end turn while observed). Queued = held-by-engine only.
+  [CORRECTED] queue success shape was shim/bogus-only -> live-observed (P2/P3 bytes).
+  [REMOVED] session/codex-thread startup families (session.started/created/resumed/initialized, codex.thread-*, codex.session-*) — never observed.
+  [REMOVED] threadId/sessionId/session_id/sessionUuid keys + thread/session nest id/uuid/name — never observed in the startup stream.
+  [REMOVED] steering correlation event types (codex.steering.received/applied, codex.queue.received, thread.message.received) + scanners — the engine emits NO delivery-attesting event (P1/P3 streams carry thread/turn/item lifecycle only); adapter auto-promotion deleted; queued stays queued/unverified.
+  [UNCHANGED/INCOMPLETE] opencode steering (P6: no route exists; read-only listings only, zero model spend).
+  [UNCHANGED/INCOMPLETE] claude steering (P7: no live call; inspected negative only, zero spend).
+UNPROVEN LEFTOVERS + REASON:
+  - Whether a queued message EVER executes as a later turn in the persistent session (both probes ended at task_complete with no second turn; longer observation would cost model turns).
+  - opencode api op catalog / live server input ops (no live server probed; would need a service + session).
+  - claude --resume honoring every session-scoped flag (prior single probe; quota unconfirmed so not re-probed).
+  - exact $ spend (tokens observed above; provider pricing not computed here).
+
+TASK B — ARTIFACTS/RESERVATIONS INTO CENTRAL STORAGE (design, documented in code):
+  Layout: `<bridgeDir>/delegation-artifacts/<runId>/attempt-<N>-<engine>-last-message.(md|json)` (run-scoped dir = full run identity; attempt in file name). Records carry base/relPath/sha256 (+relocatedFrom/relocatedVia for codex).
+  Worker path: the policy-admitted workdir `--output-last-message` destination (observed live that even read-only workers may write it; sandbox never widened, no --add-dir). Codex: transient O_EXCL reservation placeholder at the worker path (reserve->finalize only), then harness RELOCATES verified bytes centrally (rename preferred, copy+hash-verify+unlink on EXDEV; destination never overwritten) and the workdir source is removed — single source of truth afterwards, workdir keeps only task code. opencode/claude: persist DIRECTLY centrally from the retained stdout buffer (no workdir file ever). Safe reads: existing guards (.. / absolute / file-only) apply identically at the central location; legacy workdir records still resolve via their recorded base.
+  Cancel race: a finalize racing an owner cancel (killed child's late close during quiescence windows) causes NO workdir mutation (cancelRelocateHold + live-handle gate) — quiescence still proves no post-cancel worker writes; the raced finalize records only what the surviving record holds; if the cancel clobbers the finalize record, record-only teardown fails closed (no-delete) leaving at most one bounded unrecorded file, and cancelled state always wins with no misattribution.
+  Cleanup: teardownRunArtifacts(bridgeDir, run) consults RECORDS only (outputArtifact with created/worker verdict + claim-identity-matching empty placeholders); filename resemblance alone never authorizes deletion; missing/corrupt records fail closed to no-delete + explicit reason; containment + run-bound shape are secondary guards.
+  Regression: scripts/delegation-central-artifact-smoke.mjs (C1 foreign-primary fallback + central relocate, foreign bytes+presence intact; C2 opencode direct-central; C3 prune removes ONLY recorded owned artifacts with pre/post hashes; C4 transient placeholder identity-match retires, tampered survives; C5 corrupt fails closed). Adapter-level, labeled shim except where P1/P3 proved the shape (worker-writes-into-reserved-path replayed, labeled).
+
+FILES CHANGED (sha256):
+  e2ad3eaa2d92523eef5244cf40e5c6ec79a15a93ba2cf468a50f78fcc3110a4a  src/delegationEngines.ts  [source (observed-only thread grammar; queue OBSERVED; correlation REMOVED; opencode/claude negatives)]
+  3ea7d290a85e342ffb5ae2e2bc0340b3ae746603888d42111ca3d490113709b2  src/delegationStore.ts  [source (central layout + record fields + record-consulting teardown)]
+  2f69f41f4adb1fd345beb00580f918477986a5aff4356435d2030cab195481d8  src/delegationTools.ts  [source (no auto-promote reconcile; central persist/relocate; cancel-relocate hold; central reads)]
+  7f7d9e8438572da95a1e3af832a41e2f15d0f8ff953e512cbacccc782cf61d05  scripts/delegation-steer-smoke.mjs  [updated test (S1 observed-only identity + removal asserts; S7 no-promotion; S10 OBSERVED; S11 record teardown)]
+  794621f290960998c02a2a6233fd787d6af65750200eb34b330653e34103330c  scripts/delegation-artifact-isolation-smoke.mjs  [updated test (A1/A2/A3/X1/X2/X3 central isolation; workdir keeps task code)]
+  22587d10e42a04e91210cb53c8e8f29f51a2f1dcfb02d29cabbb29094713cd11  scripts/delegation-canary-smoke.mjs  [updated test (H2b central artifact + read surfacing)]
+  32b0ab4b38addc832cc8d95b9b44d4be6d94655cb957f11a782f042449c34483  scripts/delegation-cancel-artifact-smoke.mjs  [updated test (D2a/D2b central artifacts)]
+  e34479b4ac41e0f459616ce4d81b2ae776e3adcdbed0887f2de46b5377d40e20  scripts/delegation-identity-standalone-output-smoke.mjs  [updated test (C3 central artifact + workdir-evidence exclusion)]
+  c35302df5a203a8e9f9f74f939470d72ff34db5b1822c537514c9e106db05673  scripts/delegation-repair-focus-smoke.mjs  [updated test (R5b central path regex)]
+  dc646b9e5bcdac156922456808f4870119d131a5fa0c3c37243bdb26e38693e5  scripts/delegation-central-artifact-smoke.mjs  [new test (C1-C5 Task B regression)]
+  d89d7884a90cee37bd2ead5d1a94ec9c69dd8991d3f4c53659844bb285339d7c  package.json  [build input]
+  ac352ab4d2416fee6bab255d15f966be66d8281b461f55751a360f4773799aa0  scripts/build-identity.mjs  [build input]
+  80cbc28a3aae9313aa17591c6530879e828f9d65f12b893e768f2ef78c464e8e  scripts/build.mjs  [build input]
+  01707d63930e59130eb6169d3c0afe9283ad356b655220b2b0633f22b123f0f4  tsconfig.json  [build input]
+
+SERIAL PROOF COMMANDS (all exit 0, run serially after code freeze; tsc --noEmit also clean):
+  exit=0  npm run build
+    log=logs/01-build.log  sha256=89bd0cfc65d53e59f552fa2ad77a7842b939a348a32164e05e5c9e0ceb6a0ebe
+  exit=0  node scripts/delegation-codex-ownership-smoke.mjs
+    log=logs/delegation-codex-ownership-smoke.log  sha256=186663fff51e1c395cfff6ee7a7832cb3de205b5d8128781ee9e3131de470bea
+  exit=0  node scripts/delegation-artifact-isolation-smoke.mjs
+    log=logs/delegation-artifact-isolation-smoke.log  sha256=0284883820766abdb679c324abdd1d4adef8accc9e88702bdeb6b97816280ba2
+  exit=0  node scripts/delegation-terminal-cleanup-smoke.mjs
+    log=logs/delegation-terminal-cleanup-smoke.log  sha256=096815ee8d952b3c7174704ceb81b7f790cfa80116e8556de856d4833ee22227
+  exit=0  node scripts/delegation-cancel-artifact-smoke.mjs
+    log=logs/delegation-cancel-artifact-smoke.log  sha256=e89bcf02f76a86886aaf7716e0fe5d229a2a786dd73fe5382039b5dea6419ea5
+  exit=0  node scripts/delegation-identity-standalone-output-smoke.mjs
+    log=logs/delegation-identity-standalone-output-smoke.log  sha256=4dfefbbf6ada9dc477f00b14f1e09102c4ae0d4f726fa74de882114ec24c043d
+  exit=0  node scripts/delegation-triengine-smoke.mjs
+    log=logs/delegation-triengine-smoke.log  sha256=33fb5d19c75f9f96c41ff5833124ce392bd64990b71ce5d0245ace27d38d1917
+  exit=0  node scripts/delegation-repair-focus-smoke.mjs
+    log=logs/delegation-repair-focus-smoke.log  sha256=b9a5f5bb3b777ea3d3e1125d4f6f8daa1766ce69d96ccbb58adf23678440f68c
+  exit=0  node scripts/delegation-storage-smoke.mjs
+    log=logs/delegation-storage-smoke.log  sha256=e7b4277306086f137021a03fd31224b3348b87346b00c50c031bffa0f7903b70
+  exit=0  node scripts/delegation-followup-smoke.mjs
+    log=logs/delegation-followup-smoke.log  sha256=ac3f8b0d6e84954b9d021fe59e93a9a1690e433791544e786bdfc3d43ff85857
+  exit=0  node scripts/delegation-canary-smoke.mjs
+    log=logs/delegation-canary-smoke.log  sha256=69f5422df721ab3eb812fa0234be6ce0ece7a5774fed0257831920fd43a844a2
+  exit=0  node scripts/delegation-routing-smoke.mjs
+    log=logs/delegation-routing-smoke.log  sha256=c173692d4ad483644de89315b1b4035c18bab9bc97cd2bb5c2322b695a317e26
+  exit=0  node scripts/delegation-steer-smoke.mjs
+    log=logs/delegation-steer-smoke.log  sha256=5990eeea70189fbca25a97b725bc59364f6d9349736ce278054b773ef346b5b8
+  exit=0  node scripts/delegation-central-artifact-smoke.mjs
+    log=logs/delegation-central-artifact-smoke.log  sha256=5cb652fe90bdbc6719615ca62ced1e474e2aee2b5beb22cfbf8e6fee80b1388a
+IDENTICAL-LOG NOTE: ownership/terminal-cleanup/cancel-artifact/triengine/repair-focus/storage/followup/canary/routing logs hash-match the 3d6a379 leaf for the suites whose behavior is unchanged (byte-identical evidence of no regression); isolation/steer/central differ by design.
+
+FIXTURE STRAYS (preserved, never touched, never committed):
+  ce299a8defb9e1e8102a58dd1a8251ad2b7f954c9341e6fbce6beab36b90cca7  fixture-a.txt
+  13aafb27a71bb59b8c92d83248746711ddffe2d73fa2f3fbc5299851d0fac6ce  fixture-b.txt
+
+STALE-LEAF DISCLAIMER:
+  Evidence leaves at 3d6a379, 9b8607a, b3f97e5, a38ea90, and f8fef55 predate this leaf's rework (observed-only thread grammar + correlation deletion + no-promotion reconcile + central artifact storage + record-consulting teardown + cancel-relocate hold) and are STALE for the reworked surfaces (thread parse, steerable argv notes, steering bounds/capability markers, S1/S7/S10/S11 expectations, artifact locations, teardown semantics). This manifest + its 14 serial logs supersede them for those surfaces; untouched surfaces keep their prior proof (identical log hashes for 9 suites confirm no regression).
+
+PRESERVED (untouched by this leaf): full-identity run+attempt artifact ownership, pre-launch reservation (O_EXCL+NOFOLLOW, transient at the worker path), legacy cancel guards (ownership + windowed quiescence intact — the cancel-relocate hold was added to preserve them), workdir identity, replay-before-busy, standalone+legacy labels, coverage fields, Codex profile/model gates (Luna untouched), override gates, approval/redaction, ownership/crash-recovery/storage/notifications, isolation. Post-completion follow-up stays a separate protocol (never relabeled as steering). Claude stays supported (no steer verb exists; supported paths unchanged).
+
+DELIVERY: uncommitted working tree (orchestrator integrates); fixture strays preserved, never touched, never committed

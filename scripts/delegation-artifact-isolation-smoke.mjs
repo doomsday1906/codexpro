@@ -30,6 +30,37 @@ function assert(condition, message) {
 }
 
 const Tools = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationTools.js')));
+const Store = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationStore.js')));
+// Central storage resolution for assertions: locate the run's bridge dir by
+// walking the delegation home (bounded) for delegation-runs/<runId>.json —
+// no internal (owner, workspace) namespacing knowledge required.
+const centralFor = (runId) => {
+  const stack = [delegHome];
+  let guard = 0;
+  while (stack.length > 0 && guard < 512) {
+    guard += 1;
+    const dir = stack.pop();
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) { stack.push(full); continue; }
+      if (e.name === `${runId}.json` && path.basename(path.dirname(full)) === 'delegation-runs') {
+        return Store.centralArtifactsDirForRun(path.dirname(path.dirname(full)), runId);
+      }
+    }
+  }
+  throw new Error(`ASSERT: bridge dir not found for ${runId}`);
+};
+// The run must add NO durable last-message file to its workdir (central
+// storage owns them); pre-existing foreign files listed in `known` are
+// preserved and ignored here.
+const noWorkdirArtifacts = (wd, label, known = []) => {
+  const files = fs.readdirSync(wd);
+  const fresh = files.filter((f) => f.includes('last-message') && !known.includes(f));
+  assert(fresh.length === 0,
+    `${label}: workdir keeps only task code, no run artifacts added: ${fresh.join(',')} (all: ${files.join(',')})`);
+};
 
 // ---------- MCP wiring: fixtures ----------
 const codexHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-iso-codexhome-'));
@@ -101,9 +132,12 @@ const waitSettled = async (runId, tries = 120) => {
 };
 
 const OC_TASK = 'Report readiness. Change nothing.';
-const bound = (runId, n) => Tools.lastMessageRelPathForAttempt('opencode', 1 + (n - 1), runId);
+const bound = (n) => Tools.centralArtifactFileName('opencode', 1 + (n - 1));
 
 // ---------- A1: two runs sharing one workdir + continuations stay isolated ----------
+// Central storage: each run owns its central run-scoped dir; the shared
+// workdir keeps only task code (no durable artifacts). Four central files
+// (2 runs x 2 attempts), each read surfaces only its own current attempt.
 {
   const wd = path.join(wsRoot, 'shared-wd');
   const r1 = await call('delegation_launch', {
@@ -123,26 +157,28 @@ const bound = (runId, n) => Tools.lastMessageRelPathForAttempt('opencode', 1 + (
   const run2 = r2.structuredContent.run_id;
   assert(run2 !== run1, 'the two runs must have distinct ids');
   await waitSettled(run2);
-  const rel1a = bound(run1, 1);
-  const rel2a = bound(run2, 1);
-  assert(rel1a !== rel2a, `attempt suffix alone is insufficient: ${rel1a} vs ${rel2a}`);
+  const cdir1 = centralFor(run1);
+  const cdir2 = centralFor(run2);
+  assert(cdir1 !== cdir2, `distinct runs own distinct central dirs: ${cdir1} vs ${cdir2}`);
+  const rel1a = bound(1);
+  noWorkdirArtifacts(wd, 'shared opencode workdir after two runs');
   assert(!fs.existsSync(path.join(wd, 'opencode-last-message.json')),
     'no legacy shared artifact may be created for new runs');
-  assert(fs.existsSync(path.join(wd, rel1a)) && fs.existsSync(path.join(wd, rel2a)),
-    `both run-bound attempt-1 artifacts must exist: ${rel1a}, ${rel2a}`);
-  const c1a = fs.readFileSync(path.join(wd, rel1a), 'utf8');
-  const c2a = fs.readFileSync(path.join(wd, rel2a), 'utf8');
+  assert(fs.existsSync(path.join(cdir1, rel1a)) && fs.existsSync(path.join(cdir2, rel1a)),
+    `each run must own its central attempt-1 artifact: ${cdir1}/${rel1a}, ${cdir2}/${rel1a}`);
+  const c1a = fs.readFileSync(path.join(cdir1, rel1a), 'utf8');
+  const c2a = fs.readFileSync(path.join(cdir2, rel1a), 'utf8');
   assert(c1a.includes('OUTPUT-MARKER-') && c2a.includes('OUTPUT-MARKER-') && c1a !== c2a,
-    `each artifact must carry only its own output: ${JSON.stringify(c1a)} vs ${JSON.stringify(c2a)}`);
+    `each central artifact must carry only its own output: ${JSON.stringify(c1a)} vs ${JSON.stringify(c2a)}`);
   const read1 = await call('delegation_read_result', { workspace_id: wid, run_id: run1 });
   const read2 = await call('delegation_read_result', { workspace_id: wid, run_id: run2 });
   assert(read1.structuredContent.test_evidence.last_message.path === rel1a &&
     read1.structuredContent.test_evidence.last_message.status === 'present',
     `run 1 must surface only its own artifact: ${JSON.stringify(read1.structuredContent.test_evidence.last_message)}`);
-  assert(read2.structuredContent.test_evidence.last_message.path === rel2a &&
+  assert(read2.structuredContent.test_evidence.last_message.path === rel1a &&
     read2.structuredContent.test_evidence.last_message.status === 'present',
     `run 2 must surface only its own artifact: ${JSON.stringify(read2.structuredContent.test_evidence.last_message)}`);
-  // One continuation each: four artifacts, still no cross-attribution.
+  // One continuation each: four central artifacts, still no cross-attribution.
   for (const [runId, tag] of [[run1, 'iso1'], [run2, 'iso2']]) {
     const q = await call('delegation_followup', {
       workspace_id: wid, run_id: runId,
@@ -157,27 +193,32 @@ const bound = (runId, n) => Tools.lastMessageRelPathForAttempt('opencode', 1 + (
       `answer must dispatch attempt 2 for ${runId}: ${JSON.stringify(a.structuredContent)}`);
     await waitSettled(runId);
   }
-  const rel1b = bound(run1, 2);
-  const rel2b = bound(run2, 2);
-  for (const rel of [rel1a, rel1b, rel2a, rel2b]) assert(fs.existsSync(path.join(wd, rel)), `all four run-bound artifacts must exist: ${rel}`);
-  assert(new Set([rel1a, rel1b, rel2a, rel2b]).size === 4, 'all four artifact paths must be distinct');
-  const contents = [rel1a, rel1b, rel2a, rel2b].map((rel) => fs.readFileSync(path.join(wd, rel), 'utf8'));
+  const rel2 = bound(2);
+  for (const [cdir, rel] of [[cdir1, rel1a], [cdir1, rel2], [cdir2, rel1a], [cdir2, rel2]]) {
+    assert(fs.existsSync(path.join(cdir, rel)), `all four central artifacts must exist: ${cdir}/${rel}`);
+  }
+  noWorkdirArtifacts(wd, 'shared opencode workdir after continuations');
+  const contents = [[cdir1, rel1a], [cdir1, rel2], [cdir2, rel1a], [cdir2, rel2]]
+    .map(([cdir, rel]) => fs.readFileSync(path.join(cdir, rel), 'utf8'));
   assert(new Set(contents).size === 4 && contents.every((c) => c.includes('OUTPUT-MARKER-')),
-    'each of the four artifacts must carry only its own distinct output');
-  assert(fs.readFileSync(path.join(wd, rel1a), 'utf8') === c1a && fs.readFileSync(path.join(wd, rel2a), 'utf8') === c2a,
-    'attempt-1 artifacts must be untouched by the continuations (never overwritten)');
+    'each of the four central artifacts must carry only its own distinct output');
+  assert(fs.readFileSync(path.join(cdir1, rel1a), 'utf8') === c1a && fs.readFileSync(path.join(cdir2, rel1a), 'utf8') === c2a,
+    'attempt-1 central artifacts must be untouched by the continuations (never overwritten)');
   const reread1 = await call('delegation_read_result', { workspace_id: wid, run_id: run1 });
   const reread2 = await call('delegation_read_result', { workspace_id: wid, run_id: run2 });
-  assert(reread1.structuredContent.test_evidence.last_message.path === rel1b &&
+  assert(reread1.structuredContent.test_evidence.last_message.path === rel2 &&
     reread1.structuredContent.test_evidence.last_message.attempt_n === 2,
     `run 1 must now surface only its attempt-2 artifact: ${JSON.stringify(reread1.structuredContent.test_evidence.last_message)}`);
-  assert(reread2.structuredContent.test_evidence.last_message.path === rel2b &&
+  assert(reread2.structuredContent.test_evidence.last_message.path === rel2 &&
     reread2.structuredContent.test_evidence.last_message.attempt_n === 2,
     `run 2 must now surface only its attempt-2 artifact: ${JSON.stringify(reread2.structuredContent.test_evidence.last_message)}`);
-  console.log('ok: A1 MCP (two runs sharing one workdir + continuations stay isolated; no cross-attribution)');
+  console.log('ok: A1 MCP (two runs sharing one workdir + continuations stay isolated centrally; no cross-attribution; workdir keeps task code)');
 }
 
 // ---------- A2: preoccupied EMPTY legacy file -> unavailable, never filled/claimed ----------
+// Central storage: harness-persisted output goes directly central; the
+// pre-existing empty legacy file stays empty (never a slot to fill, never
+// claimed) and the workdir keeps only task code plus the legacy file.
 {
   const preDir = path.join(wsRoot, 'preocc-empty');
   fs.mkdirSync(preDir, { recursive: true, mode: 0o700 });
@@ -192,22 +233,25 @@ const bound = (runId, n) => Tools.lastMessageRelPathForAttempt('opencode', 1 + (
   await waitSettled(runId);
   assert(fs.statSync(path.join(preDir, 'opencode-last-message.json')).size === 0,
     'pre-existing empty legacy file must stay empty (never a slot to fill, never claimed)');
-  const ownRel = Tools.lastMessageRelPathForAttempt('opencode', 1, runId);
-  assert(ownRel !== 'opencode-last-message.json', 'the new attempt must bind its run, never the legacy shared name');
-  assert(fs.existsSync(path.join(preDir, ownRel)), `new attempt must write its own run-bound path: ${ownRel}`);
-  assert(fs.readFileSync(path.join(preDir, ownRel), 'utf8').includes('OUTPUT-MARKER-'),
-    'owned run-bound path must carry the worker output');
+  const ownRel = bound(1);
+  const cdir = centralFor(runId);
+  assert(fs.existsSync(path.join(cdir, ownRel)), `new attempt must persist its own central artifact: ${ownRel}`);
+  assert(fs.readFileSync(path.join(cdir, ownRel), 'utf8').includes('OUTPUT-MARKER-'),
+    'owned central artifact must carry the worker output');
+  noWorkdirArtifacts(preDir, 'preoccupied-empty workdir', ['opencode-last-message.json']);
   const read = await call('delegation_read_result', { workspace_id: wid, run_id: runId });
   const lm = read.structuredContent.test_evidence.last_message;
   assert(lm.status === 'present' && lm.path === ownRel && lm.attempt_n === 1,
-    `read must surface the attempt-owned file with provenance: ${JSON.stringify(lm)}`);
+    `read must surface the central attempt-owned file with provenance: ${JSON.stringify(lm)}`);
   const noProv = Tools.describeAttemptArtifact(preDir, 'opencode', 1);
   assert(noProv.status === 'unavailable',
     `provenance-free lookup reads unavailable, never the preoccupied file: ${JSON.stringify(noProv)}`);
-  console.log('ok: A2 MCP (preoccupied empty file unavailable + untouched; new run writes + reads its own run-bound file)');
+  console.log('ok: A2 MCP (preoccupied empty file unavailable + untouched; new run persists + reads its own central file)');
 }
 
 // ---------- A3: preoccupied NONEMPTY legacy file -> unavailable + reason, never claimed ----------
+// Central storage: the junk stays intact; the new run persists + reads its
+// own central file, never the legacy path.
 {
   const preDir = path.join(wsRoot, 'preocc-junk');
   fs.mkdirSync(preDir, { recursive: true, mode: 0o700 });
@@ -222,22 +266,24 @@ const bound = (runId, n) => Tools.lastMessageRelPathForAttempt('opencode', 1 + (
   await waitSettled(runId);
   assert(fs.readFileSync(path.join(preDir, 'opencode-last-message.json'), 'utf8') === 'JUNK-FROM-ANOTHER-RUN',
     'pre-existing nonempty legacy file must stay intact (never overwritten, never claimed)');
-  const ownRel = Tools.lastMessageRelPathForAttempt('opencode', 1, runId);
-  assert(fs.existsSync(path.join(preDir, ownRel)), `new attempt must write its own run-bound path: ${ownRel}`);
-  const ownContent = fs.readFileSync(path.join(preDir, ownRel), 'utf8');
+  const ownRel = bound(1);
+  const cdir = centralFor(runId);
+  assert(fs.existsSync(path.join(cdir, ownRel)), `new attempt must persist its own central artifact: ${ownRel}`);
+  const ownContent = fs.readFileSync(path.join(cdir, ownRel), 'utf8');
   assert(ownContent.includes('OUTPUT-MARKER-') && ownContent !== 'JUNK-FROM-ANOTHER-RUN',
-    'owned run-bound path must carry only this run output');
+    'owned central artifact must carry only this run output');
+  noWorkdirArtifacts(preDir, 'preoccupied-junk workdir', ['opencode-last-message.json']);
   const read = await call('delegation_read_result', { workspace_id: wid, run_id: runId });
   const lm = read.structuredContent.test_evidence.last_message;
   assert(lm.status === 'present' && lm.path === ownRel && lm.attempt_n === 1,
-    `read must surface the attempt-owned file, never the preoccupied junk: ${JSON.stringify(lm)}`);
+    `read must surface the central attempt-owned file, never the preoccupied junk: ${JSON.stringify(lm)}`);
   const noProv = Tools.describeAttemptArtifact(preDir, 'opencode', 1);
   assert(noProv.status === 'unavailable' && (noProv.reason ?? '').length > 0,
     `provenance-free lookup is unavailable with a reason: ${JSON.stringify(noProv)}`);
   const unprovenRecord = Tools.describeAttemptArtifact(preDir, 'opencode', 1, { relPath: 'opencode-last-message.json', created: false });
   assert(unprovenRecord.status === 'unavailable' && /without this run/.test(unprovenRecord.reason ?? ''),
     `pre-existing file without a creation verdict is never claimed: ${JSON.stringify(unprovenRecord)}`);
-  console.log('ok: A3 MCP (preoccupied nonempty file unavailable + reason + intact; new run writes + reads its own run-bound file)');
+  console.log('ok: A3 MCP (preoccupied nonempty file unavailable + reason + intact; new run persists + reads its own central file)');
 }
 
 // ---------- X0: the finding's colliding pair binds distinct artifacts (helper-level) ----------
@@ -288,7 +334,7 @@ const bound = (runId, n) => Tools.lastMessageRelPathForAttempt('opencode', 1 + (
 // Codex handler-level isolation through delegation_launch /
 // delegation_read_result / delegation_followup (canary slice, Luna profile
 // CODEX_SCOUT_FAST; counter shim writes distinct markers).
-const codexBound = (runId, n) => Tools.lastMessageRelPathForAttempt('codex', n, runId);
+const codexBound = (n) => Tools.centralArtifactFileName('codex', n);
 const launchCodexCanary = async (workdir, requestId) => {
   const launched = await call('delegation_launch', {
     workspace_id: wid, engine: 'codex', profile: 'CODEX_SCOUT_FAST',
@@ -300,6 +346,8 @@ const launchCodexCanary = async (workdir, requestId) => {
 };
 
 // ---------- X1: two Codex runs sharing one workdir + continuations (4 isolated artifacts) ----------
+// Central storage: worker files relocate centrally at finalize; the shared
+// workdir keeps only task code. Four central files (2 runs x 2 attempts).
 {
   const wd = path.join(wsRoot, 'shared-wd-codex');
   const run1 = await launchCodexCanary('shared-wd-codex', 'req-iso-cx1');
@@ -307,23 +355,25 @@ const launchCodexCanary = async (workdir, requestId) => {
   const run2 = await launchCodexCanary('shared-wd-codex', 'req-iso-cx2');
   assert(run2 !== run1, 'the two Codex runs must have distinct ids');
   await waitSettled(run2);
-  const rel1a = codexBound(run1, 1);
-  const rel2a = codexBound(run2, 1);
-  assert(rel1a !== rel2a, `distinct runs bind distinct files: ${rel1a} vs ${rel2a}`);
+  const cdir1 = centralFor(run1);
+  const cdir2 = centralFor(run2);
+  assert(cdir1 !== cdir2, `distinct Codex runs own distinct central dirs: ${cdir1} vs ${cdir2}`);
+  const rel1a = codexBound(1);
+  noWorkdirArtifacts(wd, 'shared Codex workdir after two runs');
   assert(!fs.existsSync(path.join(wd, 'codex-last-message.md')),
     'no legacy shared Codex artifact may be created for new runs');
-  assert(fs.existsSync(path.join(wd, rel1a)) && fs.existsSync(path.join(wd, rel2a)),
-    `both Codex run-bound attempt-1 artifacts must exist: ${rel1a}, ${rel2a}`);
-  const c1a = fs.readFileSync(path.join(wd, rel1a), 'utf8');
-  const c2a = fs.readFileSync(path.join(wd, rel2a), 'utf8');
+  assert(fs.existsSync(path.join(cdir1, rel1a)) && fs.existsSync(path.join(cdir2, rel1a)),
+    `both Codex central attempt-1 artifacts must exist: ${cdir1}/${rel1a}, ${cdir2}/${rel1a}`);
+  const c1a = fs.readFileSync(path.join(cdir1, rel1a), 'utf8');
+  const c2a = fs.readFileSync(path.join(cdir2, rel1a), 'utf8');
   assert(c1a.includes('CODEX-MARKER-') && c2a.includes('CODEX-MARKER-') && c1a !== c2a,
-    'each Codex artifact must carry only its own output');
+    'each Codex central artifact must carry only its own output');
   const read1 = await call('delegation_read_result', { workspace_id: wid, run_id: run1 });
   const read2 = await call('delegation_read_result', { workspace_id: wid, run_id: run2 });
   assert(read1.structuredContent.test_evidence.last_message.path === rel1a &&
     read1.structuredContent.test_evidence.last_message.status === 'present',
     `run 1 must surface only its own artifact: ${JSON.stringify(read1.structuredContent.test_evidence.last_message)}`);
-  assert(read2.structuredContent.test_evidence.last_message.path === rel2a &&
+  assert(read2.structuredContent.test_evidence.last_message.path === rel1a &&
     read2.structuredContent.test_evidence.last_message.status === 'present',
     `run 2 must surface only its own artifact: ${JSON.stringify(read2.structuredContent.test_evidence.last_message)}`);
   for (const [runId, tag] of [[run1, 'isocx1'], [run2, 'isocx2']]) {
@@ -340,27 +390,29 @@ const launchCodexCanary = async (workdir, requestId) => {
       `answer must dispatch Codex attempt 2 for ${runId}: ${JSON.stringify(a.structuredContent)}`);
     await waitSettled(runId);
   }
-  const rel1b = codexBound(run1, 2);
-  const rel2b = codexBound(run2, 2);
-  for (const rel of [rel1a, rel1b, rel2a, rel2b]) assert(fs.existsSync(path.join(wd, rel)), `all four Codex artifacts must exist: ${rel}`);
-  assert(new Set([rel1a, rel1b, rel2a, rel2b]).size === 4, 'all four Codex artifact paths must be distinct');
-  const contents = [rel1a, rel1b, rel2a, rel2b].map((rel) => fs.readFileSync(path.join(wd, rel), 'utf8'));
+  const rel2 = codexBound(2);
+  for (const [cdir, rel] of [[cdir1, rel1a], [cdir1, rel2], [cdir2, rel1a], [cdir2, rel2]]) {
+    assert(fs.existsSync(path.join(cdir, rel)), `all four Codex central artifacts must exist: ${cdir}/${rel}`);
+  }
+  noWorkdirArtifacts(wd, 'shared Codex workdir after continuations');
+  const contents = [[cdir1, rel1a], [cdir1, rel2], [cdir2, rel1a], [cdir2, rel2]]
+    .map(([cdir, rel]) => fs.readFileSync(path.join(cdir, rel), 'utf8'));
   assert(new Set(contents).size === 4 && contents.every((c) => c.includes('CODEX-MARKER-')),
-    'each of the four Codex artifacts must carry only its own distinct output');
-  assert(fs.readFileSync(path.join(wd, rel1a), 'utf8') === c1a && fs.readFileSync(path.join(wd, rel2a), 'utf8') === c2a,
-    'Codex attempt-1 artifacts must be untouched by the continuations (never overwritten; earlier attempts preserved)');
+    'each of the four Codex central artifacts must carry only its own distinct output');
+  assert(fs.readFileSync(path.join(cdir1, rel1a), 'utf8') === c1a && fs.readFileSync(path.join(cdir2, rel1a), 'utf8') === c2a,
+    'Codex attempt-1 central artifacts must be untouched by the continuations (never overwritten; earlier attempts preserved)');
   const reread1 = await call('delegation_read_result', { workspace_id: wid, run_id: run1 });
   const reread2 = await call('delegation_read_result', { workspace_id: wid, run_id: run2 });
-  assert(reread1.structuredContent.test_evidence.last_message.path === rel1b &&
+  assert(reread1.structuredContent.test_evidence.last_message.path === rel2 &&
     reread1.structuredContent.test_evidence.last_message.attempt_n === 2,
     `run 1 must now surface only its attempt-2 artifact: ${JSON.stringify(reread1.structuredContent.test_evidence.last_message)}`);
-  assert(reread2.structuredContent.test_evidence.last_message.path === rel2b &&
+  assert(reread2.structuredContent.test_evidence.last_message.path === rel2 &&
     reread2.structuredContent.test_evidence.last_message.attempt_n === 2,
     `run 2 must now surface only its attempt-2 artifact: ${JSON.stringify(reread2.structuredContent.test_evidence.last_message)}`);
-  console.log('ok: X1 MCP Codex (two runs sharing one workdir + continuations stay isolated; no cross-attribution)');
+  console.log('ok: X1 MCP Codex (two runs sharing one workdir + continuations stay isolated centrally; no cross-attribution)');
 }
 
-// ---------- X2: Codex preoccupied EMPTY legacy file -> untouched, unclaimed; own run-bound file ----------
+// ---------- X2: Codex preoccupied EMPTY legacy file -> untouched, unclaimed; own central file ----------
 // ---------- X3: Codex preoccupied NONEMPTY legacy file (recent mtime) -> untouched, unclaimed ----------
 for (const [tag, junk, req] of [['empty', '', 'req-iso-cx-preocc-empty'], ['junk-recent', 'JUNK-FROM-ANOTHER-RUN', 'req-iso-cx-preocc-junk']]) {
   const preDir = path.join(wsRoot, `preocc-codex-${tag}`);
@@ -376,16 +428,16 @@ for (const [tag, junk, req] of [['empty', '', 'req-iso-cx-preocc-empty'], ['junk
   await waitSettled(runId);
   assert(fs.readFileSync(path.join(preDir, 'codex-last-message.md'), 'utf8') === junk,
     `pre-existing ${tag} legacy file must stay intact (never overwritten, never claimed)`);
-  const ownRel = codexBound(runId, 1);
-  assert(ownRel !== 'codex-last-message.md', 'the new Codex attempt must bind its run, never the legacy shared name');
-  assert(fs.existsSync(path.join(preDir, ownRel)), `new Codex attempt must write its own run-bound path: ${ownRel}`);
-  assert(fs.readFileSync(path.join(preDir, ownRel), 'utf8').includes('CODEX-MARKER-'),
-    'owned run-bound path must carry the worker output');
+  const ownRel = codexBound(1);
+  const cdir = centralFor(runId);
+  assert(fs.existsSync(path.join(cdir, ownRel)), `new Codex attempt must persist its own central artifact: ${ownRel}`);
+  assert(fs.readFileSync(path.join(cdir, ownRel), 'utf8').includes('CODEX-MARKER-'),
+    'owned central artifact must carry the worker output');
   const read = await call('delegation_read_result', { workspace_id: wid, run_id: runId });
   const lm = read.structuredContent.test_evidence.last_message;
   assert(lm.status === 'present' && lm.path === ownRel && lm.attempt_n === 1,
-    `read must surface the attempt-owned file, never the preoccupied legacy file: ${JSON.stringify(lm)}`);
-  console.log(`ok: X2/X3 MCP Codex (preoccupied ${tag} legacy file untouched + unclaimed incl. recent mtime; own run-bound file)`);
+    `read must surface the central attempt-owned file, never the preoccupied legacy file: ${JSON.stringify(lm)}`);
+  console.log(`ok: X2/X3 MCP Codex (preoccupied ${tag} legacy file untouched + unclaimed incl. recent mtime; own central file)`);
 }
 
 // ---------- X4: Codex worker that exits without producing output -> unavailable, not present ----------

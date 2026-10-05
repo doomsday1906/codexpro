@@ -1,0 +1,198 @@
+{
+ "date_utc": "2026-10-05",
+ "base_commit": "d39c36a4828f05baefce9d5b0471e7d6bdf82637",
+ "build_identity": "Built codexpro@0.31.0; source commit d39c36a4828f05baefce9d5b0471e7d6bdf82637 (dirty)",
+ "evidence_dir": "evidence/delegation/2026-10-05-d39c36a",
+ "files": {
+  "src/delegationEngines.ts": {
+   "role": "source (observed-only thread grammar; queue OBSERVED; correlation REMOVED; opencode/claude negatives)",
+   "sha256": "e2ad3eaa2d92523eef5244cf40e5c6ec79a15a93ba2cf468a50f78fcc3110a4a"
+  },
+  "src/delegationStore.ts": {
+   "role": "source (central layout + record fields + record-consulting teardown)",
+   "sha256": "3ea7d290a85e342ffb5ae2e2bc0340b3ae746603888d42111ca3d490113709b2"
+  },
+  "src/delegationTools.ts": {
+   "role": "source (no auto-promote reconcile; central persist/relocate; cancel-relocate hold; central reads)",
+   "sha256": "2f69f41f4adb1fd345beb00580f918477986a5aff4356435d2030cab195481d8"
+  },
+  "scripts/delegation-steer-smoke.mjs": {
+   "role": "updated test (S1 observed-only identity + removal asserts; S7 no-promotion; S10 OBSERVED; S11 record teardown)",
+   "sha256": "7f7d9e8438572da95a1e3af832a41e2f15d0f8ff953e512cbacccc782cf61d05"
+  },
+  "scripts/delegation-artifact-isolation-smoke.mjs": {
+   "role": "updated test (A1/A2/A3/X1/X2/X3 central isolation; workdir keeps task code)",
+   "sha256": "794621f290960998c02a2a6233fd787d6af65750200eb34b330653e34103330c"
+  },
+  "scripts/delegation-canary-smoke.mjs": {
+   "role": "updated test (H2b central artifact + read surfacing)",
+   "sha256": "22587d10e42a04e91210cb53c8e8f29f51a2f1dcfb02d29cabbb29094713cd11"
+  },
+  "scripts/delegation-cancel-artifact-smoke.mjs": {
+   "role": "updated test (D2a/D2b central artifacts)",
+   "sha256": "32b0ab4b38addc832cc8d95b9b44d4be6d94655cb957f11a782f042449c34483"
+  },
+  "scripts/delegation-identity-standalone-output-smoke.mjs": {
+   "role": "updated test (C3 central artifact + workdir-evidence exclusion)",
+   "sha256": "e34479b4ac41e0f459616ce4d81b2ae776e3adcdbed0887f2de46b5377d40e20"
+  },
+  "scripts/delegation-repair-focus-smoke.mjs": {
+   "role": "updated test (R5b central path regex)",
+   "sha256": "c35302df5a203a8e9f9f74f939470d72ff34db5b1822c537514c9e106db05673"
+  },
+  "scripts/delegation-central-artifact-smoke.mjs": {
+   "role": "new test (C1-C5 Task B regression)",
+   "sha256": "dc646b9e5bcdac156922456808f4870119d131a5fa0c3c37243bdb26e38693e5"
+  },
+  "package.json": {
+   "role": "build input",
+   "sha256": "d89d7884a90cee37bd2ead5d1a94ec9c69dd8991d3f4c53659844bb285339d7c"
+  },
+  "scripts/build-identity.mjs": {
+   "role": "build input",
+   "sha256": "ac352ab4d2416fee6bab255d15f966be66d8281b461f55751a360f4773799aa0"
+  },
+  "scripts/build.mjs": {
+   "role": "build input",
+   "sha256": "80cbc28a3aae9313aa17591c6530879e828f9d65f12b893e768f2ef78c464e8e"
+  },
+  "tsconfig.json": {
+   "role": "build input",
+   "sha256": "01707d63930e59130eb6169d3c0afe9283ad356b655220b2b0633f22b123f0f4"
+  }
+ },
+ "serial_proof": [
+  {
+   "command": "npm run build",
+   "exit": 0,
+   "log": "logs/01-build.log",
+   "sha256": "89bd0cfc65d53e59f552fa2ad77a7842b939a348a32164e05e5c9e0ceb6a0ebe"
+  },
+  {
+   "command": "node scripts/delegation-codex-ownership-smoke.mjs",
+   "exit": 0,
+   "log": "logs/delegation-codex-ownership-smoke.log",
+   "sha256": "186663fff51e1c395cfff6ee7a7832cb3de205b5d8128781ee9e3131de470bea"
+  },
+  {
+   "command": "node scripts/delegation-artifact-isolation-smoke.mjs",
+   "exit": 0,
+   "log": "logs/delegation-artifact-isolation-smoke.log",
+   "sha256": "0284883820766abdb679c324abdd1d4adef8accc9e88702bdeb6b97816280ba2"
+  },
+  {
+   "command": "node scripts/delegation-terminal-cleanup-smoke.mjs",
+   "exit": 0,
+   "log": "logs/delegation-terminal-cleanup-smoke.log",
+   "sha256": "096815ee8d952b3c7174704ceb81b7f790cfa80116e8556de856d4833ee22227"
+  },
+  {
+   "command": "node scripts/delegation-cancel-artifact-smoke.mjs",
+   "exit": 0,
+   "log": "logs/delegation-cancel-artifact-smoke.log",
+   "sha256": "e89bcf02f76a86886aaf7716e0fe5d229a2a786dd73fe5382039b5dea6419ea5"
+  },
+  {
+   "command": "node scripts/delegation-identity-standalone-output-smoke.mjs",
+   "exit": 0,
+   "log": "logs/delegation-identity-standalone-output-smoke.log",
+   "sha256": "4dfefbbf6ada9dc477f00b14f1e09102c4ae0d4f726fa74de882114ec24c043d"
+  },
+  {
+   "command": "node scripts/delegation-triengine-smoke.mjs",
+   "exit": 0,
+   "log": "logs/delegation-triengine-smoke.log",
+   "sha256": "33fb5d19c75f9f96c41ff5833124ce392bd64990b71ce5d0245ace27d38d1917"
+  },
+  {
+   "command": "node scripts/delegation-repair-focus-smoke.mjs",
+   "exit": 0,
+   "log": "logs/delegation-repair-focus-smoke.log",
+   "sha256": "b9a5f5bb3b777ea3d3e1125d4f6f8daa1766ce69d96ccbb58adf23678440f68c"
+  },
+  {
+   "command": "node scripts/delegation-storage-smoke.mjs",
+   "exit": 0,
+   "log": "logs/delegation-storage-smoke.log",
+   "sha256": "e7b4277306086f137021a03fd31224b3348b87346b00c50c031bffa0f7903b70"
+  },
+  {
+   "command": "node scripts/delegation-followup-smoke.mjs",
+   "exit": 0,
+   "log": "logs/delegation-followup-smoke.log",
+   "sha256": "ac3f8b0d6e84954b9d021fe59e93a9a1690e433791544e786bdfc3d43ff85857"
+  },
+  {
+   "command": "node scripts/delegation-canary-smoke.mjs",
+   "exit": 0,
+   "log": "logs/delegation-canary-smoke.log",
+   "sha256": "69f5422df721ab3eb812fa0234be6ce0ece7a5774fed0257831920fd43a844a2"
+  },
+  {
+   "command": "node scripts/delegation-routing-smoke.mjs",
+   "exit": 0,
+   "log": "logs/delegation-routing-smoke.log",
+   "sha256": "c173692d4ad483644de89315b1b4035c18bab9bc97cd2bb5c2322b695a317e26"
+  },
+  {
+   "command": "node scripts/delegation-steer-smoke.mjs",
+   "exit": 0,
+   "log": "logs/delegation-steer-smoke.log",
+   "sha256": "5990eeea70189fbca25a97b725bc59364f6d9349736ce278054b773ef346b5b8"
+  },
+  {
+   "command": "node scripts/delegation-central-artifact-smoke.mjs",
+   "exit": 0,
+   "log": "logs/delegation-central-artifact-smoke.log",
+   "sha256": "5cb652fe90bdbc6719615ca62ced1e474e2aee2b5beb22cfbf8e6fee80b1388a"
+  }
+ ],
+ "live_probes": {
+  "route": "isolated candidate server on disposable port 39131 + disposable delegation dir (never :8787 shared service)",
+  "profile": "CODEX_SCOUT_FAST (gpt-6-luna/low/read-only)",
+  "spend_tokens": {
+   "P1_PONG": {
+    "input": 20403,
+    "cached_input": 16128,
+    "output": 6
+   },
+   "P5_w1": {
+    "input": 82078,
+    "cached_input": 64512,
+    "output": 93
+   },
+   "P3_midturn": {
+    "input": 144823,
+    "cached_input": 128256,
+    "output": 336
+   }
+  },
+  "verdicts": {
+   "thread.started": "CONFIRMED",
+   "thread_id": "CONFIRMED",
+   "steerable_thread_capture": "CONFIRMED",
+   "settled_steer_refusal": "CONFIRMED",
+   "queue_midturn_vs_postend": "CORRECTED to OBSERVED held-only",
+   "queue_success_shape": "CORRECTED to live-observed",
+   "session_codex_thread_families": "REMOVED",
+   "camelCase_nest_keys": "REMOVED",
+   "steering_correlation_types": "REMOVED",
+   "opencode_steering": "INCOMPLETE (unchanged)",
+   "claude_steering": "INCOMPLETE (unchanged)"
+  },
+  "unproven": [
+   "queued message ever executing as a later persistent-session turn (no second turn observed; longer observation would cost model turns)",
+   "opencode api op catalog / live server input ops (no live server probed)",
+   "claude --resume honoring every session-scoped flag (quota unconfirmed, not re-probed)",
+   "exact $ spend (tokens observed; pricing not computed)"
+  ]
+ },
+ "new_regressions": [
+  "scripts/delegation-central-artifact-smoke.mjs (C1 foreign-fallback+relocate; C2 direct-central; C3 record-only prune with pre/post hashes; C4 placeholder identity; C5 corrupt fail-closed)"
+ ],
+ "fixture_strays": {
+  "fixture-a.txt": "ce299a8defb9e1e8102a58dd1a8251ad2b7f954c9341e6fbce6beab36b90cca7",
+  "fixture-b.txt": "13aafb27a71bb59b8c92d83248746711ddffe2d73fa2f3fbc5299851d0fac6ce"
+ },
+ "delivery": "uncommitted working tree (orchestrator integrates); fixture strays preserved, never touched, never committed"
+}

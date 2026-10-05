@@ -57,6 +57,7 @@ import {
   DELEGATION_TERMINAL_STATES,
   activeSessionHolders,
   applyCheckpointReply,
+  centralArtifactsDirForRun,
   clearPendingDispatch,
   findRunByRequestId,
   isDelegationGroupId,
@@ -124,7 +125,6 @@ import {
   CODEX_RESUME_CAPABILITY,
   engineQualification,
   findPostCancelWrites,
-  findSteeringCorrelation,
   isClaudeSessionId,
   isEngineSessionId,
   isProcessIdentityAlive,
@@ -205,6 +205,17 @@ const QUIESCENCE_VERIFY_WINDOW_MS = 2000;
 function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/**
+ * Runs with an owner cancel in flight (live-cancel path only). While a run
+ * id is held here, a racing late child-close finalize must cause NO workdir
+ * mutation (no artifact relocate): the cancel quiescence windows treat any
+ * post-cancel workdir change as continued worker activity, and a harness
+ * move is not worker activity. Entries are added before the owned-tree
+ * signal and removed after the terminal save (a stale entry only ever
+ * affects an already-cancelled run, which never finalizes again).
+ */
+const cancelRelocateHold = new Set<string>();
 
 /**
  * Merge two post-cancel quiescence legs (grace leg + verification-window
@@ -468,7 +479,25 @@ export function reserveAttemptArtifactPath(
  * never attributed to the new run. Without a valid run id, or without a
  * pre-launch reservation proving absence, the result is fail-closed
  * unavailable: legacy shared names are never created anew and a timestamp
- * alone never binds output. Exported for the focused regression proof.
+ * alone never binds output.
+ *
+ * Central storage (Task B): when `centralDir` (this run's
+ * `centralArtifactsDirForRun`) is provided, durable artifacts live CENTRALLY,
+ * never durably in the workdir:
+ * - codex (retained === null): the verified worker-owned workdir file (the
+ *   policy-admitted `--output-last-message` destination — observed live that
+ *   even read-only workers may write it) is RELOCATED to central storage
+ *   with bytes + sha256 + relocation provenance; the workdir source is
+ *   removed by the move, so the central file is the single source of truth
+ *   and the workdir keeps only task code afterwards. The O_EXCL reservation
+ *   placeholder is therefore transient harness state (reserve ->
+ *   finalize-relocate), while the durable reservation record stays central
+ *   (the run file).
+ * - opencode/claude (retained string): bytes persist DIRECTLY to central
+ *   storage (O_EXCL, never overwriting); NO workdir file is ever created.
+ * Without `centralDir` the legacy workdir behavior applies (read-only
+ * back-compat for pre-central records and focused unit proof). Exported
+ * for the focused regression proof.
  */
 export function persistAttemptArtifact(
   workdir: string,
@@ -477,7 +506,8 @@ export function persistAttemptArtifact(
   retained: string | null,
   runId?: string,
   attemptStartedAt?: string,
-  reservation?: ArtifactReservation | null
+  reservation?: ArtifactReservation | null,
+  centralDir?: string
 ): NonNullable<DelegationAttempt["outputArtifact"]> {
   const primaryRel = lastMessageRelPathForAttempt(engine, attemptN, runId);
   if (!isValidRunIdForArtifact(runId)) {
@@ -540,6 +570,20 @@ export function persistAttemptArtifact(
       };
     }
     if (existingSize === 0) {
+      // Empty placeholder, worker wrote nothing: retire OUR OWN unfilled
+      // placeholder (claim identity must still match — a foreign empty file
+      // is left untouched) so the workdir keeps only task code; the attempt
+      // still records unavailable (empty = unavailable, never a slot).
+      if (typeof centralDir === "string" && centralDir) {
+        const provenEmpty = claim as { dev: number; ino: number; birthtimeMs?: number } | undefined;
+        const birthOk = Number.isFinite(provenEmpty?.birthtimeMs) && (provenEmpty?.birthtimeMs as number) > 0 &&
+          Number.isFinite(existingBirthtimeMs) && (existingBirthtimeMs as number) > 0;
+        if (provenEmpty && Number.isSafeInteger(provenEmpty.dev) && Number.isSafeInteger(provenEmpty.ino) &&
+          existingDev === provenEmpty.dev && existingIno === provenEmpty.ino &&
+          (!birthOk || existingBirthtimeMs === provenEmpty.birthtimeMs)) {
+          try { fs.rmSync(path.join(workdir, rel), { force: true }); } catch { /* best effort */ }
+        }
+      }
       return {
         relPath: rel, bytes: 0, created: false, provenance: "unavailable" as const,
         reason: `worker left an empty file at ${rel} (empty = unavailable, never a slot to fill)`
@@ -575,6 +619,12 @@ export function persistAttemptArtifact(
         reason: `reserved artifact ${rel} fails the reservation time bound (written before the pre-launch reservation); left untouched, never claimed as this run's output`
       };
     }
+    // Verified worker output: relocate centrally when a central dir is
+    // supplied (single source of truth afterwards, workdir keeps task code);
+    // otherwise the legacy workdir-bound worker verdict applies.
+    if (typeof centralDir === "string" && centralDir) {
+      return relocateWorkerFileToCentral(workdir, rel, centralDir, engine, attemptN);
+    }
     return { relPath: rel, bytes: existingSize, created: false, provenance: "worker" as const };
   }
   if (!retained) {
@@ -582,6 +632,11 @@ export function persistAttemptArtifact(
       relPath: primaryRel, bytes: 0, created: false, provenance: "unavailable" as const,
       reason: "worker produced no output; finalize created no file"
     };
+  }
+  // Harness-persisted output (opencode/claude): central storage first (no
+  // workdir file ever); legacy workdir path only without a central dir.
+  if (typeof centralDir === "string" && centralDir) {
+    return createCentralArtifact(centralDir, engine, attemptN, retained);
   }
   const candidates = [primaryRel, ...attemptArtifactFallbackPaths(engine, attemptN, runId)];
   for (const rel of candidates) {
@@ -600,6 +655,147 @@ export function persistAttemptArtifact(
     relPath: primaryRel, bytes: 0, created: false, provenance: "unavailable" as const,
     reason: `primary artifact ${primaryRel} and every run-bound fallback is preoccupied; nothing written, nothing claimed`
   };
+}
+
+/**
+ * Relocate one verified worker-owned workdir file to central run-scoped
+ * storage (`centralDir/<centralArtifactFileName>`). Single source of truth
+ * afterwards is the central file: the workdir source is removed by the move
+ * (same-device atomic rename preferred; cross-device copy + hash-verify +
+ * unlink). The central destination is never overwritten (a preoccupied
+ * destination fails closed with the workdir source left in place). Records
+ * bytes + sha256 + relocation provenance. Never throws (fail-closed
+ * unavailable records on any error).
+ */
+function relocateWorkerFileToCentral(
+  workdir: string,
+  workdirRel: string,
+  centralDir: string,
+  engine: DelegationEngine,
+  attemptN: number
+): NonNullable<DelegationAttempt["outputArtifact"]> {
+  const fileName = centralArtifactFileName(engine, attemptN);
+  const unavailable = (reason: string, bytes = 0): NonNullable<DelegationAttempt["outputArtifact"]> => ({
+    base: "central" as const, relPath: fileName, bytes, created: false,
+    provenance: "unavailable" as const, reason
+  });
+  if (!centralDir || centralDir.includes("..") || !path.isAbsolute(centralDir)) {
+    return unavailable("central artifact dir unresolvable; workdir source left in place, nothing relocated");
+  }
+  const src = path.join(workdir, workdirRel);
+  let content: Buffer;
+  try {
+    const st = fs.statSync(src);
+    if (!st.isFile() || st.size <= 0 || st.size > 8 * 1024 * 1024) {
+      return unavailable(`worker file at ${workdirRel} is not a relocatable file (missing/empty/oversize); left in place`, 0);
+    }
+    content = fs.readFileSync(src);
+  } catch {
+    return unavailable(`worker file at ${workdirRel} unreadable at relocate; left in place`);
+  }
+  const hash = createHash("sha256").update(content).digest("hex");
+  try {
+    fs.mkdirSync(centralDir, { recursive: true, mode: 0o700 });
+  } catch {
+    return unavailable("central artifact dir not creatable; workdir source left in place", content.length);
+  }
+  const dest = path.join(centralDir, fileName);
+  try {
+    fs.lstatSync(dest);
+    return unavailable(`central destination ${fileName} already exists (never overwritten); workdir source left in place`, content.length);
+  } catch { /* absent (or unstatable): rename below fails cleanly */ }
+  let via: "rename" | "copy-unlink" = "rename";
+  try {
+    fs.renameSync(src, dest);
+  } catch (error) {
+    if ((error as { code?: unknown })?.code !== "EXDEV") {
+      return unavailable(`relocate rename failed (${String((error as { code?: unknown })?.code ?? "error")}); workdir source left in place`, content.length);
+    }
+    via = "copy-unlink";
+    let fd = -1;
+    try {
+      fd = fs.openSync(dest, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+      fs.writeFileSync(fd, content);
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = -1;
+    } catch {
+      return unavailable("central O_EXCL create failed after EXDEV; workdir source left in place", content.length);
+    } finally {
+      if (fd !== -1) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+    }
+    try {
+      const back = fs.readFileSync(dest);
+      if (!back.equals(content)) {
+        return unavailable("copy-unlink hash mismatch; workdir source left in place (central copy retained for inspection)", content.length);
+      }
+      fs.rmSync(src, { force: true });
+    } catch {
+      return unavailable("copy-unlink verify/unlink failed; workdir source left in place", content.length);
+    }
+  }
+  try {
+    const st2 = fs.statSync(dest);
+    if (!st2.isFile() || st2.size !== content.length) {
+      return unavailable("relocated size mismatch; central file retained for inspection, workdir source already moved", content.length);
+    }
+  } catch {
+    return unavailable("relocated file unverifiable; workdir source already moved, central file retained for inspection", content.length);
+  }
+  return {
+    base: "central" as const, relPath: fileName, bytes: content.length, created: false,
+    provenance: "worker" as const, sha256: hash, relocatedFrom: workdirRel, relocatedVia: via
+  };
+}
+
+/**
+ * O_EXCL-create one central artifact file for harness-persisted output
+ * (opencode/claude: bytes come from the retained live stdout buffer, so NO
+ * workdir file ever exists — the workdir keeps only task code). Bounded
+ * central fallback siblings (`-x<i>`, at most 3) when the primary is
+ * preoccupied; otherwise unavailable. Never overwrites. Never throws.
+ */
+function createCentralArtifact(
+  centralDir: string,
+  engine: DelegationEngine,
+  attemptN: number,
+  text: string
+): NonNullable<DelegationAttempt["outputArtifact"]> {
+  const primary = centralArtifactFileName(engine, attemptN);
+  const dot = primary.lastIndexOf(".");
+  const stem = dot >= 0 ? primary.slice(0, dot) : primary;
+  const ext = dot >= 0 ? primary.slice(dot) : "";
+  const unavailable = (reason: string): NonNullable<DelegationAttempt["outputArtifact"]> => ({
+    base: "central" as const, relPath: primary, bytes: 0, created: false,
+    provenance: "unavailable" as const, reason
+  });
+  if (!centralDir || centralDir.includes("..") || !path.isAbsolute(centralDir)) {
+    return unavailable("central artifact dir unresolvable; nothing written, nothing claimed");
+  }
+  if (!text) {
+    return unavailable("worker produced no output; finalize created no file");
+  }
+  try {
+    fs.mkdirSync(centralDir, { recursive: true, mode: 0o700 });
+  } catch {
+    return unavailable("central artifact dir not creatable; nothing written, nothing claimed");
+  }
+  const candidates = [primary];
+  for (let i = 1; i <= 3; i += 1) candidates.push(`${stem}-x${i}${ext}`);
+  for (const rel of candidates) {
+    if (exclusivelyCreateArtifact(centralDir, rel, text) !== null) {
+      const diverted = rel !== primary;
+      return {
+        base: "central" as const, relPath: rel,
+        bytes: Buffer.byteLength(text, "utf8"),
+        created: true,
+        provenance: "created" as const,
+        sha256: sha256Text(text),
+        ...(diverted ? { reason: `central primary ${primary} preoccupied (left untouched); output persisted to the attempt's own ${rel}` } : {})
+      };
+    }
+  }
+  return unavailable(`central primary ${primary} and every bounded fallback is preoccupied; nothing written, nothing claimed`);
 }
 
 function failResult(text: string, structured: Record<string, unknown>): any {
@@ -1401,33 +1597,53 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
       };
     }
   }
-  // Per-(run, attempt) output artifact, exclusively created and
-  // provenance-bound: EVERY attempt's file binds the FULL validated run
-  // identity plus the attempt (`<stem>-<16hex>-attempt-<N><ext>`, including
-  // attempt 1 — legacy shared names are never created anew), so two runs
-  // shared names are never created anew), so two runs sharing one
+  // Per-(run, attempt) output artifact in CENTRAL run-scoped storage
+  // (`<bridgeDir>/delegation-artifacts/<runId>/attempt-<N>-<engine>-...`,
+  // full run identity in the dir name, attempt in the file name — including
+  // attempt 1, never legacy shared names), so two runs sharing one
   // caller-chosen workdir occupy disjoint namespaces and a continuation can
   // never surface an earlier attempt's output file as the current result.
   // Existing files are never overwritten, never claimed: a preoccupied
-  // file — empty or nonempty — is left untouched (retained output diverts
-  // to the attempt's own run-bound fallback; a preoccupied worker-owned
-  // file records unavailable with a reason). The recorded relPath plus the
-  // provenance verdict binds which attempt produced the artifact for the
-  // read path. Best effort and never throwing: an unavailable artifact
-  // stays explicitly unavailable in read evidence (never an implied pass).
-  // Output beyond the retained tail is reported via the stdoutTruncated
-  // flag below. Codex owns its file via --output-last-message (stat only
-  // here, never written, bound only with the pre-launch reservation proving
-  // the reserved run-bound destination was absent before spawn);
-  // opencode/claude output is persisted from the retained live stdout
-  // buffer (newest up to the 64KiB live cap).
+  // file — empty or nonempty — is left untouched (harness-persisted output
+  // diverts to the attempt's own bounded central fallback; a preoccupied
+  // worker-owned file records unavailable with a reason). The recorded
+  // central relPath plus the provenance verdict binds which attempt
+  // produced the artifact for the read path. Best effort and never
+  // throwing: an unavailable artifact stays explicitly unavailable in read
+  // evidence (never an implied pass). Output beyond the retained tail is
+  // reported via the stdoutTruncated flag below. Codex owns its file via
+  // --output-last-message to the policy-admitted workdir destination (bound
+  // only with the pre-launch reservation proving the reserved run-bound
+  // destination was absent before spawn), then the harness RELOCATES the
+  // verified bytes centrally (single source of truth afterwards; the
+  // workdir keeps only task code); opencode/claude output persists
+  // DIRECTLY centrally from the retained live stdout buffer (newest up to
+  // the 64KiB live cap; no workdir file ever).
   const attemptN = live?.attemptN ?? latest?.n ?? 1;
   let outputArtifact: DelegationAttempt["outputArtifact"];
   try {
     const retained = live && (run.engine === "opencode" || run.engine === "claude")
       ? Buffer.concat(live.stdoutChunks).toString("utf8")
       : null;
-    outputArtifact = persistAttemptArtifact(run.workdir, run.engine, attemptN, retained, run.runId, latest?.startedAt, latest?.artifactReservation ?? null);
+    // Central run-scoped storage for durable artifacts (Task B): opencode/
+    // claude persist directly central (no workdir file ever); codex worker
+    // output relocates central at finalize (workdir keeps only task code).
+    // An unresolvable central dir fails back to the legacy workdir path
+    // (fail-open to legacy persistence, never to lost evidence). Relocation
+    // Relocation is gated on a LIVE handle AND on no in-flight owner
+    // cancel: a finalize racing an owner cancel (the killed child's late
+    // close fires during the cancel quiescence windows) must cause NO
+    // workdir mutation — the windows treat any post-cancel workdir change
+    // as continued worker activity. The raced finalize then records the
+    // legacy workdir verdict (prune-time record teardown still cleans it),
+    // never a harness move the quiescence check would misread.
+    let centralDir: string | undefined;
+    if (live && !cancelRelocateHold.has(run.runId)) {
+      try {
+        centralDir = centralArtifactsDirForRun(bridgeDir, run.runId);
+      } catch { centralDir = undefined; }
+    }
+    outputArtifact = persistAttemptArtifact(run.workdir, run.engine, attemptN, retained, run.runId, latest?.startedAt, latest?.artifactReservation ?? null, centralDir);
   } catch { /* artifact stays unrecorded; read evidence reports it unavailable */ }
   let state = final.state;
   let summary = summarizeTerminal(final.state, final.exitCode, final.timedOut);
@@ -1459,8 +1675,8 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
     stderrTail: live ? tailText(live.stderrChunks, DELEGATION_BOUNDS.maxTailBytes) : undefined,
     // Explicit truncation flags: the live 64KiB cap keeps the newest bytes;
     // the 8KiB tail bound keeps the newest tail. A true flag means older
-    // output exists beyond what is shown; larger evidence rides the run
-    // workdir (last-message files) through the ordinary read route.
+    // output exists beyond what is shown; larger evidence rides the central
+    // run-scoped artifact (last-message file) through the ordinary read route.
     ...(live ? {
       stdoutTruncated: live.stdoutBytes > DELEGATION_BOUNDS.maxTailBytes,
       stderrTruncated: live.stderrBytes > DELEGATION_BOUNDS.maxTailBytes
@@ -1862,13 +2078,34 @@ export interface TestEvidenceReport {
   output_note: string;
 }
 
-/** Engine last-message filename (durable output artifact in the run workdir). */
+/** Engine last-message filename stem (transient worker destination in the run workdir; durable home is central storage). */
 export function lastMessageRelPath(engine: DelegationEngine): string {
   return engine === "codex"
     ? "codex-last-message.md"
     : engine === "opencode"
       ? "opencode-last-message.json"
       : "claude-last-message.json";
+}
+
+/**
+ * Central artifact file name for one (engine, attempt): the durable,
+ * run-scoped home under `centralArtifactsDirForRun` (the run id rides the
+ * parent dir name, so the file name carries only attempt + engine).
+ * `attempt-<N>-<engine>-last-message.(md|json)` for EVERY attempt including
+ * attempt 1. Exported for the focused regression proof.
+ */
+export function centralArtifactFileName(engine: DelegationEngine, attemptN: number): string {
+  const base = lastMessageRelPath(engine);
+  const dot = base.lastIndexOf(".");
+  const stem = dot >= 0 ? base.slice(0, dot) : base;
+  const ext = dot >= 0 ? base.slice(dot) : "";
+  const n = Number.isSafeInteger(attemptN) && attemptN >= 1 ? attemptN : 1;
+  return `attempt-${n}-${stem}${ext}`;
+}
+
+/** SHA-256 hex of a UTF-8 string (central artifact provenance). Never throws. */
+function sha256Text(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
 /**
@@ -2038,6 +2275,30 @@ export function describeAttemptArtifact(
 }
 
 /**
+ * Resolve the base dir an attempt's recorded artifact reads against: central
+ * run-scoped storage for central records, the run workdir for legacy
+ * workdir records (or when the central dir is unresolvable — fail back to
+ * the workdir rather than to lost evidence). Safe-read guards
+ * (.. / absolute / file-only) apply identically at both locations. Never
+ * throws.
+ */
+export function artifactBaseDirFor(
+  bridgeDir: string,
+  run: Pick<DelegationRunRecord, "runId" | "workdir">,
+  recorded?: Pick<NonNullable<DelegationAttempt["outputArtifact"]>, "relPath"> & { base?: unknown } | string
+): string {
+  const base = typeof recorded === "string" ? undefined : recorded?.base;
+  if (base === "central") {
+    try {
+      if (typeof bridgeDir === "string" && bridgeDir) {
+        return centralArtifactsDirForRun(bridgeDir, run.runId);
+      }
+    } catch { /* fall back to the workdir below */ }
+  }
+  return run.workdir;
+}
+
+/**
  * Legacy shared-name artifact lookup. GATED fail-closed: the legacy shared
  * name carries no per-(run, attempt) provenance, so it can NEVER present a
  * file as present — a nonempty foreign file must never surface as this
@@ -2141,72 +2402,28 @@ export function steeringMessageHash(message: string): string {
 }
 
 /**
- * Reconcile queued steering records against genuine message-correlated
- * worker-observable evidence (Finding 1: mtime-only promotion removed).
+ * Reconcile queued steering records: NO auto-promotion (observed 2026-10-05).
  *
- * A queued record becomes applied ONLY when ALL hold on the exact
- * run + attempt + engine thread + steering message:
- * - the record carries the exact thread queued to (threadId) and the run's
- *   recorded thread still equals it (same thread; a missing/conflicting
- *   thread never promotes);
- * - the record's attemptN equals the current attempt (same attempt;
- *   later-attempt output never promotes an earlier record);
- * - the current attempt's provenance-bound artifact reads present AND its
- *   FULL file content (never truncated tails alone, never mtime alone)
- *   contains a structured correlation object through the supported protocol
- *   (`exec --json` JSONL shape: validated event type + same thread +
- *   same messageHash/steeringKey via findSteeringCorrelation).
- * Unrelated output, ordinary completion text, ignored messages (no
- * correlation object), and later-attempt files all leave the record queued
- * (unverified, never claimed from queued alone). stored-local, unknown, and
- * rejected records never auto-promote. Returns the applied keys; never
- * throws. Status vocabulary stays separated: stored-local (recorded, engine
- * not yet called) vs queued/accepted (engine confirmed held) vs applied
- * (worker-observed message correlation); there is no separate received stage
- * in the codex queue interface, so anything without correlation remains
- * queued/unverified with its engine evidence explaining so.
+ * The live `exec --json` stream on real workers carries ONLY thread/turn/
+ * item lifecycle events; the engine emits NO message-delivery event
+ * attesting receipt or application of a queued message (a mid-turn queued
+ * message left no observable trace in the live turn output or session
+ * rollout), and the previously allowlisted correlation shapes were
+ * hypothetical and are deleted. There is therefore NO trusted worker-
+ * observable evidence through which this adapter may claim applied — and,
+ * as before, there is no separate received stage in the codex queue
+ * interface. Queued records stay queued/unverified (with their engine
+ * evidence explaining so); stored-local, unknown, and rejected records
+ * never auto-promote either. Any REQUESTED EFFECT is proven separately in
+ * live qualification (worker behavior change + timing + isolation), never
+ * by relabeling a queued record here. Returns no changes; never throws.
+ * Status vocabulary stays separated: stored-local (recorded, engine not
+ * yet called) vs queued/accepted (engine confirmed held) vs applied
+ * (externally qualified only, never adapter-inferred).
  */
 export function reconcileSteeringApplied(run: DelegationRunRecord): { changed: boolean; applied: string[] } {
-  const applied: string[] = [];
-  const records = Array.isArray(run.steering) ? run.steering : [];
-  if (!records.some((record) => record?.status === "queued")) return { changed: false, applied };
-  const current = run.attempts.at(-1);
-  const artifact = current?.outputArtifact;
-  const recordedThread = run.session?.threadId;
-  for (const record of records) {
-    if (!record || record.status !== "queued") continue;
-    // Exact attempt binding: later-attempt output never promotes.
-    if (!current || record.attemptN !== current.n) continue;
-    // Exact thread binding: the queued thread must still be the recorded one.
-    const queuedThread = typeof record.threadId === "string" ? record.threadId.trim() : "";
-    if (!queuedThread || !recordedThread || queuedThread !== recordedThread) continue;
-    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(queuedThread)) continue;
-    if (!artifact || artifact.provenance === "unavailable") continue;
-    const described = describeAttemptArtifact(run.workdir, run.engine, current?.n ?? 1, artifact);
-    if (described.status !== "present" || !described.path) continue;
-    if (described.path.includes("..") || path.isAbsolute(described.path)) continue;
-    // Full worker-observed content (bounded full-file read, never tails
-    // alone, never mtime): the artifact file proven to be this attempt's
-    // output must carry the structured message correlation.
-    let content = "";
-    try {
-      const abs = path.join(run.workdir, described.path);
-      const stat = fs.statSync(abs);
-      if (!stat.isFile() || stat.size <= 0 || stat.size > 256 * 1024) continue;
-      content = fs.readFileSync(abs, "utf8");
-    } catch { continue; }
-    const correlation = findSteeringCorrelation(content, {
-      threadId: queuedThread,
-      messageHash: record.messageHash,
-      steeringKey: record.steeringKey
-    });
-    if (!correlation) continue;
-    record.status = "applied";
-    record.appliedEvidence = `worker-observed message correlation on run ${run.runId} attempt ${current.n} thread ${queuedThread}: event type ${correlation.eventType} matched by ${correlation.matchedBy} in artifact ${described.path} (same attempt/thread; tails/mtime alone never suffice)`;
-    record.updatedAt = new Date().toISOString();
-    applied.push(record.steeringKey);
-  }
-  return { changed: applied.length > 0, applied };
+  void run;
+  return { changed: false, applied: [] };
 }
 
 export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[] {
@@ -2863,12 +3080,11 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           if (acked.length > 0) saveDelegationRun(bridgeDir, current);
         }
         const includeEvents = args.include_events !== false;
-        // Live-steering reconciliation: a queued steer becomes applied ONLY
-        // on genuine message-correlated worker evidence (same run+attempt+
-        // thread + validated correlation event carrying the message hash/key
-        // in the provenance-bound artifact content). Queued alone, mtimes,
-        // and tails alone never promote; anything else stays queued
-        // (unverified, never claimed from queued alone).
+        // Live-steering reconciliation: the adapter never auto-promotes
+        // queued->applied (observed 2026-10-05: the engine emits no
+        // application-attesting event; hypothetical correlation shapes are
+        // deleted). Queued records stay queued/unverified with their engine
+        // evidence explaining so.
         const steeringReconciled = reconcileSteeringApplied(current);
         if (steeringReconciled.changed) saveDelegationRun(bridgeDir, current);
         // Truthful: events with zero targets are undelivered (no-targets-
@@ -2906,7 +3122,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         const terminalStates = DELEGATION_TERMINAL_STATES.has(current.state);
         const currentAttempt = current.attempts.at(-1);
         const lastMessage = currentAttempt
-          ? describeAttemptArtifact(current.workdir, current.engine, currentAttempt.n, currentAttempt.outputArtifact)
+          ? describeAttemptArtifact(artifactBaseDirFor(bridgeDir, current, currentAttempt.outputArtifact), current.engine, currentAttempt.n, currentAttempt.outputArtifact)
           : describeAttemptArtifact(current.workdir, current.engine, 0, undefined);
         const testEvidence = buildTestEvidence({
           terminal: terminalStates,
@@ -2999,7 +3215,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               : {}),
             ...(failureClassification ? { failure_classification: failureClassification } : {}),
             ...(failureClassification ? { failure_classification: failureClassification } : {}),
-            review_note: "A completed process or green canary NEVER establishes task success: review the raw evidence above (tails, workdir changes, test evidence) against the original task and repo rules before accepting. Nonempty tails prove output presence only, never that tests ran. Larger evidence rides the run workdir (including the last-message file) through the ordinary read route.",
+            review_note: "A completed process or green canary NEVER establishes task success: review the raw evidence above (tails, workdir changes, test evidence) against the original task and repo rules before accepting. Nonempty tails prove output presence only, never that tests ran. Larger evidence rides the central run-scoped artifact (last-message file) through the ordinary read route.",
             input_requests: runInputRequests(current).map((request) => ({
               request_id: request.id,
               seq: request.seq,
@@ -3642,7 +3858,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "delegation_steer",
       options: {
         title: "Delegation Steer",
-        description: "Send one bounded live message to a RUNNING worker (mid-turn steering, distinct from needs-input follow-up and from cancel/relaunch). Codex only, via one native `codex queue --thread` call to the run's recorded engine-returned thread id; opencode/claude expose no steer verb and refuse with steer_unsupported (never emulated). Idempotent per steering_key; settled/cancelled runs refuse; applied is claimed only on worker-observable evidence.",
+        description: "Send one bounded live message to a RUNNING worker (mid-turn steering, distinct from needs-input follow-up and from cancel/relaunch). Codex only, via one native `codex queue --thread` call to the run's recorded engine-returned thread id; opencode/claude expose no steer verb and refuse with steer_unsupported (never emulated). Idempotent per steering_key; settled/cancelled runs refuse; queued records stay queued/unverified (the engine emits no application-attesting event — observed 2026-10-05 — so the adapter never auto-claims applied).",
         inputSchema: publicSchemaFrom(steerArgs),
         runtimeInputSchema: steerArgs,
         annotations: DESTRUCTIVE
@@ -3829,11 +4045,11 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         if (queue.outcome === "queued") {
           if (stored) {
             stored.status = "queued";
-            stored.engineEvidence = `codex queue exit ${queue.exitCode}: held by the engine for the worker's next turn on thread ${thread} attempt ${attemptN} (queued/accepted never implies received/applied; queue-during-active vs after-end is UNPROVEN from help alone). Evidence: ${queue.evidence}`.slice(0, 500);
+            stored.engineEvidence = `codex queue exit ${queue.exitCode}: held by the engine for the worker's next turn on thread ${thread} attempt ${attemptN} (queued/accepted never implies received/applied; observed 2026-10-05: mid-turn and post-end queues are both held with no in-turn incorporation observed, and the engine emits no application-attesting event). Evidence: ${queue.evidence}`.slice(0, 500);
             stored.updatedAt = new Date().toISOString();
             saveDelegationRun(bridgeDir, run);
           }
-          return okResult(`Steer ${key} queued by the engine for run ${run.runId} (codex thread ${thread} attempt ${attemptN}): held for the worker's next turn. Queued/accepted never implies received/applied: applied is claimed only on genuine message-correlated worker evidence (same run+attempt+thread, validated correlation event carrying the message hash/key) via delegation_read_result; otherwise the record stays queued/unverified.`, {
+          return okResult(`Steer ${key} queued by the engine for run ${run.runId} (codex thread ${thread} attempt ${attemptN}): held for the worker's next turn. Queued/accepted never implies received/applied: the engine emits no application-attesting event (observed 2026-10-05), so the record stays queued/unverified unless a REQUESTED EFFECT is proven separately in live qualification; see delegation_read_result.`, {
             run_id: run.runId,
             steering_key: key,
             status: "queued",
@@ -3843,7 +4059,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             executed: true,
             engine_evidence: queue.evidence,
             queue_note: binaryNote,
-            next_action: "poll delegation_read_result: applied is reported only on genuine message-correlated worker evidence (same attempt/thread, validated event type + message hash/key); mtimes and tails alone never suffice"
+            next_action: "poll delegation_read_result: the record stays queued/unverified (the engine emits no application-attesting event); a REQUESTED EFFECT is proven separately in live qualification, never by relabeling"
           });
         }
         if (queue.outcome === "rejected") {
@@ -4141,6 +4357,10 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         const writesBefore = snapshotWorkdirMtimes(current.workdir);
         const latest = current.attempts.at(-1);
         const uncertainCancel = isUncertainDispatch(current);
+        // Hold artifact relocation while this cancel runs (see
+        // cancelRelocateHold): a racing late child-close finalize must not
+        // mutate the workdir inside the quiescence windows below.
+        cancelRelocateHold.add(current.runId);
         let tree: {
           signalled: number[];
           remaining: number[];
@@ -4227,6 +4447,9 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         };
         enqueueTerminalEvent(current, loadSubscriptions(subscriptionAuthorityDirFor(deps.config)));
         saveDelegationRun(bridgeDir, current);
+        // Release the relocation hold only after the terminal save: a close
+        // arriving later sees the cancelled state and never finalizes.
+        cancelRelocateHold.delete(current.runId);
         await pumpDeliveries(deps, bridgeDir, loadDelegationRun(bridgeDir, current.runId) ?? current).catch(() => undefined);
         // Session-aware verification: PID-tree cleanup alone never proves a
         // session-side turn halted. For opencode (no session-scoped halt

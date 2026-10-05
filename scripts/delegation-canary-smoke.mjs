@@ -43,6 +43,31 @@ function pathToFileUrl(p) { return `file://${p}`; }
 // root (legacy bridge OFF): run/authority bridges resolve per (owner,
 // workspace) via the Store helpers below, never as repo .ai-bridge dirs.
 const delegHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-delegation-deleghome-'));
+// Central-storage assertion helper: locate the run's bridge dir by walking
+// the delegation home (bounded) for delegation-runs/<runId>.json.
+const centralFor = (runId) => {
+  const stack = [delegHome];
+  let guard = 0;
+  while (stack.length > 0 && guard < 512) {
+    guard += 1;
+    const dir = stack.pop();
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) { stack.push(full); continue; }
+      if (e.name === `${runId}.json` && path.basename(path.dirname(full)) === 'delegation-runs') {
+        return Store.centralArtifactsDirForRun(path.dirname(path.dirname(full)), runId);
+      }
+    }
+  }
+  throw new Error(`ASSERT: bridge dir not found for ${runId}`);
+};
+
+
+// Central-storage assertion helper: locate the run's bridge dir by walking
+// the delegation home (bounded) for delegation-runs/<runId>.json.
+
 process.env.CODEXPRO_DELEGATION_DIR = delegHome;
 delete process.env.CODEXPRO_DELEGATION_LEGACY_BRIDGE;
 const smokeUid = typeof process.getuid === 'function' ? String(process.getuid()) : 'unknown';
@@ -731,9 +756,18 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
   assert(realTerminal.delegationGroup === 'e2e-real-1', 'run file must store the custom group');
   assert(realTerminal.result?.fixturesUnchanged === undefined, 'real tasks carry no fixture verdict');
   const realFiles = fs.readdirSync(path.join(realRootH2, 'e2e-real-1')).sort();
-  const expectedRealArtifact = Tools.lastMessageRelPathForAttempt('codex', 1, realRunId);
-  assert(!realFiles.includes('fixture-a.txt') && realFiles.includes(expectedRealArtifact), `real workdir stages no fixtures and binds the run-bound artifact: ${realFiles.join(',')}`);
+  const expectedRealArtifact = Tools.centralArtifactFileName('codex', 1);
+  assert(!realFiles.includes('fixture-a.txt') && !realFiles.some((f) => f.includes('last-message')), `real workdir stages no fixtures and keeps only task code (artifacts live centrally): ${realFiles.join(',')}`);
   assert(!realFiles.includes('codex-last-message.md'), 'no legacy shared artifact may be created for a new run');
+  const realCentral = centralFor(realRunId);
+  assert(fs.existsSync(path.join(realCentral, expectedRealArtifact)),
+    `real run must own its central artifact: ${expectedRealArtifact}`);
+  assert(fs.readFileSync(path.join(realCentral, expectedRealArtifact), 'utf8').includes('realtask last message'),
+    'central artifact must carry the worker output');
+  const realRead = await callH2('delegation_read_result', { workspace_id: workspaceIdH2, run_id: realRunId });
+  assert(realRead.structuredContent.test_evidence.last_message.status === 'present' &&
+    realRead.structuredContent.test_evidence.last_message.path === expectedRealArtifact,
+    `read must surface the central artifact present: ${JSON.stringify(realRead.structuredContent.test_evidence.last_message)}`);
   assert(realTerminal.result?.stdoutTail?.includes('REALTASK-NO-FIXTURES'), 'worker must observe the fixture-free workdir');
   const shaOf = (s) => createHash('sha256').update(s ?? '', 'utf8').digest('hex');
   const firstSha = shaOf(realTerminal.result?.stdoutTail);

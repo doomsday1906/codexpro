@@ -491,8 +491,8 @@ process.env.CODEXPRO_CLAUDE_PROJECTS_DIR = clProjects;
   assert(bareEvidence.stdout.status === 'present' && bareEvidence.tests.status === 'unavailable',
     `shim: claude tails prove output presence only, tests never parsed: ${JSON.stringify(bareEvidence.stdout)}`);
   assert(bareEvidence.last_message.status === 'present' &&
-    /claude-last-message-[0-9a-f]{16}-attempt-\d+\.json/.test(bareEvidence.last_message.path ?? ''),
-    `shim: claude result binds the run-bound artifact: ${JSON.stringify(bareEvidence.last_message)}`);
+    /attempt-\d+-claude-last-message\.json/.test(bareEvidence.last_message.path ?? ''),
+    `shim: claude result binds the central artifact: ${JSON.stringify(bareEvidence.last_message)}`);
   assert(bareEvidence.diff.status === 'present' || bareEvidence.diff.status === 'unavailable',
     'shim: claude coverage fields must report explicitly');
   assert(readBare.structuredContent.execution_provenance.binary_overridden === true,

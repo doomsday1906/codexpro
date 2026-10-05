@@ -282,6 +282,28 @@ const ocCounter = await fake('opencode',
   `if [ "$1" = "--version" ]; then echo "opencode v2.0.22"; exit 0; fi\nif [ "$1" != "run" ]; then exit 1; fi\nCTR=${counterFile}\nn=$(cat "$CTR" 2>/dev/null || echo 0)\nn=$((n + 1))\necho "$n" > "$CTR"\necho "OUTPUT-MARKER-$n"\nexit 0`);
 process.env.CODEXPRO_OPENCODE_BIN = ocCounter;
 const delegHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-ca-deleghome-'));
+
+// Central-storage assertion helper: locate the run's bridge dir by walking
+// the delegation home (bounded) for delegation-runs/<runId>.json.
+const centralFor = (runId) => {
+  const stack = [delegHome];
+  let guard = 0;
+  while (stack.length > 0 && guard < 512) {
+    guard += 1;
+    const dir = stack.pop();
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) { stack.push(full); continue; }
+      if (e.name === `${runId}.json` && path.basename(path.dirname(full)) === 'delegation-runs') {
+        return Store.centralArtifactsDirForRun(path.dirname(path.dirname(full)), runId);
+      }
+    }
+  }
+  throw new Error(`ASSERT: bridge dir not found for ${runId}`);
+};
+
 process.env.CODEXPRO_DELEGATION_DIR = delegHome;
 delete process.env.CODEXPRO_DELEGATION_LEGACY_BRIDGE;
 
@@ -386,11 +408,14 @@ const OC_TASK = 'Report readiness. Change nothing.';
   const runId = o1.structuredContent.run_id;
   await waitSettled(runId);
   const wd = path.join(wsRoot, 'ca-cont');
-  const a1Rel = Tools.lastMessageRelPathForAttempt('opencode', 1, runId);
+  const cdir = centralFor(runId);
+  const a1Rel = Tools.centralArtifactFileName('opencode', 1);
   assert(!fs.existsSync(path.join(wd, 'opencode-last-message.json')),
     'no legacy shared artifact may be created for a new run');
-  assert(fs.existsSync(path.join(wd, a1Rel)), `attempt 1 must persist its run-bound artifact: ${a1Rel}`);
-  const a1content = fs.readFileSync(path.join(wd, a1Rel), 'utf8');
+  assert(!fs.readdirSync(wd).some((f) => f.includes('last-message')),
+    `workdir keeps only task code, no durable artifacts: ${fs.readdirSync(wd).join(',')}`);
+  assert(fs.existsSync(path.join(cdir, a1Rel)), `attempt 1 must persist its central artifact: ${a1Rel}`);
+  const a1content = fs.readFileSync(path.join(cdir, a1Rel), 'utf8');
   assert(a1content.includes('OUTPUT-MARKER-'), `attempt 1 artifact must carry its marker: ${JSON.stringify(a1content)}`);
   const q = await call('delegation_followup', {
     workspace_id: wid, run_id: runId,
@@ -404,13 +429,13 @@ const OC_TASK = 'Report readiness. Change nothing.';
   assert(!a.isError && a.structuredContent.executed === true && a.structuredContent.attempt_n === 2,
     `answer must dispatch attempt 2: ${JSON.stringify(a.structuredContent)}`);
   await waitSettled(runId);
-  const a2Rel = Tools.lastMessageRelPathForAttempt('opencode', 2, runId);
+  const a2Rel = Tools.centralArtifactFileName('opencode', 2);
   assert(a2Rel !== a1Rel, 'continuation artifact must bind the new attempt number as well as the run');
-  assert(fs.existsSync(path.join(wd, a2Rel)), `attempt 2 must persist its OWN run-bound artifact path: ${a2Rel}`);
-  const a2content = fs.readFileSync(path.join(wd, a2Rel), 'utf8');
+  assert(fs.existsSync(path.join(cdir, a2Rel)), `attempt 2 must persist its OWN central artifact path: ${a2Rel}`);
+  const a2content = fs.readFileSync(path.join(cdir, a2Rel), 'utf8');
   assert(a2content.includes('OUTPUT-MARKER-') && a2content !== a1content,
     `attempt 2 artifact must carry only its own output: ${JSON.stringify(a2content)} vs ${JSON.stringify(a1content)}`);
-  assert(fs.readFileSync(path.join(wd, a1Rel), 'utf8') === a1content,
+  assert(fs.readFileSync(path.join(cdir, a1Rel), 'utf8') === a1content,
     'attempt 1 artifact must be untouched by attempt 2 (never overwritten)');
   const read = await call('delegation_read_result', { workspace_id: wid, run_id: runId });
   assert(!read.isError, 'read must succeed');
@@ -438,11 +463,11 @@ const OC_TASK = 'Report readiness. Change nothing.';
   await waitSettled(runId);
   assert(fs.statSync(path.join(preDir, 'opencode-last-message.json')).size === 0,
     'pre-existing empty artifact must stay empty (never a slot to fill)');
-  const ownRel = Tools.lastMessageRelPathForAttempt('opencode', 1, runId);
-  assert(ownRel !== 'opencode-last-message.json', 'the new attempt must bind its run, never the legacy shared name');
-  assert(fs.existsSync(path.join(preDir, ownRel)), `new attempt must write its own run-bound path: ${ownRel}`);
-  const ownContent = fs.readFileSync(path.join(preDir, ownRel), 'utf8');
-  assert(ownContent.includes('OUTPUT-MARKER-'), 'owned path must carry the worker output');
+  const ownRel = Tools.centralArtifactFileName('opencode', 1);
+  const cdir2 = centralFor(runId);
+  assert(fs.existsSync(path.join(cdir2, ownRel)), `new attempt must persist its own central artifact: ${ownRel}`);
+  const ownContent = fs.readFileSync(path.join(cdir2, ownRel), 'utf8');
+  assert(ownContent.includes('OUTPUT-MARKER-'), 'owned central artifact must carry the worker output');
   const read = await call('delegation_read_result', { workspace_id: wid, run_id: runId });
   assert(!read.isError, 'read must succeed');
   const lm = read.structuredContent.test_evidence.last_message;

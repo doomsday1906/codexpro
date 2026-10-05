@@ -24,8 +24,9 @@
 //   follow-up pointer; unknown run id is denied (foreign sessions rejected).
 // S6 uncertain delivery: hanging queue call -> steer_uncertain recorded as
 //   unknown; same-key retry replays unknown without redispatch.
-// S7 applied reconciliation: queued + worker output newer than queue time
-//   -> applied (worker-observable evidence only); older output stays queued.
+// S7 no auto-promotion: the engine emits no application-attesting event
+//   (observed 2026-10-05), so queued stays queued/unverified — including
+//   the deleted hypothetical shapes, which must never promote.
 //
 // No live model calls. Deterministic containment: mkdtemp roots, fixture
 // CODEX_HOME / agent dirs, fake binaries via CODEXPRO_*_BIN (all
@@ -59,18 +60,23 @@ const Tools = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationTool
   assert(r2.outcome === 'rejected', 'unknown-thread text on exit 0 must map rejected, never queued');
   const u = Engines.mapCodexQueueResult(null, '', '');
   assert(u.outcome === 'unknown', 'null exit (timeout/spawn failure) must map unknown, never duplicated');
-  // Trusted identity (Finding 3): validated startup type only; arbitrary
-  // keys, wrong types, and plaintext never qualify; conflicts are unknown.
+  // Trusted identity (observed 2026-10-05): ONLY type thread.started +
+  // ONLY key thread_id qualify; every unobserved spelling, nest, session
+  // family, and plaintext never qualifies; conflicts are unknown.
   assert(Engines.parseCodexThreadId('{"thread_id":"thr_abc123","type":"thread.started"}') === 'thr_abc123',
-    'JSON thread_id with validated startup type must parse');
-  assert(Engines.parseCodexThreadId('{"thread":{"id":"thr_jsonl-9"},"type":"session.started"}') === 'thr_jsonl-9',
-    'nested thread id with validated startup type must parse');
+    'JSON thread_id with the observed startup type must parse');
+  assert(Engines.parseCodexThreadId('{"thread":{"id":"thr_jsonl-9"},"type":"session.started"}') === null,
+    'unobserved session family + nest shape must NOT parse (deleted hypothetical)');
   assert(Engines.parseCodexThreadId('{"thread_id": "thr_abc123"}') === null,
-    'arbitrary JSON without a validated startup type must NOT parse (event-type check)');
+    'arbitrary JSON without the observed startup type must NOT parse (event-type check)');
   assert(Engines.parseCodexThreadId('{"id":"thr_bare","type":"thread.started"}') === null,
-    'bare generic id (no thread/session scope) must NOT parse, even with a valid type');
+    'bare generic id (no thread_id key) must NOT parse, even with a valid type');
   assert(Engines.parseCodexThreadId('{"thread_id":"thr_x","type":"message"}') === null,
     'wrong event type (message) must NOT yield identity');
+  assert(Engines.parseCodexThreadId('{"threadId":"thr_camel","type":"thread.started"}') === null,
+    'unobserved camelCase threadId must NOT parse (only observed thread_id qualifies)');
+  assert(Engines.parseCodexThreadId('{"thread_id":"thr_x","type":"turn.started"}') === null,
+    'lifecycle type turn.started must NOT yield identity (no thread identity in lifecycle lines)');
   assert(Engines.parseCodexThreadId('session id: 9f1e2d3c-4b5a-6789-abcd-ef0123456789') === null,
     'plain-text thread/session lines must NOT parse (no unstructured fallback)');
   assert(Engines.parseCodexThreadId('no identifiers here') === null, 'null is never synthesized');
@@ -87,35 +93,29 @@ const Tools = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationTool
   const realArgv = Engines.buildCodexRealArgv('P', 'prompt', '/tmp/x.md', { executionPolicy: 'read-only' });
   assert(realArgv.includes('--ephemeral') && !realArgv.includes('--json'),
     'ephemeral real-task argv stays without --json (steerable-only protocol)');
-  // Message-correlated evidence (Finding 1): validated type + same thread +
-  // same hash/key; plaintext/mtime/wrong-thread never correlate.
-  const hSlow = Tools.steeringMessageHash('slow down a little');
-  const goodLine = JSON.stringify({ type: 'codex.steering.received', threadId: 'thr_smoke001', messageHash: hSlow });
-  const corr = Engines.findSteeringCorrelation(goodLine, { threadId: 'thr_smoke001', messageHash: hSlow, steeringKey: 'k1' });
-  assert(corr && corr.matchedBy === 'messageHash' && corr.eventType === 'codex.steering.received',
-    'genuine correlation shape (validated type + same thread + same hash) must correlate');
-  assert(Engines.findSteeringCorrelation('slow down a little', { threadId: 'thr_smoke001', messageHash: hSlow, steeringKey: 'k1' }) === null,
-    'tails/plaintext alone must never correlate');
-  assert(Engines.findSteeringCorrelation(JSON.stringify({ type: 'message', threadId: 'thr_smoke001', messageHash: hSlow }), { threadId: 'thr_smoke001', messageHash: hSlow, steeringKey: 'k1' }) === null,
-    'wrong event type must never correlate');
-  assert(Engines.findSteeringCorrelation(goodLine, { threadId: 'thr_other', messageHash: hSlow, steeringKey: 'k1' }) === null,
-    'wrong thread must never correlate');
-  assert(Engines.findSteeringCorrelation(JSON.stringify({ type: 'codex.steering.received', threadId: 'thr_smoke001', messageHash: '0'.repeat(64) }), { threadId: 'thr_smoke001', messageHash: hSlow, steeringKey: 'k1' }) === null,
-    'unrelated hash must never correlate');
+  // Correlation shapes REMOVED 2026-10-05 (observed: the engine emits no
+  // delivery-attesting event; all four hypothetical types deleted): the
+  // symbols must not exist, and no worker output shape may promote.
+  assert(Engines.STEERING_CORRELATION_EVENT_TYPES === undefined,
+    'hypothetical correlation type allowlist must be deleted (no placeholders)');
+  assert(typeof Engines.findSteeringCorrelation === 'undefined' &&
+    typeof Engines.isSteeringCorrelationType === 'undefined',
+    'hypothetical correlation scanners must be deleted (no placeholders)');
   assert(Tools.steeringMessageHash('a') === Tools.steeringMessageHash('a') &&
     Tools.steeringMessageHash('a') !== Tools.steeringMessageHash('b'),
     'steering hash must be stable and content-sensitive');
   assert(Engines.CODEX_QUEUE_CAPABILITY.ephemeralSteerable === false &&
     /Queue a message for an existing session/.test(Engines.CODEX_QUEUE_CAPABILITY.inspected) &&
-    /UNPROVEN/.test(Engines.CODEX_QUEUE_CAPABILITY.queueDuringActiveVsAfterEnd ?? ''),
-    'codex capability must carry the inspected queue evidence + UNPROVEN during-active/after-end mark');
+    /OBSERVED 2026-10-05/.test(Engines.CODEX_QUEUE_CAPABILITY.queueDuringActiveVsAfterEnd ?? '') &&
+    /held-by-engine only/.test(Engines.CODEX_QUEUE_CAPABILITY.queueDuringActiveVsAfterEnd ?? ''),
+    'codex capability must carry the inspected queue evidence + OBSERVED mid-turn/post-end held semantics');
   assert(/no halt\/stop\/steer verb|no queue\/steer/.test(Engines.OPENCODE_STEER_CAPABILITY.inspected) &&
     /serve/.test(Engines.OPENCODE_STEER_CAPABILITY.inspected) &&
     /INCOMPLETE/.test(Engines.OPENCODE_STEER_CAPABILITY.blocker) &&
     /no queue\/steer\/message-inject verb/.test(Engines.CLAUDE_STEER_CAPABILITY.inspected) &&
     /INCOMPLETE/.test(Engines.CLAUDE_STEER_CAPABILITY.blocker),
     'opencode/claude capabilities must carry the inspected no-verb evidence (incl. serve/acp/api) + INCOMPLETE blockers');
-  console.log('ok: S1 unit (queue argv/mapping, strict thread identity, --json argv, message correlation, capability evidence)');
+  console.log('ok: S1 unit (queue argv/mapping, observed-only thread identity, --json argv, correlation removal, capability evidence)');
 }
 
 // ---------- fixtures ----------
@@ -400,13 +400,13 @@ let happyId = null;
   console.log('ok: S6 uncertain delivery recorded unknown (retry replays, never duplicates); settled refuses');
 }
 
-// ---------- S7: applied reconciliation needs genuine message correlation (Finding 1) ----------
-// mtime-only promotion is removed: unrelated output, ordinary completion
-// text, ignored messages, and later-attempt files NEVER promote. ONE
-// positive uses genuine message-correlated evidence: the provenance-bound
-// artifact content carries a validated correlation event (type + same
-// thread + same messageHash) on the same attempt. The shim emulates the
-// actual `exec --json` correlation shape here (labeled shim, not live).
+// ---------- S7: no adapter auto-promotion (observed 2026-10-05) ----------
+// The engine emits no application-attesting event (live --json carries only
+// thread/turn/item lifecycle), and the hypothetical correlation shapes are
+// deleted. reconcileSteeringApplied therefore never promotes: queued stays
+// queued/unverified across unrelated output, ordinary completion text, the
+// legacy hypothetical shape (must never promote even when present),
+// wrong-thread/wrong-hash shapes, later-attempt files, and unbound records.
 {
   const wdir = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-steer-applied-'));
   const RUN = 'run_aaaaaaaaaaaaaaaa';
@@ -426,61 +426,49 @@ let happyId = null;
     session: { engine: 'codex', resumable: false, observed: false, reason: 's', threadId: THREAD, threadEvidence: 't' },
     steering: [{ steeringKey: 'k', messageHash: HASH, messageChars: MSG.length, attemptN: 1, threadId: THREAD, status, createdAt: past, updatedAt: past, ...steeringExtra }]
   });
-  // NEGATIVE 1: unrelated output (no correlation object) never promotes,
-  // however recent its mtime.
+  // CASE 1: unrelated output never promotes, however recent its mtime.
   await fsp.writeFile(path.join(wdir, rel1), 'hello unrelated worker output\n');
   const neg1 = mk('queued', {});
   const n1 = Tools.reconcileSteeringApplied(neg1);
-  assert(n1.changed === false && neg1.steering[0].status === 'queued',
+  assert(n1.changed === false && neg1.steering[0].status === 'queued' && n1.applied.length === 0,
     'unrelated worker output must never promote queued->applied');
-  // NEGATIVE 2: ordinary completion text (plaintext echo of the message, no
-  // validated event type) never promotes — tails/plaintext alone never suffice.
+  // CASE 2: ordinary completion text (plaintext echo of the message, no
+  // structured event) never promotes.
   await fsp.writeFile(path.join(wdir, rel1), `done. note: ${MSG}\n`);
   const neg2 = mk('queued', {});
   const n2 = Tools.reconcileSteeringApplied(neg2);
   assert(n2.changed === false && neg2.steering[0].status === 'queued',
-    'ordinary completion text without a validated correlation event must never promote');
-  // NEGATIVE 3: ignored message (valid type but wrong hash) never promotes.
-  await fsp.writeFile(path.join(wdir, rel1), JSON.stringify({ type: 'codex.steering.received', threadId: THREAD, messageHash: '0'.repeat(64) }));
+    'ordinary completion text must never promote');
+  // CASE 3: the legacy hypothetical shape (deleted 2026-10-05) must NEVER
+  // promote even when present in the artifact with the right hash.
+  const legacyLine = JSON.stringify({ type: 'codex.steering.received', threadId: THREAD, messageHash: HASH });
+  await fsp.writeFile(path.join(wdir, rel1), `worker log line\n${legacyLine}\n`);
   const neg3 = mk('queued', {});
   const n3 = Tools.reconcileSteeringApplied(neg3);
   assert(n3.changed === false && neg3.steering[0].status === 'queued',
-    'a correlation event for a different message must never promote');
-  // NEGATIVE 4: later-attempt output never promotes an earlier record.
-  const corrLine = JSON.stringify({ type: 'codex.steering.received', threadId: THREAD, messageHash: HASH });
-  await fsp.writeFile(path.join(wdir, rel2), `${corrLine}\n`);
+    'the deleted hypothetical correlation shape must never promote, even with matching hash');
+  // CASE 4: later-attempt output never promotes an earlier record.
+  await fsp.writeFile(path.join(wdir, rel2), `${legacyLine}\n`);
   const neg4 = mk('queued', {}, [
     { n: 1, startedAt: past, state: 'completed', outputArtifact: { relPath: rel1, bytes: 5, created: false, provenance: 'worker' } },
-    { n: 2, startedAt: past, state: 'completed', outputArtifact: { relPath: rel2, bytes: corrLine.length, created: false, provenance: 'worker' } }
+    { n: 2, startedAt: past, state: 'completed', outputArtifact: { relPath: rel2, bytes: legacyLine.length, created: false, provenance: 'worker' } }
   ]);
-  // Record is attempt 1 but current attempt is 2 with correlation: no promote.
   await fsp.writeFile(path.join(wdir, rel1), 'unrelated attempt-1 output\n');
   const n4 = Tools.reconcileSteeringApplied(neg4);
   assert(n4.changed === false && neg4.steering[0].status === 'queued',
-    'later-attempt correlation must never promote an earlier-attempt record');
-  // NEGATIVE 5: wrong thread never promotes, even with the right hash.
-  await fsp.writeFile(path.join(wdir, rel1), JSON.stringify({ type: 'codex.steering.received', threadId: 'thr_other0001', messageHash: HASH }));
-  const neg5 = mk('queued', {});
+    'later-attempt output must never promote an earlier-attempt record');
+  // CASE 5: unbound legacy record never promotes.
+  const neg5 = mk('queued', { threadId: undefined });
+  delete neg5.steering[0].threadId;
   const n5 = Tools.reconcileSteeringApplied(neg5);
   assert(n5.changed === false && neg5.steering[0].status === 'queued',
-    'correlation on a different thread must never promote');
-  // NEGATIVE 6: legacy record without thread binding never promotes.
-  await fsp.writeFile(path.join(wdir, rel1), `${corrLine}\n`);
-  const neg6 = mk('queued', { threadId: undefined });
-  delete neg6.steering[0].threadId;
-  const n6 = Tools.reconcileSteeringApplied(neg6);
-  assert(n6.changed === false && neg6.steering[0].status === 'queued',
     'a record without thread binding must never promote (unverifiable)');
-  // POSITIVE (ONE): genuine message-correlated evidence on the same
-  // run+attempt+thread promotes with exact binding evidence. Shim-emulated
-  // `exec --json` correlation shape, labeled (not live proof).
-  await fsp.writeFile(path.join(wdir, rel1), `worker log line\n${corrLine}\n`);
-  const pos = mk('queued', {});
-  const p = Tools.reconcileSteeringApplied(pos);
-  assert(p.changed === true && pos.steering[0].status === 'applied' && pos.steering[0].appliedEvidence &&
-    pos.steering[0].appliedEvidence.includes(RUN) && pos.steering[0].appliedEvidence.includes(THREAD),
-    'genuine message-correlated evidence (same run+attempt+thread, validated type + hash) must promote with binding evidence');
-  console.log('ok: S7 applied only on genuine message correlation (5 negatives + 1 shim-emulated positive, mtime removed)');
+  // CASE 6: non-queued statuses are untouched (no applied manufacturing).
+  const done = mk('rejected', {});
+  const n6 = Tools.reconcileSteeringApplied(done);
+  assert(n6.changed === false && done.steering[0].status === 'rejected',
+    'rejected records must stay rejected (no status manufacturing)');
+  console.log('ok: S7 no adapter auto-promotion (queued stays queued/unverified; deleted hypothetical shapes never promote)');
 }
 
 // ---------- S8: idempotency bound — no silent eviction (Finding 2) ----------
@@ -567,40 +555,54 @@ let happyId = null;
   console.log('ok: S9 trusted identity retained across reads (ordinary launch->identity->steer, no injection; conflicts never overwrite by construction)');
 }
 
-// ---------- S10: capability deltas with UNPROVEN marks (Finding 4) ----------
+// ---------- S10: capability deltas with OBSERVED marks ----------
 {
-  assert(/UNPROVEN/.test(Engines.CODEX_QUEUE_CAPABILITY.queueDuringActiveVsAfterEnd ?? ''),
-    'codex queue-during-active vs after-end must stay UNPROVEN (help is silent; live proof not performed)');
+  assert(/OBSERVED 2026-10-05/.test(Engines.CODEX_QUEUE_CAPABILITY.queueDuringActiveVsAfterEnd ?? ''),
+    'codex queue mid-turn vs post-end must be OBSERVED (both held exit 0, no in-turn incorporation; queued means held-by-engine only)');
   for (const cap of [Engines.OPENCODE_STEER_CAPABILITY, Engines.CLAUDE_STEER_CAPABILITY]) {
     assert(cap.supported === false && /INCOMPLETE/.test(cap.blocker),
       `${cap.engine} steering must stay INCOMPLETE with a precise blocker`);
     assert(!/follow-up.*steer|steer.*follow-up/i.test(cap.blocker) || /never relabeled|separate/.test(cap.blocker),
       `${cap.engine} blocker must never relabel follow-up as steering`);
   }
-  console.log('ok: S10 capability deltas (codex queue semantics UNPROVEN; opencode/claude INCOMPLETE, follow-up never relabeled)');
+  console.log('ok: S10 capability deltas (codex queue semantics OBSERVED held-only; opencode/claude INCOMPLETE, follow-up never relabeled)');
 }
 
-// ---------- S11: storage hygiene — central records, bounded artifacts (Finding 5) ----------
+// ---------- S11: storage hygiene — record-consulting teardown ----------
 {
   const Store = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationStore.js')));
   const tdir = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-steer-hygiene-'));
+  const bridge = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-steer-bridge-'));
   const RUN = 'run_cccccccccccccccc';
   const short = RUN.slice(4);
-  // Owned run-bound artifacts + task code + foreign artifacts + fixtures.
-  await fsp.writeFile(path.join(tdir, `codex-last-message-${short}-attempt-1.md`), 'owned output\n');
-  await fsp.writeFile(path.join(tdir, `codex-last-message-${short}-attempt-1-x1.md`), 'owned fallback\n');
+  const centralFile = 'attempt-1-codex-last-message.md';
+  const centralDir = Store.centralArtifactsDirForRun(bridge, RUN);
+  await fsp.mkdir(centralDir, { recursive: true });
+  // Recorded owned central artifact + task code + foreign workdir file with
+  // the SAME run-bound shape (record authority decides, never the name).
+  await fsp.writeFile(path.join(centralDir, centralFile), 'owned central output\n');
   await fsp.writeFile(path.join(tdir, 'task-code.txt'), 'task code, must survive\n');
   await fsp.writeFile(path.join(tdir, 'fixture-a.txt'), 'fixture, must survive\n');
-  await fsp.writeFile(path.join(tdir, 'codex-last-message-deadbeefdeadbeef-attempt-1.md'), 'other run, must survive\n');
-  const victim = { runId: RUN, workdir: tdir };
-  const torn = Store.teardownRunArtifacts(victim);
-  assert(torn.removed.length === 2 && torn.removed.every((f) => f.includes(short)),
-    `teardown must remove exactly the owned run-bound files: ${JSON.stringify(torn)}`);
+  await fsp.writeFile(path.join(tdir, `codex-last-message-${short}-attempt-1.md`), 'foreign same-shape file, must survive (no record)\n');
+  const past = new Date().toISOString();
+  const victim = {
+    runId: RUN, workdir: tdir,
+    attempts: [{ n: 1, startedAt: past, state: 'completed', outputArtifact: { base: 'central', relPath: centralFile, bytes: 22, created: false, provenance: 'worker' } }]
+  };
+  const torn = Store.teardownRunArtifacts(bridge, victim);
+  assert(torn.removed.length === 1 && torn.removed[0] === `central:${centralFile}`,
+    `teardown must remove exactly the recorded central artifact: ${JSON.stringify(torn)}`);
+  assert(!fs.existsSync(path.join(centralDir, centralFile)), 'recorded central artifact must be torn down');
   assert(fs.existsSync(path.join(tdir, 'task-code.txt')), 'task code must survive teardown');
   assert(fs.existsSync(path.join(tdir, 'fixture-a.txt')), 'fixtures must survive teardown');
-  assert(fs.existsSync(path.join(tdir, 'codex-last-message-deadbeefdeadbeef-attempt-1.md')), 'other runs must survive teardown');
-  assert(!fs.existsSync(path.join(tdir, `codex-last-message-${short}-attempt-1.md`)), 'owned primary must be torn down');
-  console.log('ok: S11 storage hygiene (central records; teardown removes only exact run-bound artifacts, preserves task code/fixtures/other runs)');
+  assert(fs.existsSync(path.join(tdir, `codex-last-message-${short}-attempt-1.md`)), 'unrecorded same-shape workdir file must survive (record authority, never name resemblance)');
+  // Missing/corrupt records fail closed to no-delete with an explicit reason.
+  const bad1 = Store.teardownRunArtifacts(bridge, null);
+  const bad2 = Store.teardownRunArtifacts(bridge, { runId: 'bogus', workdir: tdir, attempts: [] });
+  const bad3 = Store.teardownRunArtifacts(bridge, { runId: RUN, workdir: tdir });
+  assert(bad1.removed.length === 0 && bad1.reason && bad2.removed.length === 0 && bad2.reason && bad3.removed.length === 0 && bad3.reason,
+    `missing/corrupt records must fail closed with explicit reasons: ${JSON.stringify([bad1, bad2, bad3])}`);
+  console.log('ok: S11 storage hygiene (record-consulting teardown: recorded central only; task code/fixtures/unrecorded survive; corrupt fails closed)');
 }
 
 for (const id of runningIds) await bestEffortCancel(id);
