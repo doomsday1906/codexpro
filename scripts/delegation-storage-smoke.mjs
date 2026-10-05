@@ -957,12 +957,23 @@ async function makeReceiver() {
     launchRun.attempts = [{ n: 1, startedAt: now, state: 'queued', summary: 'pending dispatch for request req-s4-launch (checkpoint req-s4-launch)' }];
     Store.saveDelegationRun(bridge, launchRun);
     const launchRetry = await call('delegation_launch', {
-      workspace_id: wsB, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 's4-launch-2',
+      workspace_id: wsB, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 's4-launch',
       task: 'Seeded launch task for uncertainty.', delegation_group: 'hestia-cli-canary',
       request_id: 'req-s4-launch', timeout_ms: 60000
     });
     assert(launchRetry.isError && launchRetry.structuredContent.error === 'launch_uncertain',
       `initial-launch pid-less + marker must fail closed, got ${JSON.stringify(launchRetry.structuredContent)}`);
+    // A different canonical workdir under the same request id is a
+    // conflicting re-use (workdir IS request identity), never an uncertainty
+    // retry: it must refuse without spawning and without consuming anything.
+    const launchWrongWd = await call('delegation_launch', {
+      workspace_id: wsB, engine: 'codex', profile: 'CODEX_SCOUT_FAST', workdir: 's4-launch-2',
+      task: 'Seeded launch task for uncertainty.', delegation_group: 'hestia-cli-canary',
+      request_id: 'req-s4-launch', timeout_ms: 60000
+    });
+    assert(launchWrongWd.isError && launchWrongWd.structuredContent.error === 'duplicate_conflicting' &&
+      launchWrongWd.structuredContent.run_id === launchRunId,
+      `same request id with a different workdir must conflict, got ${JSON.stringify(launchWrongWd.structuredContent)}`);
     const launchAfter = readJson(path.join(bridge, 'delegation-runs', `${launchRunId}.json`));
     assert(launchAfter.attempts.length === 1 && launchAfter.attempts[0].pid === undefined, 'uncertain launch retry must spawn NO worker');
   } finally {

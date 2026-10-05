@@ -5,7 +5,7 @@
  * Tools:
  *   delegation_launch      - launch one canary run (Codex Luna via
  *                            `codex exec --profile`; OpenCode via
- *                            `opencode run --model ... --format json`)
+ *                            `opencode run --standalone --model ... --format json`)
  *   delegation_list        - inspect/list runs (owner-scoped)
  *   delegation_read_result - authorized read + durable event replay + explicit ack
  *   delegation_followup    - real durable follow-up: structured questions move
@@ -90,36 +90,57 @@ import {
   type CheckpointShape,
   type DelegationAttempt,
   type DelegationRunRecord,
+  type DelegationEngine,
   type DelegationRunState,
   type DelegationSessionBinding,
   type DelegationStorageConfig
 } from "./delegationStore.js";
 import {
   buildCodexCanaryArgv,
+  buildCodexRealArgv,
   buildCodexResumeArgv,
+  buildClaudeArgv,
+  buildClaudeResumeArgv,
   buildFollowupPrompt,
+  buildLaunchPreview,
   buildOpenCodeCanaryArgv,
+  buildOpenCodeRealArgv,
   CANARY_FIXTURES,
   canaryPrompt,
   cancelOwnedTree,
+  captureWorkdirBaseline,
   clampCanaryTimeout,
   clampRealTaskTimeout,
-  CODEX_RESUME_CAPABILITY,
+  CLAUDE_RESUME_CAPABILITY,
+  classifyCodexFailure,
   codexHomeDir,
   collectOwnedTree,
-  describeOpenCodeDiscovery,
+  collectWorkdirEvidence,
+  CODEX_RESUME_CAPABILITY,
+  engineQualification,
+  findPostCancelWrites,
+  isClaudeSessionId,
   isEngineSessionId,
   isProcessIdentityAlive,
+  newClaudeSessionId,
+  OPENCODE_CANCEL_CAPABILITY,
   OPENCODE_RESUME_CAPABILITY,
   parseOpenCodeSessionId,
+  probeEngineCapability,
   readProcessStartTime,
+  resolveClaudeBinary,
   resolveOpenCodeBinary,
   sha256File,
   signalOwnedTree,
-  verifyLunaProfile,
-  verifyOpenCodeModel,
+  snapshotWorkdirMtimes,
+  verifyClaudeLaunch,
+  verifyClaudeSession,
+  verifyCodexLaunch,
+  verifyOpenCodeLaunch,
   verifyOpenCodeSession,
-  waitForSpawn
+  waitForSpawn,
+  type PostCancelWrites,
+  type WorkdirBaseline
 } from "./delegationEngines.js";
 import {
   deliverEventToSubscription,
@@ -160,6 +181,75 @@ export interface DelegationToolDef {
 
 const READ_ONLY = { readOnlyHint: true, openWorldHint: false, destructiveHint: false };
 const DESTRUCTIVE = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
+
+/** Post-cancel quiescence grace: bounded wait before the no-further-writes probe. */
+const QUIESCENCE_GRACE_MS = 1500;
+/**
+ * Post-cancel verification window: a SECOND observation leg after the grace.
+ * A single quiet 1.5s interval alone is insufficient (a slow-dying worker can
+ * outlast it), so cancellation verifies quiescence across grace + window
+ * (two probes against cancel-complete) plus an owned-tree liveness recheck.
+ */
+const QUIESCENCE_VERIFY_WINDOW_MS = 2000;
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Merge two post-cancel quiescence legs (grace leg + verification-window
+ * leg, both compared against cancel-complete). BOTH legs must verify;
+ * continued writes union (bounded at 50, oldest legs first). An unverifiable
+ * leg fails the merge closed (checked false, never a clean-halt claim).
+ * Exported for the focused regression proof.
+ */
+export function mergeQuiescenceLegs(first: PostCancelWrites, second: PostCancelWrites, limit = 50): PostCancelWrites {
+  const checked = first.checked && second.checked;
+  const seen = new Set<string>();
+  const continued: string[] = [];
+  let truncated = false;
+  for (const entry of [...first.continued, ...second.continued]) {
+    if (seen.has(entry)) continue;
+    seen.add(entry);
+    if (continued.length >= limit) {
+      truncated = true;
+      break;
+    }
+    continued.push(entry);
+  }
+  if (first.truncated || second.truncated) truncated = true;
+  if (!checked) {
+    return { continued, truncated, checked, reason: first.reason ?? second.reason ?? "quiescence unverifiable" };
+  }
+  return { continued, truncated, checked };
+}
+
+/**
+ * OpenCode execution-route label for honest evidence. New runs record
+ * "standalone" (private server per turn); run files that predate the route
+ * field are "shared-service" (background service) and are never silently
+ * converted (legacy true carries the explicit note). Non-opencode runs are
+ * "n/a". Exported for the focused regression proof.
+ */
+export function opencodeExecutionRoute(run: DelegationRunRecord): { route: string; legacy: boolean } {
+  if (run.engine !== "opencode") return { route: "n/a", legacy: false };
+  if (run.opencodeRoute) return { route: run.opencodeRoute, legacy: false };
+  return { route: "shared-service", legacy: true };
+}
+
+/**
+ * Post-cancel owned-tree liveness recheck: after the quiescence window, the
+ * exact PID+starttime-verified owned tree must be gone. Returns the still-
+ * owned PIDs (empty when the tree is gone or the root never had a pid).
+ * Never broadens beyond the exact owned tree. Exported for the focused
+ * regression proof.
+ */
+export function recheckOwnedTreeGone(pid: number | undefined, startTime: string | undefined): number[] {
+  if (pid === undefined) return [];
+  const recheck = collectOwnedTree(pid, startTime);
+  if (recheck.staleRoot) return [];
+  return recheck.members.filter((member) => readProcessStartTime(member) === recheck.baselines.get(member));
+}
 
 function okResult(text: string, structured: Record<string, unknown>): any {
   return { content: [{ type: "text", text }], structuredContent: structured };
@@ -230,6 +320,394 @@ function fixtureSourceDir(): string {
 function resolveCodexBinary(): string {
   const explicit = String(process.env.CODEXPRO_CODEX_BIN ?? "").trim();
   return explicit || "codex";
+}
+
+/**
+ * Binary provenance for honest evidence: true when a CODEXPRO_*_BIN override
+ * selected the worker executable at launch. Test shims ride this override
+ * route, so overridden runs are never live proof (the read path says so);
+ * default-PATH runs carry no shim marker.
+ */
+function engineBinaryOverridden(engine: DelegationLaunchEngine): boolean {
+  const name = engine === "codex" ? "CODEXPRO_CODEX_BIN" : engine === "opencode" ? "CODEXPRO_OPENCODE_BIN" : "CODEXPRO_CLAUDE_BIN";
+  return Boolean(String(process.env[name] ?? "").trim());
+}
+
+type DelegationLaunchEngine = "codex" | "opencode" | "claude";
+
+interface GatedLaunchPlan {
+  engine: DelegationLaunchEngine;
+  isCanary: boolean;
+  delegationGroup: string;
+  taskText: string;
+  prompt: string;
+  profile: string;
+  model: string;
+  agent: string;
+  /** Explicit session id from the caller (opencode ses-id or claude UUID), or "". */
+  requestedSessionId: string;
+  executionPolicy: string;
+  permissionMode: string;
+  effort: string;
+  allowedTools: string;
+  disallowedTools: string;
+  configOverrides: string[];
+  /**
+   * Separate explicit per-run opt-in to
+   * --dangerously-bypass-approvals-and-sandbox (codex only; only meaningful
+   * with explicit execution_policy danger-full-access; the sandbox alone
+   * never implies it).
+   */
+  bypassApprovals: boolean;
+  timeoutMs: number;
+  timeoutClamped: boolean;
+  gateReason: string;
+  gateEvidence: Record<string, unknown>;
+  configuredModel: string | null;
+  configuredEffort: string | null;
+  modelExplicit: boolean;
+  effortExplicit: boolean;
+  permissionExplicit: boolean;
+  executable: string;
+}
+
+type GateOutcome =
+  | { ok: true; plan: GatedLaunchPlan }
+  | { ok: false; text: string; structured: Record<string, unknown> };
+
+/**
+ * Shared launch gate for delegation_launch AND delegation_preview (dry-run).
+ * Pure apart from definition-file reads and the timeout clamp: no workdir
+ * creation, no run record, no spawn. Per-engine rules:
+ * - codex: legacy canary keeps the Luna read-only gate; real tasks verify
+ *   the SELECTED profile (exists, non-Astra, resolvable sandbox) with an
+ *   explicit-or-profile execution policy. `model` is an explicit -m override
+ *   only; `config_overrides` are explicit -c entries only.
+ * - opencode: legacy canary keeps the host-model equality gate (agent
+ *   optional, preserved for back-compat); real tasks require the SELECTED
+ *   agent by real name plus an explicit model. No Codex flag translation.
+ * - claude: real tasks only (the legacy read-only canary slice is
+ *   codex/opencode); the agent must exist by real name; --model/--effort/
+ *   --permission-mode/--allowedTools ride ONLY when explicitly passed.
+ * Refusals never substitute another engine, model, or permission.
+ */
+function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
+  const engine = args.engine as string;
+  if (engine !== "codex" && engine !== "opencode" && engine !== "claude") {
+    return {
+      ok: false,
+      text: `Unknown engine ${JSON.stringify(String(args.engine))}: must be codex|opencode|claude (never substituted).`,
+      structured: { error: "unknown_engine" }
+    };
+  }
+  const rawGroup = String(args.delegation_group ?? "").trim();
+  const delegationGroup = rawGroup || DELEGATION_GROUP_DEFAULT;
+  if (!isDelegationGroupId(delegationGroup)) {
+    return {
+      ok: false,
+      text: `Invalid delegation_group ${JSON.stringify(rawGroup || delegationGroup)}: must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/ within 64 chars.`,
+      structured: { error: "invalid_delegation_group" }
+    };
+  }
+  let taskText = "";
+  let isCanary = true;
+  if (args.task !== undefined) {
+    const rawTask = String(args.task ?? "");
+    if (rawTask.length > DELEGATION_BOUNDS.maxTaskChars) {
+      return {
+        ok: false,
+        text: `task exceeds ${DELEGATION_BOUNDS.maxTaskChars} chars (${rawTask.length}); narrow the task and retry.`,
+        structured: { error: "task_too_large", task_chars: rawTask.length }
+      };
+    }
+    taskText = sanitizeTaskText(rawTask);
+    if (!taskText) {
+      return {
+        ok: false,
+        text: "task is empty after control-strip; supply real worker input or omit task with canary=true.",
+        structured: { error: "task_empty" }
+      };
+    }
+    isCanary = false;
+  }
+  if (isCanary && args.canary !== true) {
+    return {
+      ok: false,
+      text: "Without a task, this leaf supports only the read-only canary slice: pass canary=true or supply task.",
+      structured: { error: "non_canary_rejected" }
+    };
+  }
+  if (isCanary && engine === "claude") {
+    return {
+      ok: false,
+      text: "Engine claude supports real tasks only: supply task (the legacy read-only canary slice is codex/opencode, whose read-only gates do not apply to claude).",
+      structured: { error: "canary_unsupported_for_engine", engine }
+    };
+  }
+  const prompt = isCanary ? canaryPrompt(CANARY_FIXTURES) : taskText;
+  const timeoutMs = isCanary ? clampCanaryTimeout(args.timeout_ms) : clampRealTaskTimeout(args.timeout_ms);
+  const requestedTimeout = Number(args.timeout_ms);
+  const timeoutClamped = args.timeout_ms === undefined ||
+    !Number.isFinite(requestedTimeout) ||
+    Math.floor(requestedTimeout) !== timeoutMs;
+  const base: Omit<GatedLaunchPlan,
+    "profile" | "model" | "agent" | "requestedSessionId" | "executionPolicy" |
+    "permissionMode" | "effort" | "allowedTools" | "disallowedTools" | "configOverrides" |
+    "bypassApprovals" |
+    "gateReason" | "gateEvidence" | "configuredModel" | "configuredEffort" |
+    "modelExplicit" | "effortExplicit" | "permissionExplicit" | "executable"> = {
+    engine, isCanary, delegationGroup, taskText, prompt,
+    timeoutMs, timeoutClamped
+  };
+  if (engine === "codex") {
+    const gate = verifyCodexLaunch(codexHomeDir(), String(args.profile ?? ""), {
+      isCanary,
+      delegationGroup,
+      executionPolicy: args.execution_policy,
+      modelOverride: args.model,
+      configOverrides: args.config_overrides
+    });
+    if (!gate.allowed) {
+      return {
+        ok: false,
+        text: `${gate.gateKind === "luna" ? "Luna profile gate" : "Codex profile gate"} refused launch: ${gate.reason}`,
+        structured: { error: gate.code, configured: gate.configured }
+      };
+    }
+    const profile = String(args.profile ?? "").trim();
+    // --dangerously-bypass-approvals-and-sandbox is NEVER implied by the
+    // sandbox: it rides only with a separate explicit per-run opt-in
+    // (bypass_approvals=true) PLUS explicit execution_policy
+    // danger-full-access. Anything else refuses (including the canary slice).
+    const bypassApprovals = args.bypass_approvals === true;
+    if (bypassApprovals && isCanary) {
+      return {
+        ok: false,
+        text: "bypass_approvals is refused for the legacy canary slice (read-only; the bypass flag never rides a canary run).",
+        structured: { error: "bypass_refused_for_canary" }
+      };
+    }
+    const explicitPolicy = typeof args.execution_policy === "string" ? args.execution_policy.trim() : "";
+    if (bypassApprovals && explicitPolicy !== "danger-full-access") {
+      return {
+        ok: false,
+        text: "bypass_approvals=true requires explicit execution_policy danger-full-access: the sandbox alone never implies --dangerously-bypass-approvals-and-sandbox (sandbox != bypass).",
+        structured: { error: "bypass_requires_danger" }
+      };
+    }
+    return {
+      ok: true,
+      plan: {
+        ...base,
+        profile,
+        model: gate.modelOverride ?? "",
+        agent: "",
+        requestedSessionId: "",
+        executionPolicy: gate.executionPolicy as string,
+        permissionMode: "",
+        effort: "",
+        allowedTools: "",
+        disallowedTools: "",
+        configOverrides: gate.configOverrides ?? [],
+        bypassApprovals,
+        gateReason: gate.reason,
+        gateEvidence: {
+          model_configured: gate.configured.model,
+          reasoning_configured: gate.configured.reasoningEffort,
+          sandbox_configured: gate.configured.sandboxMode,
+          execution_policy: gate.executionPolicy,
+          ...(gate.effectiveModel ? { model_effective: gate.effectiveModel } : {}),
+          ...(gate.effectiveEffort ? { effort_effective: gate.effectiveEffort } : {}),
+          gate: gate.gateKind,
+          ...(gate.modelOverride ? { model_override: gate.modelOverride } : {}),
+          ...(gate.configOverrides?.length ? { config_overrides: gate.configOverrides } : {}),
+          ...(bypassApprovals ? { bypass_approvals: true as const } : {})
+        },
+        configuredModel: gate.configured.model ?? null,
+        configuredEffort: gate.configured.reasoningEffort ?? null,
+        modelExplicit: Boolean(gate.modelOverride),
+        effortExplicit: false,
+        permissionExplicit: false,
+        executable: resolveCodexBinary()
+      }
+    };
+  }
+  if (engine === "opencode") {
+    const gate = verifyOpenCodeLaunch({
+      model: args.model,
+      agent: args.agent,
+      isCanary,
+      delegationGroup
+    });
+    if (!gate.allowed) {
+      return {
+        ok: false,
+        text: `OpenCode launch gate refused: ${gate.reason}`,
+        structured: {
+          error: gate.code,
+          host_model: gate.hostModel ?? null,
+          requested_model: gate.requestedModel ?? null
+        }
+      };
+    }
+    const requestedSessionId = String(args.session_id ?? "").trim();
+    if (requestedSessionId && !isEngineSessionId(requestedSessionId)) {
+      return {
+        ok: false,
+        text: "session_id must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.",
+        structured: { error: "invalid_session_id" }
+      };
+    }
+    return {
+      ok: true,
+      plan: {
+        ...base,
+        profile: "",
+        model: gate.requestedModel as string,
+        agent: gate.agent?.name ?? "",
+        requestedSessionId,
+        executionPolicy: "",
+        permissionMode: "",
+        effort: "",
+        allowedTools: "",
+        disallowedTools: "",
+        configOverrides: [],
+        bypassApprovals: false,
+        gateReason: gate.reason,
+        gateEvidence: {
+          model_verified: gate.requestedModel,
+          host_model: gate.hostModel,
+          host_equality_enforced: gate.hostEqualityEnforced,
+          ...(gate.agent ? { agent: gate.agent.name } : {})
+        },
+        configuredModel: gate.hostModel,
+        configuredEffort: null,
+        modelExplicit: true,
+        effortExplicit: false,
+        permissionExplicit: false,
+        executable: resolveOpenCodeBinary()
+      }
+    };
+  }
+  const gate = verifyClaudeLaunch({
+    agent: args.agent,
+    model: args.model,
+    effort: args.effort,
+    permissionMode: args.permission_mode,
+    allowedTools: args.allowed_tools,
+    disallowedTools: args.disallowed_tools
+  });
+  if (!gate.allowed) {
+    return {
+      ok: false,
+      text: `Claude launch gate refused: ${gate.reason}`,
+      structured: { error: gate.code, agent: String(args.agent ?? "") }
+    };
+  }
+  const requestedSessionId = String(args.session_id ?? "").trim();
+  if (requestedSessionId && !isClaudeSessionId(requestedSessionId)) {
+    return {
+      ok: false,
+      text: "session_id for engine claude must be a UUID (the --session-id contract).",
+      structured: { error: "invalid_session_id", engine }
+    };
+  }
+  const model = typeof args.model === "string" ? args.model.trim() : "";
+  const effort = typeof args.effort === "string" ? args.effort.trim() : "";
+  const permissionMode = typeof args.permission_mode === "string" ? args.permission_mode.trim() : "";
+  return {
+    ok: true,
+    plan: {
+      ...base,
+      profile: "",
+      model,
+      agent: gate.agent?.name ?? "",
+      requestedSessionId,
+      executionPolicy: "",
+      permissionMode,
+      effort,
+      allowedTools: typeof args.allowed_tools === "string" ? args.allowed_tools.trim() : "",
+      disallowedTools: typeof args.disallowed_tools === "string" ? args.disallowed_tools.trim() : "",
+      configOverrides: [],
+      bypassApprovals: false,
+      gateReason: gate.reason,
+      gateEvidence: {
+        agent: gate.agent?.name,
+        model_effective: gate.effectiveModel,
+        effort_effective: gate.effectiveEffort,
+        model_explicit: gate.modelExplicit,
+        effort_explicit: gate.effortExplicit,
+        permission_explicit: gate.permissionExplicit,
+        ...(permissionMode ? { permission_mode: permissionMode } : { permission_mode_inherited: true })
+      },
+      configuredModel: gate.effectiveModel,
+      configuredEffort: gate.effectiveEffort,
+      modelExplicit: gate.modelExplicit,
+      effortExplicit: gate.effortExplicit,
+      permissionExplicit: gate.permissionExplicit,
+      executable: resolveClaudeBinary()
+    }
+  };
+}
+
+/**
+ * Build the dispatch argv for a gated plan. Codex uses the canary argv for
+ * the legacy slice and the real-task argv (profile + adjudicated sandbox)
+ * otherwise; opencode uses the canary argv only for the agent-less legacy
+ * slice; claude always uses its explicit-flag argv. Flags are never shared
+ * across engines.
+ */
+function buildPlannedArgv(plan: GatedLaunchPlan, prompt: string, lastMessagePath: string, sessionId?: string): string[] {
+  if (plan.engine === "codex") {
+    if (plan.isCanary) return buildCodexCanaryArgv(plan.profile, prompt, lastMessagePath);
+    return buildCodexRealArgv(plan.profile, prompt, lastMessagePath, {
+      executionPolicy: plan.executionPolicy as "read-only" | "workspace-write" | "danger-full-access",
+      ...(plan.model ? { modelOverride: plan.model } : {}),
+      ...(plan.configOverrides.length > 0 ? { configOverrides: plan.configOverrides } : {}),
+      ...(plan.bypassApprovals ? { dangerBypassExplicit: true as const } : {})
+    });
+  }
+  if (plan.engine === "opencode") {
+    if (!plan.agent) return buildOpenCodeCanaryArgv(plan.model, prompt, sessionId);
+    return buildOpenCodeRealArgv({ model: plan.model, agent: plan.agent, prompt, ...(sessionId ? { sessionId } : {}) });
+  }
+  return buildClaudeArgv({
+    agent: plan.agent,
+    prompt,
+    ...(plan.modelExplicit && plan.model ? { model: plan.model } : {}),
+    ...(plan.effortExplicit && plan.effort ? { effort: plan.effort } : {}),
+    ...(plan.permissionExplicit && plan.permissionMode ? { permissionMode: plan.permissionMode } : {}),
+    ...(plan.allowedTools ? { allowedTools: plan.allowedTools } : {}),
+    ...(plan.disallowedTools ? { disallowedTools: plan.disallowedTools } : {}),
+    ...(sessionId ? { sessionId } : {})
+  });
+}
+
+function launchCodexReal(
+  deps: DelegationToolDeps,
+  bridgeDir: string,
+  run: DelegationRunRecord,
+  plan: GatedLaunchPlan,
+  timeoutMs: number,
+  prompt: string,
+  isCanary: boolean
+): ChildProcess {
+  const lastMessagePath = path.join(run.workdir, "codex-last-message.md");
+  return spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildPlannedArgv(plan, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary);
+}
+
+function launchOpenCodeReal(
+  deps: DelegationToolDeps,
+  bridgeDir: string,
+  run: DelegationRunRecord,
+  plan: GatedLaunchPlan,
+  timeoutMs: number,
+  prompt: string,
+  isCanary: boolean,
+  sessionId?: string
+): ChildProcess {
+  const lastMessagePath = path.join(run.workdir, "opencode-last-message.json");
+  return spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(), buildPlannedArgv(plan, prompt, lastMessagePath, sessionId), timeoutMs, lastMessagePath, isCanary);
 }
 
 /** Live child handles for this process. Files stay the durable authority. */
@@ -502,7 +980,7 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
         resumable: true,
         observed: true,
         evidence: "session id observed in worker --format json stdout (shape best-effort); liveness verified at continuation time via session list/export before any resumed label",
-        reason: "session id observed in worker --format json stdout (shape best-effort); resume via opencode run --session"
+        reason: "session id observed in worker --format json stdout (shape best-effort); resume via opencode run --standalone --session"
       };
     } else if (!run.session?.sessionId) {
       run.session = {
@@ -511,6 +989,32 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
         reason: "no session id observed in worker stdout; follow-up starts a labeled new-continuation-attempt"
       };
     }
+  }
+  // Bounded output artifact: the opencode/claude CLIs (unlike codex
+  // --output-last-message) write no durable last-message file, so the
+  // promised bounded artifact is persisted here from the retained live
+  // stdout buffer (newest up to the 64KiB live cap). Best-effort and never
+  // throwing: an absent artifact stays explicitly unavailable in read
+  // evidence (never an implied pass), and output beyond the retained tail
+  // is reported via the stdoutTruncated flag below. Never overwrites a file
+  // the worker wrote itself.
+  if (live && (run.engine === "opencode" || run.engine === "claude")) {
+    try {
+      let absent = false;
+      try {
+        const stat = fs.statSync(live.lastMessagePath);
+        absent = !stat.isFile() || stat.size === 0;
+      } catch {
+        absent = true;
+      }
+      if (absent) {
+        const retained = Buffer.concat(live.stdoutChunks).toString("utf8");
+        if (retained) {
+          fs.mkdirSync(path.dirname(live.lastMessagePath), { recursive: true, mode: 0o700 });
+          fs.writeFileSync(live.lastMessagePath, retained, { encoding: "utf8", mode: 0o600 });
+        }
+      }
+    } catch { /* artifact stays unavailable; read evidence says so */ }
   }
   let state = final.state;
   let summary = summarizeTerminal(final.state, final.exitCode, final.timedOut);
@@ -539,6 +1043,14 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
     summary: sanitizeSummary(summary),
     stdoutTail: live ? tailText(live.stdoutChunks, DELEGATION_BOUNDS.maxTailBytes) : undefined,
     stderrTail: live ? tailText(live.stderrChunks, DELEGATION_BOUNDS.maxTailBytes) : undefined,
+    // Explicit truncation flags: the live 64KiB cap keeps the newest bytes;
+    // the 8KiB tail bound keeps the newest tail. A true flag means older
+    // output exists beyond what is shown; larger evidence rides the run
+    // workdir (last-message files) through the ordinary read route.
+    ...(live ? {
+      stdoutTruncated: live.stdoutBytes > DELEGATION_BOUNDS.maxTailBytes,
+      stderrTruncated: live.stderrBytes > DELEGATION_BOUNDS.maxTailBytes
+    } : {}),
     ...(fixturesUnchanged === undefined ? {} : { fixturesUnchanged })
   };
   enqueueTerminalEvent(run, loadSubscriptions(subscriptionAuthorityDirFor(deps.config)));
@@ -743,6 +1255,22 @@ function launchOpenCodeCanary(
   return spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(), buildOpenCodeCanaryArgv(model, prompt, sessionId), timeoutMs, lastMessagePath, isCanary);
 }
 
+function launchClaudeChild(
+  deps: DelegationToolDeps,
+  bridgeDir: string,
+  run: DelegationRunRecord,
+  argv: string[],
+  timeoutMs: number,
+  prompt: string,
+  isCanary: boolean
+): ChildProcess {
+  // Claude runs non-interactive (-p --output-format json): worker JSON goes
+  // to stdout (captured in the bounded live tails); the last-message path is
+  // recorded for evidence-route parity with the other engines.
+  const lastMessagePath = path.join(run.workdir, "claude-last-message.json");
+  return spawnCanaryChild(deps, bridgeDir, run, resolveClaudeBinary(), argv, timeoutMs, lastMessagePath, isCanary);
+}
+
 function launchCodexResume(
   deps: DelegationToolDeps,
   bridgeDir: string,
@@ -769,6 +1297,9 @@ function runSummary(run: DelegationRunRecord): Record<string, unknown> {
     is_canary: run.isCanary !== false,
     engine: run.engine,
     ...(run.profile ? { profile: run.profile } : {}),
+    ...(run.agent ? { agent: run.agent } : {}),
+    ...(run.executionPolicy ? { execution_policy: run.executionPolicy } : {}),
+    ...(run.permissionMode ? { permission_mode: run.permissionMode } : {}),
     ...(run.model ? { model: run.model } : {}),
     ...(run.session?.sessionId ? { session_id: run.session.sessionId } : {}),
     state: run.state,
@@ -803,19 +1334,184 @@ function publicSchemaFrom(runtimeSchema: z.ZodObject<any>): z.ZodObject<any> {
 const WORKSPACE_ID = z.string().min(1).max(128).describe("Explicit workspace id from open_workspace.");
 const RUN_ID = z.string().regex(/^run_[0-9a-f]{16}$/, "run_id must match the delegation run id grammar.");
 
+/**
+ * Honest worker-output evidence. Nonempty stdout/stderr tails prove OUTPUT
+ * PRESENCE ONLY, never that tests ran: worker output is not parsed for test
+ * results. Every artifact reports present/truncated/unavailable with an
+ * explicit reason; missing or empty evidence is labeled unavailable, never a
+ * pass. Exported for the focused regression proof.
+ */
+export type EvidenceArtifactStatus = "present" | "truncated" | "unavailable";
+
+export interface EvidenceArtifactReport {
+  status: EvidenceArtifactStatus;
+  truncated: boolean;
+  bytes?: number;
+  reason?: string;
+}
+
+export interface TestEvidenceReport {
+  exit_code: number | null;
+  timed_out: boolean;
+  stdout_tail_present: boolean;
+  stderr_tail_present: boolean;
+  stdout_truncated: boolean;
+  stderr_truncated: boolean;
+  unavailable: boolean;
+  unavailable_reason?: string;
+  stdout: EvidenceArtifactReport;
+  stderr: EvidenceArtifactReport;
+  diff: EvidenceArtifactReport;
+  last_message: EvidenceArtifactReport & { path?: string };
+  tests: EvidenceArtifactReport;
+  output_note: string;
+}
+
+/** Engine last-message filename (durable output artifact in the run workdir). */
+export function lastMessageRelPath(engine: DelegationEngine): string {
+  return engine === "codex"
+    ? "codex-last-message.md"
+    : engine === "opencode"
+      ? "opencode-last-message.json"
+      : "claude-last-message.json";
+}
+
+/**
+ * Describe the durable last-message artifact WITHOUT inlining it: presence,
+ * byte size, and — ONLY when the file exists — the relative path so the
+ * consumer reads it through the ordinary read route. A nonexistent file is
+ * reported as unavailable with a reason and NO path (never point at a
+ * last-message file that is not there). Empty or absent is explicitly
+ * unavailable, never a pass.
+ */
+export function describeLastMessageArtifact(
+  workdir: string,
+  engine: DelegationEngine
+): EvidenceArtifactReport & { path?: string } {
+  const rel = lastMessageRelPath(engine);
+  try {
+    const stat = fs.statSync(path.join(workdir, rel));
+    if (!stat.isFile()) return { status: "unavailable", truncated: false, reason: "last-message path exists but is not a file" };
+    if (stat.size === 0) return { status: "unavailable", truncated: false, bytes: 0, reason: "last-message file is empty" };
+    return { path: rel, status: "present", truncated: false, bytes: stat.size };
+  } catch {
+    return { status: "unavailable", truncated: false, reason: "last-message file absent (the worker wrote none); inspect the workdir through the ordinary read route" };
+  }
+}
+
+function tailArtifact(
+  tail: string | undefined,
+  truncated: boolean,
+  label: string
+): EvidenceArtifactReport {
+  const text = String(tail ?? "");
+  if (!text) {
+    return { status: "unavailable", truncated: false, reason: `no captured ${label} tail (worker produced none or the run has no terminal result)` };
+  }
+  if (truncated) {
+    return { status: "truncated", truncated: true, bytes: Buffer.byteLength(text, "utf8"), reason: `older ${label} output exists beyond the bounded tail; larger evidence rides the run workdir through the ordinary read route` };
+  }
+  return { status: "present", truncated: false, bytes: Buffer.byteLength(text, "utf8") };
+}
+
+export function buildTestEvidence(input: {
+  terminal: boolean;
+  state: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  stdoutTail?: string;
+  stderrTail?: string;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+  diffKind: "git" | "snapshot" | "unavailable";
+  diffReason?: string;
+  /** Changed-list bound (git status / snapshot slicing). */
+  diffTruncated?: boolean;
+  /** Content-fingerprint coverage bound (500-file limit hit). */
+  fingerprintsTruncated?: boolean;
+  /** Coverage-limit explanation (500-file / 256-KiB bounds). */
+  coverageReason?: string;
+  lastMessage: EvidenceArtifactReport & { path?: string };
+}): TestEvidenceReport {
+  const tailsPresent = Boolean((input.stdoutTail ?? "") || (input.stderrTail ?? ""));
+  const unavailable = !input.terminal || !tailsPresent;
+  return {
+    exit_code: input.exitCode,
+    timed_out: input.timedOut,
+    stdout_tail_present: Boolean(input.stdoutTail),
+    stderr_tail_present: Boolean(input.stderrTail),
+    stdout_truncated: input.stdoutTruncated,
+    stderr_truncated: input.stderrTruncated,
+    unavailable,
+    ...(unavailable
+      ? { unavailable_reason: !input.terminal ? `run is ${input.state}; no terminal worker evidence yet` : "worker produced no captured output tails" }
+      : {}),
+    stdout: tailArtifact(input.stdoutTail, input.stdoutTruncated, "stdout"),
+    stderr: tailArtifact(input.stderrTail, input.stderrTruncated, "stderr"),
+    diff: input.diffKind === "unavailable"
+      ? { status: "unavailable", truncated: false, reason: input.diffReason ?? "workdir change evidence unavailable" }
+      : (() => {
+        const truncated = Boolean(input.diffTruncated) || Boolean(input.fingerprintsTruncated);
+        const reasons: string[] = [];
+        if (input.diffTruncated) reasons.push("changed-file list hit its bound; older entries exist beyond what is shown");
+        if (input.coverageReason) reasons.push(input.coverageReason);
+        else if (input.fingerprintsTruncated) reasons.push("content fingerprints hit the 500-file bound; files beyond the bound are unattributed by content");
+        return truncated
+          ? { status: "present", truncated: true, reason: reasons.join("; ") }
+          : { status: "present", truncated: false };
+      })(),
+    last_message: input.lastMessage,
+    tests: {
+      status: "unavailable",
+      truncated: false,
+      reason: "worker output is not parsed for test results; a nonempty tail proves output presence only, never that tests ran — inspect the tails and the last-message file through the ordinary read route"
+    },
+    output_note: "nonempty stdout/stderr tails prove output presence only, never that tests ran"
+  };
+}
+
 export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[] {
   const launchArgs = z.object({
     workspace_id: WORKSPACE_ID.optional().describe("Workspace id. Omit to use the session-selected workspace."),
-    engine: z.enum(["codex", "opencode"]).describe("Engine adapter: codex via `codex exec --profile`, opencode via `opencode run --model ... --format json`. Flags are never shared across engines."),
-    profile: z.string().max(128).optional().describe("Explicit Codex profile name (required for engine codex; Luna-gated)."),
-    model: z.string().max(256).optional().describe("Explicit OpenCode model (required for engine opencode; must equal the host top-level model, never substituted)."),
-    session_id: z.string().max(128).optional().describe("Explicit OpenCode session id to continue-or-create via `run --session`. Omit to let the worker mint one (observed best-effort from --format json stdout). First use creates; resumed is claimed only after session list/export verification."),
-    task: z.string().max(9000).optional().describe("Real worker input (bounded to 8000 chars after control-strip, validated, never empty). Omit for the legacy read-only canary slice (requires canary=true)."),
+    engine: z.enum(["codex", "opencode", "claude"]).describe("Engine adapter: codex via `codex exec --profile`, opencode via `opencode run --standalone --model/--agent --format json` (private server per turn), claude via `-p --output-format json --agent`. Flags are never shared across engines and engines are never substituted."),
+    profile: z.string().max(128).optional().describe("Explicit Codex profile name by real name (required for engine codex; legacy canary Luna-gated, real tasks profile-gated)."),
+    agent: z.string().max(128).optional().describe("Explicit OpenCode/Claude agent name by real name (required for real tasks on opencode/claude; optional legacy canary on opencode; Codex profiles are never translated)."),
+    model: z.string().max(256).optional().describe("Engine model flag, explicit only: required for engine opencode (host-model equality is canary-only); codex -m override and claude --model only when explicitly passed (otherwise the profile/agent is inherited, never replaced)."),
+    effort: z.string().max(16).optional().describe("Explicit Claude --effort (low|medium|high|xhigh|max). Only when explicitly passed; otherwise the agent definition governs."),
+    permission_mode: z.string().max(32).optional().describe("Explicit Claude --permission-mode (acceptEdits|auto|bypassPermissions|manual|dontAsk|plan). Only when explicitly passed; bypassPermissions is explicit-only."),
+    allowed_tools: z.string().max(2048).optional().describe("Explicit Claude --allowedTools text. Only when explicitly passed."),
+    disallowed_tools: z.string().max(2048).optional().describe("Explicit Claude --disallowedTools text. Only when explicitly passed."),
+    execution_policy: z.string().max(32).optional().describe("Explicit Codex sandbox for real tasks (read-only|workspace-write|danger-full-access). Explicit wins over the profile; danger-full-access is explicit-only, never inherited or auto-escalated; refused for the legacy canary slice."),
+    bypass_approvals: z.boolean().optional().describe("Separate explicit per-run opt-in to --dangerously-bypass-approvals-and-sandbox (codex only). Honored ONLY with explicit execution_policy danger-full-access; the sandbox alone never implies it (sandbox != bypass); refused for the legacy canary slice."),
+    config_overrides: z.array(z.string().max(512)).max(8).optional().describe("Explicit Codex -c key=value overrides (bounded). Only when explicitly passed; refused for the legacy canary slice; keys that would set model/effort/sandbox/approval are protected and refused."),
+    session_id: z.string().max(128).optional().describe("Explicit session id: opencode ses-id continues-or-creates via `run --standalone --session`; claude UUID rides --session-id (first use creates) or --resume when verified. Omit to let the route mint one. First use creates; resumed is claimed only after verification."),
+    task: z.string().max(9000).optional().describe("Real worker input (bounded to 8000 chars after control-strip, validated, never empty). Omit for the legacy read-only canary slice (requires canary=true; codex/opencode only)."),
     delegation_group: z.string().max(64).optional().describe("Delegation group id (bounded, validated /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/; default hestia-cli-canary). Scopes subscription filters and events."),
     workdir: z.string().min(1).max(1024).describe("Explicit workspace-relative working directory for the disposable canary run."),
     request_id: z.string().min(1).max(128).optional().describe("Idempotency key. Repeating it returns the existing run without spawning a second worker."),
-    canary: z.boolean().optional().describe("Must be true when no task is supplied (legacy read-only canary slice). Ignored when task is present."),
+    canary: z.boolean().optional().describe("Must be true when no task is supplied (legacy read-only canary slice, codex/opencode only). Ignored when task is present."),
     timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms. Canary clamps to 5 minutes; real tasks clamp to 30 minutes; 10s minimum. The clamped value is truthfully acked.")
+  }).strict();
+
+  const previewArgs = z.object({
+    workspace_id: WORKSPACE_ID.optional().describe("Workspace id. Omit to use the session-selected workspace."),
+    engine: z.enum(["codex", "opencode", "claude"]).describe("Engine adapter to preview (never substituted)."),
+    profile: z.string().max(128).optional().describe("Explicit Codex profile name by real name."),
+    agent: z.string().max(128).optional().describe("Explicit OpenCode/Claude agent name by real name."),
+    model: z.string().max(256).optional().describe("Explicit model flag (opencode required; codex -m / claude --model only when explicitly passed)."),
+    effort: z.string().max(16).optional().describe("Explicit Claude --effort."),
+    permission_mode: z.string().max(32).optional().describe("Explicit Claude --permission-mode."),
+    allowed_tools: z.string().max(2048).optional().describe("Explicit Claude --allowedTools text."),
+    disallowed_tools: z.string().max(2048).optional().describe("Explicit Claude --disallowedTools text."),
+    execution_policy: z.string().max(32).optional().describe("Explicit Codex sandbox (read-only|workspace-write|danger-full-access)."),
+    bypass_approvals: z.boolean().optional().describe("Separate explicit per-run opt-in to --dangerously-bypass-approvals-and-sandbox (codex only; explicit danger-full-access required)."),
+    config_overrides: z.array(z.string().max(512)).max(8).optional().describe("Explicit Codex -c key=value overrides."),
+    session_id: z.string().max(128).optional().describe("Explicit session id (opencode ses-id or claude UUID)."),
+    task: z.string().max(9000).optional().describe("Real worker input (bounded, validated). Omit for the legacy read-only canary slice (requires canary=true; codex/opencode only)."),
+    delegation_group: z.string().max(64).optional().describe("Delegation group id (default hestia-cli-canary)."),
+    workdir: z.string().min(1).max(1024).describe("Explicit workspace-relative working directory that would host the run."),
+    canary: z.boolean().optional().describe("Must be true when no task is supplied (legacy read-only canary slice, codex/opencode only)."),
+    timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms (clamped + truthfully acked like launch).")
   }).strict();
 
   const listArgs = z.object({
@@ -879,7 +1575,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "delegation_launch",
       options: {
         title: "Delegation Launch",
-        description: "Launch one durable read-only delegation run (Codex via exec --profile with Luna gate; OpenCode via run --model with host-model gate). Real bounded task + validated delegation_group (default hestia-cli-canary), or the legacy canary slice (fixtures, canary=true). Requires an explicit workdir plus profile (codex) or model (opencode); idempotent request ids never spawn a second worker. Subscribe to events before launching or replay via delegation_read_result so fast completion never loses the result.",
+        description: "Launch one durable delegation run (Codex via exec --profile with Luna gate for the legacy canary / selected-profile gate + per-run execution policy for real tasks; OpenCode via run --model/--agent with host-model gate for the legacy canary / selected-agent + explicit model for real tasks; Claude via -p --output-format json --agent with explicit-flag-only overrides for real tasks only). Real bounded task + validated delegation_group (default hestia-cli-canary), or the legacy canary slice (fixtures, canary=true; codex/opencode only). Requires an explicit workdir plus profile (codex), model (+ agent for real tasks, opencode), or agent (claude); idempotent request ids never spawn a second worker. Prefer delegation_preview (dry-run) before dispatch. Subscribe to events before launching or replay via delegation_read_result so fast completion never loses the result.",
         inputSchema: publicSchemaFrom(launchArgs),
         runtimeInputSchema: launchArgs,
         annotations: DESTRUCTIVE
@@ -887,101 +1583,70 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       handler: async (args) => {
         const workspace = deps.workspaces.getWorkspace(args.workspace_id);
         const bridgeDir = bridgeDirFor(deps.config, workspace.root);
-        const engine = args.engine as "codex" | "opencode";
-        // Real task + delegation group (bounded, validated; default
-        // hestia-cli-canary). No hardcoded prompt or group: the worker input
-        // is the sanitized task, or the legacy canary prompt when no task is
-        // supplied (which still requires canary=true).
-        const rawGroup = String(args.delegation_group ?? "").trim();
-        const delegationGroup = rawGroup || DELEGATION_GROUP_DEFAULT;
-        if (!isDelegationGroupId(delegationGroup)) {
-          return failResult(`Invalid delegation_group ${JSON.stringify(rawGroup || delegationGroup)}: must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/ within 64 chars.`, { error: "invalid_delegation_group" });
-        }
-        let taskText = "";
-        let isCanary = true;
-        if (args.task !== undefined) {
-          const rawTask = String(args.task ?? "");
-          if (rawTask.length > DELEGATION_BOUNDS.maxTaskChars) {
-            return failResult(`task exceeds ${DELEGATION_BOUNDS.maxTaskChars} chars (${rawTask.length}); narrow the task and retry.`, { error: "task_too_large", task_chars: rawTask.length });
-          }
-          taskText = sanitizeTaskText(rawTask);
-          if (!taskText) {
-            return failResult("task is empty after control-strip; supply real worker input or omit task with canary=true.", { error: "task_empty" });
-          }
-          isCanary = false;
-        }
-        if (isCanary && args.canary !== true) {
-          return failResult("Without a task, this leaf supports only the read-only canary slice: pass canary=true or supply task.", { error: "non_canary_rejected" });
-        }
-        const prompt = isCanary ? canaryPrompt(CANARY_FIXTURES) : taskText;
-        let profile = "";
-        let model = "";
-        let sessionId: string | undefined;
-        let gateEvidence: Record<string, unknown> = {};
-        if (engine === "codex") {
-          profile = String(args.profile ?? "").trim();
-          if (!profile) {
-            return failResult("An explicit Codex profile is required for Luna delegation.", { error: "profile_required" });
-          }
-          const gate = verifyLunaProfile(codexHomeDir(), profile);
-          if (!gate.allowed) {
-            return failResult(`Luna profile gate refused launch: ${gate.reason}`, { error: "luna_gate_refused", configured: gate.configured });
-          }
-          gateEvidence = {
-            model_configured: gate.configured.model,
-            reasoning_configured: gate.configured.reasoningEffort,
-            sandbox_configured: gate.configured.sandboxMode
-          };
-        } else {
-          model = String(args.model ?? "").trim();
-          const discovery = describeOpenCodeDiscovery();
-          const gate = verifyOpenCodeModel(model || undefined, discovery.hostModel);
-          if (!gate.allowed) {
-            const code = !model
-              ? "model_required"
-              : !gate.hostModel
-                ? "opencode_host_model_unknown"
-                : "opencode_model_mismatch";
-            return failResult(`OpenCode model gate refused launch: ${gate.reason}`, {
-              error: code,
-              host_model: gate.hostModel ?? null,
-              requested_model: gate.requested ?? null
-            });
-          }
-          model = gate.requested as string;
-          const rawSession = String(args.session_id ?? "").trim();
-          if (rawSession) {
-            if (!isEngineSessionId(rawSession)) {
-              return failResult("session_id must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.", { error: "invalid_session_id" });
-            }
-            const holders = activeSessionHolders(listDelegationRuns(bridgeDir), rawSession);
-            if (holders.length > 0) {
-              return failResult(`Session ${rawSession} already has an active turn (${holders[0].runId}); one active turn per session.`, {
-                error: "session_busy",
-                session_id: rawSession,
-                holder_run_id: holders[0].runId
-              });
-            }
-            sessionId = rawSession;
-          }
-          gateEvidence = { model_verified: model, host_model: gate.hostModel };
-        }
+        const gated = gateLaunchRequest(args as Record<string, unknown>);
+        if (!gated.ok) return failResult(gated.text, gated.structured);
+        const plan = gated.plan;
+        const engine = plan.engine;
+        const delegationGroup = plan.delegationGroup;
+        const taskText = plan.taskText;
+        const isCanary = plan.isCanary;
+        const prompt = plan.prompt;
+        const profile = plan.profile;
+        const model = plan.model;
+        const agent = plan.agent;
+        const gateEvidence = plan.gateEvidence;
+        // Idempotency first: an exact replay (id lookup + conflict check)
+        // resolves BEFORE the active-session busy check, so an identical
+        // retry with the same request id and session replays instead of
+        // rejecting itself as session_busy. Only a genuinely new request id
+        // reaches the busy check below.
         const requestId = String(args.request_id ?? "").trim() ||
           `req_${createHash("sha256").update(`${Date.now()}:${process.pid}:${Math.random()}`).digest("hex").slice(0, 16)}`;
         const existing = findRunByRequestId(bridgeDir, requestId);
         if (existing) {
           if (!ownerAllowed(deps, existing)) return denyAccess();
-          // Same request id with different worker-input content is a
-          // conflicting re-use, not a replay: refuse without spawning a
-          // second worker and without consuming anything.
+          // Candidate canonical workdir for identity: the same request id
+          // with a different canonical directory is a conflicting re-use
+          // (duplicate_conflicting), never a replay of the old run. Resolve
+          // here (no mkdir, no side effect); an unresolvable candidate
+          // workdir fails closed as workdir_rejected (identity unprovable).
+          let candidateWorkdir: string;
+          try {
+            candidateWorkdir = deps.guard.resolve(workspace, String(args.workdir), { forWrite: true }).absPath;
+          } catch (error) {
+            return failResult(`Workdir rejected: ${error instanceof Error ? error.message : String(error)}`, { error: "workdir_rejected" });
+          }
+          // Same request id with different worker-input content (including
+          // a different canonical workdir) is a conflicting re-use, not a
+          // replay: refuse without spawning a second worker and without
+          // consuming anything.
           if (isLaunchRequestConflict(existing, {
             engine,
             delegationGroup,
             isCanary,
             ...(isCanary ? {} : { task: taskText }),
-            ...(engine === "codex" ? { profile } : { model, ...(sessionId ? { sessionId } : {}) })
+            workdir: candidateWorkdir,
+            ...(engine === "codex"
+              ? {
+                profile,
+                executionPolicy: plan.executionPolicy,
+                ...(plan.model ? { modelOverride: plan.model } : {}),
+                ...(plan.configOverrides.length > 0 ? { configOverrides: plan.configOverrides } : {}),
+                ...(plan.bypassApprovals ? { bypassApprovals: true as const } : {})
+              }
+              : engine === "opencode"
+                ? { model, ...(agent ? { agent } : {}), ...(plan.requestedSessionId ? { sessionId: plan.requestedSessionId } : {}) }
+                : {
+                  agent,
+                  ...(model ? { model } : {}),
+                  ...(plan.permissionMode ? { permissionMode: plan.permissionMode } : {}),
+                  ...(plan.effort ? { effort: plan.effort } : {}),
+                  ...(plan.allowedTools ? { allowedTools: plan.allowedTools } : {}),
+                  ...(plan.disallowedTools ? { disallowedTools: plan.disallowedTools } : {}),
+                  ...(plan.requestedSessionId ? { sessionId: plan.requestedSessionId } : {})
+                })
           })) {
-            return failResult(`Conflicting re-use of request ${requestId}: it already owns run ${existing.runId} with different task/group/model content. Relaunch only with a NEW request id. No second worker spawned.`, {
+            return failResult(`Conflicting re-use of request ${requestId}: it already owns run ${existing.runId} with different task/group/model/workdir content. Relaunch only with a NEW request id. No second worker spawned.`, {
               error: "duplicate_conflicting",
               run_id: existing.runId,
               request_id: requestId,
@@ -1022,6 +1687,25 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             run_id: existing.runId, request_id: requestId, state: existing.state, idempotent_replay: true, next_action: existing.nextAction
           });
         }
+        // Fresh request id only: one active turn per explicit session.
+        // Explicit session only: opencode ses-id or claude UUID. Claude mints
+        // a stable UUID when omitted (always passed via --session-id, so
+        // resume identity is deterministic); opencode omits the flag and the
+        // worker mints (observed best-effort).
+        let sessionId: string | undefined;
+        if (plan.requestedSessionId) {
+          const holders = activeSessionHolders(listDelegationRuns(bridgeDir), plan.requestedSessionId);
+          if (holders.length > 0) {
+            return failResult(`Session ${plan.requestedSessionId} already has an active turn (${holders[0].runId}); one active turn per session.`, {
+              error: "session_busy",
+              session_id: plan.requestedSessionId,
+              holder_run_id: holders[0].runId
+            });
+          }
+          sessionId = plan.requestedSessionId;
+        } else if (engine === "claude") {
+          sessionId = newClaudeSessionId();
+        }
         if (activeRuns(bridgeDir).length >= DELEGATION_BOUNDS.maxActiveRunsPerWorkspace) {
           return failResult(`Concurrency bound reached (${DELEGATION_BOUNDS.maxActiveRunsPerWorkspace} active runs). Wait for a run-attention event first.`, { error: "concurrency_bound" });
         }
@@ -1031,7 +1715,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         } catch (error) {
           return failResult(`Workdir rejected: ${error instanceof Error ? error.message : String(error)}`, { error: "workdir_rejected" });
         }
-        const timeoutMs = isCanary ? clampCanaryTimeout(args.timeout_ms) : clampRealTaskTimeout(args.timeout_ms);
+        const timeoutMs = plan.timeoutMs;
         const runId = newRunId();
         const owner = ownerIdFor(deps.config.authToken, localOwnerId(deps.config));
         const now = new Date().toISOString();
@@ -1047,6 +1731,18 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             }
           }
         }
+        // Workdir baseline for attributable change evidence, taken AFTER
+        // fixture staging so the baseline includes canary inputs: a bounded
+        // listing snapshot + content fingerprints (edits to existing files,
+        // including files git does not track) + the git commit baseline
+        // (HEAD) where the workdir is a repo (worker commits are attributable;
+        // `git status` alone cannot show committed work).
+        let workdirBaseline: WorkdirBaseline;
+        try {
+          workdirBaseline = captureWorkdirBaseline(resolved.absPath);
+        } catch {
+          workdirBaseline = {};
+        }
         const session: DelegationSessionBinding = engine === "codex"
           ? {
             engine: "codex",
@@ -1055,37 +1751,55 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             evidence: "codex ephemeral run persists no session; follow-up is a new attempt by construction",
             reason: "codex ephemeral run persists no session; follow-up starts a labeled new-continuation-attempt"
           }
-          : sessionId
-            ? {
-              engine: "opencode",
-              sessionId,
-              resumable: false,
-              observed: false,
-              evidence: "explicit --session id only: creation-or-resume unverified at launch; verified at continuation time via session list/export before any resumed label",
-              reason: "explicit --session id: continues when known, otherwise creates (installed CLI semantics); first use may be creation"
-            }
+          : engine === "opencode"
+            ? sessionId
+              ? {
+                engine: "opencode",
+                sessionId,
+                resumable: false,
+                observed: false,
+                evidence: "explicit --session id only: creation-or-resume unverified at launch; verified at continuation time via session list/export before any resumed label",
+                reason: "explicit --session id: continues when known, otherwise creates (installed CLI semantics); first use may be creation"
+              }
+              : {
+                engine: "opencode",
+                resumable: false,
+                observed: false,
+                evidence: "no explicit --session id; the worker mints the session, observed best-effort from --format json stdout",
+                reason: "no explicit --session id; the worker mints the session, observed best-effort from --format json stdout"
+              }
             : {
-              engine: "opencode",
+              engine: "claude",
+              sessionId: sessionId as string,
               resumable: false,
               observed: false,
-              evidence: "no explicit --session id; the worker mints the session, observed best-effort from --format json stdout",
-              reason: "no explicit --session id; the worker mints the session, observed best-effort from --format json stdout"
+              evidence: plan.requestedSessionId
+                ? "explicit --session-id UUID: first use creates, later verified uses resume via --resume"
+                : "stable --session-id UUID minted at launch (caller omitted one): first use creates, later verified uses resume via --resume",
+              reason: "claude session identity is the stable --session-id UUID; resumed only after the session file verifies"
             };
         const attemptSummary = engine === "codex"
           ? isCanary
             ? `canary attempt started via codex exec --profile ${profile}`
-            : `real-task attempt started via codex exec --profile ${profile} (${taskText.length} chars, group ${delegationGroup})`
-          : isCanary
-            ? `canary attempt started via opencode run --model ${model}`
-            : `real-task attempt started via opencode run --model ${model} (${taskText.length} chars, group ${delegationGroup})`;
+            : `real-task attempt started via codex exec --profile ${profile} -s ${plan.executionPolicy} (${taskText.length} chars, group ${delegationGroup})`
+          : engine === "opencode"
+            ? isCanary
+              ? `canary attempt started via opencode run --standalone --model ${model}`
+              : `real-task attempt started via opencode run --standalone --model ${model} --agent ${agent} (${taskText.length} chars, group ${delegationGroup})`
+            : `real-task attempt started via claude --agent ${agent} --session-id ${(sessionId as string).slice(0, 8)}… (${taskText.length} chars, group ${delegationGroup})`;
         let run: DelegationRunRecord = {
           version: 1,
           runId,
           requestId,
           delegationGroup,
           engine,
-          ...(engine === "codex" ? { profile } : { model }),
+          ...(engine === "codex" ? { profile, executionPolicy: plan.executionPolicy, ...(plan.model ? { modelOverride: plan.model } : {}), ...(plan.configOverrides.length > 0 ? { configOverrides: plan.configOverrides } : {}), ...(plan.bypassApprovals ? { bypassApprovals: true as const } : {}) } : {}),
+          ...(engine === "opencode" ? { model, ...(agent ? { agent } : {}), requestedSessionId: plan.requestedSessionId, opencodeRoute: "standalone" as const } : {}),
+          ...(engine === "claude" ? { agent, ...(model ? { model } : {}), ...(plan.permissionMode ? { permissionMode: plan.permissionMode } : {}), ...(plan.effort ? { effort: plan.effort } : {}), ...(plan.allowedTools ? { allowedTools: plan.allowedTools } : {}), ...(plan.disallowedTools ? { disallowedTools: plan.disallowedTools } : {}), requestedSessionId: plan.requestedSessionId } : {}),
           ...(isCanary ? { isCanary: true } : { isCanary: false, task: taskText }),
+          workdirBaseline,
+          executable: plan.executable,
+          binaryOverridden: engineBinaryOverridden(engine),
           session,
           attemptTimeoutMs: timeoutMs,
           workspaceId: workspace.id,
@@ -1115,15 +1829,19 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           timeoutMs,
           prompt,
           sessionEvidence: engine === "codex"
-            ? `initial launch via codex exec --profile ${profile} (Luna verified)`
-            : `initial launch via opencode run --model ${model} (host-model verified)`
+            ? `initial launch via codex exec --profile ${profile} (${plan.gateReason})`
+            : engine === "opencode"
+              ? `initial launch via opencode run --standalone --model ${model}${agent ? ` --agent ${agent}` : ""} (${plan.gateReason})`
+              : `initial launch via claude --agent ${agent} --session-id ${plan.requestedSessionId || "minted"} (${plan.gateReason})`
         });
         saveDelegationRun(bridgeDir, run);
         try {
           if (engine === "codex") {
-            launchCodexCanary(deps, bridgeDir, run, profile, timeoutMs, prompt, isCanary);
+            launchCodexReal(deps, bridgeDir, run, plan, timeoutMs, prompt, isCanary);
+          } else if (engine === "opencode") {
+            launchOpenCodeReal(deps, bridgeDir, run, plan, timeoutMs, prompt, isCanary, sessionId);
           } else {
-            launchOpenCodeCanary(deps, bridgeDir, run, model, timeoutMs, prompt, isCanary, sessionId);
+            launchClaudeChild(deps, bridgeDir, run, buildPlannedArgv(plan, prompt, path.join(run.workdir, "claude-last-message.json"), sessionId), timeoutMs, prompt, isCanary);
           }
         } catch (error) {
           // Ambiguous post-spawn (child spawned OK, then identity-save
@@ -1202,8 +1920,10 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         }
         return okResult(
           engine === "codex"
-            ? `${isCanary ? "Canary" : "Real-task"} run ${runId} launched (codex --profile ${profile}, Luna verified, group ${delegationGroup}, timeout ${timeoutMs} ms). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`
-            : `${isCanary ? "Canary" : "Real-task"} run ${runId} launched (opencode run --model ${model} --format json, host-model verified, group ${delegationGroup}, timeout ${timeoutMs} ms${sessionId ? `, session ${sessionId}` : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`,
+            ? `${isCanary ? "Canary" : "Real-task"} run ${runId} launched (codex --profile ${profile}, ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`
+            : engine === "opencode"
+              ? `${isCanary ? "Canary" : "Real-task"} run ${runId} launched (opencode run --standalone --model ${model}${agent ? ` --agent ${agent}` : ""} --format json, ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}${sessionId ? `, session ${sessionId}` : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`
+              : `Real-task run ${runId} launched (claude --agent ${agent} --session-id ${sessionId}, ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`,
           {
             run_id: runId,
             request_id: requestId,
@@ -1211,14 +1931,82 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             is_canary: isCanary,
             ...(isCanary ? {} : { task_chars: taskText.length }),
             engine,
-            ...(engine === "codex" ? { profile } : { model }),
+            ...(engine === "codex" ? { profile, execution_policy: plan.executionPolicy } : {}),
+            ...(engine === "opencode" ? { model, ...(agent ? { agent } : {}), execution_route: "standalone" } : {}),
+            ...(engine === "claude" ? { agent, ...(model ? { model } : {}), ...(plan.permissionMode ? { permission_mode: plan.permissionMode } : {}), ...(plan.effort ? { effort: plan.effort } : {}) } : {}),
             ...(sessionId ? { session_id: sessionId } : {}),
             ...gateEvidence,
+            engine_qualification: engineQualification(engine),
             workdir: resolved.absPath,
             timeout_ms: timeoutMs,
+            timeout_clamped: plan.timeoutClamped,
             state: "running",
             next_action: "subscribe to events_subscribe before completion, or replay via delegation_read_result"
           }
+        );
+      }
+    },
+    {
+      name: "delegation_preview",
+      options: {
+        title: "Delegation Preview",
+        description: "Read-only resolved-launch preview (dry-run, never spawns a worker, never persists a run): shows the actual executable, argv shape, profile/agent, model/effort WHERE resolvable from the real definition files, execution policy, and working directory, with configured settings separated from runtime-observed evidence. The capability probe executes only `<binary> --version` (binary presence, no model call, bounded timeout). Reports the exact blocker and INCOMPLETE status when the requested engine or profile capability is missing (never substitutes another engine).",
+        inputSchema: publicSchemaFrom(previewArgs),
+        runtimeInputSchema: previewArgs,
+        annotations: READ_ONLY
+      },
+      handler: async (args) => {
+        const workspace = deps.workspaces.getWorkspace(args.workspace_id);
+        let resolved: { absPath: string; relPath: string };
+        try {
+          // Resolve only: preview creates no directories and persists nothing.
+          resolved = deps.guard.resolve(workspace, String(args.workdir), { forWrite: true });
+        } catch (error) {
+          return failResult(`Workdir rejected: ${error instanceof Error ? error.message : String(error)}`, { error: "workdir_rejected" });
+        }
+        const gated = gateLaunchRequest(args as Record<string, unknown>);
+        if (!gated.ok) return failResult(gated.text, gated.structured);
+        const plan = gated.plan;
+        const lastMessagePath = path.join(resolved.absPath,
+          plan.engine === "codex" ? "codex-last-message.md"
+          : plan.engine === "opencode" ? "opencode-last-message.json"
+          : "claude-last-message.json");
+        // Claude always rides a stable --session-id (minted when omitted):
+        // preview shows the explicit id or the mint placeholder, never a fake.
+        const sessionForArgv = plan.engine === "claude"
+          ? (plan.requestedSessionId || "<uuid minted at launch>")
+          : (plan.requestedSessionId || undefined);
+        const argvPreview = buildPlannedArgv(plan, `<worker prompt ${plan.prompt.length} chars>`, lastMessagePath, sessionForArgv);
+        const capability = probeEngineCapability(plan.engine, {
+          profileOrAgent: plan.engine === "codex" ? plan.profile : plan.agent,
+          binary: plan.executable
+        });
+        const preview = buildLaunchPreview({
+          engine: plan.engine,
+          executable: plan.executable,
+          argvPreview,
+          promptChars: plan.prompt.length,
+          ...(plan.profile ? { profile: plan.profile } : {}),
+          ...(plan.agent ? { agent: plan.agent } : {}),
+          modelConfigured: plan.configuredModel,
+          effortConfigured: plan.configuredEffort,
+          modelExplicit: plan.modelExplicit,
+          effortExplicit: plan.effortExplicit,
+          ...(plan.executionPolicy ? { executionPolicy: plan.executionPolicy } : {}),
+          ...(plan.permissionMode ? { permissionMode: plan.permissionMode } : {}),
+          workdir: resolved.absPath,
+          delegationGroup: plan.delegationGroup,
+          isCanary: plan.isCanary,
+          timeoutMs: plan.timeoutMs,
+          gateReason: plan.gateReason,
+          capability,
+          qualification: engineQualification(plan.engine)
+        });
+        return okResult(
+          capability.ready
+            ? `Preview for engine ${plan.engine}: resolved launch (${plan.gateReason}). No worker spawned, nothing persisted.`
+            : `Preview for engine ${plan.engine}: INCOMPLETE (${capability.blocker}). No worker spawned, nothing persisted; fix the blocker, never substitute another engine.`,
+          { preview, timeout_clamped: plan.timeoutClamped, ...plan.gateEvidence }
         );
       }
     },
@@ -1298,6 +2086,57 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         const failedDeliveries = current.pendingEvents.flatMap((event) =>
           event.deliveries.filter((delivery) => delivery.status === "failed" || delivery.status === "permanent")
             .map((delivery) => ({ event_id: event.eventId, sub_id: delivery.subId, status: delivery.status, attempts: delivery.attempts, error: delivery.lastError ?? null, next_retry_at: delivery.nextRetryAt ?? null })));
+        // Raw change evidence for Hestia review: git-aware when the workdir
+        // is a repo (status plus worker commits since the launch commit
+        // baseline), otherwise a snapshot diff against the launch baseline
+        // (added/removed by name, content edits by fingerprint). Bounded with
+        // an explicit truncation flag; never throws. Legacy run files carry
+        // workdirSnapshot (bare listing); newer runs carry workdirBaseline.
+        const workdirEvidence = collectWorkdirEvidence(
+          current.workdir,
+          current.workdirBaseline ?? current.workdirSnapshot
+        );
+        // Worker-executed test evidence is whatever the worker printed under
+        // the selected policy: captured tail + exit code. Nonempty tails prove
+        // output presence only, never that tests ran. When the run has no
+        // terminal result (or empty tails) the evidence is explicitly
+        // unavailable, never implied. The durable last-message file is
+        // reported by presence + path (ordinary read route), never inlined.
+        const terminalStates = DELEGATION_TERMINAL_STATES.has(current.state);
+        const lastMessage = describeLastMessageArtifact(current.workdir, current.engine);
+        const testEvidence = buildTestEvidence({
+          terminal: terminalStates,
+          state: current.state,
+          exitCode: current.result?.exitCode ?? null,
+          timedOut: current.result?.timedOut ?? false,
+          stdoutTail: current.result?.stdoutTail,
+          stderrTail: current.result?.stderrTail,
+          stdoutTruncated: current.result?.stdoutTruncated ?? false,
+          stderrTruncated: current.result?.stderrTruncated ?? false,
+          diffKind: workdirEvidence.kind,
+          ...(workdirEvidence.reason ? { diffReason: workdirEvidence.reason } : {}),
+          ...(workdirEvidence.kind === "unavailable" ? {} : { diffTruncated: workdirEvidence.truncated }),
+          ...(workdirEvidence.fingerprintsTruncated ? { fingerprintsTruncated: true as const } : {}),
+          ...(workdirEvidence.coverageReason ? { coverageReason: workdirEvidence.coverageReason } : {}),
+          lastMessage
+        });
+        // Execution provenance: which binary ran this worker. Override-route
+        // runs (test shims) are labeled as such and are never live proof.
+        const provenance = {
+          executable: current.executable ?? null,
+          binary_overridden: current.binaryOverridden ?? null,
+          ...(current.binaryOverridden
+            ? { note: "a CODEXPRO_*_BIN override selected the worker executable at launch (test shims ride this route): shim results are never live proof" }
+            : current.executable
+              ? { note: "default PATH binary at launch (no CODEXPRO_*_BIN override); no shim marker" }
+              : { note: "executable provenance unrecorded (legacy run); shim vs live cannot be judged from this record" })
+        };
+        // Classify codex failures BEFORE any permission change is proposed:
+        // only a real tool-execution denial warrants proposing one (still
+        // explicit, still per-run, through the confirmation surface).
+        const failureClassification = current.engine === "codex" && current.result && current.state !== "completed"
+          ? classifyCodexFailure({ exitCode: current.result.exitCode, stderrTail: current.result.stderrTail })
+          : null;
         return okResult(
           `# Run ${current.runId}: ${current.state}\n\n${current.result?.summary ?? current.nextAction}`,
           {
@@ -1307,6 +2146,25 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             ...(current.task ? { task: current.task } : {}),
             engine: current.engine,
             ...(current.profile ? { profile: current.profile } : {}),
+            ...(current.agent ? { agent: current.agent } : {}),
+            ...(current.executionPolicy ? { execution_policy: current.executionPolicy } : {}),
+            ...(current.permissionMode ? { permission_mode: current.permissionMode } : {}),
+            ...(current.model ? { model: current.model } : {}),
+            // OpenCode execution route, honestly labeled: new runs record
+            // "standalone" (private server per turn); run files that predate
+            // the route field are "shared-service" (background service) and
+            // are never silently converted.
+            ...(current.engine === "opencode"
+              ? (() => {
+                const routeLabel = opencodeExecutionRoute(current);
+                return {
+                  execution_route: routeLabel.route,
+                  ...(routeLabel.legacy
+                    ? { execution_route_note: "legacy run predates the standalone route; labeled shared-service, never silently converted" }
+                    : {})
+                };
+              })()
+              : {}),
             state: current.state,
             classification: reconciled.classification,
             seq: current.seq,
@@ -1317,6 +2175,15 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               summary: attempt.summary ?? null
             })),
             result: current.result ?? null,
+            workdir: current.workdir,
+            workdir_evidence: workdirEvidence,
+            test_evidence: testEvidence,
+            execution_provenance: provenance,
+            engine_qualification: engineQualification(current.engine),
+            ...(current.lastCancelVerification ? { last_cancel_verification: current.lastCancelVerification } : {}),
+            ...(failureClassification ? { failure_classification: failureClassification } : {}),
+            ...(failureClassification ? { failure_classification: failureClassification } : {}),
+            review_note: "A completed process or green canary NEVER establishes task success: review the raw evidence above (tails, workdir changes, test evidence) against the original task and repo rules before accepting. Nonempty tails prove output presence only, never that tests ran. Larger evidence rides the run workdir (including the last-message file) through the ordinary read route.",
             input_requests: runInputRequests(current).map((request) => ({
               request_id: request.id,
               seq: request.seq,
@@ -1327,7 +2194,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             })),
             open_input_requests: openInputRequests(current).length,
             ...(current.session ? { session: current.session } : {}),
-            resume_capability: current.engine === "codex" ? CODEX_RESUME_CAPABILITY : OPENCODE_RESUME_CAPABILITY,
+            resume_capability: current.engine === "codex" ? CODEX_RESUME_CAPABILITY : current.engine === "opencode" ? OPENCODE_RESUME_CAPABILITY : CLAUDE_RESUME_CAPABILITY,
             ...(includeEvents ? {
               pending_events: current.pendingEvents.map((event) => ({
                 event_id: event.eventId, seq: event.seq, state: event.state,
@@ -1351,7 +2218,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "delegation_followup",
       options: {
         title: "Delegation Follow-up",
-        description: "Durable follow-up Q&A: a checkpoint with questions moves a settled run to needs-input (structured, stored with run id + seq); a checkpoint with input_request_id answers the exact request at most once and launches one bounded continuation (opencode --session true resume; ephemeral Codex a labeled new attempt). Rejects wrong-run, stale, conflicting-duplicate, unknown/closed/expired requests, and live-attempt races with typed errors. Approval-kind answers never widen the engine gate.",
+        description: "Durable follow-up Q&A: a checkpoint with questions moves a settled run to needs-input (structured, stored with run id + seq); a checkpoint with input_request_id answers the exact request at most once and launches one bounded continuation (opencode --standalone --session true resume after list/export verification; claude --resume after session-file verification, otherwise the stable --session-id; codex a labeled new attempt under the stored profile + policy). Rejects wrong-run, stale, conflicting-duplicate, unknown/closed/expired requests, and live-attempt races with typed errors. Approval-kind answers never widen the engine gate.",
         inputSchema: publicSchemaFrom(followupArgs),
         runtimeInputSchema: followupArgs,
         annotations: DESTRUCTIVE
@@ -1404,12 +2271,21 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             );
           }
           // Re-verify the engine gate at continuation time BEFORE applying:
-          // config may have drifted since launch.
+          // config may have drifted since launch. Legacy canary keeps its
+          // original gate (Luna / host-model equality); real tasks re-verify
+          // the SELECTED profile/agent with the stored per-run policy.
+          const runIsCanaryForGate = run.isCanary !== false;
           if (run.engine === "codex") {
-            const gate = verifyLunaProfile(codexHomeDir(), run.profile ?? "");
+            const gate = verifyCodexLaunch(codexHomeDir(), run.profile ?? "", {
+              isCanary: runIsCanaryForGate,
+              delegationGroup: run.delegationGroup,
+              executionPolicy: run.executionPolicy,
+              modelOverride: run.modelOverride,
+              configOverrides: run.configOverrides
+            });
             if (!gate.allowed) {
-              return failResult(`Answer not applied: the Luna profile gate refused continuation: ${gate.reason}. Request ${request.id} stays open and the reply was not consumed.`, {
-                error: "luna_gate_refused",
+              return failResult(`Answer not applied: the Codex profile gate refused continuation: ${gate.reason}. Request ${request.id} stays open and the reply was not consumed.`, {
+                error: gate.gateKind === "luna" ? "luna_gate_refused" : gate.code,
                 run_id: run.runId,
                 checkpoint_id: checkpoint.id,
                 input_request_id: request.id,
@@ -1418,11 +2294,16 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                 configured: gate.configured
               });
             }
-          } else {
-            const gate = verifyOpenCodeModel(run.model, describeOpenCodeDiscovery().hostModel);
+          } else if (run.engine === "opencode") {
+            const gate = verifyOpenCodeLaunch({
+              model: run.model,
+              agent: run.agent,
+              isCanary: runIsCanaryForGate,
+              delegationGroup: run.delegationGroup
+            });
             if (!gate.allowed) {
-              return failResult(`Answer not applied: the OpenCode model gate refused continuation: ${gate.reason}. Request ${request.id} stays open and the reply was not consumed.`, {
-                error: "opencode_model_mismatch",
+              return failResult(`Answer not applied: the OpenCode launch gate refused continuation: ${gate.reason}. Request ${request.id} stays open and the reply was not consumed.`, {
+                error: gate.code,
                 run_id: run.runId,
                 checkpoint_id: checkpoint.id,
                 input_request_id: request.id,
@@ -1433,6 +2314,42 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             }
             const sid = run.session?.sessionId;
             if (sid && isEngineSessionId(sid)) {
+              const holders = activeSessionHolders(listDelegationRuns(bridgeDir), sid, run.runId);
+              if (holders.length > 0) {
+                return failResult(`Answer not applied: session ${sid} has an active turn (${holders[0].runId}); one active turn per session, retry after it settles. Request ${request.id} stays open and the reply was not consumed.`, {
+                  error: "session_busy",
+                  run_id: run.runId,
+                  checkpoint_id: checkpoint.id,
+                  input_request_id: request.id,
+                  stored: false,
+                  executed: false,
+                  session_id: sid,
+                  holder_run_id: holders[0].runId
+                });
+              }
+            }
+          } else {
+            const gate = verifyClaudeLaunch({
+              agent: run.agent,
+              model: run.model,
+              effort: run.effort,
+              permissionMode: run.permissionMode,
+              allowedTools: run.allowedTools,
+              disallowedTools: run.disallowedTools
+            });
+            if (!gate.allowed) {
+              return failResult(`Answer not applied: the Claude launch gate refused continuation: ${gate.reason}. Request ${request.id} stays open and the reply was not consumed.`, {
+                error: gate.code,
+                run_id: run.runId,
+                checkpoint_id: checkpoint.id,
+                input_request_id: request.id,
+                stored: false,
+                executed: false,
+                agent: run.agent ?? null
+              });
+            }
+            const sid = run.session?.sessionId;
+            if (sid && isClaudeSessionId(sid)) {
               const holders = activeSessionHolders(listDelegationRuns(bridgeDir), sid, run.runId);
               if (holders.length > 0) {
                 return failResult(`Answer not applied: session ${sid} has an active turn (${holders[0].runId}); one active turn per session, retry after it settles. Request ${request.id} stays open and the reply was not consumed.`, {
@@ -1486,7 +2403,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             // construction, even if a stale record names a session.
             spawnNote = "codex ephemeral run persists no session: follow-up runs a new attempt, never a resumed session";
             sessionEvidence = "codex ephemeral run persists no session; resumed requires observed + verified session evidence, which cannot exist here";
-          } else {
+          } else if (run.engine === "opencode") {
             const sid = run.session?.sessionId;
             if (sid && isEngineSessionId(sid)) {
               // Verified resume only: the id must have been observed AND be
@@ -1496,7 +2413,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               if (probe.verified) {
                 continuationLabel = "resumed";
                 resumeSessionId = sid;
-                spawnNote = `opencode session ${sid} verified live (${probe.evidence}) and continued via run --session (true resume)`;
+                spawnNote = `opencode session ${sid} verified live (${probe.evidence}) and continued via run --standalone --session (true resume)`;
                 sessionEvidence = probe.evidence;
               } else {
                 spawnNote = `opencode session ${sid} unverified (${probe.evidence}): follow-up runs a new attempt (first-use creation), never a resumed session`;
@@ -1504,6 +2421,37 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               }
             } else {
               spawnNote = "no opencode session id recorded: follow-up runs a new attempt, never a resumed session";
+            }
+          } else {
+            // Claude runs carry a stable --session-id UUID (minted at launch
+            // when omitted). Verified session file => true resume via
+            // --resume, EXCEPT when the stored run carries explicit
+            // model/effort/tool settings: the resume argv drops them (agent +
+            // permission-mode only; Claude qualification deferred), so resume
+            // is withheld and the full explicit-flag argv runs as a labeled
+            // new attempt instead. Otherwise the same id rides --session-id
+            // as first-use creation, labeled new-continuation-attempt.
+            const sid = run.session?.sessionId;
+            const dropsStoredSettings = Boolean(run.model || run.effort || run.allowedTools || run.disallowedTools);
+            if (sid && isClaudeSessionId(sid)) {
+              const probe = verifyClaudeSession(sid);
+              if (probe.verified && dropsStoredSettings) {
+                continuationLabel = "new-continuation-attempt";
+                resumeSessionId = sid;
+                spawnNote = `claude session ${sid} verified (${probe.evidence}) BUT resume withheld: stored explicit model/effort/tool settings would be dropped by --resume (resume argv carries agent + permission-mode only; Claude qualification deferred) — follow-up reuses the full explicit-flag argv as a new attempt, never labeled resumed`;
+                sessionEvidence = `session verified (${probe.evidence}); resume withheld (stored explicit model/effort/tool settings would drop under --resume; Claude qualification deferred)`;
+              } else if (probe.verified) {
+                continuationLabel = "resumed";
+                resumeSessionId = sid;
+                spawnNote = `claude session ${sid} verified (${probe.evidence}) and continued via --resume (true resume)`;
+                sessionEvidence = probe.evidence;
+              } else {
+                resumeSessionId = sid;
+                spawnNote = `claude session ${sid} unverified (${probe.evidence}): follow-up reuses the stable --session-id (first-use creation), never a resumed session`;
+                sessionEvidence = probe.evidence;
+              }
+            } else {
+              spawnNote = "no claude session UUID recorded: follow-up runs a new attempt, never a resumed session";
             }
           }
           const n = existingPending ? existingPending.attemptN : run.attempts.length + 1;
@@ -1580,11 +2528,19 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           sessionEvidence = staged.sessionEvidence;
           spawnNote = run.engine === "codex"
             ? "codex ephemeral run persists no session: follow-up runs a new attempt, never a resumed session"
-            : resumeSessionId && continuationLabel === "resumed"
-              ? `opencode session ${resumeSessionId} verified live (${sessionEvidence}) and continued via run --session (true resume)`
-              : (run.session?.sessionId
-                ? `opencode session ${run.session.sessionId} unverified (${sessionEvidence}): follow-up runs a new attempt (first-use creation), never a resumed session`
-                : "no opencode session id recorded: follow-up runs a new attempt, never a resumed session");
+            : run.engine === "opencode"
+              ? (resumeSessionId && continuationLabel === "resumed"
+                ? `opencode session ${resumeSessionId} verified live (${sessionEvidence}) and continued via run --standalone --session (true resume)`
+                : (run.session?.sessionId
+                  ? `opencode session ${run.session.sessionId} unverified (${sessionEvidence}): follow-up runs a new attempt (first-use creation), never a resumed session`
+                  : "no opencode session id recorded: follow-up runs a new attempt, never a resumed session"))
+              : (resumeSessionId && continuationLabel === "resumed"
+                ? `claude session ${resumeSessionId} verified (${sessionEvidence}) and continued via --resume (true resume)`
+                : (resumeSessionId ?? run.session?.sessionId
+                  ? ((staged.sessionEvidence ?? "").includes("resume withheld")
+                    ? `claude session ${resumeSessionId ?? run.session?.sessionId} verified but resume withheld (${sessionEvidence}): follow-up reuses the full explicit-flag argv as a new attempt, never labeled resumed`
+                    : `claude session ${resumeSessionId ?? run.session?.sessionId} unverified (${sessionEvidence}): follow-up reuses the stable --session-id (first-use creation), never a resumed session`)
+                  : "no claude session UUID recorded: follow-up runs a new attempt, never a resumed session"));
           if (alreadyDispatched) {
             spawnNote = `staged continuation worker still alive (pid ${stagedAlivePid}); confirmed without spawning a second worker; ${spawnNote}`;
           } else {
@@ -1596,13 +2552,60 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           // async spawn error also leaves pending retryable, never consumed.
           if (!alreadyDispatched) {
             let child: ChildProcess;
+            // Continuation argv is rebuilt from STORED run fields (profile +
+            // execution policy + explicit overrides for codex; agent + model
+            // for opencode; agent + explicit flags for claude): the selected
+            // identity is preserved, never substituted.
+            const lastMessagePath = path.join(run.workdir,
+              run.engine === "codex" ? "codex-last-message.md"
+              : run.engine === "opencode" ? "opencode-last-message.json"
+              : "claude-last-message.json");
             try {
               if (run.engine === "codex" && continuationLabel === "resumed" && resumeSessionId) {
                 child = launchCodexResume(deps, bridgeDir, run, resumeSessionId, staged.timeoutMs, staged.prompt, runIsCanary);
               } else if (run.engine === "codex") {
-                child = launchCodexCanary(deps, bridgeDir, run, run.profile ?? "", staged.timeoutMs, staged.prompt, runIsCanary);
+                if (runIsCanary) {
+                  child = launchCodexCanary(deps, bridgeDir, run, run.profile ?? "", staged.timeoutMs, staged.prompt, runIsCanary);
+                } else {
+                  const policy = (run.executionPolicy === "workspace-write" || run.executionPolicy === "danger-full-access" || run.executionPolicy === "read-only")
+                    ? run.executionPolicy
+                    : "read-only";
+                  child = spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(),
+                    buildCodexRealArgv(run.profile ?? "", staged.prompt, lastMessagePath, {
+                      executionPolicy: policy,
+                      ...(run.modelOverride ? { modelOverride: run.modelOverride } : {}),
+                      ...(run.configOverrides?.length ? { configOverrides: run.configOverrides } : {}),
+                      ...(run.bypassApprovals ? { dangerBypassExplicit: true as const } : {})
+                    }), staged.timeoutMs, lastMessagePath, runIsCanary);
+                }
+              } else if (run.engine === "opencode") {
+                if (run.agent) {
+                  child = spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(),
+                    buildOpenCodeRealArgv({
+                      model: run.model ?? "", agent: run.agent, prompt: staged.prompt,
+                      ...(resumeSessionId ? { sessionId: resumeSessionId } : {})
+                    }), staged.timeoutMs, lastMessagePath, runIsCanary);
+                } else {
+                  child = launchOpenCodeCanary(deps, bridgeDir, run, run.model ?? "", staged.timeoutMs, staged.prompt, runIsCanary, resumeSessionId);
+                }
+              } else if (continuationLabel === "resumed" && resumeSessionId) {
+                child = launchClaudeChild(deps, bridgeDir, run,
+                  buildClaudeResumeArgv(resumeSessionId, staged.prompt, {
+                    ...(run.agent ? { agent: run.agent } : {}),
+                    ...(run.permissionMode ? { permissionMode: run.permissionMode } : {})
+                  }), staged.timeoutMs, staged.prompt, runIsCanary);
               } else {
-                child = launchOpenCodeCanary(deps, bridgeDir, run, run.model ?? "", staged.timeoutMs, staged.prompt, runIsCanary, resumeSessionId);
+                const claudeSession = resumeSessionId ?? run.session?.sessionId;
+                child = launchClaudeChild(deps, bridgeDir, run,
+                  buildClaudeArgv({
+                    agent: run.agent ?? "", prompt: staged.prompt,
+                    ...(run.model ? { model: run.model } : {}),
+                    ...(run.effort ? { effort: run.effort } : {}),
+                    ...(run.permissionMode ? { permissionMode: run.permissionMode } : {}),
+                    ...(run.allowedTools ? { allowedTools: run.allowedTools } : {}),
+                    ...(run.disallowedTools ? { disallowedTools: run.disallowedTools } : {}),
+                    ...(claudeSession ? { sessionId: claudeSession } : {})
+                  }), staged.timeoutMs, staged.prompt, runIsCanary);
               }
             } catch (error) {
               // Ambiguous post-spawn (child spawned OK, then identity-save
@@ -1770,6 +2773,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               ...(staged.resumeSessionId ? { session_id: staged.resumeSessionId } : {}),
               timeout_ms: staged.timeoutMs,
               state: "running",
+              engine_qualification: engineQualification(run.engine),
               next_action: "poll delegation_read_result or await the run-attention event"
             }
           );
@@ -1803,6 +2807,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           stored: true,
           executed: false,
           state: "needs-input",
+          engine_qualification: engineQualification(run.engine),
           next_action: "answer via delegation_followup with the matching input-request id"
         });
       }
@@ -1811,7 +2816,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "delegation_cancel",
       options: {
         title: "Delegation Cancel",
-        description: "Idempotent cancel of one run: signals only the exact PID+starttime-verified owned tree. The ack never claims cleanup finished while descendants remain.",
+        description: "Idempotent cancel of one run: signals only the exact PID+starttime-verified owned tree, rechecks the tree is gone after a grace + verification window, then verifies windowed quiescence (no further workdir writes across both legs). New opencode turns run --standalone (the owned tree is the serving tree); pre-standalone shared-service runs stay labeled, never silently converted. PID-tree cleanup alone is never presented as proof that a session-side turn halted: for opencode (no session-scoped halt in v2.0.22 on either route) session-side halt stays explicitly unclaimed with a blocker. The ack never claims cleanup finished while descendants remain, and a repeated cancel re-verifies live (never converts a cached incomplete into success).",
         inputSchema: publicSchemaFrom(cancelArgs),
         runtimeInputSchema: cancelArgs,
         annotations: DESTRUCTIVE
@@ -1823,39 +2828,180 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         if (!run || !ownerAllowed(deps, run)) return denyAccess();
         const reconciled = reconcileRunState(run, isProcessIdentityAlive);
         let current = reconciled.run;
-        if (current.state === "completed" || current.state === "failed" || current.state === "cancelled" ||
+        // Already-cancelled runs RE-VERIFY live on every cancel call: cleanup
+        // stays incomplete/uncertain until verified, and a repeated cancel
+        // never converts a cached incomplete into success. The fresh window
+        // proves no NEW writes plus the owned tree gone, right now.
+        if (current.state === "cancelled") {
+          if (reconciled.changed) saveDelegationRun(bridgeDir, current);
+          const repeatLatest = current.attempts.at(-1);
+          const repeatBefore = snapshotWorkdirMtimes(current.workdir);
+          const repeatStart = Date.now();
+          await sleepMs(QUIESCENCE_GRACE_MS);
+          const repeatFirst = findPostCancelWrites(current.workdir, repeatBefore, repeatStart);
+          await sleepMs(QUIESCENCE_VERIFY_WINDOW_MS);
+          const repeatSecond = findPostCancelWrites(current.workdir, repeatBefore, repeatStart);
+          const repeatQuiescence = mergeQuiescenceLegs(repeatFirst, repeatSecond);
+          const repeatRemaining = recheckOwnedTreeGone(repeatLatest?.pid, repeatLatest?.processStartTime);
+          const repeatClean = repeatRemaining.length === 0;
+          const repeatQuiesced = repeatQuiescence.checked && repeatQuiescence.continued.length === 0;
+          const repeatComplete = repeatClean && repeatQuiesced;
+          current.lastCancelVerification = {
+            at: new Date().toISOString(),
+            cleanupFinished: repeatClean,
+            verificationComplete: repeatComplete,
+            remainingPids: repeatRemaining,
+            quiesced: repeatQuiesced,
+            quiescenceChecked: repeatQuiescence.checked,
+            ...(repeatQuiescence.reason ? { reason: repeatQuiescence.reason } : {})
+          };
+          saveDelegationRun(bridgeDir, current);
+          const repeatVerification = {
+            rechecked: true as const,
+            pid_tree: {
+              remaining: repeatRemaining,
+              cleanup_finished: repeatClean
+            },
+            quiescence: {
+              checked: repeatQuiescence.checked,
+              quiesced: repeatQuiesced,
+              continued_writes: repeatQuiescence.continued,
+              ...(repeatQuiescence.truncated ? { truncated: true as const } : {}),
+              ...(repeatQuiescence.reason ? { reason: repeatQuiescence.reason } : {})
+            },
+            verification_complete: repeatComplete
+          };
+          return okResult(
+            repeatComplete
+              ? `Run ${current.runId} is already cancelled; re-verified: owned tree gone, workdir quiet across the verification window.`
+              : `Run ${current.runId} is already cancelled; re-verified INCOMPLETE: ${repeatRemaining.length > 0 ? `${repeatRemaining.length} owned descendant(s) still remain (${repeatRemaining.join(",")}). ` : ""}${!repeatQuiescence.checked ? `quiescence UNVERIFIABLE (${repeatQuiescence.reason ?? "workdir unreadable"}).` : repeatQuiescence.continued.length > 0 ? `quiescence FAILED: ${repeatQuiescence.continued.length} post-cancel write(s).` : ""}`,
+            {
+              run_id: current.runId, state: current.state, already_terminal: true, cancelled: true,
+              cleanup_finished: repeatClean,
+              remaining_pids: repeatRemaining,
+              cancel_verification: repeatVerification,
+              engine_qualification: engineQualification(current.engine)
+            }
+          );
+        }
+        if (current.state === "completed" || current.state === "failed" ||
           current.state === "timed_out" || current.state === "interrupted") {
           if (reconciled.changed) saveDelegationRun(bridgeDir, current);
           return okResult(`Run ${current.runId} is already ${current.state}; cancel is idempotent.`, {
             run_id: current.runId, state: current.state, already_terminal: true, cleanup_finished: true
           });
         }
+        // Quiescence baseline BEFORE signaling: any workdir write at/after
+        // cancel-complete means the worker (or an orphan of it) kept going.
+        const writesBefore = snapshotWorkdirMtimes(current.workdir);
         const latest = current.attempts.at(-1);
         let tree = { signalled: [] as number[], remaining: [] as number[], cleanupFinished: true, staleRoot: true };
         if (latest?.pid !== undefined) {
           tree = await cancelOwnedTree(latest.pid, latest.processStartTime, 2_000);
         }
         processRuntime().live.delete(current.runId);
+        const cancelDoneAt = Date.now();
+        // Windowed quiescence: a single quiet grace alone is insufficient (a
+        // slow-dying worker can outlast it), so TWO legs — grace + a further
+        // verification window — are both compared against cancel-complete.
+        // Either leg failing closed (or any post-cancel write) denies the
+        // clean-halt claim.
+        await sleepMs(QUIESCENCE_GRACE_MS);
+        const quiescenceFirst = findPostCancelWrites(current.workdir, writesBefore, cancelDoneAt);
+        await sleepMs(QUIESCENCE_VERIFY_WINDOW_MS);
+        const quiescenceSecond = findPostCancelWrites(current.workdir, writesBefore, cancelDoneAt);
+        const quiescence = mergeQuiescenceLegs(quiescenceFirst, quiescenceSecond);
+        const quiesced = quiescence.checked && quiescence.continued.length === 0;
+        // Owned-process exit recheck AFTER the window: the exact owned tree
+        // must be gone, not just signalled. Any still-owned member keeps
+        // cleanup incomplete (never claimed finished early).
+        const stillOwned = recheckOwnedTreeGone(latest?.pid, latest?.processStartTime);
+        const remainingPids = [...new Set([...tree.remaining, ...stillOwned])];
+        const cleanupFinished = tree.cleanupFinished && stillOwned.length === 0;
         const now = new Date().toISOString();
         if (latest) {
           latest.finishedAt = now;
           latest.state = "cancelled";
-          latest.summary = sanitizeSummary(tree.cleanupFinished ? "cancelled by owner; owned tree reaped" : "cancelled by owner; owned descendants remain");
+          latest.summary = sanitizeSummary(cleanupFinished
+            ? (quiesced ? "cancelled by owner; owned tree reaped and rechecked gone; workdir quiesced across grace + verification window (no further writes)" : "cancelled by owner; owned tree reaped and rechecked gone; quiescence INCOMPLETE (see cancel_verification)")
+            : "cancelled by owner; owned descendants remain");
         }
         current.state = "cancelled";
         current.result = { exitCode: null, signal: null, timedOut: false, summary: sanitizeSummary("cancelled by owner") };
+        current.lastCancelVerification = {
+          at: now,
+          cleanupFinished,
+          verificationComplete: cleanupFinished && quiescence.checked && quiescence.continued.length === 0,
+          remainingPids,
+          quiesced,
+          quiescenceChecked: quiescence.checked,
+          ...(quiescence.reason ? { reason: quiescence.reason } : {})
+        };
         enqueueTerminalEvent(current, loadSubscriptions(subscriptionAuthorityDirFor(deps.config)));
         saveDelegationRun(bridgeDir, current);
         await pumpDeliveries(deps, bridgeDir, loadDelegationRun(bridgeDir, current.runId) ?? current).catch(() => undefined);
+        // Session-aware verification: PID-tree cleanup alone never proves a
+        // session-side turn halted. For opencode (no session-scoped halt
+        // subcommand in v2.0.22 on either the --standalone private-server
+        // route or the legacy shared-service route) session halt stays
+        // explicitly unclaimed with the capability blocker (fail closed);
+        // the owned-tree recheck plus windowed quiescence carries the
+        // execution proof instead. Unverifiable workdirs fail closed too
+        // (no clean-halt claim).
+        const sessionId = current.session?.sessionId;
+        const sessionHalt = current.engine === "opencode"
+          ? {
+            applicable: true as const,
+            claimed: false as const,
+            ...(sessionId ? { session_id: sessionId } : {}),
+            blocker: OPENCODE_CANCEL_CAPABILITY.blocker,
+            note: "owned tree reaped + rechecked gone (+ windowed quiescence below); session-side halt unproven via the qualified CLI and never claimed"
+          }
+          : { applicable: false as const, claimed: false as const, reason: "session-scoped halt applies to the opencode route only" };
+        const verification = {
+          pid_tree: {
+            signalled: tree.signalled,
+            remaining: remainingPids,
+            cleanup_finished: cleanupFinished,
+            stale_root: tree.staleRoot,
+            liveness_rechecked: true as const,
+            owned_tree_gone: stillOwned.length === 0
+          },
+          quiescence: {
+            checked: quiescence.checked,
+            quiesced,
+            continued_writes: quiescence.continued,
+            ...(quiescence.truncated ? { truncated: true as const } : {}),
+            ...(quiescence.reason ? { reason: quiescence.reason } : {})
+          },
+          session_halt: sessionHalt,
+          verification_complete: cleanupFinished && quiescence.checked && quiescence.continued.length === 0
+        };
+        const quiescenceText = !quiescence.checked
+          ? `quiescence UNVERIFIABLE (${quiescence.reason ?? "workdir unreadable"}); no clean-halt claim`
+          : quiescence.continued.length > 0
+            ? `quiescence FAILED: ${quiescence.continued.length} post-cancel write(s) (${quiescence.continued.slice(0, 5).join("; ")}); a worker or orphan may still be executing`
+            : "quiescence passed (no further workdir writes across grace + verification window after cancel-complete)";
+        const routeText = current.engine === "opencode"
+          ? (() => {
+            const routeLabel = opencodeExecutionRoute(current);
+            return ` Execution route: ${routeLabel.route}${routeLabel.legacy ? " (legacy pre-standalone run; labeled, never silently converted)" : ""}.`;
+          })()
+          : "";
+        const sessionText = current.engine === "opencode"
+          ? " Session-side halt unclaimed (no session-scoped halt in opencode v2.0.22; owned-tree recheck + windowed quiescence only)."
+          : "";
         return okResult(
-          tree.cleanupFinished
-            ? `Run ${current.runId} cancelled; owned tree reaped.`
-            : `Run ${current.runId} cancelled; cleanup INCOMPLETE: ${tree.remaining.length} owned descendant(s) remain (${tree.remaining.join(",")}).`,
+          cleanupFinished
+            ? `Run ${current.runId} cancelled; owned tree reaped and rechecked gone. ${quiescenceText}.${routeText}${sessionText}`
+            : `Run ${current.runId} cancelled; cleanup INCOMPLETE: ${remainingPids.length} owned descendant(s) remain (${remainingPids.join(",")}). ${quiescenceText}.${routeText}${sessionText}`,
           {
             run_id: current.runId, state: "cancelled", cancelled: true,
-            cleanup_finished: tree.cleanupFinished,
-            remaining_pids: tree.remaining,
-            signalled_pids: tree.signalled
+            cleanup_finished: cleanupFinished,
+            remaining_pids: remainingPids,
+            signalled_pids: tree.signalled,
+            cancel_verification: verification,
+            engine_qualification: engineQualification(current.engine)
           }
         );
       }

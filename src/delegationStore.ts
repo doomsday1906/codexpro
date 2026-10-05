@@ -38,7 +38,7 @@ export const DELEGATION_STORE_VERSION = 1;
 export const DELEGATION_RUNS_DIRNAME = "delegation-runs";
 export const DELEGATION_SUBSCRIPTIONS_FILENAME = "delegation-subscriptions.json";
 
-export type DelegationEngine = "codex" | "opencode";
+export type DelegationEngine = "codex" | "opencode" | "claude";
 
 /** Terminal states reuse the handoff vocabulary so wait_for_handoff stays valid. */
 export type DelegationRunState =
@@ -185,6 +185,9 @@ export interface DelegationRunRecord {
     summary?: string;
     stdoutTail?: string;
     stderrTail?: string;
+    /** True when the live 64KiB cap truncated the tail (explicit truncation flag). */
+    stdoutTruncated?: boolean;
+    stderrTruncated?: boolean;
     fixturesUnchanged?: boolean;
   };
   pendingEvents: DelegationPendingEvent[];
@@ -197,6 +200,76 @@ export interface DelegationRunRecord {
   session?: DelegationSessionBinding;
   /** Explicit OpenCode --model for engine opencode. Optional: codex runs omit it. */
   model?: string;
+  /** Explicit OpenCode --agent / Claude --agent by real name (real tasks). */
+  agent?: string;
+  /** Adjudicated Codex sandbox for engine codex (explicit per-run wins over profile). */
+  executionPolicy?: string;
+  /** Explicit Claude --permission-mode (otherwise the agent/settings default governs). */
+  permissionMode?: string;
+  /** Explicit Claude --effort (otherwise the agent definition governs). */
+  effort?: string;
+  /** Explicit codex -m model override (real tasks only; canary never carries one). */
+  modelOverride?: string;
+  /** Explicit codex -c key=value overrides (real tasks only). */
+  configOverrides?: string[];
+  /** Explicit Claude --allowedTools / --disallowedTools text. */
+  allowedTools?: string;
+  disallowedTools?: string;
+  /** Launch-time workdir listing baseline for non-repo snapshot diffs (bounded). Legacy: prefer workdirBaseline. */
+  workdirSnapshot?: string[];
+  /** True when the workdir was a git repo at launch (git-aware evidence). Legacy: prefer workdirBaseline. */
+  workdirIsRepo?: boolean;
+  /**
+   * Launch-time baseline for attributable change evidence: listing snapshot,
+   * content fingerprints (edits to existing files, including files git does
+   * not track), and the git commit baseline (HEAD) where the workdir is a
+   * repo. Runs that predate this field fall back to workdirSnapshot.
+   */
+  workdirBaseline?: {
+    snapshot?: string[];
+    fingerprints?: Array<{ path: string; sha256: string | null; mtimeMs: number; reason?: string }>;
+    fingerprintsTruncated?: boolean;
+    gitHead?: string | null;
+    gitHeadReason?: string;
+  };
+  /**
+   * Explicit session id supplied at launch (opencode ses-id or claude UUID),
+   * "" when the caller omitted one (claude mints a stable UUID afterwards;
+   * opencode leaves minting to the worker). Present on runs launched after
+   * this field; legacy runs predate it and keep the old session rule (an
+   * omitted/minted session never conflicts; only a differing explicit
+   * candidate id conflicts with the observed session).
+   */
+  requestedSessionId?: string;
+  /** Separate explicit per-run opt-in to --dangerously-bypass-approvals-and-sandbox (codex danger only). */
+  bypassApprovals?: boolean;
+  /**
+   * OpenCode execution route at launch: "standalone" runs a private server
+   * (`opencode run --standalone`); "shared-service" uses the background
+   * service (pre-standalone launches). Absent on run files that predate this
+   * field, which are honestly treated as shared-service (labeled, never
+   * silently converted). Only meaningful for engine opencode.
+   */
+  opencodeRoute?: "standalone" | "shared-service";
+  /**
+   * Last cancel verification for this run (persisted so an incomplete or
+   * uncertain cancel stays incomplete until a later cancel re-verifies live;
+   * a repeated cancel never converts it into success from cache). Optional:
+   * runs that were never cancelled carry no record.
+   */
+  lastCancelVerification?: {
+    at: string;
+    cleanupFinished: boolean;
+    verificationComplete: boolean;
+    remainingPids: number[];
+    quiesced: boolean;
+    quiescenceChecked: boolean;
+    reason?: string;
+  };
+  /** Resolved worker executable at launch (provenance: shim vs live is judged from binaryOverridden, never guessed). */
+  executable?: string;
+  /** True when a CODEXPRO_*_BIN override selected the executable at launch (test shims ride this route). */
+  binaryOverridden?: boolean;
   /** Clamped canary attempt timeout reused for continuations. Optional. */
   attemptTimeoutMs?: number;
   /**
@@ -453,6 +526,46 @@ export interface LaunchConflictCandidate {
   model?: string;
   /** Explicit session id supplied at launch, if any. Omitted (minted) sessions never conflict. */
   sessionId?: string;
+  /**
+   * Canonical absolute workdir for identity. The SAME request id with a
+   * DIFFERENT canonical directory is a conflicting re-use
+   * (duplicate_conflicting), never a replay of the old run. Compare via
+   * canonicalizeWorkdirForCompare (realpath when the path exists).
+   */
+  workdir?: string;
+  /** Real-task identity: selected agent (opencode/claude), Codex sandbox, Claude permission/effort. */
+  agent?: string;
+  executionPolicy?: string;
+  permissionMode?: string;
+  effort?: string;
+  /** Explicit codex -m model override (real tasks only). */
+  modelOverride?: string;
+  /** Explicit codex -c key=value overrides (order-sensitive, real tasks only). */
+  configOverrides?: string[];
+  /** Explicit Claude --allowedTools / --disallowedTools text. */
+  allowedTools?: string;
+  disallowedTools?: string;
+  /** Separate explicit per-run bypass opt-in (codex danger only). */
+  bypassApprovals?: boolean;
+}
+
+/**
+ * Canonicalize a workdir for request-identity comparison: the realpath when
+ * the path exists (resolves symlinks and spelling variants to one canonical
+ * directory), otherwise the resolved absolute path. Never throws.
+ */
+export function canonicalizeWorkdirForCompare(workdir: string): string {
+  const text = String(workdir ?? "");
+  if (!text) return text;
+  try {
+    return fs.realpathSync.native(path.resolve(text));
+  } catch {
+    try {
+      return path.resolve(text);
+    } catch {
+      return text;
+    }
+  }
 }
 
 /**
@@ -460,9 +573,26 @@ export interface LaunchConflictCandidate {
  * identical worker-input content replays (no second worker); the same id with
  * different task/group/model content is a conflicting re-use and must be
  * rejected with duplicate_conflicting (no new worker, nothing consumed).
- * Operational fields (workdir, timeout) are not identity: retries may restate
- * them. An omitted session id never conflicts with a later-observed minted
- * session; only two explicit session ids are compared.
+ * The canonical workdir IS identity: the same request id with a different
+ * canonical directory is a conflicting re-use (duplicate_conflicting), never
+ * a replay of the old run. Only the timeout stays non-identity (retries may
+ * restate it). EVERY other launch-affecting setting is identity: engine, profile/agent,
+ * model AND model/config overrides, tool filters (allowed/disallowed),
+ * execution policy, permission mode, effort, bypass opt-in, session
+ * selection, task, group, canary flag. A different value in any of them is a
+ * different worker and refuses (no second worker, no silent reuse).
+ * Backward compatibility for run files that predate a field: agent,
+ * execution policy, permission mode, and effort are compared only when the
+ * STORED run carries them, so an absent stored field never turns an
+ * idempotent replay (or an uncertain-dispatch retry) into a conflict. Newer
+ * identity fields (model/config overrides, tool filters, bypass) compare
+ * symmetrically (absent means not selected): selecting a setting the stored
+ * run did not select is a changed launch and refuses rather than silently
+ * reusing the old worker. Session selection: runs launched after
+ * requestedSessionId compare strictly in both directions (explicit X vs
+ * omitted is a changed selection and refuses); legacy runs without the
+ * marker keep the old rule (only a differing explicit candidate id conflicts
+ * with the observed session; an omitted session never conflicts).
  */
 export function isLaunchRequestConflict(existing: DelegationRunRecord, candidate: LaunchConflictCandidate): boolean {
   if (existing.engine !== candidate.engine) return true;
@@ -470,11 +600,47 @@ export function isLaunchRequestConflict(existing: DelegationRunRecord, candidate
   const existingCanary = existing.isCanary !== false;
   if (existingCanary !== candidate.isCanary) return true;
   if (!candidate.isCanary && (existing.task ?? "") !== (candidate.task ?? "")) return true;
-  if (candidate.engine === "codex" && (existing.profile ?? "") !== (candidate.profile ?? "")) return true;
+  // Canonical workdir IS identity: the same request id with a different
+  // canonical directory is a conflicting re-use, never a replay. Stored runs
+  // always carry workdir; a stored record that somehow predates the field
+  // keeps the legacy wildcard (absent stored workdir never conflicts) so old
+  // replays cannot turn into conflicts.
+  if (candidate.workdir !== undefined && existing.workdir !== undefined) {
+    if (canonicalizeWorkdirForCompare(existing.workdir) !== canonicalizeWorkdirForCompare(candidate.workdir)) return true;
+  }
+  if (candidate.engine === "codex") {
+    if ((existing.profile ?? "") !== (candidate.profile ?? "")) return true;
+    // Stored-guarded (legacy wildcard): Leaf 1/2 run files predate these
+    // fields, and an absent stored field must not turn an idempotent replay
+    // (or an uncertain-dispatch retry) into a conflict.
+    if (existing.executionPolicy !== undefined &&
+      (existing.executionPolicy ?? "") !== (candidate.executionPolicy ?? "")) return true;
+    // Symmetric: absent means not selected. A model/config/bypass setting
+    // the stored run did not select is a changed launch and refuses rather
+    // than silently reusing the old worker.
+    if ((existing.modelOverride ?? "") !== (candidate.modelOverride ?? "")) return true;
+    if ((existing.configOverrides ?? []).join("\0") !== (candidate.configOverrides ?? []).join("\0")) return true;
+    if (Boolean(existing.bypassApprovals) !== Boolean(candidate.bypassApprovals)) return true;
+  }
   if (candidate.engine === "opencode") {
     if ((existing.model ?? "") !== (candidate.model ?? "")) return true;
-    const candidateSession = candidate.sessionId ?? "";
-    if (candidateSession && (existing.session?.sessionId ?? "") !== candidateSession) return true;
+    if (existing.agent !== undefined && (existing.agent ?? "") !== (candidate.agent ?? "")) return true;
+  }
+  if (candidate.engine === "claude") {
+    if (existing.agent !== undefined && (existing.agent ?? "") !== (candidate.agent ?? "")) return true;
+    if ((existing.model ?? "") !== (candidate.model ?? "")) return true;
+    if (existing.permissionMode !== undefined && (existing.permissionMode ?? "") !== (candidate.permissionMode ?? "")) return true;
+    if (existing.effort !== undefined && (existing.effort ?? "") !== (candidate.effort ?? "")) return true;
+    if ((existing.allowedTools ?? "") !== (candidate.allowedTools ?? "")) return true;
+    if ((existing.disallowedTools ?? "") !== (candidate.disallowedTools ?? "")) return true;
+  }
+  if (candidate.engine !== "codex") {
+    if (existing.requestedSessionId !== undefined) {
+      if ((existing.requestedSessionId ?? "") !== (candidate.sessionId ?? "")) return true;
+    } else {
+      const candidateSession = candidate.sessionId ?? "";
+      if (candidateSession && (existing.session?.sessionId ?? "") !== candidateSession) return true;
+    }
   }
   return false;
 }
