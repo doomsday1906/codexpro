@@ -1,0 +1,35 @@
+ok: A luna profile gate (allow + 4 refusals)
+ok: B opencode discovery (depth-1) + model gate + qualified argv per engine
+ok: C durable store + reconcile + owner + idempotency
+ok: D events validation + challenge -32015 + delivery matrix (stubs)
+ok: D loopback wire proof OBSERVED (challenge + signed delivery)
+ok: E cli run state extension + idempotency + interrupted reconcile
+ok: F mcp tool flow (refusals, launch, replay, read, ack, followup, cancel, owner scoping)
+ok: H e2e leaf unit contract (group/task/timeout/prompt/envelope/DNS/subs-0600)
+ok: H2a launch validation (group/task bounded, non-empty)
+ok: H2b real-task launch (custom group, no fixtures, worker-observed)
+ok: H2c follow-up payload forwarded, result changes (diff SHAs)
+ok: H2d gate refusal consumes nothing (no answered mark, no attempt, seq unchanged), retry succeeds
+ok: H2e split flags (app delivery gated pending; verification + storage allowed while OFF)
+ok: H2f explicit opt-in delivers server-side with the subscription header (loopback)
+ok: G sdk gap confirmed (no native server/discover or events/*)
+ok: I1 real server/discover + events/* handlers with official envelopes (verification/event/headers, webhook-id fixes)
+ok: I2 validated-IP dial (single resolve, IP literal, Host+SNI preserved, v4-mapped blocked, no redirect)
+ok: I3 split flags (verification + storage allowed while app POSTs gated)
+ok: I4 reserved answer bytes (whole-prompt truncation never drops answer, multibyte-safe)
+ok: I5 crash-safe pending-dispatch (staged before spawn, retry same ID, no consumed without attempt)
+ok: J MCP pending-dispatch (spawn failure leaves retryable pending, same ID retries to success)
+ok: K7 transport negotiation (init 2026-07-28 -> 2025-11-25; tools/call runtime_status with draft/older headers; invalid still 400; discover/list with compat header)
+ok: K8 LEGACY-COMPAT wire proof (init downgrade validates against SDK InitializeResultSchema; tools/call body validates against SDK CallToolResult shape — legacy negotiation only, NO modern compliance claimed)
+ok: K8m advertised 2026-07-28 contract shapes (discover resultType/supportedVersions/capabilities.events/ttlMs/cacheScope; list run-attention delivery/inputSchema/payloadSchema; challenge/event envelopes + exact header set — exact-shape conformance to the authoritative draft DiscoverResult schema + documented contract)
+ok: K endpoint wire proof (POST /mcp server/discover + events/* reach the real handlers, auth-checked, batch, -32015 mapping)
+ok: L1 crash-boundary (persisted pending survives reload + retries the same attemptN)
+ok: L2 async spawn-error (spawn rejects after staging -> pending retryable, same ID succeeds)
+ok: L3 conflicting-retry (same pending ID same payload reuses, different payload rejected; launch task/group conflicts rejected)
+ok: M1 initial-launch crash-before-save (fault-injected pid-less pending -> retry same ID launch_uncertain, no second worker)
+ok: M2 followup pid-less pending (fault-injected -> retry same ID dispatch_uncertain, stagedAlivePid gate insufficient alone, no second worker)
+ok: M3 async spawn-error (observed failure marks retryable pending with lastDispatchError, same ID retries to success)
+ok: N reviewed assignment computed RHS (ternary IfExp PR555 + concat PR556 + format/f-string with refs, class/nested/module scope, credential+.env retained, hash-only, no literal substitution)
+
+delegation-canary-smoke: PASS (code SUBSCRIBED-loopback OBSERVED; ChatGPT-side subscription pending coordination)
+exit=0

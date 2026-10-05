@@ -1,0 +1,10 @@
+ok: C1 unit (canonical workdir is request identity; timeout stays non-identity by construction)
+ok: C2 unit (standalone argv on launch + continuation, honest legacy labels, real-binary route grounding)
+ok: C2 unit (windowed quiescence merge fail-closed, owned-tree recheck never broadens)
+ok: C3 unit (500-file/256-KiB coverage propagates; absent last-message reports no path)
+ok: C1 MCP (changed workdir conflicts; identical restatement replays)
+ok: C2 MCP (identical active-session retry replays; new request on busy session refuses)
+ok: C2/C4 MCP (opencode-route cancel stops owned work + writes, unrelated work runs, repeat re-verifies)
+ok: C3 MCP (bounded OpenCode output artifact persisted, attributed, route acked)
+delegation-identity-standalone-output-smoke: PASS (no live model calls; fake-binary results labeled shim)
+exit=0

@@ -105,6 +105,7 @@ import {
   buildLaunchPreview,
   buildOpenCodeCanaryArgv,
   buildOpenCodeRealArgv,
+  aliveTreeMembers,
   CANARY_FIXTURES,
   canaryPrompt,
   cancelOwnedTree,
@@ -139,6 +140,7 @@ import {
   verifyOpenCodeLaunch,
   verifyOpenCodeSession,
   waitForSpawn,
+  type OwnedTreeMemberIdentity,
   type PostCancelWrites,
   type WorkdirBaseline
 } from "./delegationEngines.js";
@@ -253,6 +255,71 @@ export function recheckOwnedTreeGone(pid: number | undefined, startTime: string 
 
 function okResult(text: string, structured: Record<string, unknown>): any {
   return { content: [{ type: "text", text }], structuredContent: structured };
+}
+
+/**
+ * Persist one attempt's output artifact with provenance. Never overwrites:
+ * the primary path is exclusively created (O_EXCL); an existing file —
+ * including an existing EMPTY file (empty = unavailable, never a slot to
+ * fill) — is left untouched. When the primary is preoccupied by an empty
+ * file and retained output exists, the output goes to the attempt's own
+ * fallback sibling instead. `retained === null` means "stat only, never
+ * write" (codex owns its file via --output-last-message). Exported for the
+ * focused regression proof.
+ */
+export function persistAttemptArtifact(
+  workdir: string,
+  engine: DelegationEngine,
+  attemptN: number,
+  retained: string | null
+): NonNullable<DelegationAttempt["outputArtifact"]> {
+  const primaryRel = lastMessageRelPathForAttempt(engine, attemptN);
+  let existingSize: number | null = null;
+  try {
+    const stat = fs.statSync(path.join(workdir, primaryRel));
+    if (stat.isFile()) existingSize = stat.size;
+  } catch { /* absent */ }
+  if (existingSize !== null && existingSize > 0) {
+    // The worker wrote this attempt's file itself (codex
+    // --output-last-message, or a worker-owned write): keep it, never
+    // touch it. Provenance binds it to this attempt.
+    return { relPath: primaryRel, bytes: existingSize, created: false };
+  }
+  if (retained === null) {
+    // No finalize write for this engine: record only what the worker left.
+    return {
+      relPath: primaryRel, bytes: existingSize ?? 0, created: false,
+      ...(existingSize === 0
+        ? { reason: "worker left an empty file (empty = unavailable, never a slot to fill)" }
+        : { reason: "worker wrote no file for this attempt" })
+    };
+  }
+  if (!retained) {
+    return {
+      relPath: primaryRel, bytes: existingSize ?? 0, created: false,
+      ...(existingSize === 0
+        ? { reason: `primary artifact ${primaryRel} is preoccupied by an empty file (left untouched); no retained output to persist elsewhere` }
+        : { reason: "worker produced no output; finalize created no file" })
+    };
+  }
+  const preoccupiedEmpty = existingSize === 0;
+  const candidates = preoccupiedEmpty
+    ? attemptArtifactFallbackPaths(engine, attemptN)
+    : [primaryRel, ...attemptArtifactFallbackPaths(engine, attemptN)];
+  for (const rel of candidates) {
+    if (exclusivelyCreateArtifact(workdir, rel, retained) !== null) {
+      return {
+        relPath: rel,
+        bytes: Buffer.byteLength(retained, "utf8"),
+        created: true,
+        ...(preoccupiedEmpty ? { reason: `primary artifact ${primaryRel} preoccupied by an empty file; left untouched, output persisted to ${rel}` } : {})
+      };
+    }
+  }
+  return {
+    relPath: primaryRel, bytes: existingSize ?? 0, created: false,
+    reason: `primary artifact ${primaryRel}${preoccupiedEmpty ? " (preoccupied by an empty file, left untouched)" : ""} and every fallback is preoccupied; nothing written`
+  };
 }
 
 function failResult(text: string, structured: Record<string, unknown>): any {
@@ -690,10 +757,11 @@ function launchCodexReal(
   plan: GatedLaunchPlan,
   timeoutMs: number,
   prompt: string,
-  isCanary: boolean
+  isCanary: boolean,
+  attemptN = 1
 ): ChildProcess {
-  const lastMessagePath = path.join(run.workdir, "codex-last-message.md");
-  return spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildPlannedArgv(plan, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary);
+  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("codex", attemptN));
+  return spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildPlannedArgv(plan, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary, attemptN);
 }
 
 function launchOpenCodeReal(
@@ -704,10 +772,11 @@ function launchOpenCodeReal(
   timeoutMs: number,
   prompt: string,
   isCanary: boolean,
-  sessionId?: string
+  sessionId?: string,
+  attemptN = 1
 ): ChildProcess {
-  const lastMessagePath = path.join(run.workdir, "opencode-last-message.json");
-  return spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(), buildPlannedArgv(plan, prompt, lastMessagePath, sessionId), timeoutMs, lastMessagePath, isCanary);
+  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("opencode", attemptN));
+  return spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(), buildPlannedArgv(plan, prompt, lastMessagePath, sessionId), timeoutMs, lastMessagePath, isCanary, attemptN);
 }
 
 /** Live child handles for this process. Files stay the durable authority. */
@@ -721,6 +790,8 @@ interface LiveRun {
   stderrBytes: number;
   fixtureHashes: Record<string, string>;
   lastMessagePath: string;
+  /** 1-based attempt number that owns this live child (artifact provenance). */
+  attemptN: number;
   timedOut: boolean;
 }
 
@@ -990,32 +1061,27 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
       };
     }
   }
-  // Bounded output artifact: the opencode/claude CLIs (unlike codex
-  // --output-last-message) write no durable last-message file, so the
-  // promised bounded artifact is persisted here from the retained live
-  // stdout buffer (newest up to the 64KiB live cap). Best-effort and never
-  // throwing: an absent artifact stays explicitly unavailable in read
-  // evidence (never an implied pass), and output beyond the retained tail
-  // is reported via the stdoutTruncated flag below. Never overwrites a file
-  // the worker wrote itself.
-  if (live && (run.engine === "opencode" || run.engine === "claude")) {
-    try {
-      let absent = false;
-      try {
-        const stat = fs.statSync(live.lastMessagePath);
-        absent = !stat.isFile() || stat.size === 0;
-      } catch {
-        absent = true;
-      }
-      if (absent) {
-        const retained = Buffer.concat(live.stdoutChunks).toString("utf8");
-        if (retained) {
-          fs.mkdirSync(path.dirname(live.lastMessagePath), { recursive: true, mode: 0o700 });
-          fs.writeFileSync(live.lastMessagePath, retained, { encoding: "utf8", mode: 0o600 });
-        }
-      }
-    } catch { /* artifact stays unavailable; read evidence says so */ }
-  }
+  // Per-(run, attempt) output artifact, exclusively created and
+  // provenance-bound: attempt N's file is never an earlier attempt's file
+  // (attempt 1 keeps the legacy name; later attempts use suffixed names),
+  // existing files are never overwritten — including existing EMPTY files
+  // (empty = unavailable, never a slot to fill; the output goes to the
+  // attempt's own fallback sibling instead) — and the recorded relPath
+  // binds which attempt produced the artifact for the read path. Best
+  // effort and never throwing: an unavailable artifact stays explicitly
+  // unavailable in read evidence (never an implied pass). Output beyond
+  // the retained tail is reported via the stdoutTruncated flag below.
+  // Codex owns its file via --output-last-message (stat only here, never
+  // written); opencode/claude output is persisted from the retained live
+  // stdout buffer (newest up to the 64KiB live cap).
+  const attemptN = live?.attemptN ?? latest?.n ?? 1;
+  let outputArtifact: DelegationAttempt["outputArtifact"];
+  try {
+    const retained = live && (run.engine === "opencode" || run.engine === "claude")
+      ? Buffer.concat(live.stdoutChunks).toString("utf8")
+      : null;
+    outputArtifact = persistAttemptArtifact(run.workdir, run.engine, attemptN, retained);
+  } catch { /* artifact stays unrecorded; read evidence reports it unavailable */ }
   let state = final.state;
   let summary = summarizeTerminal(final.state, final.exitCode, final.timedOut);
   if (note) summary = `${summary}; ${note}`;
@@ -1031,7 +1097,8 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
         exitCode: final.exitCode,
         signal: final.signal,
         timedOut: final.timedOut,
-        summary: sanitizeSummary(summary)
+        summary: sanitizeSummary(summary),
+        ...(outputArtifact ? { outputArtifact } : {})
       }
     : undefined;
   run.state = state;
@@ -1101,7 +1168,8 @@ export function spawnCanaryChild(
   argv: string[],
   timeoutMs: number,
   lastMessagePath: string,
-  isCanary: boolean
+  isCanary: boolean,
+  attemptN = 1
 ): ChildProcess {
   const runtime = processRuntime();
   // Canary runs hash the read-only fixtures before spawn so completion can
@@ -1129,6 +1197,7 @@ export function spawnCanaryChild(
     stderrBytes: 0,
     fixtureHashes,
     lastMessagePath,
+    attemptN: Number.isSafeInteger(attemptN) && attemptN >= 1 ? attemptN : 1,
     timedOut: false
   };
   clearTimeout(live.timeout);
@@ -1235,10 +1304,11 @@ function launchCodexCanary(
   profile: string,
   timeoutMs: number,
   prompt: string,
-  isCanary: boolean
+  isCanary: boolean,
+  attemptN = 1
 ): ChildProcess {
-  const lastMessagePath = path.join(run.workdir, "codex-last-message.md");
-  return spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildCodexCanaryArgv(profile, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary);
+  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("codex", attemptN));
+  return spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildCodexCanaryArgv(profile, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary, attemptN);
 }
 
 function launchOpenCodeCanary(
@@ -1249,10 +1319,11 @@ function launchOpenCodeCanary(
   timeoutMs: number,
   prompt: string,
   isCanary: boolean,
-  sessionId?: string
+  sessionId?: string,
+  attemptN = 1
 ): ChildProcess {
-  const lastMessagePath = path.join(run.workdir, "opencode-last-message.json");
-  return spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(), buildOpenCodeCanaryArgv(model, prompt, sessionId), timeoutMs, lastMessagePath, isCanary);
+  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("opencode", attemptN));
+  return spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(), buildOpenCodeCanaryArgv(model, prompt, sessionId), timeoutMs, lastMessagePath, isCanary, attemptN);
 }
 
 function launchClaudeChild(
@@ -1262,13 +1333,14 @@ function launchClaudeChild(
   argv: string[],
   timeoutMs: number,
   prompt: string,
-  isCanary: boolean
+  isCanary: boolean,
+  attemptN = 1
 ): ChildProcess {
   // Claude runs non-interactive (-p --output-format json): worker JSON goes
   // to stdout (captured in the bounded live tails); the last-message path is
   // recorded for evidence-route parity with the other engines.
-  const lastMessagePath = path.join(run.workdir, "claude-last-message.json");
-  return spawnCanaryChild(deps, bridgeDir, run, resolveClaudeBinary(), argv, timeoutMs, lastMessagePath, isCanary);
+  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("claude", attemptN));
+  return spawnCanaryChild(deps, bridgeDir, run, resolveClaudeBinary(), argv, timeoutMs, lastMessagePath, isCanary, attemptN);
 }
 
 function launchCodexResume(
@@ -1278,10 +1350,11 @@ function launchCodexResume(
   sessionId: string,
   timeoutMs: number,
   prompt: string,
-  isCanary: boolean
+  isCanary: boolean,
+  attemptN = 1
 ): ChildProcess {
-  const lastMessagePath = path.join(run.workdir, "codex-last-message.md");
-  return spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildCodexResumeArgv(sessionId, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary);
+  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("codex", attemptN));
+  return spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildCodexResumeArgv(sessionId, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary, attemptN);
 }
 
 function runSummary(run: DelegationRunRecord): Record<string, unknown> {
@@ -1362,7 +1435,7 @@ export interface TestEvidenceReport {
   stdout: EvidenceArtifactReport;
   stderr: EvidenceArtifactReport;
   diff: EvidenceArtifactReport;
-  last_message: EvidenceArtifactReport & { path?: string };
+  last_message: EvidenceArtifactReport & { path?: string; attempt_n?: number };
   tests: EvidenceArtifactReport;
   output_note: string;
 }
@@ -1374,6 +1447,116 @@ export function lastMessageRelPath(engine: DelegationEngine): string {
     : engine === "opencode"
       ? "opencode-last-message.json"
       : "claude-last-message.json";
+}
+
+/**
+ * Per-(run, attempt) output artifact path. Attempt 1 keeps the legacy
+ * filename (existing evidence keeps working); every later attempt gets its
+ * own suffixed file, so a continuation can never surface an earlier
+ * attempt's output file as the current result. Exported for the focused
+ * regression proof.
+ */
+export function lastMessageRelPathForAttempt(engine: DelegationEngine, attemptN: number): string {
+  const base = lastMessageRelPath(engine);
+  if (!Number.isSafeInteger(attemptN) || attemptN <= 1) return base;
+  const dot = base.lastIndexOf(".");
+  const stem = dot >= 0 ? base.slice(0, dot) : base;
+  const ext = dot >= 0 ? base.slice(dot) : "";
+  return `${stem}-attempt-${attemptN}${ext}`;
+}
+
+/**
+ * Ordered fallback siblings for an preoccupied artifact path: the first
+ * absent file wins. Bounded (at most 4 fallbacks); when all are preoccupied
+ * the attempt records unavailable rather than overwriting anything.
+ * Exported for the focused regression proof.
+ */
+export function attemptArtifactFallbackPaths(engine: DelegationEngine, attemptN: number): string[] {
+  const base = lastMessageRelPath(engine);
+  const dot = base.lastIndexOf(".");
+  const stem = dot >= 0 ? base.slice(0, dot) : base;
+  const ext = dot >= 0 ? base.slice(dot) : "";
+  const out: string[] = [];
+  if (!Number.isSafeInteger(attemptN) || attemptN <= 1) {
+    // Attempt 1's primary is the legacy name; its first fallback is the
+    // same suffixed shape later attempts use as their primary.
+    out.push(`${stem}-attempt-1${ext}`);
+  } else {
+    const primary = lastMessageRelPathForAttempt(engine, attemptN);
+    const pdot = primary.lastIndexOf(".");
+    const pstem = pdot >= 0 ? primary.slice(0, pdot) : primary;
+    const pext = pdot >= 0 ? primary.slice(pdot) : "";
+    for (let i = 1; i <= 3; i += 1) out.push(`${pstem}-x${i}${pext}`);
+    return out;
+  }
+  for (let i = 1; i <= 3; i += 1) out.push(`${stem}-x${i}${ext}`);
+  return out;
+}
+
+/**
+ * Exclusively create one artifact file (O_EXCL): succeeds ONLY when the
+ * path does not exist yet. An existing file — including an existing EMPTY
+ * file (empty = unavailable, never a slot to fill) — is never overwritten,
+ * never truncated, never filled. Returns the created relative path, or null
+ * when the path is preoccupied. Never throws.
+ */
+export function exclusivelyCreateArtifact(workdir: string, relPath: string, text: string): string | null {
+  if (relPath.includes("..") || path.isAbsolute(relPath)) return null;
+  const abs = path.join(workdir, relPath);
+  let fd = -1;
+  try {
+    fs.mkdirSync(path.dirname(abs), { recursive: true, mode: 0o700 });
+    fd = fs.openSync(abs, "wx", 0o600);
+    fs.writeFileSync(fd, text, "utf8");
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = -1;
+    return relPath;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== -1) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+}
+
+/**
+ * Describe one attempt's durable last-message artifact WITH provenance:
+ * which attempt produced it and which relative path was recorded at
+ * finalize. The recorded path binds the evidence (never the legacy shared
+ * name by default); a run without recorded provenance falls back to the
+ * attempt's primary path, and a legacy attempt-1 run without provenance
+ * falls back to the legacy lookup. Empty or absent is explicitly
+ * unavailable, never a pass.
+ */
+export function describeAttemptArtifact(
+  workdir: string,
+  engine: DelegationEngine,
+  attemptN: number,
+  recordedRelPath?: string
+): EvidenceArtifactReport & { path?: string; attempt_n: number } {
+  const primary = lastMessageRelPathForAttempt(engine, attemptN);
+  const candidates = recordedRelPath && !recordedRelPath.includes("..") && !path.isAbsolute(recordedRelPath)
+    ? [recordedRelPath, primary]
+    : [primary];
+  for (const rel of candidates) {
+    try {
+      const stat = fs.statSync(path.join(workdir, rel));
+      if (!stat.isFile()) continue;
+      if (stat.size === 0) {
+        return {
+          path: rel, status: "unavailable", truncated: false, bytes: 0, attempt_n: attemptN,
+          reason: `attempt ${attemptN} artifact ${rel} is empty (empty = unavailable, never a slot to fill)`
+        };
+      }
+      return { path: rel, status: "present", truncated: false, bytes: stat.size, attempt_n: attemptN };
+    } catch { /* try the next candidate */ }
+  }
+  return {
+    status: "unavailable", truncated: false, attempt_n: attemptN,
+    reason: `attempt ${attemptN} artifact absent (no ${candidates.join(" nor ")}; the worker wrote none and finalize created none)`
+  };
 }
 
 /**
@@ -1431,7 +1614,7 @@ export function buildTestEvidence(input: {
   fingerprintsTruncated?: boolean;
   /** Coverage-limit explanation (500-file / 256-KiB bounds). */
   coverageReason?: string;
-  lastMessage: EvidenceArtifactReport & { path?: string };
+  lastMessage: EvidenceArtifactReport & { path?: string; attempt_n?: number };
 }): TestEvidenceReport {
   const tailsPresent = Boolean((input.stdoutTail ?? "") || (input.stderrTail ?? ""));
   const unavailable = !input.terminal || !tailsPresent;
@@ -2101,9 +2284,14 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         // output presence only, never that tests ran. When the run has no
         // terminal result (or empty tails) the evidence is explicitly
         // unavailable, never implied. The durable last-message file is
-        // reported by presence + path (ordinary read route), never inlined.
+        // reported by presence + path (ordinary read route), never inlined,
+        // and is bound to the CURRENT attempt by recorded provenance (an
+        // earlier attempt's file is never surfaced as the current result).
         const terminalStates = DELEGATION_TERMINAL_STATES.has(current.state);
-        const lastMessage = describeLastMessageArtifact(current.workdir, current.engine);
+        const currentAttempt = current.attempts.at(-1);
+        const lastMessage = currentAttempt
+          ? describeAttemptArtifact(current.workdir, current.engine, currentAttempt.n, currentAttempt.outputArtifact?.relPath)
+          : describeLastMessageArtifact(current.workdir, current.engine);
         const testEvidence = buildTestEvidence({
           terminal: terminalStates,
           state: current.state,
@@ -2555,17 +2743,17 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             // Continuation argv is rebuilt from STORED run fields (profile +
             // execution policy + explicit overrides for codex; agent + model
             // for opencode; agent + explicit flags for claude): the selected
-            // identity is preserved, never substituted.
+            // identity is preserved, never substituted. The last-message
+            // path is per-(run, attempt): a continuation never reuses an
+            // earlier attempt's output file as its result.
             const lastMessagePath = path.join(run.workdir,
-              run.engine === "codex" ? "codex-last-message.md"
-              : run.engine === "opencode" ? "opencode-last-message.json"
-              : "claude-last-message.json");
+              lastMessageRelPathForAttempt(run.engine, staged.attemptN));
             try {
               if (run.engine === "codex" && continuationLabel === "resumed" && resumeSessionId) {
-                child = launchCodexResume(deps, bridgeDir, run, resumeSessionId, staged.timeoutMs, staged.prompt, runIsCanary);
+                child = launchCodexResume(deps, bridgeDir, run, resumeSessionId, staged.timeoutMs, staged.prompt, runIsCanary, staged.attemptN);
               } else if (run.engine === "codex") {
                 if (runIsCanary) {
-                  child = launchCodexCanary(deps, bridgeDir, run, run.profile ?? "", staged.timeoutMs, staged.prompt, runIsCanary);
+                  child = launchCodexCanary(deps, bridgeDir, run, run.profile ?? "", staged.timeoutMs, staged.prompt, runIsCanary, staged.attemptN);
                 } else {
                   const policy = (run.executionPolicy === "workspace-write" || run.executionPolicy === "danger-full-access" || run.executionPolicy === "read-only")
                     ? run.executionPolicy
@@ -2576,7 +2764,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                       ...(run.modelOverride ? { modelOverride: run.modelOverride } : {}),
                       ...(run.configOverrides?.length ? { configOverrides: run.configOverrides } : {}),
                       ...(run.bypassApprovals ? { dangerBypassExplicit: true as const } : {})
-                    }), staged.timeoutMs, lastMessagePath, runIsCanary);
+                    }), staged.timeoutMs, lastMessagePath, runIsCanary, staged.attemptN);
                 }
               } else if (run.engine === "opencode") {
                 if (run.agent) {
@@ -2584,16 +2772,16 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                     buildOpenCodeRealArgv({
                       model: run.model ?? "", agent: run.agent, prompt: staged.prompt,
                       ...(resumeSessionId ? { sessionId: resumeSessionId } : {})
-                    }), staged.timeoutMs, lastMessagePath, runIsCanary);
+                    }), staged.timeoutMs, lastMessagePath, runIsCanary, staged.attemptN);
                 } else {
-                  child = launchOpenCodeCanary(deps, bridgeDir, run, run.model ?? "", staged.timeoutMs, staged.prompt, runIsCanary, resumeSessionId);
+                  child = launchOpenCodeCanary(deps, bridgeDir, run, run.model ?? "", staged.timeoutMs, staged.prompt, runIsCanary, resumeSessionId, staged.attemptN);
                 }
               } else if (continuationLabel === "resumed" && resumeSessionId) {
                 child = launchClaudeChild(deps, bridgeDir, run,
                   buildClaudeResumeArgv(resumeSessionId, staged.prompt, {
                     ...(run.agent ? { agent: run.agent } : {}),
                     ...(run.permissionMode ? { permissionMode: run.permissionMode } : {})
-                  }), staged.timeoutMs, staged.prompt, runIsCanary);
+                  }), staged.timeoutMs, staged.prompt, runIsCanary, staged.attemptN);
               } else {
                 const claudeSession = resumeSessionId ?? run.session?.sessionId;
                 child = launchClaudeChild(deps, bridgeDir, run,
@@ -2605,7 +2793,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                     ...(run.allowedTools ? { allowedTools: run.allowedTools } : {}),
                     ...(run.disallowedTools ? { disallowedTools: run.disallowedTools } : {}),
                     ...(claudeSession ? { sessionId: claudeSession } : {})
-                  }), staged.timeoutMs, staged.prompt, runIsCanary);
+                  }), staged.timeoutMs, staged.prompt, runIsCanary, staged.attemptN);
               }
             } catch (error) {
               // Ambiguous post-spawn (child spawned OK, then identity-save
@@ -2716,6 +2904,12 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             );
           }
           run = applied.run;
+          // The previous attempt's terminal result is history, not the
+          // current result: a new attempt is now running with its own
+          // per-attempt artifact. Clear the stale result so the new
+          // attempt can never surface the previous attempt's output or
+          // tails as its own; the attempts history keeps the old outcome.
+          delete run.result;
           // Promote the queued pending attempt (n) to running with dispatch identity.
           // Preserve the spawn-captured pid/startTime (set by spawnCanaryChild
           // before confirm); never drop process identity.
@@ -2842,10 +3036,47 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           await sleepMs(QUIESCENCE_VERIFY_WINDOW_MS);
           const repeatSecond = findPostCancelWrites(current.workdir, repeatBefore, repeatStart);
           const repeatQuiescence = mergeQuiescenceLegs(repeatFirst, repeatSecond);
-          const repeatRemaining = recheckOwnedTreeGone(repeatLatest?.pid, repeatLatest?.processStartTime);
-          const repeatClean = repeatRemaining.length === 0;
+          // Ownership/exit evidence (never cached): recheck the persisted
+          // descendant PID+starttime identities live. A root-walk alone
+          // proves nothing when the root is stale — an exited root never
+          // hides a surviving reparented descendant — and a stale root with
+          // no persisted identities is UNVERIFIED, never clean. Quiescence
+          // only supports this ownership evidence: a quiet workdir never
+          // substitutes for it.
+          const priorMembers: OwnedTreeMemberIdentity[] = Array.isArray(current.lastCancelVerification?.ownedTreeMembers)
+            ? current.lastCancelVerification.ownedTreeMembers.filter((m) =>
+              !!m && Number.isSafeInteger(m.pid) && (m.pid as number) > 0 && typeof m.startTime === "string" && !!(m.startTime as string))
+            : [];
+          const memberAlive = aliveTreeMembers(priorMembers);
+          const rootWalk = repeatLatest?.pid === undefined
+            ? { staleRoot: true as const, members: [] as number[], baselines: new Map<number, string>() }
+            : collectOwnedTree(repeatLatest.pid, repeatLatest.processStartTime);
+          const rootWalkAlive = rootWalk.staleRoot
+            ? []
+            : rootWalk.members.filter((pid) => readProcessStartTime(pid) === rootWalk.baselines.get(pid));
+          const repeatRemaining = [...new Set([...memberAlive, ...rootWalkAlive])];
+          // Grounded only by a live enumeration: persisted members from a
+          // cancel that saw the root alive, or a root verifiable alive
+          // right now (its tree is then freshly enumerable). A stale root
+          // with no persisted identities is never proof of cleanup.
+          const ownershipGrounded = priorMembers.length > 0 || !rootWalk.staleRoot;
+          const repeatClean = repeatRemaining.length === 0 && ownershipGrounded;
           const repeatQuiesced = repeatQuiescence.checked && repeatQuiescence.continued.length === 0;
           const repeatComplete = repeatClean && repeatQuiesced;
+          // Carry the identities forward (plus any freshly enumerated
+          // while the root is alive) so the NEXT repeat rechecks them too.
+          const freshMembers: OwnedTreeMemberIdentity[] = rootWalk.staleRoot
+            ? []
+            : [...rootWalk.baselines.entries()]
+              .filter(([pid]) => rootWalk.members.includes(pid))
+              .map(([pid, startTime]) => ({ pid, startTime }));
+          const mergedIdentities = new Map<number, string>();
+          for (const m of [...priorMembers, ...freshMembers]) {
+            if (!mergedIdentities.has(m.pid)) mergedIdentities.set(m.pid, m.startTime);
+          }
+          const ownershipReason = ownershipGrounded
+            ? undefined
+            : "ownership UNVERIFIED (no live owned-tree enumeration: missing pid or stale root is never proof of cleanup)";
           current.lastCancelVerification = {
             at: new Date().toISOString(),
             cleanupFinished: repeatClean,
@@ -2853,14 +3084,18 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             remainingPids: repeatRemaining,
             quiesced: repeatQuiesced,
             quiescenceChecked: repeatQuiescence.checked,
-            ...(repeatQuiescence.reason ? { reason: repeatQuiescence.reason } : {})
+            ownedTreeMembers: [...mergedIdentities.entries()].map(([pid, startTime]) => ({ pid, startTime })),
+            ...([ownershipReason, repeatQuiescence.reason].some(Boolean)
+              ? { reason: [ownershipReason, repeatQuiescence.reason].filter(Boolean).join("; ") }
+              : {})
           };
           saveDelegationRun(bridgeDir, current);
           const repeatVerification = {
             rechecked: true as const,
             pid_tree: {
               remaining: repeatRemaining,
-              cleanup_finished: repeatClean
+              cleanup_finished: repeatClean,
+              ownership_verified: ownershipGrounded
             },
             quiescence: {
               checked: repeatQuiescence.checked,
@@ -2874,7 +3109,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           return okResult(
             repeatComplete
               ? `Run ${current.runId} is already cancelled; re-verified: owned tree gone, workdir quiet across the verification window.`
-              : `Run ${current.runId} is already cancelled; re-verified INCOMPLETE: ${repeatRemaining.length > 0 ? `${repeatRemaining.length} owned descendant(s) still remain (${repeatRemaining.join(",")}). ` : ""}${!repeatQuiescence.checked ? `quiescence UNVERIFIABLE (${repeatQuiescence.reason ?? "workdir unreadable"}).` : repeatQuiescence.continued.length > 0 ? `quiescence FAILED: ${repeatQuiescence.continued.length} post-cancel write(s).` : ""}`,
+              : `Run ${current.runId} is already cancelled; re-verified INCOMPLETE: ${repeatRemaining.length > 0 ? `${repeatRemaining.length} owned descendant(s) still remain (${repeatRemaining.join(",")}). ` : ""}${!ownershipGrounded ? "ownership UNVERIFIED (no live owned-tree enumeration; a missing pid or stale root is never proof of cleanup). " : ""}${!repeatQuiescence.checked ? `quiescence UNVERIFIABLE (${repeatQuiescence.reason ?? "workdir unreadable"}).` : repeatQuiescence.continued.length > 0 ? `quiescence FAILED: ${repeatQuiescence.continued.length} post-cancel write(s).` : ""}`,
             {
               run_id: current.runId, state: current.state, already_terminal: true, cancelled: true,
               cleanup_finished: repeatClean,
@@ -2893,10 +3128,20 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         }
         // Quiescence baseline BEFORE signaling: any workdir write at/after
         // cancel-complete means the worker (or an orphan of it) kept going.
+        // A missing PID or an uncertain dispatch is NEVER proof of cleanup:
+        // with no verifiable PID+starttime identity there is nothing to
+        // probe, so the verdict stays incomplete/uncertain (fail closed).
         const writesBefore = snapshotWorkdirMtimes(current.workdir);
         const latest = current.attempts.at(-1);
-        let tree = { signalled: [] as number[], remaining: [] as number[], cleanupFinished: true, staleRoot: true };
-        if (latest?.pid !== undefined) {
+        const uncertainCancel = isUncertainDispatch(current);
+        let tree: {
+          signalled: number[];
+          remaining: number[];
+          cleanupFinished: boolean;
+          staleRoot: boolean;
+          members: OwnedTreeMemberIdentity[];
+        } = { signalled: [], remaining: [], cleanupFinished: false, staleRoot: true, members: [] };
+        if (!uncertainCancel && latest?.pid !== undefined && latest.processStartTime !== undefined) {
           tree = await cancelOwnedTree(latest.pid, latest.processStartTime, 2_000);
         }
         processRuntime().live.delete(current.runId);
@@ -2914,17 +3159,28 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         const quiesced = quiescence.checked && quiescence.continued.length === 0;
         // Owned-process exit recheck AFTER the window: the exact owned tree
         // must be gone, not just signalled. Any still-owned member keeps
-        // cleanup incomplete (never claimed finished early).
+        // cleanup incomplete (never claimed finished early). Quiescence
+        // only supports this ownership evidence: a quiet workdir never
+        // substitutes for it, and an unverified identity (missing pid,
+        // stale root, uncertain dispatch) stays incomplete regardless of
+        // how quiet the workdir is.
         const stillOwned = recheckOwnedTreeGone(latest?.pid, latest?.processStartTime);
         const remainingPids = [...new Set([...tree.remaining, ...stillOwned])];
         const cleanupFinished = tree.cleanupFinished && stillOwned.length === 0;
+        const ownershipReason = tree.staleRoot
+          ? (uncertainCancel || latest?.pid === undefined || latest?.processStartTime === undefined
+            ? "cancel identity unverifiable (missing pid or uncertain dispatch is never proof of cleanup)"
+            : "owned-tree root already stale at cancel (stale root is never proof of cleanup; no live enumeration happened)")
+          : undefined;
         const now = new Date().toISOString();
         if (latest) {
           latest.finishedAt = now;
           latest.state = "cancelled";
           latest.summary = sanitizeSummary(cleanupFinished
             ? (quiesced ? "cancelled by owner; owned tree reaped and rechecked gone; workdir quiesced across grace + verification window (no further writes)" : "cancelled by owner; owned tree reaped and rechecked gone; quiescence INCOMPLETE (see cancel_verification)")
-            : "cancelled by owner; owned descendants remain");
+            : (remainingPids.length > 0
+              ? "cancelled by owner; owned descendants remain"
+              : "cancelled by owner; cleanup UNVERIFIED (no live owned-tree identity; a missing pid or stale root is never proof of cleanup)"));
         }
         current.state = "cancelled";
         current.result = { exitCode: null, signal: null, timedOut: false, summary: sanitizeSummary("cancelled by owner") };
@@ -2935,7 +3191,14 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           remainingPids,
           quiesced,
           quiescenceChecked: quiescence.checked,
-          ...(quiescence.reason ? { reason: quiescence.reason } : {})
+          // Persist the enumerated descendant identities (full owned tree,
+          // not just the attempt root) so a repeated cancel rechecks the
+          // SAME identities live. Empty when no live enumeration happened,
+          // which keeps repeat verification incomplete until grounded.
+          ownedTreeMembers: tree.members,
+          ...([ownershipReason, quiescence.reason].some(Boolean)
+            ? { reason: [ownershipReason, quiescence.reason].filter(Boolean).join("; ") }
+            : {})
         };
         enqueueTerminalEvent(current, loadSubscriptions(subscriptionAuthorityDirFor(deps.config)));
         saveDelegationRun(bridgeDir, current);
@@ -2955,7 +3218,9 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             claimed: false as const,
             ...(sessionId ? { session_id: sessionId } : {}),
             blocker: OPENCODE_CANCEL_CAPABILITY.blocker,
-            note: "owned tree reaped + rechecked gone (+ windowed quiescence below); session-side halt unproven via the qualified CLI and never claimed"
+            note: cleanupFinished
+              ? "owned tree reaped + rechecked gone (+ windowed quiescence below); session-side halt unproven via the qualified CLI and never claimed"
+              : "owned-tree cleanup unverified or incomplete; session-side halt unproven via the qualified CLI and never claimed"
           }
           : { applicable: false as const, claimed: false as const, reason: "session-scoped halt applies to the opencode route only" };
         const verification = {
@@ -2964,6 +3229,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             remaining: remainingPids,
             cleanup_finished: cleanupFinished,
             stale_root: tree.staleRoot,
+            ownership_verified: !tree.staleRoot,
             liveness_rechecked: true as const,
             owned_tree_gone: stillOwned.length === 0
           },
@@ -2994,7 +3260,9 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         return okResult(
           cleanupFinished
             ? `Run ${current.runId} cancelled; owned tree reaped and rechecked gone. ${quiescenceText}.${routeText}${sessionText}`
-            : `Run ${current.runId} cancelled; cleanup INCOMPLETE: ${remainingPids.length} owned descendant(s) remain (${remainingPids.join(",")}). ${quiescenceText}.${routeText}${sessionText}`,
+            : remainingPids.length > 0
+              ? `Run ${current.runId} cancelled; cleanup INCOMPLETE: ${remainingPids.length} owned descendant(s) remain (${remainingPids.join(",")}). ${quiescenceText}.${routeText}${sessionText}`
+              : `Run ${current.runId} cancelled; cleanup UNVERIFIED: no live owned-tree identity to recheck (a missing pid or stale root is never proof of cleanup). ${quiescenceText}.${routeText}${sessionText}`,
           {
             run_id: current.runId, state: "cancelled", cancelled: true,
             cleanup_finished: cleanupFinished,

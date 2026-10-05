@@ -694,6 +694,33 @@ export interface OwnedTree {
 }
 
 /**
+ * One persisted descendant identity: a PID plus the starttime baseline that
+ * proves it is still the same process. PID alone is never identity; a
+ * recycled PID carries a different starttime and never matches.
+ */
+export interface OwnedTreeMemberIdentity {
+  pid: number;
+  startTime: string;
+}
+
+/**
+ * Liveness of persisted descendant identities: a member counts as alive
+ * ONLY while its CURRENT starttime still matches the captured baseline. A
+ * reaped member (/proc gone) or a recycled PID (different starttime) counts
+ * as gone. Never broadens beyond the listed identities. Exported for the
+ * cancel-verification regression proof.
+ */
+export function aliveTreeMembers(members: readonly OwnedTreeMemberIdentity[]): number[] {
+  const alive: number[] = [];
+  for (const member of members) {
+    if (!Number.isSafeInteger(member.pid) || member.pid <= 0) continue;
+    if (!member.startTime) continue;
+    if (readProcessStartTime(member.pid) === member.startTime) alive.push(member.pid);
+  }
+  return alive;
+}
+
+/**
  * Exact owned-tree discovery: the root PID must verify against its spawn
  * baseline, and a child is adopted only through a parent whose identity is
  * currently valid. Stale baselines are never refreshed with a replacement's
@@ -754,6 +781,13 @@ export interface CancelTreeResult {
   remaining: number[];
   cleanupFinished: boolean;
   staleRoot: boolean;
+  /**
+   * Full owned-tree identities enumerated while the root was alive
+   * (persisted by the caller so a repeated cancel can recheck the same
+   * identities). Empty when the root was already stale at entry: no live
+   * enumeration happened, so nothing here can ground a later verdict.
+   */
+  members: OwnedTreeMemberIdentity[];
 }
 
 /**
@@ -782,15 +816,34 @@ function sleepMs(ms: number): Promise<void> {
  * sweeps or parent sessions. The ack reports cleanupFinished:false while any
  * owned descendant remains; it never claims cleanup finished early.
  *
+ * A missing PID or an already-stale root is NEVER proof of cleanup: when
+ * the root cannot be verified alive at entry, no live enumeration happened,
+ * so unknown (possibly reparented) descendants may survive. The result is
+ * cleanupFinished:false with the still-alive KNOWN members (if any) in
+ * remaining — incomplete/uncertain until a live enumeration grounds the
+ * verdict. Callers persist `members` so a repeated cancel rechecks the same
+ * identities instead of trusting a cached outcome.
+ *
  * NOTE: async with real sleeps (never a blocking busy-wait): the event loop
  * must turn so the kernel reaps our signalled children; otherwise they linger
  * as same-identity zombies and every liveness check lies. Timeout paths use
  * the non-blocking signalOwnedTree instead and finalize on close/settle.
  */
-export async function cancelOwnedTree(rootPid: number, rootStartTime: string | undefined, graceMs = 2000): Promise<CancelTreeResult> {
+export async function cancelOwnedTree(
+  rootPid: number,
+  rootStartTime: string | undefined,
+  graceMs = 2000,
+  knownMembers: readonly OwnedTreeMemberIdentity[] = []
+): Promise<CancelTreeResult> {
   const discovered = collectOwnedTree(rootPid, rootStartTime);
   if (discovered.staleRoot) {
-    return { signalled: [], remaining: [], cleanupFinished: true, staleRoot: true };
+    // No live enumeration: the root is already gone (or was never
+    // verifiable), so the tree cannot be bounded. Recheck the caller-held
+    // known identities only — an exited root never hides a surviving
+    // reparented descendant — but the verdict stays incomplete regardless:
+    // a stale root proves nothing about unknown descendants.
+    const remaining = aliveTreeMembers(knownMembers);
+    return { signalled: [], remaining, cleanupFinished: false, staleRoot: true, members: [] };
   }
   // A member counts as remaining only while its CURRENT starttime still
   // matches the captured baseline: a recycled PID is not our descendant.
@@ -821,7 +874,10 @@ export async function cancelOwnedTree(rootPid: number, rootStartTime: string | u
     await sleepMs(200);
     remaining = discovered.members.filter(stillOwned);
   }
-  return { signalled, remaining, cleanupFinished: remaining.length === 0, staleRoot: false };
+  const members: OwnedTreeMemberIdentity[] = [...discovered.baselines.entries()]
+    .filter(([pid]) => discovered.members.includes(pid))
+    .map(([pid, startTime]) => ({ pid, startTime }));
+  return { signalled, remaining, cleanupFinished: remaining.length === 0, staleRoot: false, members };
 }
 
 export function clampCanaryTimeout(requestedMs: unknown): number {

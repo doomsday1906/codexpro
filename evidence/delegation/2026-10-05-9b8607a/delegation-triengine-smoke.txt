@@ -1,0 +1,11 @@
+ok: T1 codex gates (luna canary-only, selected-profile real tasks, explicit-only danger, astra forbidden)
+ok: T2 codex argv (policy-gated sandbox, explicit-only escalation/overrides)
+ok: T3 failure classification (only real execution denial warrants a proposal)
+ok: T4 opencode gates (host equality canary-only, selected agent + explicit model for real tasks)
+ok: T5 claude gates (real agent, explicit-only flags, UUID sessions, file-verified resume)
+ok: T6 capability probe blockers + preview shape
+ok: T7 store conflict identity (policy/agent are identity; absent legacy fields are wildcards)
+ok: T8 workdir evidence (snapshot diff, explicit unavailable)
+ok: T9 MCP wiring (preview dry-run, claude launch + stable session + followup, raw evidence + review note)
+delegation-triengine-smoke: PASS (no live model calls)
+exit=0

@@ -75,6 +75,21 @@ export interface DelegationAttempt {
   continuation?: "resumed" | "new-continuation-attempt";
   /** Sanitized one-line outcome only. Never transcripts, prompts, or credentials. */
   summary?: string;
+  /**
+   * Per-attempt output artifact provenance: which workdir-relative file THIS
+   * attempt produced (or preoccupied). Attempt N never reuses attempt N-1's
+   * file as its result; the read path surfaces only the recorded path.
+   */
+  outputArtifact?: {
+    /** Workdir-relative artifact path recorded at finalize. */
+    relPath: string;
+    /** Byte size observed at finalize (0 = empty/unavailable, never a slot). */
+    bytes: number;
+    /** True when this attempt exclusively created the file (O_EXCL). */
+    created: boolean;
+    /** Unavailable reason when bytes is 0 or the file was preoccupied. */
+    reason?: string;
+  };
 }
 
 export interface DelegationEventDelivery {
@@ -265,6 +280,16 @@ export interface DelegationRunRecord {
     quiesced: boolean;
     quiescenceChecked: boolean;
     reason?: string;
+    /**
+     * Descendant PID+starttime identities enumerated while the root was
+     * alive at cancel time (the full owned tree, not just the attempt
+     * root). A repeated cancel rechecks THESE identities live (never a
+     * cached success); an exited root can therefore never hide a surviving
+     * reparented descendant. Empty when no live enumeration ever happened
+     * (pid-less or stale-root cancel), which keeps repeat verification
+     * incomplete until a live enumeration grounds it.
+     */
+    ownedTreeMembers?: Array<{ pid: number; startTime: string }>;
   };
   /** Resolved worker executable at launch (provenance: shim vs live is judged from binaryOverridden, never guessed). */
   executable?: string;

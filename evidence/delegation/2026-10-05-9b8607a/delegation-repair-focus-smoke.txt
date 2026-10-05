@@ -1,0 +1,9 @@
+ok: R1 codex effective settings (protected override rejected, danger explicit-only, effective model/effort, sandbox!=bypass)
+ok: R2 idempotency (model/config/tool-filter/bypass/session/workdir changes conflict; timeout stays non-identity by construction)
+ok: R3 baseline + honest evidence (commit baseline, attributed edits, unavailable-not-pass)
+ok: R4 unit (real-binary probe, no session halt in v2.0.22, quiescence helpers fail closed)
+ok: R1 MCP gate (sandbox!=bypass, inherited danger refused, protected override refused)
+ok: R4 shim cancel (cancel -> no further writes, unrelated shim run intact, shim labeled as shim)
+ok: R5 deferred (Claude UNQUALIFIED; resume withheld only where settings would drop; Codex/OpenCode independent)
+delegation-repair-focus-smoke: PASS (no live model calls; fake-binary results labeled shim)
+exit=0
