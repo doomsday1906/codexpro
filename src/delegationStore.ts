@@ -73,16 +73,37 @@ export interface DelegationAttempt {
   sessionId?: string;
   /** Honest continuation label: true resume vs a new attempt. */
   continuation?: "resumed" | "new-continuation-attempt";
+  /**
+   * Pre-launch artifact ownership reservation (codex worker-owned path).
+   * Persisted BEFORE the worker spawns: the exact run+attempt-bound output
+   * destination reserved for this attempt, whether the file already existed
+   * at reservation time, and when the reservation was recorded. Finalize
+   * binds a worker verdict ONLY when the reservation proves the file was
+   * absent at reserve time (this attempt's namespace, nobody else's file);
+   * a preoccupied, missing, or uncertain reservation reports unavailable.
+   * Optional: attempts that predate reservations carry none and read
+   * unavailable under the current standard.
+   */
+  artifactReservation?: {
+    /** Workdir-relative reserved output destination for this attempt. */
+    relPath: string;
+    /** True when the file did NOT exist at reservation (clean slot). */
+    absentAtReserve: boolean;
+    /** ISO timestamp of the reservation (temporal baseline, not proof alone). */
+    reservedAt: string;
+  };
   /** Sanitized one-line outcome only. Never transcripts, prompts, or credentials. */
   summary?: string;
   /**
    * Per-attempt output artifact provenance: which workdir-relative file THIS
    * attempt produced (or preoccupied). Attempt N never reuses attempt N-1's
    * file as its result; the read path surfaces only the recorded path.
-   * New artifacts always bind (run_id, attempt): the filename carries the
-   * short run id plus the attempt number, so two runs sharing one workdir
-   * can never cross-attribute. Legacy shared names are never created anew
-   * and never read as present without this record.
+   * New artifacts always bind the FULL validated run identity plus the
+   * attempt number: the filename carries the complete run_<16hex> id plus
+   * the attempt number, so two runs sharing one workdir can never
+   * cross-attribute even when their trailing hex collides. Legacy shared
+   * names are never created anew and never read as present without this
+   * record.
    */
   outputArtifact?: {
     /** Workdir-relative artifact path recorded at finalize. */

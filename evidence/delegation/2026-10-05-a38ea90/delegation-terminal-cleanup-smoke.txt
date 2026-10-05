@@ -1,0 +1,8 @@
+ok: B1 MCP (interrupted cancel without evidence stays incomplete/unknown; repeat rechecks live)
+ok: B2 MCP (timed_out cancel without evidence stays incomplete/unknown; repeat rechecks live)
+ok: B3a MCP (legacy live run with VALID ownership: clean reap yet verification incomplete on first + repeat; backend never terminated)
+ok: B3b MCP (legacy terminal, grounded + quiet + exit-0: cleanup reportable, verification incomplete on first + repeat; label preserved)
+ok: B3c MCP (matched standalone control verifies complete; the gate flips only legacy)
+ok: B4 MCP (seeded cached success overturned by live recheck; no cached success)
+ok: B5 MCP (live owned tree verifies success; repeat stays success only when proven)
+delegation-terminal-cleanup-smoke: PASS (no live model calls; fake-binary results labeled shim)

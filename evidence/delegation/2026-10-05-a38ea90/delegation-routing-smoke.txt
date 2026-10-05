@@ -1,0 +1,9 @@
+ok: R0 owner-identity unit + authority derivation
+ok: R1 cross-workspace routing (subscribe A, run B, target attached, authority-only storage, no secret copy)
+ok: R2 owner isolation (foreign sub untargeted, foreign read denied)
+ok: R3 group mismatch is truthful no-target (undelivered_count>0, explicit state, replay hint)
+ok: R4 restart persistence (reload authority + run file, still pending then deliverable)
+ok: R5 explicit replay (in-scope attached+delivered, wider scope gets nothing, idempotent)
+ok: R6 real-protocol proof (POST /mcp subscribe on authority + /tmp run delivers to matching sub)
+
+delegation-routing-smoke: PASS (one authority; owner+filter selection; truthful no-target; explicit replay; real-protocol cross-workspace delivery)

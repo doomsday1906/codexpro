@@ -44,12 +44,25 @@ const Tools = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationTool
 
 // ---------- unit D1/D2: run-bound per-attempt paths + exclusive create ----------
 {
-  // New artifacts ALWAYS bind (run_id, attempt) — including attempt 1.
-  // Legacy shared names are never created anew; the legacy shape survives
-  // read-only (no run id) for pre-binding run files only.
+  // New artifacts ALWAYS bind the FULL validated run identity plus the
+  // attempt — including attempt 1. Two ids sharing a trailing 8-hex
+  // suffix bind distinct files (no collision). Legacy shared names are
+  // never created anew; the legacy shape survives read-only (no valid run
+  // id) for pre-binding run files only.
   const RUN_A = 'run_aaaaaaaaaaaaaaaa';
   const SHORT_A = Tools.shortRunId(RUN_A);
-  assert(SHORT_A === 'aaaaaaaa', `short run id binds the run: ${SHORT_A}`);
+  assert(SHORT_A === 'aaaaaaaaaaaaaaaa', `full run identity binds the run: ${SHORT_A}`);
+  assert(Tools.isValidRunIdForArtifact(RUN_A) === true, 'valid run ids validate');
+  assert(Tools.isValidRunIdForArtifact('run_SHORT') === false, 'invalid run ids never bind new writes');
+  assert(Tools.isValidRunIdForArtifact('') === false, 'missing run identity never binds new writes');
+  // The finding's colliding pair shares the trailing 8 hex yet binds
+  // distinct artifacts (no cross-attribution).
+  const RUN_COLLIDE_1 = 'run_000000001234abcd';
+  const RUN_COLLIDE_2 = 'run_ffffffff1234abcd';
+  assert(Tools.shortRunId(RUN_COLLIDE_1) !== Tools.shortRunId(RUN_COLLIDE_2),
+    `colliding trailing hex must not collide: ${Tools.shortRunId(RUN_COLLIDE_1)} vs ${Tools.shortRunId(RUN_COLLIDE_2)}`);
+  assert(Tools.lastMessageRelPathForAttempt('codex', 1, RUN_COLLIDE_1) !== Tools.lastMessageRelPathForAttempt('codex', 1, RUN_COLLIDE_2),
+    'the colliding pair binds distinct Codex artifacts');
   assert(Tools.lastMessageRelPathForAttempt('opencode', 1, RUN_A) === `opencode-last-message-${SHORT_A}-attempt-1.json`,
     `attempt 1 binds run+attempt, never the legacy shared name: ${Tools.lastMessageRelPathForAttempt('opencode', 1, RUN_A)}`);
   assert(Tools.lastMessageRelPathForAttempt('opencode', 0, RUN_A) === `opencode-last-message-${SHORT_A}-attempt-1.json`,
@@ -127,24 +140,68 @@ const Tools = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationTool
     'forged file must stay untouched');
   assert(fs.readFileSync(path.join(wdir, recForged.relPath), 'utf8') === 'new-output',
     'new output must land in the attempt-owned fallback');
-  // Forged worker-owned preoccupation (junk written BEFORE the attempt
-  // started) is never attributed to the new run.
+  // Forged worker-owned preoccupation (junk already present at the
+  // pre-launch reservation, with a RECENT mtime the old timestamp-only
+  // check would have claimed) is never attributed to the new run. The
+  // reservation diverts to the attempt's own clean fallback; the forged
+  // primary is never examined, never claimed, never overwritten.
   const RUN_D = 'run_dddddddddddddddd';
   const codexPrimary = Tools.lastMessageRelPathForAttempt('codex', 1, RUN_D);
   await fsp.writeFile(path.join(wdir, codexPrimary), 'STALE-JUNK');
-  fs.utimesSync(path.join(wdir, codexPrimary), new Date('2020-01-01T00:00:00Z'), new Date('2020-01-01T00:00:00Z'));
-  const recStale = Tools.persistAttemptArtifact(wdir, 'codex', 1, null, RUN_D, new Date().toISOString());
+  fs.utimesSync(path.join(wdir, codexPrimary), new Date(), new Date());
+  const resD = Tools.reserveAttemptArtifactPath(wdir, 'codex', 1, RUN_D);
+  assert(resD.absentAtReserve === true && resD.relPath !== codexPrimary,
+    `reservation must divert from the preoccupied primary to a clean fallback: ${JSON.stringify(resD)}`);
+  await fsp.writeFile(path.join(wdir, resD.relPath), 'worker wrote this after a clean reserve');
+  const recDiverted = Tools.persistAttemptArtifact(wdir, 'codex', 1, null, RUN_D, new Date().toISOString(), resD);
+  assert(recDiverted.provenance === 'worker' && recDiverted.relPath === resD.relPath,
+    `clean reserved fallback binds the worker verdict: ${JSON.stringify(recDiverted)}`);
+  assert(fs.readFileSync(path.join(wdir, codexPrimary), 'utf8') === 'STALE-JUNK',
+    'forged primary stays untouched (recent mtime included: never claimed, never overwritten)');
+  // Every bounded candidate preoccupied: the reservation extends within
+  // the same run+attempt namespace (never overwrites a foreign file).
+  const RUN_F = 'run_ffffffffffffffff';
+  const forgedAll = [Tools.lastMessageRelPathForAttempt('codex', 1, RUN_F),
+    ...Tools.attemptArtifactFallbackPaths('codex', 1, RUN_F)];
+  for (const rel of forgedAll) {
+    await fsp.writeFile(path.join(wdir, rel), 'FORGED');
+    fs.utimesSync(path.join(wdir, rel), new Date(), new Date());
+  }
+  const resF = Tools.reserveAttemptArtifactPath(wdir, 'codex', 1, RUN_F);
+  assert(resF.absentAtReserve === true && !forgedAll.includes(resF.relPath) && resF.relPath.includes(Tools.shortRunId(RUN_F)),
+    `fully forged bounded namespace extends within its own run namespace, never overwrites: ${JSON.stringify(resF)}`);
+  // Every extended candidate preoccupied too: the reservation reports
+  // preoccupied and finalize records unavailable with a reason.
+  for (let i = 4; i <= 9; i += 1) {
+    const dot = forgedAll[0].lastIndexOf('.');
+    const stem = forgedAll[0].slice(0, dot);
+    const ext = forgedAll[0].slice(dot);
+    const rel = `${stem}-x${i}${ext}`;
+    await fsp.writeFile(path.join(wdir, rel), 'FORGED');
+    fs.utimesSync(path.join(wdir, rel), new Date(), new Date());
+  }
+  const resG = Tools.reserveAttemptArtifactPath(wdir, 'codex', 1, RUN_F);
+  assert(resG.absentAtReserve === false, `fully preoccupied namespace reserves preoccupied: ${JSON.stringify(resG)}`);
+  const recStale = Tools.persistAttemptArtifact(wdir, 'codex', 1, null, RUN_F, new Date().toISOString(), resG);
   assert(recStale.created === false && recStale.provenance === 'unavailable' && /preoccupied/.test(recStale.reason ?? ''),
-    `pre-existing worker-owned file must record unavailable, never bound: ${JSON.stringify(recStale)}`);
+    `fully preoccupied namespace records unavailable, never bound (recent mtimes included): ${JSON.stringify(recStale)}`);
   const descStale = Tools.describeAttemptArtifact(wdir, 'codex', 1, recStale);
   assert(descStale.status === 'unavailable' && /preoccupied/.test(descStale.reason ?? ''),
     `pre-existing file reads unavailable with a reason: ${JSON.stringify(descStale)}`);
-  // A genuine worker write (during the attempt) binds the worker verdict.
+  // A worker write with NO reservation is unavailable too: a timestamp
+  // alone is never proof of ownership.
+  const recNoRes = Tools.persistAttemptArtifact(wdir, 'codex', 1, null, RUN_D, new Date().toISOString(), null);
+  assert(recNoRes.created === false && recNoRes.provenance === 'unavailable' && /reservation/.test(recNoRes.reason ?? ''),
+    `missing ownership reservation must fail closed: ${JSON.stringify(recNoRes)}`);
+  // A genuine worker write binds the worker verdict ONLY through the
+  // reservation: reserve (absent) BEFORE the write, then finalize.
   const RUN_E = 'run_eeeeeeeeeeeeeeee';
+  const resE = Tools.reserveAttemptArtifactPath(wdir, 'codex', 1, RUN_E);
+  assert(resE.absentAtReserve === true, `clean slot must reserve absent: ${JSON.stringify(resE)}`);
   const codexPrimaryE = Tools.lastMessageRelPathForAttempt('codex', 1, RUN_E);
-  const startE = new Date(Date.now() - 1000).toISOString();
+  assert(resE.relPath === codexPrimaryE, 'a clean primary reserves the primary itself');
   await fsp.writeFile(path.join(wdir, codexPrimaryE), 'worker wrote this during the attempt');
-  const recWorker = Tools.persistAttemptArtifact(wdir, 'codex', 1, null, RUN_E, startE);
+  const recWorker = Tools.persistAttemptArtifact(wdir, 'codex', 1, null, RUN_E, new Date().toISOString(), resE);
   assert(recWorker.provenance === 'worker' && recWorker.created === false,
     `worker-written run-bound file binds the worker verdict: ${JSON.stringify(recWorker)}`);
   const descWorker = Tools.describeAttemptArtifact(wdir, 'codex', 1, recWorker);
@@ -392,8 +449,8 @@ const OC_TASK = 'Report readiness. Change nothing.';
   assert(lm.status === 'present' && lm.path === ownRel && lm.attempt_n === 1,
     `read must surface the attempt-owned file with provenance: ${JSON.stringify(lm)}`);
   const legacy = Tools.describeLastMessageArtifact(preDir, 'opencode');
-  assert(legacy.status === 'unavailable',
-    `the preoccupied empty file reports unavailable: ${JSON.stringify(legacy)}`);
+  assert(legacy.status === 'unavailable' && !('path' in legacy) && /never proves/.test(legacy.reason ?? ''),
+    `the gated legacy lookup never presents a foreign file as present: ${JSON.stringify(legacy)}`);
   console.log('ok: D2b MCP (empty preoccupied file untouched + unavailable; new attempt writes own path)');
 }
 

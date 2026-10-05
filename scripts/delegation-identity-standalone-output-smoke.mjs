@@ -145,8 +145,8 @@ const Tools = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationTool
   assert(te.diff.truncated === true && /500-file/.test(te.diff.reason ?? ''),
     `test evidence diff must propagate coverage truncation + reason: ${JSON.stringify(te.diff)}`);
   const ghost = Tools.describeLastMessageArtifact(path.join(big, 'no-such-workdir'), 'opencode');
-  assert(ghost.status === 'unavailable' && !('path' in ghost) && ghost.reason,
-    `absent last-message must be unavailable with a reason and NO path: ${JSON.stringify(ghost)}`);
+  assert(ghost.status === 'unavailable' && !('path' in ghost) && ghost.reason && /never proves/.test(ghost.reason),
+    `gated legacy lookup is unavailable with a reason and NO path (never a foreign attribution): ${JSON.stringify(ghost)}`);
   console.log('ok: C3 unit (500-file/256-KiB coverage propagates; absent last-message reports no path)');
 }
 
