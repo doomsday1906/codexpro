@@ -74,6 +74,8 @@ import {
   newRunId,
   nextActionFor,
   openInputRequests,
+  opencodeServerDbPathForRun,
+  opencodeServerDirForRun,
   ownerIdFor,
   pendingDispatchFor,
   reconcileRunState,
@@ -93,6 +95,7 @@ import {
   type DelegationAttempt,
   type DelegationRunRecord,
   type DelegationEngine,
+  type DelegationOpenCodeServer,
   type DelegationRunState,
   type DelegationSessionBinding,
   type DelegationSteeringRecord,
@@ -109,6 +112,11 @@ import {
   buildLaunchPreview,
   buildOpenCodeCanaryArgv,
   buildOpenCodeRealArgv,
+  buildOpenCodeServerArgv,
+  mintOpenCodeServerPassword,
+  spawnOpenCodeServer,
+  runOpenCodePrompt,
+  verifyOpenCodeServerSession,
   aliveTreeMembers,
   CANARY_FIXTURES,
   canaryPrompt,
@@ -133,6 +141,7 @@ import {
   OPENCODE_CANCEL_CAPABILITY,
   OPENCODE_RESUME_CAPABILITY,
   OPENCODE_STEER_CAPABILITY,
+  OPENCODE_STEERABLE_SERVER_CAPABILITY,
   parseCodexThreadId,
   parseOpenCodeSessionId,
   probeEngineCapability,
@@ -904,10 +913,13 @@ interface GatedLaunchPlan {
    */
   bypassApprovals: boolean;
   /**
-   * Explicit steerable opt-in (codex real tasks only): launch without
+   * Explicit steerable opt-in (real tasks only): codex launches without
    * --ephemeral so the session persists and the engine returns an
-   * addressable thread id. Profile + execution-policy boundaries are
-   * unchanged; the default stays ephemeral.
+   * addressable thread id; opencode launches server-backed (worker CLI
+   * against a per-run adapter-owned disposable server) so live steering
+   * can address the run's session. Profile + execution-policy + model +
+   * agent boundaries are unchanged; the defaults stay ephemeral
+   * (codex) and standalone (opencode).
    */
   steerable: boolean;
   timeoutMs: number;
@@ -1010,15 +1022,17 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
     engine, isCanary, delegationGroup, taskText, prompt,
     timeoutMs, timeoutClamped
   };
-  // Steerable launches are codex real-task only: opencode/claude expose no
-  // steer verb in the qualified CLI, and the read-only canary slice takes
-  // no injected messages. Explicit steerable anywhere else refuses (never
-  // silently ignored, never substituted).
+  // Steerable launches are real-task only: the read-only canary slice takes
+  // no injected messages. Codex uses the non-ephemeral thread route;
+  // opencode uses the per-run server route (worker CLI against an
+  // adapter-owned disposable server). Claude exposes no steer verb in the
+  // qualified CLI, so explicit steerable there refuses (never silently
+  // ignored, never substituted).
   const steerableRequested = args.steerable === true;
-  if (steerableRequested && engine !== "codex") {
+  if (steerableRequested && engine !== "codex" && engine !== "opencode") {
     return {
       ok: false,
-      text: `steerable=true is codex-only (opencode/claude expose no steer verb in the qualified CLI); refusing rather than silently ignoring it.`,
+      text: `steerable=true is codex/opencode-only (claude exposes no steer verb in the qualified CLI); refusing rather than silently ignoring it.`,
       structured: { error: "steerable_unsupported_for_engine", engine }
     };
   }
@@ -1144,13 +1158,14 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
         disallowedTools: "",
         configOverrides: [],
         bypassApprovals: false,
-        steerable: false,
+        steerable: steerableRequested,
         gateReason: gate.reason,
         gateEvidence: {
           model_verified: gate.requestedModel,
           host_model: gate.hostModel,
           host_equality_enforced: gate.hostEqualityEnforced,
-          ...(gate.agent ? { agent: gate.agent.name } : {})
+          ...(gate.agent ? { agent: gate.agent.name } : {}),
+          ...(steerableRequested ? { steerable_server_route: true as const } : {})
         },
         configuredModel: gate.hostModel,
         configuredEffort: null,
@@ -1230,7 +1245,7 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
  * slice; claude always uses its explicit-flag argv. Flags are never shared
  * across engines.
  */
-function buildPlannedArgv(plan: GatedLaunchPlan, prompt: string, lastMessagePath: string, sessionId?: string): string[] {
+function buildPlannedArgv(plan: GatedLaunchPlan, prompt: string, lastMessagePath: string, sessionId?: string, serverUrl?: string): string[] {
   if (plan.engine === "codex") {
     if (plan.isCanary) return buildCodexCanaryArgv(plan.profile, prompt, lastMessagePath);
     const codexOpts = {
@@ -1247,6 +1262,17 @@ function buildPlannedArgv(plan: GatedLaunchPlan, prompt: string, lastMessagePath
   }
   if (plan.engine === "opencode") {
     if (!plan.agent) return buildOpenCodeCanaryArgv(plan.model, prompt, sessionId);
+    // Steerable launches address a per-run adapter-owned disposable server
+    // (run --server) so live steering can reach the run's session; the
+    // model/agent gates are identical. The URL is minted at launch; preview
+    // shows an explicit placeholder, never a fake.
+    if (plan.steerable) {
+      return buildOpenCodeServerArgv({
+        model: plan.model, agent: plan.agent, prompt,
+        serverUrl: serverUrl ?? "<steerable-server URL minted at launch>",
+        ...(sessionId ? { sessionId } : {})
+      });
+    }
     return buildOpenCodeRealArgv({ model: plan.model, agent: plan.agent, prompt, ...(sessionId ? { sessionId } : {}) });
   }
   return buildClaudeArgv({
@@ -1292,6 +1318,142 @@ function launchOpenCodeReal(
 ): ChildProcess {
   const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("opencode", attemptN, run.runId));
   return spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(), buildPlannedArgv(plan, prompt, lastMessagePath, sessionId), timeoutMs, lastMessagePath, isCanary, attemptN);
+}
+
+/**
+ * Best-effort SIGTERM of one recorded per-run server identity (no wait, no
+ * verification here — cancel verifies). Never throws. Used at attempt
+ * settle (the attempt window owns the server process; the session DB
+ * persists for continuations) and on launch-failure cleanup.
+ */
+function stopOpenCodeServerByIdentity(backend: DelegationOpenCodeServer | undefined): void {
+  if (!backend || backend.pid === undefined) return;
+  try {
+    if (backend.startTime && !isProcessIdentityAlive(backend.pid, backend.startTime)) return;
+    if (!backend.startTime && readProcessStartTime(backend.pid) === null) return;
+    process.kill(backend.pid, "SIGTERM");
+  } catch { /* already gone */ }
+}
+
+/**
+ * Ensure the run's per-run backend: reuse the recorded server while its
+ * PID+starttime identity is alive (never a second concurrent server);
+ * otherwise spawn a fresh server process on the SAME recorded dir/DB/
+ * password (session continuity for true resume) and persist the new
+ * identity. The recorded dir/db must equal the recomputed run authority
+ * (a stored path alone never directs a backend). Throws a truthful error
+ * when no recorded server state exists or the spawn fails (observed
+ * pre-worker failure, retryable; never a second worker).
+ */
+async function ensureOpenCodeServerForRun(
+  bridgeDir: string,
+  run: DelegationRunRecord
+): Promise<DelegationOpenCodeServer> {
+  const recorded = run.opencodeServer;
+  if (recorded?.url && recorded.password && recorded.pid !== undefined &&
+    ((recorded.startTime && isProcessIdentityAlive(recorded.pid, recorded.startTime)) ||
+      (!recorded.startTime && readProcessStartTime(recorded.pid) !== null))) {
+    return recorded;
+  }
+  if (!recorded?.dir || !recorded?.dbPath || !recorded?.password) {
+    throw new Error("no recorded per-run server state (dir/db/password); cannot resurrect the backend — relaunch with a new request id");
+  }
+  let authorityDir: string;
+  let authorityDb: string;
+  try {
+    authorityDir = opencodeServerDirForRun(bridgeDir, run.runId);
+    authorityDb = opencodeServerDbPathForRun(bridgeDir, run.runId);
+  } catch {
+    throw new Error("per-run server dir unresolvable for this run id; cannot resurrect the backend");
+  }
+  if (path.normalize(recorded.dir) !== path.normalize(authorityDir) ||
+    path.normalize(recorded.dbPath) !== path.normalize(authorityDb)) {
+    throw new Error("recorded server state does not equal the recomputed run authority (never a stored path alone); cannot resurrect the backend");
+  }
+  const server = await spawnOpenCodeServer({
+    binary: resolveOpenCodeBinary(),
+    workdir: run.workdir,
+    serverDir: authorityDir,
+    dbPath: authorityDb,
+    password: recorded.password
+  });
+  const persisted = loadDelegationRun(bridgeDir, run.runId) ?? run;
+  persisted.opencodeServer = {
+    url: server.url, pid: server.pid,
+    ...(server.startTime ? { startTime: server.startTime } : {}),
+    password: recorded.password, dir: authorityDir, dbPath: authorityDb
+  };
+  saveDelegationRun(bridgeDir, persisted);
+  run.opencodeServer = persisted.opencodeServer;
+  return persisted.opencodeServer;
+}
+
+/**
+ * Steerable-server opencode launch: mint a per-run password, spawn the
+ * per-run disposable server (readiness-bounded), persist its identity
+ * BEFORE the worker spawns (so cancel reaps a recorded server even when
+ * the worker is pid-less), then spawn the worker CLI against it. Model/
+ * agent gates are identical to standalone. A server-spawn failure throws
+ * before any worker exists (observed pre-spawn failure, retryable); a
+ * worker-spawn failure stops the just-started server best-effort (the
+ * recorded identity stays for archaeology/reap).
+ */
+async function launchOpenCodeServerBacked(
+  deps: DelegationToolDeps,
+  bridgeDir: string,
+  run: DelegationRunRecord,
+  plan: GatedLaunchPlan,
+  timeoutMs: number,
+  prompt: string,
+  isCanary: boolean,
+  sessionId?: string,
+  attemptN = 1
+): Promise<ChildProcess> {
+  const serverDir = opencodeServerDirForRun(bridgeDir, run.runId);
+  const dbPath = opencodeServerDbPathForRun(bridgeDir, run.runId);
+  const password = mintOpenCodeServerPassword();
+  let server: { url: string; pid: number; startTime?: string };
+  try {
+    server = await spawnOpenCodeServer({
+      binary: resolveOpenCodeBinary(),
+      workdir: run.workdir,
+      serverDir,
+      dbPath,
+      password
+    });
+  } catch (error) {
+    throw new Error(`opencode steerable server failed before worker spawn: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const backend: DelegationOpenCodeServer = {
+    url: server.url, pid: server.pid,
+    ...(server.startTime ? { startTime: server.startTime } : {}),
+    password, dir: serverDir, dbPath
+  };
+  const persisted = loadDelegationRun(bridgeDir, run.runId) ?? run;
+  persisted.opencodeServer = backend;
+  try {
+    saveDelegationRun(bridgeDir, persisted);
+  } catch (error) {
+    // Identity unpersisted with a live server behind it: stop it
+    // best-effort, then fail with an ordinary (retryable) error. The crash
+    // window between spawn and this kill is the documented residual (the
+    // server dir recomputes from the run id for later archaeology).
+    stopOpenCodeServerByIdentity(backend);
+    throw new Error(`opencode server identity persistence failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  run.opencodeServer = backend;
+  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("opencode", attemptN, run.runId));
+  const argv = buildOpenCodeServerArgv({
+    model: plan.model, agent: plan.agent, prompt, serverUrl: server.url,
+    ...(sessionId ? { sessionId } : {})
+  });
+  try {
+    return spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(), argv, timeoutMs,
+      lastMessagePath, isCanary, attemptN, { OPENCODE_PASSWORD: password });
+  } catch (error) {
+    stopOpenCodeServerByIdentity(backend);
+    throw error;
+  }
 }
 
 /** Live child handles for this process. Files stay the durable authority. */
@@ -1537,6 +1699,19 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
   runtime.live.delete(runId);
   const run = loadDelegationRun(bridgeDir, runId);
   if (!run) return;
+  // Server-backed opencode: the attempt window owns the server process.
+  // Stop the owned server identity best-effort at settle (SIGTERM only, no
+  // verification here — cancel verifies). The session DB persists for
+  // continuations; a later follow-up respawns the backend on the same DB.
+  // Never touches the worker outcome below. A cancel in flight owns the
+  // server reap + verification instead (dual-root cancel): a racing late
+  // child-close finalize must not SIGTERM the server out from under it —
+  // that would leave the cancel holding a stale server root and failing
+  // closed incomplete. (Same race, same owner as cancelRelocateHold.)
+  if (run.engine === "opencode" && run.opencodeRoute === "steerable-server" && run.opencodeServer &&
+    !cancelRelocateHold.has(runId)) {
+    stopOpenCodeServerByIdentity(run.opencodeServer);
+  }
   const latest = run.attempts.at(-1);
   const finishedAt = new Date().toISOString();
   let fixturesUnchanged: boolean | undefined;
@@ -1733,7 +1908,8 @@ export function spawnCanaryChild(
   timeoutMs: number,
   lastMessagePath: string,
   isCanary: boolean,
-  attemptN = 1
+  attemptN = 1,
+  extraEnv?: Record<string, string>
 ): ChildProcess {
   const runtime = processRuntime();
   // Canary runs hash the read-only fixtures before spawn so completion can
@@ -1744,7 +1920,7 @@ export function spawnCanaryChild(
   }
   const child = spawn(binary, argv, {
     cwd: run.workdir,
-    env: { ...process.env, NO_COLOR: "1" },
+    env: { ...process.env, NO_COLOR: "1", ...(extraEnv ?? {}) },
     stdio: ["ignore", "pipe", "pipe"],
     shell: false,
     windowsHide: true
@@ -2448,7 +2624,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     request_id: z.string().min(1).max(128).optional().describe("Idempotency key. Repeating it returns the existing run without spawning a second worker."),
     canary: z.boolean().optional().describe("Must be true when no task is supplied (legacy read-only canary slice, codex/opencode only). Ignored when task is present."),
     timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms. Canary clamps to 5 minutes; real tasks clamp to 30 minutes; 10s minimum. The clamped value is truthfully acked."),
-    steerable: z.boolean().optional().describe("Codex real tasks only: launch without --ephemeral so the session persists and the engine may return an addressable thread id for delegation_steer. Profile + execution-policy boundaries unchanged; refused for canary and non-codex engines.")
+    steerable: z.boolean().optional().describe("Real tasks only: codex launches without --ephemeral so the session persists and the engine may return an addressable thread id for delegation_steer; opencode launches server-backed (worker CLI against a per-run adapter-owned disposable server) so delegation_steer can address the run's session. Profile/execution-policy/model/agent boundaries unchanged; refused for canary and non-codex/opencode engines.")
   }).strict();
 
   const previewArgs = z.object({
@@ -2470,7 +2646,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     workdir: z.string().min(1).max(1024).describe("Explicit workspace-relative working directory that would host the run."),
     canary: z.boolean().optional().describe("Must be true when no task is supplied (legacy read-only canary slice, codex/opencode only)."),
     timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms (clamped + truthfully acked like launch)."),
-    steerable: z.boolean().optional().describe("Codex real tasks only: preview the non-ephemeral session-persisting argv (same profile + execution-policy boundaries). Refused for canary and non-codex engines.")
+    steerable: z.boolean().optional().describe("Real tasks only: preview the codex non-ephemeral session-persisting argv or the opencode server-backed argv (same profile/execution-policy/model/agent boundaries). Refused for canary and non-codex/opencode engines.")
   }).strict();
 
   const listArgs = z.object({
@@ -2542,7 +2718,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "delegation_launch",
       options: {
         title: "Delegation Launch",
-        description: "Launch one durable delegation run (Codex via exec --profile with Luna gate for the legacy canary / selected-profile gate + per-run execution policy for real tasks; OpenCode via run --model/--agent with host-model gate for the legacy canary / selected-agent + explicit model for real tasks; Claude via -p --output-format json --agent with explicit-flag-only overrides for real tasks only). Real bounded task + validated delegation_group (default hestia-cli-canary), or the legacy canary slice (fixtures, canary=true; codex/opencode only). Requires an explicit workdir plus profile (codex), model (+ agent for real tasks, opencode), or agent (claude); idempotent request ids never spawn a second worker. Prefer delegation_preview (dry-run) before dispatch. Subscribe to events before launching or replay via delegation_read_result so fast completion never loses the result.",
+        description: "Launch one durable delegation run (Codex via exec --profile with Luna gate for the legacy canary / selected-profile gate + per-run execution policy for real tasks; OpenCode via run --model/--agent with host-model gate for the legacy canary / selected-agent + explicit model for real tasks, --standalone by default or --server against a per-run adapter-owned disposable server with explicit steerable=true; Claude via -p --output-format json --agent with explicit-flag-only overrides for real tasks only). Real bounded task + validated delegation_group (default hestia-cli-canary), or the legacy canary slice (fixtures, canary=true; codex/opencode only). Requires an explicit workdir plus profile (codex), model (+ agent for real tasks, opencode), or agent (claude); idempotent request ids never spawn a second worker. Prefer delegation_preview (dry-run) before dispatch. Subscribe to events before launching or replay via delegation_read_result so fast completion never loses the result.",
         inputSchema: publicSchemaFrom(launchArgs),
         runtimeInputSchema: launchArgs,
         annotations: DESTRUCTIVE
@@ -2729,15 +2905,21 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                 sessionId,
                 resumable: false,
                 observed: false,
-                evidence: "explicit --session id only: creation-or-resume unverified at launch; verified at continuation time via session list/export before any resumed label",
+                evidence: plan.steerable
+                  ? "explicit --session id on the per-run server backend: creation-or-resume unverified at launch; verified at continuation time via api session.list/get against the run's own server before any resumed label"
+                  : "explicit --session id only: creation-or-resume unverified at launch; verified at continuation time via session list/export before any resumed label",
                 reason: "explicit --session id: continues when known, otherwise creates (installed CLI semantics); first use may be creation"
               }
               : {
                 engine: "opencode",
                 resumable: false,
                 observed: false,
-                evidence: "no explicit --session id; the worker mints the session, observed best-effort from --format json stdout",
-                reason: "no explicit --session id; the worker mints the session, observed best-effort from --format json stdout"
+                evidence: plan.steerable
+                  ? "no explicit --session id; the worker mints the session on the per-run server backend, observed best-effort from --format json stdout; live steering addresses the recorded id via session.prompt (delivery steer)"
+                  : "no explicit --session id; the worker mints the session, observed best-effort from --format json stdout",
+                reason: plan.steerable
+                  ? "no explicit --session id; the worker mints the session on the per-run server, observed best-effort from --format json stdout"
+                  : "no explicit --session id; the worker mints the session, observed best-effort from --format json stdout"
               }
             : {
               engine: "claude",
@@ -2756,7 +2938,9 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           : engine === "opencode"
             ? isCanary
               ? `canary attempt started via opencode run --standalone --model ${model}`
-              : `real-task attempt started via opencode run --standalone --model ${model} --agent ${agent} (${taskText.length} chars, group ${delegationGroup})`
+              : plan.steerable
+                ? `real-task attempt started via opencode run --server <per-run server> --model ${model} --agent ${agent} (${taskText.length} chars, group ${delegationGroup})`
+                : `real-task attempt started via opencode run --standalone --model ${model} --agent ${agent} (${taskText.length} chars, group ${delegationGroup})`
             : `real-task attempt started via claude --agent ${agent} --session-id ${(sessionId as string).slice(0, 8)}… (${taskText.length} chars, group ${delegationGroup})`;
         let run: DelegationRunRecord = {
           version: 1,
@@ -2765,7 +2949,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           delegationGroup,
           engine,
           ...(engine === "codex" ? { profile, executionPolicy: plan.executionPolicy, ...(plan.model ? { modelOverride: plan.model } : {}), ...(plan.configOverrides.length > 0 ? { configOverrides: plan.configOverrides } : {}), ...(plan.bypassApprovals ? { bypassApprovals: true as const } : {}), ...(plan.steerable ? { steerable: true as const } : {}) } : {}),
-          ...(engine === "opencode" ? { model, ...(agent ? { agent } : {}), requestedSessionId: plan.requestedSessionId, opencodeRoute: "standalone" as const } : {}),
+          ...(engine === "opencode" ? { model, ...(agent ? { agent } : {}), requestedSessionId: plan.requestedSessionId, opencodeRoute: (plan.steerable ? "steerable-server" : "standalone") as "standalone" | "steerable-server", ...(plan.steerable ? { steerable: true as const } : {}) } : {}),
           ...(engine === "claude" ? { agent, ...(model ? { model } : {}), ...(plan.permissionMode ? { permissionMode: plan.permissionMode } : {}), ...(plan.effort ? { effort: plan.effort } : {}), ...(plan.allowedTools ? { allowedTools: plan.allowedTools } : {}), ...(plan.disallowedTools ? { disallowedTools: plan.disallowedTools } : {}), requestedSessionId: plan.requestedSessionId } : {}),
           ...(isCanary ? { isCanary: true } : { isCanary: false, task: taskText }),
           workdirBaseline,
@@ -2802,7 +2986,9 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           sessionEvidence: engine === "codex"
             ? `initial launch via codex exec --profile ${profile} (${plan.gateReason})`
             : engine === "opencode"
-              ? `initial launch via opencode run --standalone --model ${model}${agent ? ` --agent ${agent}` : ""} (${plan.gateReason})`
+              ? plan.steerable
+                ? `initial launch via opencode run --server <per-run server> --model ${model}${agent ? ` --agent ${agent}` : ""} (${plan.gateReason})`
+                : `initial launch via opencode run --standalone --model ${model}${agent ? ` --agent ${agent}` : ""} (${plan.gateReason})`
               : `initial launch via claude --agent ${agent} --session-id ${plan.requestedSessionId || "minted"} (${plan.gateReason})`
         });
         saveDelegationRun(bridgeDir, run);
@@ -2810,7 +2996,11 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           if (engine === "codex") {
             launchCodexReal(deps, bridgeDir, run, plan, timeoutMs, prompt, isCanary);
           } else if (engine === "opencode") {
-            launchOpenCodeReal(deps, bridgeDir, run, plan, timeoutMs, prompt, isCanary, sessionId);
+            if (plan.steerable) {
+              await launchOpenCodeServerBacked(deps, bridgeDir, run, plan, timeoutMs, prompt, isCanary, sessionId);
+            } else {
+              launchOpenCodeReal(deps, bridgeDir, run, plan, timeoutMs, prompt, isCanary, sessionId);
+            }
           } else {
             launchClaudeChild(deps, bridgeDir, run, buildPlannedArgv(plan, prompt, path.join(run.workdir, lastMessageRelPathForAttempt("claude", 1, run.runId)), sessionId), timeoutMs, prompt, isCanary);
           }
@@ -2897,7 +3087,9 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           engine === "codex"
             ? `${isCanary ? "Canary" : "Real-task"} run ${runId} launched (codex --profile ${profile}, ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`
             : engine === "opencode"
-              ? `${isCanary ? "Canary" : "Real-task"} run ${runId} launched (opencode run --standalone --model ${model}${agent ? ` --agent ${agent}` : ""} --format json, ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}${sessionId ? `, session ${sessionId}` : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`
+              ? plan.steerable
+                ? `${isCanary ? "Canary" : "Real-task"} run ${runId} launched (opencode run --server <per-run server> --model ${model}${agent ? ` --agent ${agent}` : ""} --format json, steerable server-backed route, ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}${sessionId ? `, session ${sessionId}` : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`
+                : `${isCanary ? "Canary" : "Real-task"} run ${runId} launched (opencode run --standalone --model ${model}${agent ? ` --agent ${agent}` : ""} --format json, ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}${sessionId ? `, session ${sessionId}` : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`
               : `Real-task run ${runId} launched (claude --agent ${agent} --session-id ${sessionId}, ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`,
           {
             run_id: runId,
@@ -2907,7 +3099,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             ...(isCanary ? {} : { task_chars: taskText.length }),
             engine,
             ...(engine === "codex" ? { profile, execution_policy: plan.executionPolicy, ...(plan.steerable ? { steerable: true as const } : {}) } : {}),
-            ...(engine === "opencode" ? { model, ...(agent ? { agent } : {}), execution_route: "standalone" } : {}),
+            ...(engine === "opencode" ? { model, ...(agent ? { agent } : {}), execution_route: (plan.steerable ? "steerable-server" : "standalone") as "standalone" | "steerable-server", ...(plan.steerable ? { steerable: true as const } : {}) } : {}),
             ...(engine === "claude" ? { agent, ...(model ? { model } : {}), ...(plan.permissionMode ? { permission_mode: plan.permissionMode } : {}), ...(plan.effort ? { effort: plan.effort } : {}) } : {}),
             ...(sessionId ? { session_id: sessionId } : {}),
             ...gateEvidence,
@@ -2960,7 +3152,8 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         const sessionForArgv = plan.engine === "claude"
           ? (plan.requestedSessionId || "<uuid minted at launch>")
           : (plan.requestedSessionId || undefined);
-        const argvPreview = buildPlannedArgv(plan, `<worker prompt ${plan.prompt.length} chars>`, lastMessagePath, sessionForArgv);
+        const argvPreview = buildPlannedArgv(plan, `<worker prompt ${plan.prompt.length} chars>`, lastMessagePath, sessionForArgv,
+          plan.engine === "opencode" && plan.steerable ? "<steerable-server URL minted at launch>" : undefined);
         const capability = probeEngineCapability(plan.engine, {
           profileOrAgent: plan.engine === "codex" ? plan.profile : plan.agent,
           binary: plan.executable
@@ -3264,7 +3457,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "delegation_followup",
       options: {
         title: "Delegation Follow-up",
-        description: "Durable follow-up Q&A: a checkpoint with questions moves a settled run to needs-input (structured, stored with run id + seq); a checkpoint with input_request_id answers the exact request at most once and launches one bounded continuation (opencode --standalone --session true resume after list/export verification; claude --resume after session-file verification, otherwise the stable --session-id; codex a labeled new attempt under the stored profile + policy). Rejects wrong-run, stale, conflicting-duplicate, unknown/closed/expired requests, and live-attempt races with typed errors. Approval-kind answers never widen the engine gate.",
+        description: "Durable follow-up Q&A: a checkpoint with questions moves a settled run to needs-input (structured, stored with run id + seq); a checkpoint with input_request_id answers the exact request at most once and launches one bounded continuation (opencode --standalone --session true resume after list/export verification, or --server against the run's own server after api verification on steerable-server runs; claude --resume after session-file verification, otherwise the stable --session-id; codex a labeled new attempt under the stored profile + policy). Rejects wrong-run, stale, conflicting-duplicate, unknown/closed/expired requests, and live-attempt races with typed errors. Approval-kind answers never widen the engine gate.",
         inputSchema: publicSchemaFrom(followupArgs),
         runtimeInputSchema: followupArgs,
         annotations: DESTRUCTIVE
@@ -3452,9 +3645,39 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             sessionEvidence = "codex ephemeral run persists no session; resumed requires observed + verified session evidence, which cannot exist here";
           } else if (run.engine === "opencode") {
             const sid = run.session?.sessionId;
-            if (sid && isEngineSessionId(sid)) {
+            const serverBacked = run.opencodeRoute === "steerable-server" && run.steerable === true;
+            if (serverBacked && sid && isEngineSessionId(sid)) {
+              // Server-backed resume: the id must be confirmed live by the
+              // run's OWN server (api session.list/get). `opencode session
+              // list/export` target the background service (no --server
+              // flag) and must NEVER verify server-backed sessions — a
+              // colliding id there would falsely resume onto the wrong
+              // backend. A gone backend fails closed to a new attempt (a
+              // fresh per-run server on the same DB at dispatch); the
+              // recorded session may then verify on the resurrected
+              // backend, but nothing is ever claimed resumed without that
+              // verification.
+              const backend = run.opencodeServer;
+              const backendAlive = backend?.url !== undefined && !!backend?.password && backend?.pid !== undefined &&
+                ((backend?.startTime && isProcessIdentityAlive(backend.pid, backend.startTime)) ||
+                  (!backend?.startTime && readProcessStartTime(backend.pid) !== null));
+              const probe = backendAlive
+                ? verifyOpenCodeServerSession((backend as DelegationOpenCodeServer).url, sid, run.workdir, {
+                  binary: resolveOpenCodeBinary(), password: (backend as DelegationOpenCodeServer).password
+                })
+                : { verified: false, evidence: "per-run server backend is gone (no live owned server); verification needs the running backend" };
+              if (probe.verified) {
+                continuationLabel = "resumed";
+                resumeSessionId = sid;
+                spawnNote = `opencode session ${sid} verified live on the run's own server (${probe.evidence}) and continued via run --server --session (true resume, same server DB)`;
+                sessionEvidence = probe.evidence;
+              } else {
+                spawnNote = `opencode session ${sid} unverified on the run's own server (${probe.evidence}): follow-up runs a new attempt on a fresh per-run server (same server DB), never a resumed session`;
+                sessionEvidence = probe.evidence;
+              }
+            } else if (sid && isEngineSessionId(sid)) {
               // Verified resume only: the id must have been observed AND be
-              // confirmed live by session list/export. First use of an
+              // confirmed live by api session list/get. First use of an
               // explicit id creates (installed continue-or-create semantics).
               const probe = verifyOpenCodeSession(sid, run.workdir);
               if (probe.verified) {
@@ -3600,7 +3823,9 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             ? "codex ephemeral run persists no session: follow-up runs a new attempt, never a resumed session"
             : run.engine === "opencode"
               ? (resumeSessionId && continuationLabel === "resumed"
-                ? `opencode session ${resumeSessionId} verified live (${sessionEvidence}) and continued via run --standalone --session (true resume)`
+                ? (run.opencodeRoute === "steerable-server" && run.steerable === true
+                  ? `opencode session ${resumeSessionId} verified live on the run's own server (${sessionEvidence}) and continued via run --server --session (true resume, same server DB)`
+                  : `opencode session ${resumeSessionId} verified live (${sessionEvidence}) and continued via run --standalone --session (true resume)`)
                 : (run.session?.sessionId
                   ? `opencode session ${run.session.sessionId} unverified (${sessionEvidence}): follow-up runs a new attempt (first-use creation), never a resumed session`
                   : "no opencode session id recorded: follow-up runs a new attempt, never a resumed session"))
@@ -3656,7 +3881,26 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                     }), staged.timeoutMs, lastMessagePath, runIsCanary, staged.attemptN);
                 }
               } else if (run.engine === "opencode") {
-                if (run.agent) {
+                const continuationServerBacked = run.opencodeRoute === "steerable-server" && run.steerable === true;
+                if (continuationServerBacked) {
+                  // Server-backed continuation: ensure the per-run backend
+                  // (reuses the live recorded server; otherwise respawns on
+                  // the SAME recorded dir/DB/password — never a second
+                  // concurrent server, never another run's backend). A true
+                  // resume rides --session; anything else mints on the
+                  // fresh backend and stays labeled new-continuation-attempt.
+                  const ensured = await ensureOpenCodeServerForRun(bridgeDir, run);
+                  run = loadDelegationRun(bridgeDir, run.runId) ?? run;
+                  const backendNow = run.opencodeServer ?? ensured;
+                  const resumeNow = continuationLabel === "resumed" ? resumeSessionId : undefined;
+                  child = spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(),
+                    buildOpenCodeServerArgv({
+                      model: run.model ?? "", agent: run.agent ?? "", prompt: staged.prompt,
+                      serverUrl: backendNow.url,
+                      ...(resumeNow ? { sessionId: resumeNow } : {})
+                    }), staged.timeoutMs, lastMessagePath, runIsCanary, staged.attemptN,
+                    { OPENCODE_PASSWORD: backendNow.password });
+                } else if (run.agent) {
                   child = spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(),
                     buildOpenCodeRealArgv({
                       model: run.model ?? "", agent: run.agent, prompt: staged.prompt,
@@ -3918,7 +4162,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "delegation_steer",
       options: {
         title: "Delegation Steer",
-        description: "Send one bounded live message to a RUNNING worker (mid-turn steering, distinct from needs-input follow-up and from cancel/relaunch). Codex only, via one native `codex queue --thread` call to the run's recorded engine-returned thread id; opencode/claude expose no steer verb and refuse with steer_unsupported (never emulated). Idempotent per steering_key; settled/cancelled runs refuse; queued records stay queued/unverified (the engine emits no application-attesting event — observed 2026-10-05 — so the adapter never auto-claims applied).",
+        description: "Send one bounded live message to a RUNNING worker (mid-turn steering, distinct from needs-input follow-up and from cancel/relaunch). Codex via one native `codex queue --thread` call to the run's recorded engine-returned thread id; opencode ONLY on explicit steerable-server runs via one `opencode api session.prompt` (delivery steer) to the recorded session id on the run's own per-run server. Default opencode runs and claude expose no steer verb and refuse with steer_unsupported (never emulated). Idempotent per steering_key; settled/cancelled runs refuse; accepted records stay queued/unverified (neither engine emits an application-attesting event — observed 2026-10-05 — so the adapter never auto-claims applied).",
         inputSchema: publicSchemaFrom(steerArgs),
         runtimeInputSchema: steerArgs,
         annotations: DESTRUCTIVE
@@ -4027,11 +4271,13 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             executed: false
           });
         }
-        // Engine routing: only codex exposes a native live-input route.
-        // opencode/claude refuse with the inspected capability blocker —
-        // delivery is never emulated via a second session, a resume, or a
-        // cancel+relaunch disguised as steering.
-        if (run.engine === "opencode") {
+        // Engine routing: codex exposes a native live-input route (queue);
+        // opencode exposes one ONLY on explicit steerable-server runs
+        // (session.prompt delivery steer against the run's own server).
+        // Default opencode runs and claude refuse with the inspected
+        // capability blocker — delivery is never emulated via a second
+        // session, a resume, or a cancel+relaunch disguised as steering.
+        if (run.engine === "opencode" && (run.opencodeRoute !== "steerable-server" || run.steerable !== true)) {
           const record: DelegationSteeringRecord = {
             steeringKey: key, messageHash, messageChars: message.length, attemptN,
             status: "rejected", engineEvidence: OPENCODE_STEER_CAPABILITY.blocker,
@@ -4045,6 +4291,128 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             engine: "opencode",
             stored: true,
             executed: false
+          });
+        }
+        if (run.engine === "opencode") {
+          // Server-backed steer: the message reaches ONLY its intended run
+          // via the recorded session id on the run's OWN server (wrong
+          // sessions live on other backends or not at all: a foreign or
+          // stale id is rejected here or by the server, never rerouted).
+          // Effect is on the RUNNING turn only: settled/needs-input/other
+          // states already refused above like every engine.
+          const sid = run.session?.sessionId;
+          if (!sid || !isEngineSessionId(sid)) {
+            return failResult(`Steering unavailable for run ${run.runId} (opencode steerable-server: no recorded session id yet). The session is recorded only from the explicit --session id or engine-observed worker output, never synthesized; retry once the run reports one, or use delegation_followup when the run needs input (a separate protocol, never live steering).`, {
+              error: "steer_unavailable_no_session",
+              run_id: run.runId,
+              steering_key: key,
+              engine: "opencode",
+              steerable_launch: true,
+              stored: false,
+              executed: false
+            });
+          }
+          const backend = run.opencodeServer;
+          const backendAlive = backend?.url !== undefined && !!backend?.password && backend?.pid !== undefined &&
+            ((backend?.startTime && isProcessIdentityAlive(backend.pid, backend.startTime)) ||
+              (!backend?.startTime && readProcessStartTime(backend.pid) !== null));
+          if (!backendAlive) {
+            return failResult(`Steering unavailable for run ${run.runId} (opencode steerable-server: the per-run server backend is gone — no live owned server to address). Nothing dispatched. Smallest feasible alternative: wait for the turn to settle and continue via delegation_followup (a new attempt on a fresh per-run server, never relabeled as steering).`, {
+              error: "steer_backend_unavailable",
+              run_id: run.runId,
+              steering_key: key,
+              engine: "opencode",
+              stored: false,
+              executed: false
+            });
+          }
+          // Narrow the settle race: when the latest attempt carries a
+          // verifiable worker identity that is observably dead, the turn is
+          // already over (close not yet processed) — a prompt now could
+          // start a NEW turn on the idle session, which is follow-up work,
+          // never steering. Refuse rather than risk an untracked turn.
+          const latestAttempt = run.attempts.at(-1);
+          if (latestAttempt?.pid !== undefined && latestAttempt.processStartTime !== undefined &&
+            !isProcessIdentityAlive(latestAttempt.pid, latestAttempt.processStartTime)) {
+            return failResult(`Steering refused for run ${run.runId} (opencode steerable-server: the worker turn already exited — prompting the idle session now would start a new turn, which is follow-up work, never live steering). Nothing dispatched; continue via delegation_followup.`, {
+              error: "steer_worker_gone",
+              run_id: run.runId,
+              steering_key: key,
+              engine: "opencode",
+              stored: false,
+              executed: false
+            });
+          }
+          const server = backend as DelegationOpenCodeServer;
+          // Durable stored-local BEFORE the engine call (same crash
+          // discipline as codex): the exact steered session rides the
+          // record for same session/attempt applied binding.
+          persistSteering({
+            steeringKey: key, messageHash, messageChars: message.length, attemptN,
+            sessionId: sid,
+            status: "stored-local",
+            engineEvidence: `stored for opencode session ${sid} on the run's own server attempt ${attemptN}; engine call dispatching`,
+            createdAt: now, updatedAt: now
+          });
+          const prompted = runOpenCodePrompt(server.url, sid, message, {
+            binary: resolveOpenCodeBinary(), password: server.password, workdir: run.workdir
+          });
+          const stored = (Array.isArray(run.steering) ? run.steering : []).find((record) => record?.steeringKey === key);
+          const binaryNote = run.binaryOverridden
+            ? "a CODEXPRO_*_BIN override selected the api executable (test shims ride this route): shim results are never live proof"
+            : "default PATH opencode binary (no CODEXPRO_OPENCODE_BIN override); no shim marker";
+          if (prompted.outcome === "steered") {
+            if (stored) {
+              stored.status = "queued";
+              stored.engineEvidence = `opencode api session.prompt (delivery steer) accepted by the run's own server for session ${sid} attempt ${attemptN} (held; accepted never implies received/applied — the prompt op emits no application attestation, so the record stays queued/unverified unless a REQUESTED EFFECT is proven separately in live qualification). Evidence: ${prompted.evidence}`.slice(0, 500);
+              stored.updatedAt = new Date().toISOString();
+              saveDelegationRun(bridgeDir, run);
+            }
+            return okResult(`Steer ${key} accepted by the run's own server for run ${run.runId} (opencode session ${sid} attempt ${attemptN}): held as steer input. Accepted never implies received/applied: the prompt op emits no application attestation (live-turn effect live-unproven), so the record stays queued/unverified unless a REQUESTED EFFECT is proven separately in live qualification; see delegation_read_result.`, {
+              run_id: run.runId,
+              steering_key: key,
+              status: "queued",
+              attempt_n: attemptN,
+              engine: "opencode",
+              stored: true,
+              executed: true,
+              engine_evidence: prompted.evidence,
+              prompt_note: binaryNote,
+              next_action: "poll delegation_read_result: the record stays queued/unverified (accepted never implies applied); a REQUESTED EFFECT is proven separately in live qualification, never by relabeling"
+            });
+          }
+          if (prompted.outcome === "rejected") {
+            if (stored) {
+              stored.status = "rejected";
+              stored.engineEvidence = `opencode api session.prompt refused (exit ${prompted.exitCode}): ${prompted.evidence}`.slice(0, 500);
+              stored.updatedAt = new Date().toISOString();
+              saveDelegationRun(bridgeDir, run);
+            }
+            return failResult(`Steering rejected by the server for run ${run.runId} (opencode session ${sid}): ${prompted.evidence}`, {
+              error: "steer_rejected",
+              run_id: run.runId,
+              steering_key: key,
+              engine: "opencode",
+              stored: true,
+              executed: false,
+              engine_evidence: prompted.evidence
+            });
+          }
+          if (stored) {
+            stored.status = "unknown";
+            stored.engineEvidence = `opencode api session.prompt outcome uncertain (timeout/lost reply/ambiguous output): ${prompted.evidence}. Retry reuses the same key and reconciles against this record first, never duplicates.`.slice(0, 500);
+            stored.updatedAt = new Date().toISOString();
+            saveDelegationRun(bridgeDir, run);
+          }
+          return failResult(`Steering dispatch for run ${run.runId} is uncertain (opencode session ${sid}): ${prompted.evidence}. Recorded as unknown; retry with the SAME steering key reconciles first and never duplicates.`, {
+            error: "steer_uncertain",
+            run_id: run.runId,
+            steering_key: key,
+            engine: "opencode",
+            stored: true,
+            executed: false,
+            uncertain_delivery: true,
+            engine_evidence: prompted.evidence
           });
         }
         if (run.engine === "claude") {
@@ -4161,7 +4529,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "delegation_cancel",
       options: {
         title: "Delegation Cancel",
-        description: "Idempotent cancel of one run: signals only the exact PID+starttime-verified owned tree, rechecks the tree is gone after a grace + verification window, then verifies windowed quiescence (no further workdir writes across both legs). New opencode turns run --standalone (the owned tree is the serving tree); pre-standalone shared-service runs stay labeled, never silently converted. PID-tree cleanup alone is never presented as proof that a session-side turn halted: for opencode (no session-scoped halt in v2.0.22 on either route) session-side halt stays explicitly unclaimed with a blocker. The ack never claims cleanup finished while descendants remain, and a repeated cancel re-verifies live (never converts a cached incomplete into success).",
+        description: "Idempotent cancel of one run: signals only the exact PID+starttime-verified owned tree (worker tree plus the per-run server tree on opencode steerable-server runs), rechecks the tree is gone after a grace + verification window, then verifies windowed quiescence (no further workdir writes across both legs). New opencode turns run --standalone, or --server against a per-run adapter-owned server when steerable (both roots owned and both reaped); pre-standalone shared-service runs stay labeled, never silently converted. PID-tree cleanup alone is never presented as proof that a session-side turn halted: for opencode (no session-scoped halt in v2.0.22 on any CLI route) session-side halt stays explicitly unclaimed with a blocker. The ack never claims cleanup finished while descendants remain, and a repeated cancel re-verifies live (never converts a cached incomplete into success).",
         inputSchema: publicSchemaFrom(cancelArgs),
         runtimeInputSchema: cancelArgs,
         annotations: DESTRUCTIVE
@@ -4205,12 +4573,31 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           const rootWalkAlive = rootWalk.staleRoot
             ? []
             : rootWalk.members.filter((pid) => readProcessStartTime(pid) === rootWalk.baselines.get(pid));
-          const repeatRemaining = [...new Set([...memberAlive, ...rootWalkAlive])];
+          // Server-backed opencode: re-walk the recorded per-run server
+          // root live too (the persisted member set already carries it
+          // when the first cancel enumerated it; the fresh walk covers
+          // the rest). A surviving server keeps cleanup incomplete, same
+          // as a surviving worker descendant.
+          const repeatBackend = current.engine === "opencode" && current.opencodeRoute === "steerable-server"
+            ? current.opencodeServer
+            : undefined;
+          const repeatServerWalk = repeatBackend?.pid === undefined
+            ? { staleRoot: true as const, members: [] as number[], baselines: new Map<number, string>() }
+            : collectOwnedTree(repeatBackend.pid, repeatBackend.startTime);
+          const repeatServerAlive = repeatServerWalk.staleRoot
+            ? []
+            : repeatServerWalk.members.filter((pid) => readProcessStartTime(pid) === repeatServerWalk.baselines.get(pid));
+          const repeatRemaining = [...new Set([...memberAlive, ...rootWalkAlive, ...repeatServerAlive])];
           // Grounded only by a live enumeration: persisted members from a
           // cancel that saw the root alive, or a root verifiable alive
           // right now (its tree is then freshly enumerable). A stale root
           // with no persisted identities is never proof of cleanup.
-          const ownershipGrounded = priorMembers.length > 0 || !rootWalk.staleRoot;
+          // Server side mirrors worker side: no recorded server is
+          // vacuously grounded; a recorded server needs its pid in the
+          // persisted set or a fresh live walk.
+          const repeatServerGrounded = !repeatBackend || repeatBackend.pid === undefined ||
+            priorMembers.some((m) => m.pid === repeatBackend.pid) || !repeatServerWalk.staleRoot;
+          const ownershipGrounded = (priorMembers.length > 0 || !rootWalk.staleRoot) && repeatServerGrounded;
           const repeatClean = repeatRemaining.length === 0 && ownershipGrounded;
           const repeatQuiesced = repeatQuiescence.checked && repeatQuiescence.continued.length === 0;
           // Legacy shared-service gate: verified local cleanup (repeatClean)
@@ -4220,14 +4607,20 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           const repeatBackendUnproven = legacyBackendCessationUnproven(current);
           const repeatComplete = repeatClean && repeatQuiesced && !repeatBackendUnproven;
           // Carry the identities forward (plus any freshly enumerated
-          // while the root is alive) so the NEXT repeat rechecks them too.
+          // while the root is alive — worker tree plus per-run server
+          // tree) so the NEXT repeat rechecks them too.
           const freshMembers: OwnedTreeMemberIdentity[] = rootWalk.staleRoot
             ? []
             : [...rootWalk.baselines.entries()]
               .filter(([pid]) => rootWalk.members.includes(pid))
               .map(([pid, startTime]) => ({ pid, startTime }));
+          const freshServerMembers: OwnedTreeMemberIdentity[] = repeatServerWalk.staleRoot
+            ? []
+            : [...repeatServerWalk.baselines.entries()]
+              .filter(([pid]) => repeatServerWalk.members.includes(pid))
+              .map(([pid, startTime]) => ({ pid, startTime }));
           const mergedIdentities = new Map<number, string>();
-          for (const m of [...priorMembers, ...freshMembers]) {
+          for (const m of [...priorMembers, ...freshMembers, ...freshServerMembers]) {
             if (!mergedIdentities.has(m.pid)) mergedIdentities.set(m.pid, m.startTime);
           }
           const ownershipReason = ownershipGrounded
@@ -4323,8 +4716,21 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             isProcessIdentityAlive(termLatest.pid, termLatest.processStartTime)
             ? [termLatest.pid]
             : [];
-          const termRemaining = [...new Set([...termMemberAlive, ...termRootAlive, ...termLatestAlive])];
-          const termGrounded = termPriorMembers.length > 0 || !termRootWalk.staleRoot;
+          // Server-backed opencode: re-walk the recorded per-run server
+          // root live too (same discipline as the worker walk above).
+          const termBackend = current.engine === "opencode" && current.opencodeRoute === "steerable-server"
+            ? current.opencodeServer
+            : undefined;
+          const termServerWalk = termBackend?.pid === undefined
+            ? { staleRoot: true as const, members: [] as number[], baselines: new Map<number, string>() }
+            : collectOwnedTree(termBackend.pid, termBackend.startTime);
+          const termServerAlive = termServerWalk.staleRoot
+            ? []
+            : termServerWalk.members.filter((pid) => readProcessStartTime(pid) === termServerWalk.baselines.get(pid));
+          const termRemaining = [...new Set([...termMemberAlive, ...termRootAlive, ...termLatestAlive, ...termServerAlive])];
+          const termServerGrounded = !termBackend || termBackend.pid === undefined ||
+            termPriorMembers.some((m) => m.pid === termBackend.pid) || !termServerWalk.staleRoot;
+          const termGrounded = (termPriorMembers.length > 0 || !termRootWalk.staleRoot) && termServerGrounded;
           const termClean = termRemaining.length === 0 && termGrounded;
           const termQuiesced = termQuiescence.checked && termQuiescence.continued.length === 0;
           // Legacy shared-service gate (same as the repeat path): local
@@ -4336,14 +4742,20 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             ? undefined
             : "ownership UNVERIFIED (no live owned-tree enumeration for this terminal run: a missing pid or stale root is never proof of cleanup)";
           // Carry identities forward (plus any freshly enumerated while the
-          // root is alive) so a later cancel rechecks them too.
+          // root is alive — worker tree plus per-run server tree) so a
+          // later cancel rechecks them too.
           const termFreshMembers: OwnedTreeMemberIdentity[] = termRootWalk.staleRoot
             ? []
             : [...termRootWalk.baselines.entries()]
               .filter(([pid]) => termRootWalk.members.includes(pid))
               .map(([pid, startTime]) => ({ pid, startTime }));
+          const termFreshServerMembers: OwnedTreeMemberIdentity[] = termServerWalk.staleRoot
+            ? []
+            : [...termServerWalk.baselines.entries()]
+              .filter(([pid]) => termServerWalk.members.includes(pid))
+              .map(([pid, startTime]) => ({ pid, startTime }));
           const termMergedIdentities = new Map<number, string>();
-          for (const m of [...termPriorMembers, ...termFreshMembers]) {
+          for (const m of [...termPriorMembers, ...termFreshMembers, ...termFreshServerMembers]) {
             if (!termMergedIdentities.has(m.pid)) termMergedIdentities.set(m.pid, m.startTime);
           }
           const termBackendReason = termBackendUnproven ? LEGACY_BACKEND_CESSATION_BLOCKER : undefined;
@@ -4431,6 +4843,32 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         if (!uncertainCancel && latest?.pid !== undefined && latest.processStartTime !== undefined) {
           tree = await cancelOwnedTree(latest.pid, latest.processStartTime, 2_000);
         }
+        // Server-backed opencode: the per-run server is a second owned
+        // root. Reap it independently (either root may be missing/dead;
+        // BOTH must be gone for cleanupFinished). Unlike the worker tree,
+        // the server reap is NOT gated on uncertainCancel: a recorded
+        // server identity is addressable even when the worker never
+        // persisted a pid.
+        const cancelBackend = current.engine === "opencode" && current.opencodeRoute === "steerable-server"
+          ? current.opencodeServer
+          : undefined;
+        let serverTree: {
+          signalled: number[];
+          remaining: number[];
+          cleanupFinished: boolean;
+          staleRoot: boolean;
+          members: OwnedTreeMemberIdentity[];
+        } = { signalled: [], remaining: [], cleanupFinished: cancelBackend?.pid === undefined, staleRoot: true, members: [] };
+        if (cancelBackend?.pid !== undefined) {
+          const cancelledServer = await cancelOwnedTree(cancelBackend.pid, cancelBackend.startTime, 2_000);
+          serverTree = {
+            signalled: cancelledServer.signalled,
+            remaining: cancelledServer.remaining,
+            cleanupFinished: cancelledServer.cleanupFinished,
+            staleRoot: cancelledServer.staleRoot,
+            members: cancelledServer.members
+          };
+        }
         processRuntime().live.delete(current.runId);
         const cancelDoneAt = Date.now();
         // Windowed quiescence: a single quiet grace alone is insufficient (a
@@ -4452,8 +4890,12 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         // stale root, uncertain dispatch) stays incomplete regardless of
         // how quiet the workdir is.
         const stillOwned = recheckOwnedTreeGone(latest?.pid, latest?.processStartTime);
-        const remainingPids = [...new Set([...tree.remaining, ...stillOwned])];
-        const cleanupFinished = tree.cleanupFinished && stillOwned.length === 0;
+        const serverStillOwned = cancelBackend?.pid !== undefined
+          ? recheckOwnedTreeGone(cancelBackend.pid, cancelBackend.startTime)
+          : [];
+        const remainingPids = [...new Set([...tree.remaining, ...stillOwned, ...serverTree.remaining, ...serverStillOwned])];
+        const cleanupFinished = tree.cleanupFinished && stillOwned.length === 0 &&
+          serverTree.cleanupFinished && serverStillOwned.length === 0;
         const ownershipReason = tree.staleRoot
           ? (uncertainCancel || latest?.pid === undefined || latest?.processStartTime === undefined
             ? "cancel identity unverifiable (missing pid or uncertain dispatch is never proof of cleanup)"
@@ -4497,10 +4939,11 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           quiesced,
           quiescenceChecked: quiescence.checked,
           // Persist the enumerated descendant identities (full owned tree,
-          // not just the attempt root) so a repeated cancel rechecks the
+          // not just the attempt root — worker tree PLUS per-run server
+          // tree when server-backed) so a repeated cancel rechecks the
           // SAME identities live. Empty when no live enumeration happened,
           // which keeps repeat verification incomplete until grounded.
-          ownedTreeMembers: tree.members,
+          ownedTreeMembers: [...tree.members, ...serverTree.members.filter((m) => !tree.members.some((w) => w.pid === m.pid))],
           ...([ownershipReason, quiescence.reason, initialBackendReason].some(Boolean)
             ? { reason: [ownershipReason, quiescence.reason, initialBackendReason].filter(Boolean).join("; ") }
             : {})
@@ -4513,12 +4956,12 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         await pumpDeliveries(deps, bridgeDir, loadDelegationRun(bridgeDir, current.runId) ?? current).catch(() => undefined);
         // Session-aware verification: PID-tree cleanup alone never proves a
         // session-side turn halted. For opencode (no session-scoped halt
-        // subcommand in v2.0.22 on either the --standalone private-server
-        // route or the legacy shared-service route) session halt stays
-        // explicitly unclaimed with the capability blocker (fail closed);
-        // the owned-tree recheck plus windowed quiescence carries the
-        // execution proof instead. Unverifiable workdirs fail closed too
-        // (no clean-halt claim).
+        // subcommand in v2.0.22 on the --standalone private-server route,
+        // the steerable-server per-run route, or the legacy shared-service
+        // route) session halt stays explicitly unclaimed with the
+        // capability blocker (fail closed); the owned-tree recheck plus
+        // windowed quiescence carries the execution proof instead.
+        // Unverifiable workdirs fail closed too (no clean-halt claim).
         const sessionId = current.session?.sessionId;
         const sessionHalt = current.engine === "opencode"
           ? {

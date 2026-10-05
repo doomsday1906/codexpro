@@ -1,0 +1,161 @@
+STEERING-TRANSPORT LEAF MANIFEST — 2026-10-05, base 42f8fa6
+codexpro steering-transport leaf: verify usable mid-turn steer routes per engine,
+integrate only minimal supported paths. UNCOMMITTED. No live MODEL calls in this
+leaf (disposable local servers + offline schema dumps + labeled shims only).
+
+1) BASE / WORKING TREE
+- HEAD: 42f8fa6a8b51e3c5d1a3e7f6632976bac829575e (verified via git rev-parse)
+- Tracked modifications (uncommitted): package.json,
+  scripts/delegation-steer-smoke.mjs, src/delegationEngines.ts,
+  src/delegationStore.ts, src/delegationTools.ts
+- New untracked (leaf-owned): scripts/delegation-steer-server-smoke.mjs,
+  evidence/delegation/2026-10-05-42f8fa6/
+- Untouched strays (preserved, never committed): fixture-a.txt, fixture-b.txt
+
+2) CHANGED-FILE SHA256 (post-proof, source frozen since clean rebuild)
+a36ddbbb1f3fc5517a309d0f9c12399c6558f92470918b7fe57f0f27aa266073  package.json
+77f19d851079f472da10631310c6362a34a4fa20cce2afb3502e79b4effdb4f6  scripts/delegation-steer-smoke.mjs
+3039d66344eae82892b57398b1f3036c5f0ed79b27d163b84c4ee09523a40859  src/delegationEngines.ts
+c0fd582861647c93b9f22e25b0791c4ac6532b2bed13fd763acf7db28cd17a14  src/delegationStore.ts
+3840b7bc769a9a186924caee4e9a761756e5152b6bfe2789da0360a4b9b8216b  src/delegationTools.ts
+70e22732750060f801249136d955ac3ae7c2156437df565b15915dad5ed3dce4  scripts/delegation-steer-server-smoke.mjs (new)
+
+3) BUILD IDENTITY
+- codexpro@0.31.0; `node scripts/build.mjs`
+- Build log: "Built codexpro@0.31.0; source commit 42f8fa6... (dirty)."
+
+4) SERIAL PROOF MATRIX (runner /tmp/opencode/run-proof.sh; serial, stop-at-first-red;
+runner printed ALL GREEN; every suite log ends with its PASS line => exit 0 each)
+[01] build: npm run build -> exit 0
+  log 01-build.log sha256 7251c0e73d32105c0ea587112eef2831914c9c28b337b6c557ebe1a696cd7513
+[02] steer-server: node scripts/delegation-steer-server-smoke.mjs -> exit 0
+  log 02-steer-server.log sha256 c4f0d6321f5fdfa190c5b3300c0f5e0b4e79cdbc902120a8f7648708d1661ce1
+  tail: delegation-steer-server-smoke: PASS (no live model calls; fake-binary results labeled shim)
+[03] steer: node scripts/delegation-steer-smoke.mjs -> exit 0
+  log 03-steer.log sha256 b49d0827fb903f30f5c13f3ead4d328e441f0b581e3435940f8b398570c123d8
+[04] ownership: node scripts/delegation-codex-ownership-smoke.mjs -> exit 0
+  log 04-ownership.log sha256 186663fff51e1c395cfff6ee7a7832cb3de205b5d8128781ee9e3131de470bea
+[05] isolation: node scripts/delegation-artifact-isolation-smoke.mjs -> exit 0
+  log 05-isolation.log sha256 0284883820766abdb679c324abdd1d4adef8accc9e88702bdeb6b97816280ba2
+[06] terminal-cleanup: node scripts/delegation-terminal-cleanup-smoke.mjs -> exit 0
+  log 06-terminal-cleanup.log sha256 096815ee8d952b3c7174704ceb81b7f790cfa80116e8556de856d4833ee22227
+[07] cancel-artifact: node scripts/delegation-cancel-artifact-smoke.mjs -> exit 0
+  log 07-cancel-artifact.log sha256 e89bcf02f76a86886aaf7716e0fe5d229a2a786dd73fe5382039b5dea6419ea5
+[08] identity: node scripts/delegation-identity-standalone-output-smoke.mjs -> exit 0
+  log 08-identity.log sha256 4dfefbbf6ada9dc477f00b14f1e09102c4ae0d4f726fa74de882114ec24c043d
+[09] central-artifact: node scripts/delegation-central-artifact-smoke.mjs -> exit 0
+  log 09-central-artifact.log sha256 dce6885e43a0fc6f09ae5ac83b41244dd096f3f543354d08fb0c39db42f8d813
+[10] amendment: node scripts/delegation-followup-amendment-smoke.mjs -> exit 0
+  log 10-amendment.log sha256 1daab2062df013a8ddcbdc95ff913b67fc17e5e8ccc8eed135b389cbb08a01bc
+[11] followup: node scripts/delegation-followup-smoke.mjs -> exit 0
+  log 11-followup.log sha256 ac3f8b0d6e84954b9d021fe59e93a9a1690e433791544e786bdfc3d43ff85857
+[12] triengine: node scripts/delegation-triengine-smoke.mjs -> exit 0
+  log 12-triengine.log sha256 33fb5d19c75f9f96c41ff5833124ce392bd64990b71ce5d0245ace27d38d1917
+[13] repair-focus: node scripts/delegation-repair-focus-smoke.mjs -> exit 0
+  log 13-repair-focus.log sha256 b9a5f5bb3b777ea3d3e1125d4f6f8daa1766ce69d96ccbb58adf23678440f68c
+[14] storage: node scripts/delegation-storage-smoke.mjs -> exit 0
+  log 14-storage.log sha256 e7b4277306086f137021a03fd31224b3348b87346b00c50c031bffa0f7903b70
+[15] routing: node scripts/delegation-routing-smoke.mjs -> exit 0
+  log 15-routing.log sha256 c173692d4ad483644de89315b1b4035c18bab9bc97cd2bb5c2322b695a317e26
+[16] canary: node scripts/delegation-canary-smoke.mjs -> exit 0
+  log 16-canary.log sha256 69f5422df721ab3eb812fa0234be6ce0ece7a5774fed0257831920fd43a844a2
+No suite red; no repair was required, so no re-run was needed.
+
+5) OFFLINE EXCERPTS (no live model calls)
+(a) Codex TurnSteerParams schema (offline `codex generate-json-schema` dump,
+    offline/TurnSteerParams.json sha256 857e7a2b061ae46ed6aedea6a5fddd3a6ce14f0334bf7eafaf10d4cbe68ec78b):
+    TurnSteerParams requires { expectedTurnId, input, threadId }; expectedTurnId is
+    "Required active turn id precondition. The request fails when it does not match
+    the currently active turn." VERDICT: exec --json never exposes the active turn
+    id, so no usable mid-turn steer route exists -> Codex stays on the existing
+    `codex queue --thread` held-only path (capability note extended only).
+    Prior live receipt: evidence/delegation/2026-10-05-live-steer-5c05913.md
+    (queue acceptance "Queued message ... for thread ...", held-only).
+(b) OpenCode disposable-server findings (probe port 48971, disposable DB dirs,
+    minted probe-only password, shared :8787 untouched; transcript
+    offline/disposable-server-transcript.md sha256
+    b20580b10d5f44054977e83a47b87f55e42db34f5433f8cf6e8f0dc9c4a7503c;
+    serve log offline/disposable-serve.log sha256
+    08af127bf88d9a6ab8d7a994eab15843a2fceeb04011a854616d4cf52eed43da):
+    - session.create/list/get/interrupt/remove lifecycle works with zero model
+      tokens (cost 0, all tokens 0); session.active reports {} for idle sessions.
+    - Unknown session -> SessionNotFoundError 404 for prompt/interrupt/inbox.list
+      (lookup precedes delivery validation); delivery:"bogus" on missing session
+      gives the identical 404, so delivery validation order is unproven there.
+    - session.export is NOT an api op ("Error: Operation not found:
+      session.export"); server-backed verification therefore uses session.list
+      then session.get (NOT export).
+    - Binary delivery-steer excerpts
+      (offline/opencode-delivery-steer-binary-lines.txt sha256
+      957ec86e51ff8532cd5d83a2549e4c93bf05cc6536227090d5034a6588cc30b4):
+      session.prompt accepts delivery:"steer"; inbox rows carry delivery
+      "queue"/"steer"; steer admission/cancel/queue verbs present in binary.
+    - opencode session --help: list|delete|export|import only (no halt/stop/steer
+      verb); opencode run --help documents --standalone/--server.
+    Probe server SIGTERM'd after; port confirmed FREE; probe dirs cleaned.
+(c) Claude: NEGATIVE, hermetic-only — no mid-turn verb in 2.1.289 help; INCOMPLETE
+    marker kept; no source change. Prior hook-block receipt:
+    evidence/delegation/2026-10-05-live-claude-75e1a15.md.
+
+6) PER-ENGINE ROUTE VERDICTS
+- Codex: NEGATIVE (no mid-turn route) + kept held-only integration: existing
+  `codex queue --thread` path retained, capability note extended; S2 gate asserts
+  codex-only non-ephemeral argv + canary refusal. Live-turn steer effect unproven.
+- OpenCode: INTEGRATED as opt-in steerable-server — per-run adapter-owned
+  disposable server + worker CLI `run --server`; steer via one `api session.prompt`
+  with delivery:"steer"; accepted stays queued/unverified (T12 asserts no
+  auto-promotion). Live-turn steer effect remains queued/unverified for
+  orchestrator live-proof.
+- Claude: NEGATIVE, hermetic-only — no mid-turn verb; INCOMPLETE marker; zero
+  source change.
+
+7) NEW / UPDATED CASES
+- New suite scripts/delegation-steer-server-smoke.mjs (T1-T13): T1 unit
+  (argv/mapping/password/port/capability/store authority + teardown); T2
+  server-backed launch; T3 steer happy path (recorded-session-only,
+  delivery-steer payload, duplicate/conflict/foreign, never applied); T4/T5
+  uncertain replay + missing-session rejection; T6 idempotency bound (refuse-new
+  past 16, oldest replay); T7 cancel-complete (dual-root reap, verified complete);
+  T8/T9 worker-gone + backend-gone refusals (dead-backend cancel fail-closed);
+  T10 default-route steer_unsupported + no-session refusal; T11 followup on fresh
+  server + same DB (exactly one backend per window); T12 no auto-promotion
+  (queued stays queued/unverified); T13 secret redaction (passwords in run files
+  only, zero leaks in outputs/logs).
+- Updated S2 in scripts/delegation-steer-smoke.mjs: opencode steerable argv shape
+  (--server + minted-at-launch placeholder, no --standalone) + opencode canary
+  refusal; codex/claude expectations preserved.
+- Registered delegation-steer-server:smoke in package.json.
+
+8) ITEM-(3) CONFIRMATION (no untested behavior changes remain)
+(a) Followup verify + continuation on fresh-server/same-DB: COVERED by T11
+    (fresh server process per continuation, SAME recorded server DB, exactly one
+    backend per window via serve-count assert, new-continuation-attempt).
+(b) Dual-root cancel (worker tree + server tree): COVERED by T7 (both identities
+    alive pre-cancel, verified complete, zero remaining pids, both identities dead
+    post-cancel) with fail-closed edge in T8/T9 (pre-dead backend -> incomplete).
+(c) Finalize/cancel race fix via in-flight hold: COVERED by T7 outcome via the
+    pre-existing shared cancelRelocateHold owner — cancel holds the run for its
+    whole duration (add at cancel start, delete after terminal save;
+    src/delegationTools.ts), and finalize's server-stop guard
+    (!cancelRelocateHold.has(runId)) plus the relocation guard reuse that same
+    hold. T7 runs a real cancel against live worker+server with genuine child-close
+    events arriving during the quiescence windows; had finalize stolen the server
+    or mutated the workdir, the verified-complete + zero-remaining assertion would
+    fail. No new hold mechanism was introduced (one-line reuse of existing owner).
+All other diff hunks (store identity/authority/teardown, engine spawn/readiness/
+prompt-mapping/verify/capabilities, tool launch/steer/followup paths, preview
+argv, secret handling) are exercised by T1-T13 + updated S2. No src/script/package
+changes were made after the clean rebuild; all 16 suites green with no repair.
+
+9) STRAYS (preserved untouched, never committed)
+ce299a8defb9e1e8102a58dd1a8251ad2b7f954c9341e6fbce6beab36b90cca7  fixture-a.txt
+13aafb27a71bb59b8c92d83248746711ddffe2d73fa2f3fbc5299851d0fac6ce  fixture-b.txt
+
+10) STALE-LEAF DISCLAIMER
+This leaf proves hermetic transport mechanics only (labeled shims + disposable
+local servers + offline dumps). Live-turn steer EFFECT (a running worker observably
+incorporating a steered message mid-turn) remains unproven for orchestrator
+live-proof; server-route steer records stay queued/unverified by design (T12).
+Codex mid-turn steer is NEGATIVE on current evidence; Claude has no mid-turn verb.
+Evidence dir evidence/delegation/2026-10-05-42f8fa6/ is fresh for this leaf; prior
+receipts cited above belong to earlier leaves/bases and are referenced, not renewed.

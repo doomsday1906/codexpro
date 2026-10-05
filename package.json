@@ -164,7 +164,8 @@
     "release:check": "npm run release:guard && npm run build && npm run smoke && npm run stress && npm run release:reproducibility && npm audit --audit-level=high",
     "release:publish": "node scripts/release-publish.mjs",
     "delegation-ownership:smoke": "npm run build && node scripts/delegation-codex-ownership-smoke.mjs",
-    "delegation-steer:smoke": "npm run build && node scripts/delegation-steer-smoke.mjs"
+    "delegation-steer:smoke": "npm run build && node scripts/delegation-steer-smoke.mjs",
+    "delegation-steer-server:smoke": "npm run build && node scripts/delegation-steer-server-smoke.mjs"
   },
   "dependencies": {
     "@lezer/python": "1.1.19",

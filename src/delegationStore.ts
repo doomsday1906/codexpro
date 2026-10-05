@@ -262,12 +262,39 @@ export interface DelegationSessionBinding {
    * Engine-returned live-steer thread id (codex steerable launches only:
    * the session UUID/name the engine persisted for a non-ephemeral run).
    * Ephemeral codex runs carry none (no steerable thread by construction);
-   * opencode/claude runs carry none (no steer verb in the qualified CLI).
+   * opencode server-backed runs steer by sessionId (no thread id) and
+   * claude runs carry none (no steer verb in the qualified CLI).
    * Steering queues only to this recorded id, never a synthesized one.
    */
   threadId?: string;
   /** How the thread id was evidenced (never synthesized). */
   threadEvidence?: string;
+}
+
+/**
+ * Per-run adapter-owned OpenCode server identity (steerable-server route).
+ * The server process is an owned backend member: cancel/ownership evidence
+ * covers it alongside the worker CLI tree. The password is a per-run
+ * disposable local-only secret: stored so steering, verification, and
+ * continuation can address the server across adapter reconnects, and NEVER
+ * emitted in tool outputs, evidence, or logs.
+ */
+export interface DelegationOpenCodeServer {
+  /** Server URL (127.0.0.1 + minted port; no credential embedded, ever). */
+  url: string;
+  /** Owned server process identity (PID + starttime baseline). */
+  pid: number;
+  startTime?: string;
+  /** Per-run disposable server password (SECRET: env-only, never emitted). */
+  password: string;
+  /**
+   * Recorded server state dir. Must equal the recomputed
+   * opencodeServerDirForRun authority for the same run id; a stored path
+   * alone never authorizes deletion.
+   */
+  dir: string;
+  /** Session database path inside dir (durable across attempt windows). */
+  dbPath: string;
 }
 
 export interface DelegationRunRecord {
@@ -372,20 +399,40 @@ export interface DelegationRunRecord {
   bypassApprovals?: boolean;
   /**
    * OpenCode execution route at launch: "standalone" runs a private server
-   * (`opencode run --standalone`); "shared-service" uses the background
-   * service (pre-standalone launches). Absent on run files that predate this
-   * field, which are honestly treated as shared-service (labeled, never
-   * silently converted). Only meaningful for engine opencode.
+   * (`opencode run --standalone`); "steerable-server" runs the worker CLI
+   * against a per-run adapter-owned disposable server (`opencode run
+   * --server <url>`, explicit steerable=true opt-in only, same model/agent
+   * gates); "shared-service" uses the background service (pre-standalone
+   * launches). Absent on run files that predate this field, which are
+   * honestly treated as shared-service (labeled, never silently converted).
+   * Only meaningful for engine opencode.
    */
-  opencodeRoute?: "standalone" | "shared-service";
+  opencodeRoute?: "standalone" | "shared-service" | "steerable-server";
   /**
-   * Explicit steerable opt-in (codex real tasks only): the launch ran
-   * without --ephemeral so the session persists and the engine may return
-   * an addressable thread id (recorded on session.threadId when observed).
-   * Profile + execution-policy boundaries are unchanged; the default stays
-   * ephemeral. Absent/false on runs that predate this field (ephemeral).
+   * Explicit steerable opt-in: codex real tasks run without --ephemeral so
+   * the session persists and the engine may return an addressable thread id
+   * (recorded on session.threadId when observed); opencode real tasks run
+   * server-backed (opencodeRoute steerable-server) so live steering can
+   * address the run's session through the per-run server below. Profile /
+   * execution-policy / model / agent boundaries are unchanged; the defaults
+   * stay ephemeral (codex) and standalone (opencode). Absent/false on runs
+   * that predate this field.
    */
   steerable?: boolean;
+  /**
+   * Per-run adapter-owned OpenCode server for the steerable-server route
+   * (engine opencode + steerable only). The server process is an owned
+   * backend: its PID+starttime identity joins the cancel/ownership evidence
+   * alongside the worker CLI tree, and its state dir is retired only with
+   * the run (prune-time teardown, same retention as central artifacts).
+   * `password` is a per-run disposable local-only secret for the 127.0.0.1
+   * server: it is NEVER emitted in tool outputs, evidence, or logs (only
+   * ever passed via process env to the adapter's own server/api children).
+   * `dir` must always equal the recomputed opencodeServerDirForRun authority
+   * (a stored path alone never authorizes deletion). Optional: runs that
+   * never used the server-backed route carry no record.
+   */
+  opencodeServer?: DelegationOpenCodeServer;
   /**
    * Last cancel verification for this run (persisted so an incomplete or
    * uncertain cancel stays incomplete until a later cancel re-verifies live;
@@ -472,9 +519,16 @@ export interface DelegationSteeringRecord {
   /**
    * Exact engine thread id queued to (codex steerable only). Binds applied
    * correlation to the same attempt/thread; a record without it (legacy or
-   * non-codex) never promotes to applied.
+   * non-codex) never promotes to applied unless bound by sessionId below.
    */
   threadId?: string;
+  /**
+   * Exact engine session id steered (opencode steerable-server only: the
+   * run's recorded session id the server accepted input for). Binds applied
+   * correlation to the same session/attempt; a record with neither threadId
+   * nor sessionId (legacy or unbound) never promotes to applied.
+   */
+  sessionId?: string;
   status: "stored-local" | "queued" | "applied" | "rejected" | "unknown";
   /** Engine-observed evidence excerpt for the status (never synthesized). */
   engineEvidence?: string;
@@ -601,6 +655,30 @@ export const DELEGATION_ARTIFACTS_DIRNAME = "delegation-artifacts";
 export function centralArtifactsDirForRun(bridgeDir: string, runId: string): string {
   if (!/^run_[0-9a-f]{16}$/.test(String(runId ?? ""))) throw new Error("Invalid delegation run id.");
   return path.join(bridgeDir, DELEGATION_ARTIFACTS_DIRNAME, String(runId));
+}
+
+/**
+ * Pure per-run OpenCode server state dir for the steerable-server route:
+ * `<bridgeDir>/opencode-servers/<runId>/` (session DB + server state/cache
+ * inside; the run's conversation survives attempt windows in the DB while
+ * the server process itself is per-window and disposable). Run-scoped by
+ * the full run identity. Throws on an invalid run id (fail closed, never a
+ * shared fallback dir). No IO.
+ */
+export function opencodeServerDirForRun(bridgeDir: string, runId: string): string {
+  if (!/^run_[0-9a-f]{16}$/.test(String(runId ?? ""))) throw new Error("Invalid delegation run id.");
+  return path.join(bridgeDir, "opencode-servers", String(runId));
+}
+
+/** Session database filename inside the per-run server dir (fixed name). */
+export const OPENCODE_SERVER_DB_FILENAME = "opencode.db";
+
+/**
+ * Pure per-run OpenCode server session-DB path (durable across attempt
+ * windows of the same run so continuations can truly resume). No IO.
+ */
+export function opencodeServerDbPathForRun(bridgeDir: string, runId: string): string {
+  return path.join(opencodeServerDirForRun(bridgeDir, runId), OPENCODE_SERVER_DB_FILENAME);
 }
 
 export function subscriptionsPath(bridgeDir: string): string {
@@ -879,6 +957,7 @@ function pruneDelegationRuns(bridgeDir: string): void {
   for (const victim of victims) {
     try { fs.rmSync(delegationRunPath(bridgeDir, victim.runId), { force: true }); } catch { /* ignore */ }
     teardownRunArtifacts(bridgeDir, victim);
+    teardownOpenCodeServerDir(bridgeDir, victim);
   }
 }
 
@@ -1002,6 +1081,64 @@ export function teardownRunArtifacts(bridgeDir: string, run: DelegationRunRecord
     return { removed, reason: `run ${runId}: no recorded owned artifacts to tear down (nothing deleted)` };
   }
   return { removed };
+}
+
+/**
+ * Bounded lifecycle for per-run OpenCode server state (steerable-server
+ * route only): the recorded server dir (`<bridgeDir>/opencode-servers/
+ * <runId>/`: session DB + server state/cache) is retired only with its run,
+ * same retention as central artifacts. The stored dir must EQUAL the
+ * recomputed opencodeServerDirForRun authority for the same run id (a
+ * stored path alone never authorizes deletion); the dbPath must be the
+ * fixed filename inside that dir. Anything else fails closed to no-delete
+ * with an explicit reason. Missing/non-server runs report no owned server
+ * state (nothing deleted). Never touches task code, fixtures, other runs,
+ * subscription state, or foreign files. Never throws. Exported for the
+ * focused regression proof.
+ */
+export function teardownOpenCodeServerDir(bridgeDir: string, run: DelegationRunRecord): { removed: string[]; reason?: string } {
+  const failClosed = (reason: string): { removed: string[]; reason?: string } => ({ removed: [], reason });
+  const runRecord = (run ?? null) as DelegationRunRecord | null;
+  const runId = String((runRecord as { runId?: unknown })?.runId ?? "");
+  if (!runRecord || typeof runRecord !== "object" || !/^run_[0-9a-f]{16}$/.test(runId)) {
+    return failClosed("run record missing or invalid (no valid run id): failing closed, nothing deleted");
+  }
+  if (typeof bridgeDir !== "string" || !bridgeDir) {
+    return failClosed("bridge dir missing: server dir unresolvable, nothing deleted");
+  }
+  const recorded = (runRecord as { opencodeServer?: unknown })?.opencodeServer as
+    { dir?: unknown; dbPath?: unknown } | undefined;
+  if (!recorded || typeof recorded !== "object") {
+    return { removed: [], reason: `run ${runId}: no recorded opencode server state (nothing deleted)` };
+  }
+  let authorityDir: string;
+  try {
+    authorityDir = opencodeServerDirForRun(bridgeDir, runId);
+  } catch {
+    return failClosed(`run ${runId} server dir unresolvable: failing closed, nothing deleted`);
+  }
+  const recordedDir = typeof recorded.dir === "string" ? recorded.dir : "";
+  const recordedDb = typeof recorded.dbPath === "string" ? recorded.dbPath : "";
+  if (!recordedDir || path.normalize(recordedDir) !== path.normalize(authorityDir)) {
+    return failClosed(`run ${runId}: recorded server dir does not equal the recomputed run authority (never a stored path alone): failing closed, nothing deleted`);
+  }
+  if (!recordedDb || path.normalize(recordedDb) !== path.normalize(path.join(authorityDir, OPENCODE_SERVER_DB_FILENAME))) {
+    return failClosed(`run ${runId}: recorded server db is not the fixed filename inside the run authority: failing closed, nothing deleted`);
+  }
+  try {
+    const lst = fs.lstatSync(authorityDir);
+    if (!lst.isDirectory() || lst.isSymbolicLink()) {
+      return { removed: [], reason: `run ${runId}: server dir absent or not a real directory (nothing deleted)` };
+    }
+  } catch {
+    return { removed: [], reason: `run ${runId}: server dir absent (nothing deleted)` };
+  }
+  try {
+    fs.rmSync(authorityDir, { recursive: true, force: true });
+    return { removed: [`server:${runId}`] };
+  } catch {
+    return failClosed(`run ${runId}: server dir removal failed (left in place)`);
+  }
 }
 
 /** Backward-compatible accessor: Leaf 1 run files carry no inputRequests. */

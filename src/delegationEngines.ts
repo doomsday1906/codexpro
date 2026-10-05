@@ -18,9 +18,10 @@
  * is never identity. Cancellation signals only the exact owned tree.
  */
 
-import { createHash } from "node:crypto";
-import { spawnSync, type ChildProcess } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -527,7 +528,7 @@ export const CODEX_QUEUE_CAPABILITY = {
   inspected: "codex-cli 0.159.0 `codex queue --help`: 'Queue a message for an existing session'; usage 'codex queue [OPTIONS] --thread <THREAD> --message <TEXT>'; '--thread <THREAD>: Session UUID or exact session name'; '--message <TEXT>: Message text to queue'. `codex exec --help`: '--json: Print events to stdout as JSONL' (structured startup/control protocol requested on steerable launches). Live 2026-10-05 (trivial Luna tasks): --json stdout line 1 is {\"type\":\"thread.started\",\"thread_id\":\"<uuid>\"} (ONLY observed startup type/key; turn/item lifecycle lines carry no thread identity); mid-turn and post-end `codex queue` both exit 0 with `Queued message <msg-uuid> for thread <thread>.` (held-by-engine; no in-turn incorporation observed)",
   ephemeralSteerable: false,
   queueDuringActiveVsAfterEnd: "OBSERVED 2026-10-05 (codex-cli 0.159.0, live Luna workers): mid-turn queue exits 0 `Queued message <msg-uuid> for thread <thread>` (held; live turn completed without observable incorporation — final output ignored queued content, rollout ends at task_complete, no second turn); post-end queue exits 0 with the same held shape (no new turn while observed). Queued means held-by-engine only; received/applied stay unverified (engine emits no application-attesting event)",
-  note: "ephemeral runs persist no session and expose no thread: steer refuses with steer_unavailable_no_thread (never emulated via resume, second session, or cancel+relaunch). Steerable launches use the explicit non-ephemeral + --json variant and queue only to the recorded engine-returned thread id."
+  note: "ephemeral runs persist no session and expose no thread: steer refuses with steer_unavailable_no_thread (never emulated via resume, second session, or cancel+relaunch). Steerable launches use the explicit non-ephemeral + --json variant and queue only to the recorded engine-returned thread id. app-server turn/steer is NOT a second route: offline 2026-10-05 schema dump (codex app-server generate-json-schema) shows TurnSteerParams requires {threadId, expectedTurnId, input[]} (expectedTurnId is a REQUIRED active-turn precondition; no additionalContext field exists), and the exec --json route never exposes a turn id — so turn/steer is unusable without an app-server-managed launch (new worker architecture, out of scope). Queue stays the one supported mechanism, held-only."
 } as const;
 
 /** OpenCode live-steer capability: no native mid-run steer verb exists. */
@@ -545,6 +546,334 @@ export const CLAUDE_STEER_CAPABILITY = {
   inspected: "claude 2.1.289 `claude --help`: session verbs are -c/--continue, -r/--resume, --fork-session, --session-id, plus --bg background agents managed via attach/logs/stop/rm and `claude attach <id>` (terminal attach, no message-inject flag in help; no queue/steer/message-inject verb); --print supports --input-format/--output-format stream-json for single-shot non-interactive input (a new process, not mid-turn injection into a live worker). No live Claude call attempted 2026-10-05 (quota unconfirmed from the prior probe state; never retry paid calls): precise inspected negative, no genuine local mid-turn input route exists",
   blocker: "steer_unsupported: claude 2.1.289 exposes no mid-run message-inject verb (attach opens the session in the terminal, it does not queue a bounded message from this adapter); --resume continues (same or copied session) rather than steering a live turn, so delivery is never relabeled from follow-up/resume. Engine steering stays INCOMPLETE; delegation_followup stays a separate post-completion Q&A protocol. Smallest alternative for Andrew: wait for the turn to settle, then answer/continue via delegation_followup or relaunch with revised task text — a new turn, never a live steer."
 } as const;
+
+/**
+ * OpenCode server-backed live-steer route (explicit steerable=true opt-in,
+ * real tasks only; default --standalone runs keep steer_unsupported above).
+ * The worker CLI runs `opencode run --server <per-run adapter-owned
+ * disposable server>` and steering is one `opencode api --server <url>
+ * session.prompt --param sessionID=<id> --data {text, delivery:"steer"}`
+ * call against the run's recorded session id. Verified offline 2026-10-05
+ * against opencode v2.0.22 (binary op catalog + a disposable `opencode
+ * serve` on 127.0.0.1:48971 with disposable config/state/db and a minted
+ * password; shared :8787 untouched; no model sessions): session.prompt,
+ * session.interrupt, session.inbox.update, session.inbox.list, and
+ * session.active are registered ops; in-bundle callers pass
+ * delivery:"steer" and the server defaults a missing delivery to steer
+ * (`t.prompt.delivery??"steer"`); session.inbox.update dispatches steerInbox
+ * vs queueInbox on payload.delivery==="steer"; session.prompt/interrupt/
+ * inbox.list against a missing session return typed SessionNotFoundError
+ * (HTTP 404, session-scoped, no model invoked, nothing created); a bogus
+ * delivery value still 404s first (session lookup precedes delivery
+ * validation); the raw method+path form is rejected by the CLI (op-ID form
+ * only); `opencode session` has no --server flag (list/delete/export/
+ * import target the background service, so server-backed verification uses
+ * the api route); serve without OPENCODE_PASSWORD auto-mints and prints
+ * `server password ...` (the adapter sets an explicit per-run password
+ * instead). The LIVE-TURN steer effect (preemption vs inbox-hold) is NOT
+ * proven in-leaf (no model calls): a server-accepted steer is recorded
+ * queued/held (never applied); applied requires worker-observable evidence
+ * and is never adapter-inferred.
+ */
+export const OPENCODE_STEERABLE_SERVER_CAPABILITY = {
+  engine: "opencode",
+  supported: true,
+  scope: "steerable-server launches only (explicit steerable=true on real tasks; per-run adapter-owned disposable server; default --standalone runs stay steer_unsupported, never emulated)",
+  route: "opencode api --server <url> session.prompt --param sessionID=<id> --data {text, delivery: steer}",
+  inspected: "opencode v2.0.22 binary op catalog contains session.prompt/session.interrupt/session.inbox.update/session.inbox.list/session.active; in-bundle run caller passes delivery:\"steer\", server reads t.prompt.delivery??\"steer\", inbox.update dispatches steerInbox vs queueInbox on delivery===\"steer\". Disposable serve 127.0.0.1:48971 2026-10-05: session.list -> {\"data\":[]}, session.active -> {\"data\":{}}; session.prompt/session.interrupt/session.inbox.list vs missing session -> {\"_tag\":\"SessionNotFoundError\"} HTTP 404; bogus delivery still 404s first; raw method+path form rejected by CLI (op-ID form only); `opencode session` has no --server flag; serve without OPENCODE_PASSWORD auto-mints and prints `server password ...`",
+  note: "server-accepted means held-by-server only (never applied: applied requires worker-observable evidence). Live-turn steer effect (preemption vs inbox-hold) is live-unproven in-leaf (no model calls); the orchestrator live-proves separately. A steer raced past settle may start a new turn on an idle session (documented residual: the gate requires running/queued + live PIDs, and cancel reaps the owned server, bounding the blast radius)."
+} as const;
+
+/** Build the OpenCode server-backed argv (run --server route; no Codex flags). */
+export function buildOpenCodeServerArgv(opts: {
+  model: string;
+  agent: string;
+  prompt: string;
+  serverUrl: string;
+  sessionId?: string;
+  title?: string;
+}): string[] {
+  const argv = ["run", "--server", opts.serverUrl, "--model", opts.model, "--agent", opts.agent, "--format", "json"];
+  if (opts.sessionId) argv.push("--session", opts.sessionId);
+  if (opts.title) argv.push("--title", opts.title);
+  argv.push(opts.prompt);
+  return argv;
+}
+
+/** Per-run disposable OpenCode server password (base64url, 192 bits). */
+export function mintOpenCodeServerPassword(): string {
+  return randomBytes(24).toString("base64url");
+}
+
+/**
+ * Pick a free 127.0.0.1 port for a per-run disposable server: bind port 0,
+ * read the assigned port, close. The bind-then-use race is closed by the
+ * caller: a serve that fails to bind is an observed failure (fail closed,
+ * bounded port retries), never a shared-port squat (127.0.0.1 only, never
+ * the shared :8787 by construction of the pick).
+ */
+export async function pickFreeLoopbackPort(): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const probe = net.createServer();
+    probe.on("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      const port = typeof address === "object" && address ? (address as { port?: unknown }).port : undefined;
+      probe.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        if (typeof port !== "number" || !Number.isSafeInteger(port) || port <= 0 || port > 65535 || port === 8787) {
+          reject(new Error(`free-port pick rejected (port ${String(port)} unusable; never the shared :8787)`));
+          return;
+        }
+        resolve(port);
+      });
+    });
+  });
+}
+
+export interface OpenCodeServerLaunch {
+  /** Server URL (127.0.0.1 + minted port; no credential embedded, ever). */
+  url: string;
+  port: number;
+  /** Owned server PID + starttime identity (no handle retained: unref'd). */
+  pid: number;
+  startTime?: string;
+}
+
+function sleepMsSync(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Spawn one per-run disposable `opencode serve` and wait for readiness.
+ * The child is spawned detached from the adapter event loop (stdio ignored
+ * + unref): NO handle is retained, so an adapter restart neither kills the
+ * server nor loses it — PID+starttime is the identity (crash-safe), and
+ * cancel/steer/continuation address it by that identity. Env scoping:
+ * OPENCODE_V2_DB/STATE/CACHE homes point inside serverDir (per-run
+ * isolation; the session DB survives attempt windows for true resume),
+ * OPENCODE_PASSWORD carries the minted secret (env only, never argv, never
+ * logged); host config/agents are inherited untouched so the same agents
+ * and host model resolve as standalone runs. Readiness polls `api --server
+ * <url> session.list` (exit 0). Any failure kills the child best-effort
+ * and throws a truthful error (observed pre-worker failure, retryable with
+ * a fresh launch). Never throws a bare spawn error without cleanup.
+ */
+export async function spawnOpenCodeServer(opts: {
+  binary?: string;
+  workdir: string;
+  serverDir: string;
+  dbPath: string;
+  password: string;
+  port?: number;
+  readinessTimeoutMs?: number;
+}): Promise<OpenCodeServerLaunch> {
+  const bin = opts.binary ?? resolveOpenCodeBinary();
+  const port = opts.port ?? await pickFreeLoopbackPort();
+  if (!Number.isSafeInteger(port) || port <= 0 || port > 65535 || port === 8787) {
+    throw new Error(`refusing to serve on port ${String(port)} (never the shared :8787)`);
+  }
+  const url = `http://127.0.0.1:${port}`;
+  fs.mkdirSync(opts.serverDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(opts.serverDir, "state"), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(opts.serverDir, "cache"), { recursive: true, mode: 0o700 });
+  const child = spawn(bin, ["serve", "--hostname", "127.0.0.1", "--port", String(port)], {
+    cwd: opts.workdir,
+    env: {
+      ...process.env,
+      OPENCODE_V2_DB: opts.dbPath,
+      OPENCODE_V2_STATE_HOME: path.join(opts.serverDir, "state"),
+      OPENCODE_V2_CACHE_HOME: path.join(opts.serverDir, "cache"),
+      OPENCODE_PASSWORD: opts.password,
+      NO_COLOR: "1"
+    },
+    stdio: "ignore",
+    shell: false,
+    windowsHide: true,
+    detached: false
+  });
+  let spawnError: Error | null = null;
+  child.on("error", (error: Error) => { spawnError = error; });
+  try {
+    (child as { unref?: () => void }).unref?.();
+  } catch { /* best effort; identity is PID-based either way */ }
+  const pid = child.pid;
+  if (pid === undefined) {
+    try { child.kill("SIGKILL"); } catch { /* ignore */ }
+    throw new Error("opencode serve spawned without a pid (no backend started)");
+  }
+  const startTime = readProcessStartTime(pid) ?? undefined;
+  const serverIdentAlive = (): boolean =>
+    startTime ? isProcessIdentityAlive(pid, startTime) : readProcessStartTime(pid) !== null;
+  const deadline = Date.now() + Math.max(5000, Math.min(opts.readinessTimeoutMs ?? 15000, 60000));
+  let lastEvidence = "no readiness probe completed";
+  while (Date.now() < deadline) {
+    if (spawnError) {
+      throw new Error(`opencode serve spawn failed: ${(spawnError as Error).message}`.slice(0, 500));
+    }
+    if (child.exitCode !== null) {
+      try { child.kill("SIGKILL"); } catch { /* ignore */ }
+      throw new Error(`opencode serve exited during readiness (exit ${child.exitCode}): ${lastEvidence}`.slice(0, 500));
+    }
+    try {
+      const probe = spawnSync(bin, ["api", "--server", url, "session.list"], {
+        cwd: opts.workdir,
+        env: { ...process.env, OPENCODE_PASSWORD: opts.password, NO_COLOR: "1" },
+        timeout: 5000,
+        encoding: "utf8",
+        maxBuffer: 64 * 1024
+      });
+      const out = String(probe.stdout ?? "");
+      if (probe.status === 0) {
+        return { url, port, pid, ...(startTime ? { startTime } : {}) };
+      }
+      lastEvidence = `${String(probe.stdout ?? "")}\n${String(probe.stderr ?? "")}`.slice(0, 300) || `api exit ${probe.status}`;
+    } catch (error) {
+      lastEvidence = `readiness probe threw: ${error instanceof Error ? error.message : String(error)}`.slice(0, 300);
+    }
+    await sleepMsSync(500);
+  }
+  // Identity-checked kill only: never signal a recycled PID on a failed
+  // readiness path.
+  if (serverIdentAlive()) {
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  }
+  throw new Error(`opencode serve not ready within the bounded window at ${url}: ${lastEvidence}`.slice(0, 500));
+}
+
+export type OpenCodePromptOutcome = "steered" | "rejected" | "unknown";
+
+export interface OpenCodePromptResult {
+  outcome: OpenCodePromptOutcome;
+  /** Bounded engine evidence excerpt (never the full stream, never secrets). */
+  evidence: string;
+  exitCode: number | null;
+}
+
+/**
+ * Map one observed `opencode api ... session.prompt` call. Exit 0 with no
+ * error tag is steered ONLY as "held by the server" (accepted, never
+ * applied: applied requires worker-observable evidence and the prompt op
+ * emits no application attestation). Typed SessionNotFound and deterministic
+ * malformed/unsupported shapes are rejected (retry cannot help; a missing
+ * session is never routed elsewhere). Timeouts, spawn failures, lost
+ * replies, and ambiguous output are unknown (never duplicated on retry:
+ * callers reconcile against the stored steering record first). Never
+ * throws.
+ */
+export function mapOpenCodePromptResult(exitCode: number | null, stdout: string, stderr: string): OpenCodePromptResult {
+  const combined = `${stdout}\n${stderr}`.slice(0, 2000);
+  const lower = combined.toLowerCase();
+  if (exitCode === null || exitCode === undefined) {
+    return { outcome: "unknown", evidence: combined.slice(0, 500) || "api returned no exit code (timeout, spawn failure, or lost reply)", exitCode };
+  }
+  // Deterministic negatives observed against opencode v2.0.22 (disposable
+  // serve 2026-10-05): missing session -> {"_tag":"SessionNotFoundError",
+  // "sessionID": ...} HTTP 404. A gone session is never steered by
+  // retrying, and must never be routed to another session.
+  if (/sessionnotfounderror|session not found|no such session/.test(lower)) {
+    return { outcome: "rejected", evidence: combined.slice(0, 500), exitCode };
+  }
+  // Malformed/unsupported call (wrong op shape, bad session id, validation):
+  // deterministic, retry cannot help.
+  if (/operation not found|invalid session|bad request|validation|_tag.*error/.test(lower) && exitCode !== 0) {
+    return { outcome: "rejected", evidence: combined.slice(0, 500), exitCode };
+  }
+  if (exitCode === 0 && !/sessionnotfounderror|operation not found/.test(lower)) {
+    return { outcome: "steered", evidence: combined.slice(0, 500), exitCode };
+  }
+  return { outcome: "unknown", evidence: combined.slice(0, 500) || `api exited ${exitCode} with ambiguous output`, exitCode };
+}
+
+/**
+ * Send one bounded session.prompt (delivery steer) to the exact recorded
+ * session on the run's own server. Message text rides --data JSON
+ * (delivery:"steer"); the password rides env only (never argv, never
+ * logged). One native call, no second session, no resume, no relaunch.
+ * Never throws: spawn failures map to unknown.
+ */
+export function runOpenCodePrompt(
+  serverUrl: string,
+  sessionId: string,
+  message: string,
+  opts?: { binary?: string; password?: string; workdir?: string; timeoutMs?: number }
+): OpenCodePromptResult {
+  const bin = opts?.binary ?? resolveOpenCodeBinary();
+  const timeoutMs = Math.max(1000, Math.min(opts?.timeoutMs ?? 30_000, 120_000));
+  const payload = JSON.stringify({ text: message, delivery: "steer" });
+  try {
+    const result = spawnSync(bin,
+      ["api", "--server", serverUrl, "session.prompt", "--param", `sessionID=${sessionId}`, "--data", payload],
+      {
+        cwd: opts?.workdir ?? process.cwd(),
+        env: { ...process.env, ...(opts?.password ? { OPENCODE_PASSWORD: opts.password } : {}), NO_COLOR: "1" },
+        timeout: timeoutMs,
+        encoding: "utf8",
+        maxBuffer: 256 * 1024
+      });
+    const error = (result as { error?: Error }).error;
+    if (error) {
+      return { outcome: "unknown", evidence: `api spawn failed: ${error.message}`.slice(0, 500), exitCode: null };
+    }
+    return mapOpenCodePromptResult(
+      result.status,
+      String(result.stdout ?? ""),
+      String(result.stderr ?? "")
+    );
+  } catch (error) {
+    return { outcome: "unknown", evidence: `api threw: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500), exitCode: null };
+  }
+}
+
+/**
+ * Verify an opencode session against the run's OWN server (steerable-server
+ * route): `api --server <url> session.list` containing the id (JSON
+ * round-trip, never a log-line accident), else `api ... session.get` exit
+ * 0 with the id in the record. (`session.export` is NOT an api op —
+ * observed 2026-10-05: the CLI reports "Operation not found"; export
+ * exists only as a `session export <id>` CLI subcommand.) `opencode
+ * session list/export` (no --server flag) target the background service
+ * and must NEVER verify server-backed sessions (a colliding id there
+ * would falsely resume onto the wrong backend). Anything inconclusive
+ * fails closed. No model call.
+ */
+export function verifyOpenCodeServerSession(
+  serverUrl: string,
+  sessionId: string,
+  workdir: string,
+  opts?: { binary?: string; password?: string; timeoutMs?: number }
+): SessionVerification {
+  const sid = String(sessionId ?? "").trim();
+  if (!isEngineSessionId(sid)) {
+    return { verified: false, evidence: "session id malformed; never claimed resumed" };
+  }
+  const bin = opts?.binary ?? resolveOpenCodeBinary();
+  const timeoutMs = Math.max(1000, Math.min(opts?.timeoutMs ?? 20_000, 60_000));
+  const env = { ...process.env, ...(opts?.password ? { OPENCODE_PASSWORD: opts.password } : {}), NO_COLOR: "1" };
+  const runProbe = (argv: string[]): { status: number | null; stdout: string } => {
+    try {
+      const result = spawnSync(bin, argv, { cwd: workdir, env, timeout: timeoutMs, encoding: "utf8", maxBuffer: 256 * 1024 });
+      return { status: result.status, stdout: String(result.stdout ?? "") };
+    } catch {
+      return { status: null, stdout: "" };
+    }
+  };
+  const listed = runProbe(["api", "--server", serverUrl, "session.list"]);
+  if (listed.status === 0 && sessionListContains(listed.stdout, sid)) {
+    return { verified: true, evidence: `session id on the run's own server (${serverUrl}) via api session.list (cwd = run workdir)` };
+  }
+  const gotten = runProbe(["api", "--server", serverUrl, "session.get", "--param", `sessionID=${sid}`]);
+  if (gotten.status === 0 && String(gotten.stdout ?? "").includes(sid)) {
+    return { verified: true, evidence: `session id on the run's own server (${serverUrl}) confirmed by api session.get (exit 0)` };
+  }
+  return {
+    verified: false,
+    evidence: "session id not confirmed by the run's own server (list/get); first use creates under continue-or-create semantics; labeled new-continuation-attempt"
+  };
+}
 
 /** Build the Codex queue argv (single native call, no prompt construction). */
 export function buildCodexQueueArgv(thread: string, message: string): string[] {
@@ -2228,7 +2557,7 @@ export const OPENCODE_ENGINE_QUALIFICATION = {
   engine: "opencode",
   qualified: true,
   qualifiedCli: "opencode v2.0.22",
-  note: "qualified on the selected-agent + explicit-model route via `opencode run --standalone` (private server per turn); pre-standalone shared-service runs stay labeled and are never silently converted; independent of the Claude path"
+  note: "qualified on the selected-agent + explicit-model route via `opencode run --standalone` (private server per turn; default) or `opencode run --server` against a per-run adapter-owned disposable server (explicit steerable=true only, same gates); pre-standalone shared-service runs stay labeled and are never silently converted; independent of the Claude path"
 } as const;
 
 export const CLAUDE_ENGINE_QUALIFICATION = {

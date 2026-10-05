@@ -202,8 +202,19 @@ const bestEffortCancel = async (runId) => {
   const argv = prev.structuredContent.preview.argv_preview;
   assert(!argv.includes('--ephemeral') && argv.includes('--profile') && argv.includes('-s') && argv.includes('--json'),
     `steerable argv drops --ephemeral, requests --json structured protocol, keeps profile+policy boundaries: ${JSON.stringify(argv)}`);
+  // Opencode steerable previews the server-backed argv shape (per-run
+  // server URL is minted at launch: the preview carries an explicit
+  // placeholder, never a fake; --standalone is gone on this route).
+  const ocPrev = await call('delegation_preview', {
+    workspace_id: wid, engine: 'opencode', agent: 'implementer', model: 'opencode-go/muse-spark-1.3-contributor',
+    workdir: 'steer-prev-oc', task: 'Steerable probe. Change nothing.', delegation_group: 'team-steer', steerable: true
+  });
+  assert(!ocPrev.isError, `steerable opencode preview must resolve: ${JSON.stringify(ocPrev.structuredContent)}`);
+  const ocArgv = ocPrev.structuredContent.preview.argv_preview;
+  assert(ocArgv.includes('--server') && !ocArgv.includes('--standalone') &&
+    ocArgv.some((a) => String(a).includes('minted at launch')),
+    `steerable opencode argv must ride --server with a minted-at-launch placeholder and no --standalone: ${JSON.stringify(ocArgv)}`);
   for (const bad of [
-    { engine: 'opencode', agent: 'implementer', model: 'shim-model' },
     { engine: 'claude', agent: 'implementer' }
   ]) {
     const refused = await call('delegation_preview', {
@@ -218,7 +229,14 @@ const bestEffortCancel = async (runId) => {
   });
   assert(canaryRefused.isError && canaryRefused.structuredContent.error === 'steerable_refused_for_canary',
     'steerable canary must refuse (read-only slice takes no injected messages)');
-  console.log('ok: S2 steerable gate (codex-only, non-ephemeral argv, canary refused)');
+  const ocCanaryRefused = await call('delegation_launch', {
+    workspace_id: wid, engine: 'opencode', agent: 'implementer', model: 'opencode-go/muse-spark-1.3-contributor',
+    workdir: 'steer-canary-oc-x', canary: true, delegation_group: 'team-steer',
+    request_id: 'req-steer-canary-oc', steerable: true
+  });
+  assert(ocCanaryRefused.isError && ocCanaryRefused.structuredContent.error === 'steerable_refused_for_canary',
+    'steerable opencode canary must refuse (read-only slice takes no injected messages)');
+  console.log('ok: S2 steerable gate (codex non-ephemeral argv; opencode server-backed argv with minted-at-launch placeholder; claude refused; canary refused)');
 }
 
 // ---------- S3: unsupported engines refuse, never emulate ----------
