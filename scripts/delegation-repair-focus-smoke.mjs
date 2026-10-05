@@ -403,19 +403,21 @@ process.env.CODEXPRO_CLAUDE_PROJECTS_DIR = clProjects;
     Engines.OPENCODE_ENGINE_QUALIFICATION.qualified === true,
     'Codex/OpenCode qualification must be independent of the Claude deferral');
   const resumeArgv = Engines.buildClaudeResumeArgv('123e4567-e89b-42d3-a456-426614174000', 'hi', { agent: 'implementer', permissionMode: 'acceptEdits', model: 'opus', effort: 'high', allowedTools: 'Read', disallowedTools: 'Bash' });
-  // Changed 2026-10-05 (scoped bypass): resume argv now also carries exactly
-  // one `--settings '{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}'`
-  // element immediately before the prompt (was: prompt directly after the
-  // last explicit flag). Full byte shape is pinned in
+  // Changed 2026-10-05 (scoped bypass explicit opt-in, default OFF): default
+  // resume argv omits --settings; only disableGitkrakenHooks:true rides the
+  // exact element. Full byte shape is pinned in
   // delegation-claude-bypass-smoke.
   assert(resumeArgv.includes('--resume') && resumeArgv.includes('--model') && resumeArgv.includes('opus') &&
     resumeArgv.includes('--effort') && resumeArgv.includes('--allowedTools') && resumeArgv.includes('--disallowedTools') &&
-    resumeArgv.includes('--settings') && resumeArgv.includes('{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}'),
-    `resume argv must carry the full explicit-flag set (no override dropped) + the scoped bypass: ${JSON.stringify(resumeArgv)}`);
+    !resumeArgv.includes('--settings'),
+    `default-OFF resume argv must carry the full explicit-flag set (no override dropped) with no --settings: ${JSON.stringify(resumeArgv)}`);
+  const resumeOpt = Engines.buildClaudeResumeArgv('123e4567-e89b-42d3-a456-426614174000', 'hi', { agent: 'implementer', permissionMode: 'acceptEdits', model: 'opus', effort: 'high', allowedTools: 'Read', disallowedTools: 'Bash', disableGitkrakenHooks: true });
+  assert(resumeOpt.includes('--settings') && resumeOpt.includes('{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}'),
+    `opt-in resume argv must carry the scoped bypass: ${JSON.stringify(resumeOpt)}`);
   const resumeBare = Engines.buildClaudeResumeArgv('123e4567-e89b-42d3-a456-426614174000', 'hi', { agent: 'implementer' });
   assert(resumeBare.includes('--resume') && !resumeBare.includes('--model') && !resumeBare.includes('--effort') &&
-    resumeBare.includes('--settings') && resumeBare.at(-3) === '--settings' && resumeBare.at(-1) === 'hi',
-    `resume argv without explicit flags must not invent any (bypass still rides): ${JSON.stringify(resumeBare)}`);
+    !resumeBare.includes('--settings') && resumeBare.at(-1) === 'hi',
+    `default-OFF bare resume argv must not invent flags and must omit --settings: ${JSON.stringify(resumeBare)}`);
   const prevClaude = await call('delegation_preview', {
     workspace_id: wid, engine: 'claude', agent: 'implementer', workdir: 'focus-claude-1',
     task: 'Do the thing.', delegation_group: 'team-focus'

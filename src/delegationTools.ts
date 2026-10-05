@@ -914,6 +914,13 @@ interface GatedLaunchPlan {
    */
   bypassApprovals: boolean;
   /**
+   * Explicit per-run Claude scoped-bypass opt-in (disable_gitkraken_hooks).
+   * Default OFF: false/absent omits the --settings element entirely; true
+   * rides the constant per-invocation --settings pair (zero files). Stored
+   * on the run and preserved across follow-ups, never re-interpreted.
+   */
+  disableGitkrakenHooks: boolean;
+  /**
    * Explicit steerable opt-in (real tasks only): codex launches without
    * --ephemeral so the session persists and the engine returns an
    * addressable thread id; opencode launches server-backed (worker CLI
@@ -1017,7 +1024,7 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
   const base: Omit<GatedLaunchPlan,
     "profile" | "model" | "agent" | "requestedSessionId" | "executionPolicy" |
     "permissionMode" | "effort" | "allowedTools" | "disallowedTools" | "configOverrides" |
-    "bypassApprovals" | "steerable" |
+    "bypassApprovals" | "disableGitkrakenHooks" | "steerable" |
     "gateReason" | "gateEvidence" | "configuredModel" | "configuredEffort" |
     "modelExplicit" | "effortExplicit" | "permissionExplicit" | "executable"> = {
     engine, isCanary, delegationGroup, taskText, prompt,
@@ -1042,6 +1049,18 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
       ok: false,
       text: "steerable=true is refused for the legacy canary slice (read-only; no injected messages). Supply a real task.",
       structured: { error: "steerable_refused_for_canary" }
+    };
+  }
+  // Scoped gitkraken-hooks bypass: explicit per-run opt-in, default OFF,
+  // claude-only. True rides the per-invocation --settings pair (zero files);
+  // false/omitted omits --settings entirely. Refused for non-claude engines
+  // rather than silently ignored; never a global settings change.
+  const disableGitkrakenHooks = args.disable_gitkraken_hooks === true;
+  if (disableGitkrakenHooks && engine !== "claude") {
+    return {
+      ok: false,
+      text: "disable_gitkraken_hooks=true is claude-only (the hanging user-scope gitkraken-hooks PermissionRequest hook exists only on the claude route); refusing rather than silently ignoring it.",
+      structured: { error: "disable_gitkraken_hooks_unsupported_for_engine", engine }
     };
   }
   if (engine === "codex") {
@@ -1095,6 +1114,7 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
         disallowedTools: "",
         configOverrides: gate.configOverrides ?? [],
         bypassApprovals,
+        disableGitkrakenHooks: false,
         steerable: steerableRequested,
         gateReason: gate.reason,
         gateEvidence: {
@@ -1159,6 +1179,7 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
         disallowedTools: "",
         configOverrides: [],
         bypassApprovals: false,
+        disableGitkrakenHooks: false,
         steerable: steerableRequested,
         gateReason: gate.reason,
         gateEvidence: {
@@ -1218,6 +1239,7 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
       disallowedTools: typeof args.disallowed_tools === "string" ? args.disallowed_tools.trim() : "",
       configOverrides: [],
       bypassApprovals: false,
+      disableGitkrakenHooks,
       steerable: false,
       gateReason: gate.reason,
       gateEvidence: {
@@ -1227,6 +1249,7 @@ function gateLaunchRequest(args: Record<string, unknown>): GateOutcome {
         model_explicit: gate.modelExplicit,
         effort_explicit: gate.effortExplicit,
         permission_explicit: gate.permissionExplicit,
+        disable_gitkraken_hooks: disableGitkrakenHooks,
         ...(permissionMode ? { permission_mode: permissionMode } : { permission_mode_inherited: true })
       },
       configuredModel: gate.effectiveModel,
@@ -1284,7 +1307,8 @@ function buildPlannedArgv(plan: GatedLaunchPlan, prompt: string, lastMessagePath
     ...(plan.permissionExplicit && plan.permissionMode ? { permissionMode: plan.permissionMode } : {}),
     ...(plan.allowedTools ? { allowedTools: plan.allowedTools } : {}),
     ...(plan.disallowedTools ? { disallowedTools: plan.disallowedTools } : {}),
-    ...(sessionId ? { sessionId } : {})
+    ...(sessionId ? { sessionId } : {}),
+    ...(plan.disableGitkrakenHooks ? { disableGitkrakenHooks: true as const } : {})
   });
 }
 
@@ -2604,6 +2628,17 @@ export function reconcileSteeringApplied(run: DelegationRunRecord): { changed: b
   return { changed: false, applied: [] };
 }
 
+/**
+ * Release gate for live steering (deferred for this release on all
+ * engines). Intentionally opaque to the type checker (declared boolean,
+ * always true at runtime) so the preserved steering implementation in the
+ * delegation_steer handler stays type-reachable in-file while ordinary
+ * release use always defers via steer_deferred.
+ */
+function isSteeringDeferredForRelease(): boolean {
+  return true;
+}
+
 export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[] {
   const launchArgs = z.object({
     workspace_id: WORKSPACE_ID.optional().describe("Workspace id. Omit to use the session-selected workspace."),
@@ -2615,6 +2650,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     permission_mode: z.string().max(32).optional().describe("Explicit Claude --permission-mode (acceptEdits|auto|bypassPermissions|manual|dontAsk|plan). Only when explicitly passed; bypassPermissions is explicit-only."),
     allowed_tools: z.string().max(2048).optional().describe("Explicit Claude --allowedTools text. Only when explicitly passed."),
     disallowed_tools: z.string().max(2048).optional().describe("Explicit Claude --disallowedTools text. Only when explicitly passed."),
+    disable_gitkraken_hooks: z.boolean().optional().describe("Explicit per-run opt-in (claude only, default OFF): when true, every claude argv for this run carries per-invocation --settings '{\"enabledPlugins\":{\"gitkraken-hooks@gitkraken\":false}}' disabling the hanging user-scope gitkraken-hooks PermissionRequest hook (inert when absent, zero files touched, never task content, never a model/permission substitution). Default OFF omits --settings entirely. Stored on the run and preserved across follow-ups; refused for non-claude engines."),
     execution_policy: z.string().max(32).optional().describe("Explicit Codex sandbox for real tasks (read-only|workspace-write|danger-full-access). Explicit wins over the profile; danger-full-access is explicit-only, never inherited or auto-escalated; refused for the legacy canary slice."),
     bypass_approvals: z.boolean().optional().describe("Separate explicit per-run opt-in to --dangerously-bypass-approvals-and-sandbox (codex only). Honored ONLY with explicit execution_policy danger-full-access; the sandbox alone never implies it (sandbox != bypass); refused for the legacy canary slice."),
     config_overrides: z.array(z.string().max(512)).max(8).optional().describe("Explicit Codex -c key=value overrides (bounded). Only when explicitly passed; refused for the legacy canary slice; keys that would set model/effort/sandbox/approval are protected and refused."),
@@ -2625,7 +2661,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     request_id: z.string().min(1).max(128).optional().describe("Idempotency key. Repeating it returns the existing run without spawning a second worker."),
     canary: z.boolean().optional().describe("Must be true when no task is supplied (legacy read-only canary slice, codex/opencode only). Ignored when task is present."),
     timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms. Canary clamps to 5 minutes; real tasks clamp to 30 minutes; 10s minimum. The clamped value is truthfully acked."),
-    steerable: z.boolean().optional().describe("Real tasks only: codex launches without --ephemeral so the session persists and the engine may return an addressable thread id for delegation_steer; opencode launches server-backed (worker CLI against a per-run adapter-owned disposable server) so delegation_steer can address the run's session. Profile/execution-policy/model/agent boundaries unchanged; refused for canary and non-codex/opencode engines.")
+    steerable: z.boolean().optional().describe("Real tasks only: codex launches without --ephemeral so the session persists; opencode launches server-backed (worker CLI against a per-run adapter-owned disposable server). Profile/execution-policy/model/agent boundaries unchanged; refused for canary and non-codex/opencode engines. Note: live steering via delegation_steer is deferred for this release (steer_deferred); use delegation_followup for amended/ordinary follow-ups or delegation_cancel + relaunch — follow-up and cancel/relaunch are not live steering.")
   }).strict();
 
   const previewArgs = z.object({
@@ -2638,6 +2674,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     permission_mode: z.string().max(32).optional().describe("Explicit Claude --permission-mode."),
     allowed_tools: z.string().max(2048).optional().describe("Explicit Claude --allowedTools text."),
     disallowed_tools: z.string().max(2048).optional().describe("Explicit Claude --disallowedTools text."),
+    disable_gitkraken_hooks: z.boolean().optional().describe("Explicit per-run opt-in (claude only, default OFF): preview the per-invocation --settings bypass argv element + scoped_bypass notice when true; default OFF omits both."),
     execution_policy: z.string().max(32).optional().describe("Explicit Codex sandbox (read-only|workspace-write|danger-full-access)."),
     bypass_approvals: z.boolean().optional().describe("Separate explicit per-run opt-in to --dangerously-bypass-approvals-and-sandbox (codex only; explicit danger-full-access required)."),
     config_overrides: z.array(z.string().max(512)).max(8).optional().describe("Explicit Codex -c key=value overrides."),
@@ -2647,7 +2684,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     workdir: z.string().min(1).max(1024).describe("Explicit workspace-relative working directory that would host the run."),
     canary: z.boolean().optional().describe("Must be true when no task is supplied (legacy read-only canary slice, codex/opencode only)."),
     timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms (clamped + truthfully acked like launch)."),
-    steerable: z.boolean().optional().describe("Real tasks only: preview the codex non-ephemeral session-persisting argv or the opencode server-backed argv (same profile/execution-policy/model/agent boundaries). Refused for canary and non-codex/opencode engines.")
+    steerable: z.boolean().optional().describe("Real tasks only: preview the codex non-ephemeral session-persisting argv or the opencode server-backed argv (same profile/execution-policy/model/agent boundaries). Refused for canary and non-codex/opencode engines. Note: live steering via delegation_steer is deferred for this release (steer_deferred).")
   }).strict();
 
   const listArgs = z.object({
@@ -2719,7 +2756,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "delegation_launch",
       options: {
         title: "Delegation Launch",
-        description: "Launch one durable delegation run (Codex via exec --profile with Luna gate for the legacy canary / selected-profile gate + per-run execution policy for real tasks; OpenCode via run --model/--agent with host-model gate for the legacy canary / selected-agent + explicit model for real tasks, --standalone by default or --server against a per-run adapter-owned disposable server with explicit steerable=true; Claude via -p --output-format json --agent with explicit-flag-only overrides for real tasks only, plus a per-invocation --settings scoped bypass disabling gitkraken-hooks@gitkraken (inert when absent, zero files)). Real bounded task + validated delegation_group (default hestia-cli-canary), or the legacy canary slice (fixtures, canary=true; codex/opencode only). Requires an explicit workdir plus profile (codex), model (+ agent for real tasks, opencode), or agent (claude); idempotent request ids never spawn a second worker. Prefer delegation_preview (dry-run) before dispatch. Subscribe to events before launching or replay via delegation_read_result so fast completion never loses the result.",
+        description: "Launch one durable delegation run (Codex via exec --profile with Luna gate for the legacy canary / selected-profile gate + per-run execution policy for real tasks; OpenCode via run --model/--agent with host-model gate for the legacy canary / selected-agent + explicit model for real tasks, --standalone by default or --server against a per-run adapter-owned disposable server with explicit steerable=true; Claude via -p --output-format json --agent with explicit-flag-only overrides for real tasks only, plus an explicit per-run opt-in disable_gitkraken_hooks (default OFF): when true, every claude argv for the run carries per-invocation --settings '{\"enabledPlugins\":{\"gitkraken-hooks@gitkraken\":false}}' disabling the hanging gitkraken-hooks hook (inert when absent, zero files, never task content); default OFF omits --settings entirely, stored on the run and preserved across follow-ups). Real bounded task + validated delegation_group (default hestia-cli-canary), or the legacy canary slice (fixtures, canary=true; codex/opencode only). Requires an explicit workdir plus profile (codex), model (+ agent for real tasks, opencode), or agent (claude); idempotent request ids never spawn a second worker. Prefer delegation_preview (dry-run) before dispatch. Subscribe to events before launching or replay via delegation_read_result so fast completion never loses the result.",
         inputSchema: publicSchemaFrom(launchArgs),
         runtimeInputSchema: launchArgs,
         annotations: DESTRUCTIVE
@@ -2787,7 +2824,8 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                   ...(plan.effort ? { effort: plan.effort } : {}),
                   ...(plan.allowedTools ? { allowedTools: plan.allowedTools } : {}),
                   ...(plan.disallowedTools ? { disallowedTools: plan.disallowedTools } : {}),
-                  ...(plan.requestedSessionId ? { sessionId: plan.requestedSessionId } : {})
+                  ...(plan.requestedSessionId ? { sessionId: plan.requestedSessionId } : {}),
+                  ...(plan.disableGitkrakenHooks ? { disableGitkrakenHooks: true as const } : {})
                 })
           })) {
             return failResult(`Conflicting re-use of request ${requestId}: it already owns run ${existing.runId} with different task/group/model/workdir content. Relaunch only with a NEW request id. No second worker spawned.`, {
@@ -2951,7 +2989,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           engine,
           ...(engine === "codex" ? { profile, executionPolicy: plan.executionPolicy, ...(plan.model ? { modelOverride: plan.model } : {}), ...(plan.configOverrides.length > 0 ? { configOverrides: plan.configOverrides } : {}), ...(plan.bypassApprovals ? { bypassApprovals: true as const } : {}), ...(plan.steerable ? { steerable: true as const } : {}) } : {}),
           ...(engine === "opencode" ? { model, ...(agent ? { agent } : {}), requestedSessionId: plan.requestedSessionId, opencodeRoute: (plan.steerable ? "steerable-server" : "standalone") as "standalone" | "steerable-server", ...(plan.steerable ? { steerable: true as const } : {}) } : {}),
-          ...(engine === "claude" ? { agent, ...(model ? { model } : {}), ...(plan.permissionMode ? { permissionMode: plan.permissionMode } : {}), ...(plan.effort ? { effort: plan.effort } : {}), ...(plan.allowedTools ? { allowedTools: plan.allowedTools } : {}), ...(plan.disallowedTools ? { disallowedTools: plan.disallowedTools } : {}), requestedSessionId: plan.requestedSessionId } : {}),
+          ...(engine === "claude" ? { agent, ...(model ? { model } : {}), ...(plan.permissionMode ? { permissionMode: plan.permissionMode } : {}), ...(plan.effort ? { effort: plan.effort } : {}), ...(plan.allowedTools ? { allowedTools: plan.allowedTools } : {}), ...(plan.disallowedTools ? { disallowedTools: plan.disallowedTools } : {}), requestedSessionId: plan.requestedSessionId, ...(plan.disableGitkrakenHooks ? { disableGitkrakenHooks: true as const } : {}) } : {}),
           ...(isCanary ? { isCanary: true } : { isCanary: false, task: taskText }),
           workdirBaseline,
           executable: plan.executable,
@@ -3091,7 +3129,9 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
               ? plan.steerable
                 ? `${isCanary ? "Canary" : "Real-task"} run ${runId} launched (opencode run --server <per-run server> --model ${model}${agent ? ` --agent ${agent}` : ""} --format json, steerable server-backed route, ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}${sessionId ? `, session ${sessionId}` : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`
                 : `${isCanary ? "Canary" : "Real-task"} run ${runId} launched (opencode run --standalone --model ${model}${agent ? ` --agent ${agent}` : ""} --format json, ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}${sessionId ? `, session ${sessionId}` : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`
-              : `Real-task run ${runId} launched (claude --agent ${agent} --session-id ${sessionId} + per-invocation --settings scoped bypass disabling gitkraken-hooks@gitkraken (inert when absent, zero files), ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`,
+              : plan.disableGitkrakenHooks
+                ? `Real-task run ${runId} launched (claude --agent ${agent} --session-id ${sessionId} + per-invocation --settings scoped bypass disabling gitkraken-hooks@gitkraken (explicit opt-in, inert when absent, zero files), ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`
+                : `Real-task run ${runId} launched (claude --agent ${agent} --session-id ${sessionId}, scoped gitkraken-hooks bypass OFF by default (no --settings; pass disable_gitkraken_hooks=true to opt in per-run), ${plan.gateReason}, group ${delegationGroup}, timeout ${timeoutMs} ms${plan.timeoutClamped ? " (requested value defaulted or clamped, truthfully acked)" : ""}). Subscribe to the run-attention event before launch, or replay via delegation_read_result.`,
           {
             run_id: runId,
             request_id: requestId,
@@ -3101,7 +3141,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             engine,
             ...(engine === "codex" ? { profile, execution_policy: plan.executionPolicy, ...(plan.steerable ? { steerable: true as const } : {}) } : {}),
             ...(engine === "opencode" ? { model, ...(agent ? { agent } : {}), execution_route: (plan.steerable ? "steerable-server" : "standalone") as "standalone" | "steerable-server", ...(plan.steerable ? { steerable: true as const } : {}) } : {}),
-            ...(engine === "claude" ? { agent, ...(model ? { model } : {}), ...(plan.permissionMode ? { permission_mode: plan.permissionMode } : {}), ...(plan.effort ? { effort: plan.effort } : {}) } : {}),
+            ...(engine === "claude" ? { agent, ...(model ? { model } : {}), ...(plan.permissionMode ? { permission_mode: plan.permissionMode } : {}), ...(plan.effort ? { effort: plan.effort } : {}), disable_gitkraken_hooks: plan.disableGitkrakenHooks } : {}),
             ...(sessionId ? { session_id: sessionId } : {}),
             ...gateEvidence,
             engine_qualification: engineQualification(engine),
@@ -3162,6 +3202,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         const preview = buildLaunchPreview({
           engine: plan.engine,
           executable: plan.executable,
+          ...(plan.engine === "claude" && plan.disableGitkrakenHooks ? { disableGitkrakenHooks: true as const } : {}),
           argvPreview,
           promptChars: plan.prompt.length,
           ...(plan.profile ? { profile: plan.profile } : {}),
@@ -3338,9 +3379,10 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         });
         // Execution provenance: which binary ran this worker. Override-route
         // runs (test shims) are labeled as such and are never live proof.
-        // Claude runs always carry the per-invocation --settings scoped
-        // bypass (CLAUDE_SCOPED_BYPASS_NOTICE): surfaced here so Hestia can
-        // see it without reading source.
+        // Claude runs carry the per-invocation --settings scoped bypass
+        // (CLAUDE_SCOPED_BYPASS_NOTICE) ONLY on explicit opt-in
+        // (run.disableGitkrakenHooks === true, default OFF): surfaced here
+        // so Hestia can see it without reading source; default OFF omits it.
         const provenance = {
           executable: current.executable ?? null,
           binary_overridden: current.binaryOverridden ?? null,
@@ -3349,7 +3391,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             : current.executable
               ? { note: "default PATH binary at launch (no CODEXPRO_*_BIN override); no shim marker" }
               : { note: "executable provenance unrecorded (legacy run); shim vs live cannot be judged from this record" }),
-          ...(current.engine === "claude" ? { scoped_bypass: { ...CLAUDE_SCOPED_BYPASS_NOTICE } } : {})
+          ...(current.engine === "claude" && current.disableGitkrakenHooks === true ? { scoped_bypass: { ...CLAUDE_SCOPED_BYPASS_NOTICE } } : {})
         };
         // Classify codex failures BEFORE any permission change is proposed:
         // only a real tool-execution denial warrants proposing one (still
@@ -3915,6 +3957,10 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                   child = launchOpenCodeCanary(deps, bridgeDir, run, run.model ?? "", staged.timeoutMs, staged.prompt, runIsCanary, resumeSessionId, staged.attemptN);
                 }
               } else if (continuationLabel === "resumed" && resumeSessionId) {
+                // Claude continuation preserves the ORIGINAL run's stored
+                // bypass choice (run.disableGitkrakenHooks, default OFF):
+                // follow-ups never re-interpret it and never touch global
+                // settings (per-invocation argv only when opted in).
                 child = launchClaudeChild(deps, bridgeDir, run,
                   buildClaudeResumeArgv(resumeSessionId, staged.prompt, {
                     ...(run.agent ? { agent: run.agent } : {}),
@@ -3922,7 +3968,8 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                     ...(run.effort ? { effort: run.effort } : {}),
                     ...(run.permissionMode ? { permissionMode: run.permissionMode } : {}),
                     ...(run.allowedTools ? { allowedTools: run.allowedTools } : {}),
-                    ...(run.disallowedTools ? { disallowedTools: run.disallowedTools } : {})
+                    ...(run.disallowedTools ? { disallowedTools: run.disallowedTools } : {}),
+                    ...(run.disableGitkrakenHooks === true ? { disableGitkrakenHooks: true as const } : {})
                   }), staged.timeoutMs, staged.prompt, runIsCanary, staged.attemptN);
               } else {
                 const claudeSession = resumeSessionId ?? run.session?.sessionId;
@@ -3934,7 +3981,8 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                     ...(run.permissionMode ? { permissionMode: run.permissionMode } : {}),
                     ...(run.allowedTools ? { allowedTools: run.allowedTools } : {}),
                     ...(run.disallowedTools ? { disallowedTools: run.disallowedTools } : {}),
-                    ...(claudeSession ? { sessionId: claudeSession } : {})
+                    ...(claudeSession ? { sessionId: claudeSession } : {}),
+                    ...(run.disableGitkrakenHooks === true ? { disableGitkrakenHooks: true as const } : {})
                   }), staged.timeoutMs, staged.prompt, runIsCanary, staged.attemptN);
               }
             } catch (error) {
@@ -4166,8 +4214,8 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     {
       name: "delegation_steer",
       options: {
-        title: "Delegation Steer",
-        description: "Send one bounded live message to a RUNNING worker (mid-turn steering, distinct from needs-input follow-up and from cancel/relaunch). Codex via one native `codex queue --thread` call to the run's recorded engine-returned thread id; opencode ONLY on explicit steerable-server runs via one `opencode api session.prompt` (delivery steer) to the recorded session id on the run's own per-run server. Default opencode runs and claude expose no steer verb and refuse with steer_unsupported (never emulated). Idempotent per steering_key; settled/cancelled runs refuse; accepted records stay queued/unverified (neither engine emits an application-attesting event — observed 2026-10-05 — so the adapter never auto-claims applied).",
+        title: "Delegation Steer (Deferred)",
+        description: "DEFERRED FOR THIS RELEASE: live steering is unavailable on all engines (codex, opencode, claude) and every call refuses with steer_deferred. Use delegation_followup for amended/ordinary follow-ups or delegation_cancel + relaunch for a fresh attempt; follow-up and cancel/relaunch are not live steering. The steering implementation remains in Git history; ordinary release use never dispatches a steering message and creates no steering record.",
         inputSchema: publicSchemaFrom(steerArgs),
         runtimeInputSchema: steerArgs,
         annotations: DESTRUCTIVE
@@ -4177,6 +4225,24 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         const bridgeDir = bridgeDirFor(deps.config, workspace.root);
         const run = loadDelegationRun(bridgeDir, args.run_id);
         if (!run || !ownerAllowed(deps, run)) return denyAccess();
+        // Release deferral (fail-closed): live steering is deferred for all
+        // engines. The predicate below is intentionally opaque to the type
+        // checker (always true at runtime) so the preserved steering
+        // implementation below stays type-reachable in-file and in Git
+        // history, while ordinary release use returns deterministically
+        // BEFORE any steering_key/message validation, state gates, or record
+        // creation: nothing is queued, nothing is stored, nothing is
+        // dispatched. steering_key idempotency is preserved trivially
+        // (every call with any key/message defers).
+        if (isSteeringDeferredForRelease()) {
+          return failResult("Live steering is deferred for this release; use delegation_followup for amended/ordinary follow-ups or delegation_cancel + relaunch; follow-up and cancel/relaunch are not live steering.", {
+            error: "steer_deferred",
+            run_id: run.runId,
+            engine: run.engine,
+            stored: false,
+            executed: false
+          });
+        }
         const key = String(args.steering_key ?? "").trim();
         if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(key)) {
           return failResult("steering_key must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/ (per-run unique idempotency key).", {

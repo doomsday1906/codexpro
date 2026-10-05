@@ -369,6 +369,14 @@ export interface DelegationRunRecord {
   /** Explicit Claude --allowedTools / --disallowedTools text. */
   allowedTools?: string;
   disallowedTools?: string;
+  /**
+   * Explicit per-run Claude scoped-bypass opt-in (disable_gitkraken_hooks).
+   * True only when the caller passed disable_gitkraken_hooks=true at launch
+   * (per-invocation --settings bypass, zero files); absent/false is default
+   * OFF (no --settings element). Follow-ups preserve this stored choice and
+   * never re-interpret it. Optional: legacy runs predate it and are OFF.
+   */
+  disableGitkrakenHooks?: boolean;
   /** Launch-time workdir listing baseline for non-repo snapshot diffs (bounded). Legacy: prefer workdirBaseline. */
   workdirSnapshot?: string[];
   /** True when the workdir was a git repo at launch (git-aware evidence). Legacy: prefer workdirBaseline. */
@@ -848,6 +856,8 @@ export interface LaunchConflictCandidate {
   /** Explicit Claude --allowedTools / --disallowedTools text. */
   allowedTools?: string;
   disallowedTools?: string;
+  /** Explicit per-run Claude scoped-bypass opt-in (disable_gitkraken_hooks, default OFF). */
+  disableGitkrakenHooks?: boolean;
   /** Separate explicit per-run bypass opt-in (codex danger only). */
   bypassApprovals?: boolean;
 }
@@ -936,6 +946,7 @@ export function isLaunchRequestConflict(existing: DelegationRunRecord, candidate
     if (existing.effort !== undefined && (existing.effort ?? "") !== (candidate.effort ?? "")) return true;
     if ((existing.allowedTools ?? "") !== (candidate.allowedTools ?? "")) return true;
     if ((existing.disallowedTools ?? "") !== (candidate.disallowedTools ?? "")) return true;
+    if (Boolean(existing.disableGitkrakenHooks) !== Boolean(candidate.disableGitkrakenHooks)) return true;
   }
   if (candidate.engine !== "codex") {
     if (existing.requestedSessionId !== undefined) {

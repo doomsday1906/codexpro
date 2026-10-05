@@ -168,16 +168,23 @@ const HOST_MODEL = 'opencode-go/muse-spark-1.3-contributor';
   const argv = Engines.buildClaudeArgv({ agent: 'implementer', prompt: 'hi', sessionId: knownUuid });
   assert(argv[0] === '-p' && argv.includes('--output-format') && argv.includes('--agent') && argv.includes('--session-id') && !argv.includes('--model'), `new claude argv must inherit model: ${JSON.stringify(argv)}`);
   assert(!argv.includes('-s') && !argv.includes('--profile') && !argv.includes('--sandbox'), 'claude argv must never carry Codex flags');
-  // Changed 2026-10-05 (scoped bypass): every claude argv now also carries
+  // Changed 2026-10-05 (scoped bypass explicit opt-in, default OFF): default
+  // argv omits --settings entirely; only disableGitkrakenHooks:true rides
   // exactly one `--settings '{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}'`
-  // element immediately before the prompt (was: prompt directly after
-  // --session-id). Full byte shape is pinned in delegation-claude-bypass-smoke.
-  assert(argv.includes('--settings') && argv.includes('{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}') && argv.at(-3) === '--settings' && argv.at(-1) === 'hi',
-    `launch argv must carry the exact scoped-bypass element before the prompt: ${JSON.stringify(argv)}`);
+  // element immediately before the prompt. Full byte shape is pinned in
+  // delegation-claude-bypass-smoke.
+  assert(!argv.includes('--settings') && argv.at(-1) === 'hi',
+    `default-OFF launch argv must omit --settings: ${JSON.stringify(argv)}`);
+  const argvOpt = Engines.buildClaudeArgv({ agent: 'implementer', prompt: 'hi', sessionId: knownUuid, disableGitkrakenHooks: true });
+  assert(argvOpt.includes('--settings') && argvOpt.includes('{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}') && argvOpt.at(-3) === '--settings' && argvOpt.at(-1) === 'hi',
+    `opt-in launch argv must carry the exact scoped-bypass element before the prompt: ${JSON.stringify(argvOpt)}`);
   const resumed = Engines.buildClaudeResumeArgv(knownUuid, 'hi', { agent: 'implementer' });
   assert(resumed.includes('--resume') && !resumed.includes('--session-id'), 'resume argv uses --resume only');
-  assert(resumed.includes('--settings') && resumed.includes('{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}') && resumed.at(-3) === '--settings' && resumed.at(-1) === 'hi',
-    `resume argv must carry the exact scoped-bypass element before the prompt: ${JSON.stringify(resumed)}`);
+  assert(!resumed.includes('--settings') && resumed.at(-1) === 'hi',
+    `default-OFF resume argv must omit --settings: ${JSON.stringify(resumed)}`);
+  const resumedOpt = Engines.buildClaudeResumeArgv(knownUuid, 'hi', { agent: 'implementer', disableGitkrakenHooks: true });
+  assert(resumedOpt.includes('--settings') && resumedOpt.includes('{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}') && resumedOpt.at(-3) === '--settings' && resumedOpt.at(-1) === 'hi',
+    `opt-in resume argv must carry the exact scoped-bypass element before the prompt: ${JSON.stringify(resumedOpt)}`);
   assert(Engines.isClaudeSessionId(knownUuid) && !Engines.isClaudeSessionId('ses_abc'), 'claude session grammar is UUID');
   assert(Engines.isClaudeSessionId(Engines.newClaudeSessionId()), 'minted claude session id must be a UUID');
   const verified = Engines.verifyClaudeSession(knownUuid);

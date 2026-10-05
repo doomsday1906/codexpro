@@ -12,8 +12,9 @@ and permissions are never silently substituted.
 | `delegation_preview` | Read-only dry-run: executable, argv shape, profile/agent, model/effort where resolvable, execution policy, workdir. No spawn, no run record. Use before dispatch. |
 | `delegation_launch` | Dispatch one run (idempotent `request_id`). Returns the clamped timeout truthfully (`timeout_clamped`). |
 | `delegation_read_result` | Authorized read: raw tails + truncation flags, workdir change evidence, test evidence, failure classification, review note. Reading never implies ack. |
-| `delegation_followup` | Question path (settled → `needs-input`) and reply path (answer once → one bounded continuation). |
-| `delegation_cancel` | Idempotent cancel of the exact PID+starttime-verified tree only. |
+| `delegation_followup` | Question path (settled → `needs-input`) and reply path (answer once → one bounded continuation). Follow-up is not live steering. |
+| `delegation_cancel` | Idempotent cancel of the exact PID+starttime-verified tree only. Cancel + relaunch is not live steering. |
+| `delegation_steer` | DEFERRED FOR THIS RELEASE: every call refuses with `steer_deferred` on all engines. Use `delegation_followup` for amended/ordinary follow-ups or `delegation_cancel` + relaunch; follow-up and cancel/relaunch are not live steering. |
 | `delegation_replay_events` / `events_*` | Wake-up delivery on the one canonical subscription authority (unchanged). |
 
 ## Per-engine rules
@@ -34,8 +35,27 @@ and permissions are never silently substituted.
   default governs. Every run carries a stable `--session-id` UUID (minted
   when omitted); `--resume` only after the session file verifies, otherwise
   the same id reuses as first-use creation labeled
-  `new-continuation-attempt`.
+  `new-continuation-attempt`. Scoped gitkraken-hooks bypass is explicit
+  per-run opt-in only (`disable_gitkraken_hooks=true`, default OFF):
+  when true, every claude argv for the run carries per-invocation
+  `--settings '{"enabledPlugins":{"gitkraken-hooks@gitkraken":false}}'`
+  (inert when the plugin is absent/disabled, zero files touched, never task
+  content, never a model/permission substitution); default OFF omits
+  `--settings` entirely. The choice is stored on the run and preserved
+  across follow-ups; no global `~/.claude` change is ever made.
 - **Astra** is never used, never spent, never a fallback, on any engine.
+- **Live steering is deferred for this release** on all engines (codex,
+  opencode, claude): `delegation_steer` refuses with `steer_deferred`
+  (`Live steering is deferred for this release; use delegation_followup
+  for amended/ordinary follow-ups or delegation_cancel + relaunch;
+  follow-up and cancel/relaunch are not live steering.`). The steering
+  implementation remains in Git history; ordinary release use never
+  dispatches steering and creates no steering record.
+- **Per-run reasoning/variant overrides are unavailable**: there is no
+  generic reasoning param; protected Codex `-c` keys that would set
+  model/effort/sandbox/approval refuse loudly with
+  `protected_config_override` (never silently ignored). Do not add new
+  reasoning controls for this release.
 
 ## Review discipline
 
