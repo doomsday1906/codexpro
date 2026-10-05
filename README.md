@@ -224,3 +224,6 @@ npm run release:publish
 - [Stable URL guide](DOMAIN_SETUP.md)
 - [Changelog](CHANGELOG.md)
 - [Contributors](CONTRIBUTORS.md)
+
+RepoConnect delegation, explicit closeout, and its shared-helper ownership
+limits are documented in [Hestia CLI Delegation](docs/HESTIA_DELEGATION.md).

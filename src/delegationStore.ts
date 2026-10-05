@@ -962,7 +962,13 @@ export function isLaunchRequestConflict(existing: DelegationRunRecord, candidate
 function pruneDelegationRuns(bridgeDir: string): void {
   const runs = listDelegationRuns(bridgeDir);
   if (runs.length <= DELEGATION_BOUNDS.maxRunsPerWorkspace) return;
-  const terminal = runs.filter((run) => DELEGATION_TERMINAL_STATES.has(run.state));
+  // Explicitly retired runs pin their durable history/intent. Automatic
+  // bounded retention is not authority to discard a closeout archive.
+  const terminal = runs.filter((run) => {
+    if (!DELEGATION_TERMINAL_STATES.has(run.state)) return false;
+    try { fs.lstatSync(path.join(centralArtifactsDirForRun(bridgeDir, run.runId), "retirement.json")); return false; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+  });
   const excess = runs.length - DELEGATION_BOUNDS.maxRunsPerWorkspace;
   const victims = terminal.slice(0, excess);
   for (const victim of victims) {
