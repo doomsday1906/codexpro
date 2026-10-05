@@ -904,7 +904,7 @@ export function teardownRunArtifacts(bridgeDir: string, run: DelegationRunRecord
         if (isCentral) {
           // Central record: the run's own central dir is the authority.
           // Secondary shape guard: per-attempt artifact file shape.
-          if (/^attempt-\d+-(codex|opencode|claude)-last-message\.(md|json)$/.test(path.basename(artifact.relPath))) {
+          if (/^attempt-\d+-(codex|opencode|claude)-last-message(-x\d+)?\.(md|json)$/.test(path.basename(artifact.relPath))) {
             removeFile(path.join(centralDir, artifact.relPath), `central:${artifact.relPath}`, centralDir);
           }
         } else if (workdir) {

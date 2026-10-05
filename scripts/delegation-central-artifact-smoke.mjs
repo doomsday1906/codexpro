@@ -153,6 +153,39 @@ assert(!torn4.removed.some((f) => f.includes(res4.relPath)) &&
   `tampered placeholder (claim identity mismatch) must survive: ${JSON.stringify(torn4)}`);
 console.log('ok: C4 transient reservation teardown (identity match retires; tampered survives)');
 
+// ---------- C6: central -xN fallback prunes; preoccupying foreign primary survives ----------
+const workdir6 = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-central-work6-'));
+const RUN6 = 'run_6666666666666666';
+const centralDir6 = Store.centralArtifactsDirForRun(bridge, RUN6);
+const centralPrimary6 = Tools.centralArtifactFileName('opencode', 1);
+const FOREIGN6 = 'FOREIGN CENTRAL BYTES — not this run\n';
+await fsp.mkdir(centralDir6, { recursive: true });
+await fsp.writeFile(path.join(centralDir6, centralPrimary6), FOREIGN6);
+const foreign6PreHash = sha256(FOREIGN6);
+await fsp.writeFile(path.join(workdir6, 'task-code.txt'), 'task code\n');
+const rec6 = Tools.persistAttemptArtifact(workdir6, 'opencode', 1, '{"session":"c6"}', RUN6, new Date().toISOString(), null, centralDir6);
+assert(rec6.base === 'central' && rec6.created === true && rec6.provenance === 'created',
+  `C6 run artifact must record an owned central verdict: ${JSON.stringify(rec6)}`);
+assert(/-x1\.json$/.test(rec6.relPath),
+  `C6 preoccupied central primary must force the run artifact into -x1: ${JSON.stringify(rec6)}`);
+assert(fs.existsSync(path.join(centralDir6, rec6.relPath)),
+  'C6 owned fallback artifact file must exist before prune');
+const victim6 = {
+  runId: RUN6, workdir: workdir6,
+  attempts: [{ n: 1, startedAt: new Date().toISOString(), state: 'completed', outputArtifact: rec6 }]
+};
+const torn6 = Store.teardownRunArtifacts(bridge, victim6);
+assert(torn6.removed.some((f) => f === `central:${rec6.relPath}`),
+  `C6 prune must remove the recorded owned -x1 fallback: ${JSON.stringify(torn6)}`);
+assert(!fs.existsSync(path.join(centralDir6, rec6.relPath)),
+  'C6 owned fallback must disappear after prune');
+assert(fs.existsSync(path.join(centralDir6, centralPrimary6)) &&
+  sha256(await fsp.readFile(path.join(centralDir6, centralPrimary6), 'utf8')) === foreign6PreHash,
+  'C6 foreign central primary must survive prune with identical bytes (presence + post hash)');
+assert(fs.existsSync(path.join(workdir6, 'task-code.txt')), 'C6 task code must survive prune');
+assert(fs.existsSync(path.join(centralDir2, rec2.relPath)), 'C6 other runs must survive prune');
+console.log('ok: C6 central -x1 fallback prunes (owned fallback gone; foreign primary bytes+presence intact, task-code/other-runs untouched)');
+
 // ---------- missing/corrupt records fail closed ----------
 const m1 = Store.teardownRunArtifacts(bridge, null);
 const m2 = Store.teardownRunArtifacts(bridge, { runId: RUN, workdir });

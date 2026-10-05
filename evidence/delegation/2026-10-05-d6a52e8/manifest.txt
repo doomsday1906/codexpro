@@ -1,0 +1,50 @@
+Delegation leaf evidence manifest — 2026-10-05 — base d6a52e8a3adb7b7b0818745f412d646d398821cf
+Fix: central teardownRunArtifacts shape guard accepts recorded -xN fallback suffix.
+Package codexpro@0.31.0. Build: Built codexpro@0.31.0; source commit d6a52e8a3adb7b7b0818745f412d646d398821cf (dirty)
+
+FILES CHANGED (sha256):
+  daee37c0ccead903d964f4d841cdc1d65def37f2644028575d4f8d3b9fef8a20  src/delegationStore.ts  [source (central teardown shape guard: +(-xN)? fallback suffix only)]
+  89e8777faed553afeeb8615a6e539258b5910a8058ced072a0ec5e96e8cf711b  scripts/delegation-central-artifact-smoke.mjs  [new test (C6 central -x1 fallback prune)]
+  d89d7884a90cee37bd2ead5d1a94ec9c69dd8991d3f4c53659844bb285339d7c  package.json  [build input]
+  80cbc28a3aae9313aa17591c6530879e828f9d65f12b893e768f2ef78c464e8e  scripts/build.mjs  [build input]
+  ac352ab4d2416fee6bab255d15f966be66d8281b461f55751a360f4773799aa0  scripts/build-identity.mjs  [build input]
+  01707d63930e59130eb6169d3c0afe9283ad356b655220b2b0633f22b123f0f4  tsconfig.json  [build input]
+
+SERIAL PROOF COMMANDS (all exit 0, run serially after code freeze):
+  exit=0  npm run build
+    log=logs/01-build.log  sha256=8a8ea26ebecae7fc35ea02755e5d3c37790634b80e69b1b40304249b5d11d28e
+  exit=0  node scripts/delegation-central-artifact-smoke.mjs
+    log=logs/02-central-artifact.log  sha256=dce6885e43a0fc6f09ae5ac83b41244dd096f3f543354d08fb0c39db42f8d813
+  exit=0  node scripts/delegation-steer-smoke.mjs
+    log=logs/03-steer.log  sha256=5990eeea70189fbca25a97b725bc59364f6d9349736ce278054b773ef346b5b8
+  exit=0  node scripts/delegation-codex-ownership-smoke.mjs
+    log=logs/04-ownership.log  sha256=186663fff51e1c395cfff6ee7a7832cb3de205b5d8128781ee9e3131de470bea
+  exit=0  node scripts/delegation-artifact-isolation-smoke.mjs
+    log=logs/05-artifact-isolation.log  sha256=0284883820766abdb679c324abdd1d4adef8accc9e88702bdeb6b97816280ba2
+  exit=0  node scripts/delegation-terminal-cleanup-smoke.mjs
+    log=logs/06-terminal-cleanup.log  sha256=096815ee8d952b3c7174704ceb81b7f790cfa80116e8556de856d4833ee22227
+  exit=0  node scripts/delegation-cancel-artifact-smoke.mjs
+    log=logs/07-cancel-artifact.log  sha256=e89bcf02f76a86886aaf7716e0fe5d229a2a786dd73fe5382039b5dea6419ea5
+  exit=0  node scripts/delegation-identity-standalone-output-smoke.mjs
+    log=logs/08-identity.log  sha256=4dfefbbf6ada9dc477f00b14f1e09102c4ae0d4f726fa74de882114ec24c043d
+  exit=0  node scripts/delegation-triengine-smoke.mjs
+    log=logs/09-triengine.log  sha256=33fb5d19c75f9f96c41ff5833124ce392bd64990b71ce5d0245ace27d38d1917
+  exit=0  node scripts/delegation-repair-focus-smoke.mjs
+    log=logs/10-repair-focus.log  sha256=b9a5f5bb3b777ea3d3e1125d4f6f8daa1766ce69d96ccbb58adf23678440f68c
+  exit=0  node scripts/delegation-storage-smoke.mjs
+    log=logs/11-storage.log  sha256=e7b4277306086f137021a03fd31224b3348b87346b00c50c031bffa0f7903b70
+  exit=0  node scripts/delegation-followup-smoke.mjs
+    log=logs/12-followup.log  sha256=ac3f8b0d6e84954b9d021fe59e93a9a1690e433791544e786bdfc3d43ff85857
+  exit=0  node scripts/delegation-canary-smoke.mjs
+    log=logs/13-canary.log  sha256=69f5422df721ab3eb812fa0234be6ce0ece7a5774fed0257831920fd43a844a2
+  exit=0  node scripts/delegation-routing-smoke.mjs
+    log=logs/14-routing.log  sha256=c173692d4ad483644de89315b1b4035c18bab9bc97cd2bb5c2322b695a317e26
+
+PRE-EXISTING STRAYS (untouched, never committed):
+  ce299a8defb9e1e8102a58dd1a8251ad2b7f954c9341e6fbce6beab36b90cca7  fixture-a.txt
+  13aafb27a71bb59b8c92d83248746711ddffe2d73fa2f3fbc5299851d0fac6ce  fixture-b.txt
+
+STALE-LEAF DISCLAIMER: this leaf ran against HEAD d6a52e8 with only the two
+files above changed (plus this evidence dir). If HEAD has since advanced or
+other leaves have mutated adjacent delegation surfaces, re-verify before
+integrating.
