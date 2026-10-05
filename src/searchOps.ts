@@ -25,6 +25,7 @@ import {
 } from "./analysis/types.js";
 import { resolveSearchScope } from "./analysis/scope.js";
 import { classifyFileRole, classifyLanguage } from "./analysis/classify.js";
+import { traceFact, tracePhase } from "./toolLog.js";
 
 export type { SearchTextStatus, SearchUnavailableReason };
 export { UNAVAILABLE_SEARCH_CONTEXT };
@@ -1057,7 +1058,7 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
             if (options.includeHidden) scopeArgs.push("--hidden");
             for (const glob of config.blockedGlobs) scopeArgs.push("-g", `!${glob}`);
             if (options.glob) scopeArgs.push("-g", options.glob);
-            const probed = await probeRipgrepSizeSkips(target.absPath, scopeArgs, fileSizeCeiling);
+            const probed = await tracePhase("rg_size_probe", () => probeRipgrepSizeSkips(target.absPath, scopeArgs, fileSizeCeiling));
             if (probed < 0) coverageUnknown = true;
             else sizeSkips = probed;
           }
@@ -1274,12 +1275,14 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
   };
   let lexical: SearchResult;
   if (await commandExists("rg")) {
-    lexical = await runRipgrep(config, guard, workspace, options);
+    lexical = await tracePhase("lexical_rg", () => runRipgrep(config, guard, workspace, options));
   } else if (options.regex) {
     throw new CodexProError("regex search requires ripgrep. Install rg or retry with regex=false.");
   } else {
-    lexical = await runNodeSearch(config, guard, workspace, options);
+    lexical = await tracePhase("lexical_node", () => runNodeSearch(config, guard, workspace, options));
   }
+  traceFact("lexical_matches", lexical.matches.length);
+  traceFact("structured", structuredRequested);
   if (!structuredRequested) return lexical;
   if (!config.analysisEnabled) {
     lexical.analysis = {
@@ -1295,7 +1298,7 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
     return lexical;
   }
   try {
-    const structured = await searchWorkspaceStructured(config, guard, workspace, {
+    const structured = await tracePhase("structured", () => searchWorkspaceStructured(config, guard, workspace, {
       query,
       intent: rawOptions.intent ?? "auto",
       includeTests: Boolean(rawOptions.includeTests),
@@ -1304,7 +1307,7 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
       root: options.root,
       glob: options.glob,
       maxResults: options.maxResults
-    });
+    }));
     // Keep the public projection behind the same request-local scope predicate
     // as the structured producers, even if a future producer adds a record
     // through a path not covered by its own admission loop.
@@ -1365,6 +1368,7 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
     }
     lexical.analysis = structured;
   } catch (error) {
+    traceFact("analysis_error", true);
     lexical.analysis = {
       schemaVersion: 1,
       query: redactSearchQuery(query, lexical.matches.map((match) => match.text)),

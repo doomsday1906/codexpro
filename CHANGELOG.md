@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Made structured search and `inspect_workspace` much faster on large workspaces: blocked-glob matchers are compiled once instead of per path, the analysis inventory honors ignore files via `rg --files` (`CODEXPRO_ANALYSIS_RESPECT_IGNORE=0` restores the full walk), and line-preserving redaction and Python import parsing are memoized by content digest within bounded caches.
+- Tool-call logs now include per-phase timings, concurrency, cache state, bounded counts, and an allowlisted argument summary; slow calls (`CODEXPRO_LOG_SLOW_MS`, default 10s) are always logged, and `CODEXPRO_LOG_FILE` appends JSON lines.
+
 - Added the bounded read-only `read_many` MCP tool for ordered text-file batches with existing read/path protections, isolated item errors, a hard aggregate response budget, and complete-prefix continuation via request-bound cursor/`next_index`.
 
 ## 0.30.0 (2026-08-08)

@@ -3,9 +3,28 @@ import { createHash } from "node:crypto";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { minimatch } from "minimatch";
+import { Minimatch, type MinimatchOptions } from "minimatch";
 import type { CodexProConfig } from "./config.js";
 import { expandHome } from "./config.js";
+
+// minimatch(path, pattern) recompiles the pattern on every call. Path policy
+// runs once per traversed entry against every blocked glob, so a large
+// workspace walk spent most of its time rebuilding identical regexes.
+// Compiled matchers are pure functions of (pattern, options); the cache is
+// bounded so caller-supplied globs cannot grow it without limit.
+const COMPILED_GLOB_CACHE_MAX = 512;
+const compiledGlobs = new Map<string, Minimatch>();
+
+export function compiledGlob(pattern: string, options: MinimatchOptions): Minimatch {
+  const key = `${options.dot ? 1 : 0}${options.nocase ? 1 : 0}${options.matchBase ? 1 : 0}\0${pattern}`;
+  let matcher = compiledGlobs.get(key);
+  if (matcher === undefined) {
+    if (compiledGlobs.size >= COMPILED_GLOB_CACHE_MAX) compiledGlobs.clear();
+    matcher = new Minimatch(pattern, options);
+    compiledGlobs.set(key, matcher);
+  }
+  return matcher;
+}
 
 export interface Workspace {
   id: string;
@@ -441,15 +460,30 @@ export class WorkspaceManager {
 }
 
 export class PathGuard {
+  private blockedMatchers?: { globs: readonly string[]; matchers: Array<[Minimatch, Minimatch]> };
+
   constructor(private readonly config: CodexProConfig) {}
+
+  private blockedGlobMatchers(): Array<[Minimatch, Minimatch]> {
+    // Recompiled whenever config supplies a different glob list.
+    const globs = this.config.blockedGlobs;
+    if (this.blockedMatchers?.globs !== globs) {
+      this.blockedMatchers = {
+        globs,
+        matchers: this.config.blockedGlobs.map((glob) => [
+          new Minimatch(glob, { dot: true, nocase: false, matchBase: false }),
+          new Minimatch(glob, { dot: true, nocase: false, matchBase: true })
+        ])
+      };
+    }
+    return this.blockedMatchers.matchers;
+  }
 
   isBlockedRelativePath(relPath: string): boolean {
     const rel = normalizeRelPath(relPath).replace(/^\.\//, "");
     if (!rel || rel === ".") return false;
-    return this.config.blockedGlobs.some((glob) =>
-      minimatch(rel, glob, { dot: true, nocase: false, matchBase: false }) ||
-      minimatch(path.basename(rel), glob, { dot: true, nocase: false, matchBase: true })
-    );
+    const base = path.basename(rel);
+    return this.blockedGlobMatchers().some(([full, basename]) => full.match(rel) || basename.match(base));
   }
 
   assertNotBlocked(relPath: string): void {

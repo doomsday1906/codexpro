@@ -1,11 +1,14 @@
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fsp from "node:fs/promises";
+import path from "node:path";
 import type { CodexProConfig } from "../config.js";
-import { isHiddenRelativePath, listFilesDetailed, textScanByteLimit } from "../fsOps.js";
-import { CodexProError } from "../guard.js";
+import { isHiddenRelativePath, listFilesDetailed, textScanByteLimit, type ListFilesPathScope } from "../fsOps.js";
+import { CodexProError, displayPath } from "../guard.js";
 import type { PathGuard, Workspace } from "../guard.js";
 import { classifyFileRole, classifyLanguage, isEntrypoint, isGeneratedFile } from "./classify.js";
 import type { InventoryFile, InventoryResult } from "./types.js";
+import { traceFact, tracePhase } from "../toolLog.js";
 
 function compareCodeUnit(left: string, right: string): number {
   if (left === right) return 0;
@@ -17,6 +20,75 @@ function isOrdinaryInventorySkip(error: unknown): boolean {
   if (!error || typeof error !== "object" || !("code" in error)) return false;
   const code = (error as { code?: unknown }).code;
   return code === "EACCES" || code === "EISDIR" || code === "ELOOP" || code === "ENOENT" || code === "ENOTDIR" || code === "EPERM";
+}
+
+// Upper bound on the ignore-aware listing. Past it the scope sets would cost
+// more memory than the walk they save, so inventory falls back to the walk.
+const IGNORE_SCOPE_MAX_FILES = 500_000;
+
+/**
+ * Ignore-aware admissible scope for the inventory walk: the same file set the
+ * lexical ripgrep route searches (.gitignore/.ignore honored, hidden files
+ * included, blocked globs excluded). Without it the walk descends into
+ * ignored trees such as worktrees, caches and backups and fills the
+ * inventory cap with files lexical search never sees. Returns undefined when
+ * rg is unavailable or fails, keeping the unscoped walk as the fallback.
+ */
+async function ignoreAwareScope(config: CodexProConfig, workspace: Workspace): Promise<ListFilesPathScope | undefined> {
+  if (config.analysisRespectIgnore === false) return undefined;
+  const args = ["--files", "--hidden", "--color=never"];
+  for (const glob of config.blockedGlobs) args.push("-g", `!${glob}`);
+  args.push("--", workspace.root);
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn("rg", args, { cwd: workspace.root, stdio: ["ignore", "pipe", "ignore"] });
+    } catch {
+      resolve(undefined);
+      return;
+    }
+    const files = new Set<string>();
+    const directories = new Set<string>();
+    let tail = "";
+    let overflow = false;
+    let malformed = false;
+    const rootPrefix = workspace.root.endsWith(path.sep) ? workspace.root : `${workspace.root}${path.sep}`;
+    const admit = (line: string): void => {
+      if (!line) return;
+      // Anything but a path under the root means the listing cannot be
+      // trusted as a scope; the caller then falls back to the full walk.
+      if (!line.startsWith(rootPrefix)) {
+        malformed = true;
+        return;
+      }
+      const rel = displayPath(line, workspace.root);
+      files.add(rel);
+      for (let index = rel.lastIndexOf("/"); index > 0; index = rel.lastIndexOf("/", index - 1)) {
+        const dir = rel.slice(0, index);
+        if (directories.has(dir)) break;
+        directories.add(dir);
+      }
+    };
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      if (overflow || malformed) return;
+      const parts = (tail + chunk).split("\n");
+      tail = parts.pop() ?? "";
+      for (const part of parts) admit(part);
+      if (files.size > IGNORE_SCOPE_MAX_FILES || tail.length > 64 * 1024) overflow = true;
+      if (overflow || malformed) child.kill();
+    });
+    child.on("error", () => resolve(undefined));
+    child.on("close", (code) => {
+      // Exit 1 is rg's empty-listing code: a legitimate empty scope.
+      if (overflow || malformed || (code !== 0 && code !== 1)) {
+        resolve(undefined);
+        return;
+      }
+      admit(tail);
+      resolve(malformed ? undefined : { files, directories });
+    });
+  });
 }
 
 export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuard, workspace: Workspace): Promise<InventoryResult> {
@@ -49,11 +121,14 @@ export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuar
       .digest();
     for (let i = 0; i < exclusionFold.length; i += 1) exclusionFold[i] ^= digest[i];
   };
+  const pathScope = await tracePhase("ignore_scope", () => ignoreAwareScope(config, workspace));
+  traceFact("ignore_scope", pathScope ? pathScope.files.size : "unavailable");
   const traversalResult = await listFilesDetailed(guard, workspace, {
     root: ".",
     includeHidden: true,
     maxFiles,
     visibilityPriority: true,
+    pathScope,
     admitFile: async ({ relPath }) => {
       try {
         const resolved = guard.resolve(workspace, relPath);

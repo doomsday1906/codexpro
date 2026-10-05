@@ -45,6 +45,7 @@ import { hasSecretValue, hasSecretValueInUnifiedDiff, redactDiagnosticStructured
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { createDiagnosticContext, type CodexProDiagnosticContext } from "./diagnosticContext.js";
 import { normalizeGitPushPolicy, sanitizeGitPushPolicy } from "./gitPushPolicy.js";
+import { runLoggedToolCall, traceFact } from "./toolLog.js";
 export type { CodexProDiagnosticContext, DiagnosticContextOptions, DiagnosticTransportKind, HttpDiagnosticCurrentRequest, HttpDiagnosticCurrentSession, HttpDiagnosticSnapshot } from "./diagnosticContext.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
@@ -1606,13 +1607,11 @@ function descriptorOptionsForConfig(config: CodexProConfig, name: string, option
   return { ...options, _meta: meta };
 }
 
-function toolCallLoggingEnabled(): boolean {
-  return process.env.CODEXPRO_LOG_TOOL_CALLS === "1" || process.env.CODEXPRO_LOG_REQUESTS === "1";
-}
-
-function logToolCall(name: string, status: "ok" | "error", started: number): void {
-  if (!toolCallLoggingEnabled()) return;
-  console.error(`[CodexProTool] ${name} ${status} ${Date.now() - started}ms`);
+function toolResultError(result: any): unknown {
+  const text = Array.isArray(result?.content)
+    ? result.content.find((item: any) => item?.type === "text" && typeof item.text === "string")?.text
+    : undefined;
+  return typeof text === "string" ? text : undefined;
 }
 
 function registerToolCardResource(server: McpServer, config: CodexProConfig): void {
@@ -1754,18 +1753,19 @@ function registerToolCompat(
   options: Record<string, unknown>,
   handler: CodexToolHandler
 ): void {
-  const wrapped = async (args: any, extra?: { signal?: AbortSignal }) => {
-    const started = Date.now();
-    try {
-      const result = tagToolResult(await handler(args ?? {}, extra), name, options);
-      logToolCall(name, result?.isError ? "error" : "ok", started);
-      return result;
-    } catch (error) {
-      const result = tagToolResult(errorResult(error), name, options);
-      logToolCall(name, "error", started);
-      return result;
-    }
-  };
+  const wrapped = async (args: any, extra?: { signal?: AbortSignal }) => runLoggedToolCall(
+    name,
+    args,
+    async () => {
+      try {
+        return tagToolResult(await handler(args ?? {}, extra), name, options);
+      } catch (error) {
+        traceFact("thrown", error instanceof Error ? error.name : typeof error);
+        return tagToolResult(errorResult(error), name, options);
+      }
+    },
+    (result: any) => (result?.isError ? { status: "error", error: toolResultError(result) } : { status: "ok" })
+  );
 
   const { runtimeInputSchema: _runtimeInputSchema, ...descriptorOptions } = options;
   const securitySchemes = [{ type: "noauth" }];

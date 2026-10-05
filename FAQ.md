@@ -45,6 +45,18 @@ Analysis is process-local and cached by a bounded workspace fingerprint. Direct 
 
 Set `CODEXPRO_ANALYSIS=0` to disable this layer while keeping the standard file, search, Git, and review tools available.
 
+The analysis inventory honors `.gitignore`/`.ignore` the same way lexical search does (via `rg --files`), so ignored trees such as worktrees, caches, and backups are not inventoried. Set `CODEXPRO_ANALYSIS_RESPECT_IGNORE=0` to restore the full walk; without ripgrep the full walk is used automatically.
+
+### How do I see why a tool call is slow?
+
+Set `CODEXPRO_LOG_TOOL_CALLS=1` (or `CODEXPRO_LOG_REQUESTS=1`) to log one stderr line per tool call:
+
+```text
+[CodexProTool] search ok 4616ms args{query_len=9 intent="auto"} phases{lexical_rg=980ms inventory=1734ms structured=3335ms} facts{inventory_files=2031 analysis_cache="hit"}
+```
+
+The line carries timing per phase, concurrency, bounded counts, cache state, and an allowlisted argument summary. Free-text arguments such as queries, contents, patches, and commands are logged only as lengths. Calls slower than `CODEXPRO_LOG_SLOW_MS` (default `10000`, `0` disables) are always logged and marked `SLOW`, even with logging off. Set `CODEXPRO_LOG_FILE=/path/to/codexpro-tools.jsonl` to also append each logged call as a JSON line.
+
 Terminal users can inspect the same facts without ChatGPT:
 
 ```bash

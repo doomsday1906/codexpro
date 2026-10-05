@@ -1257,6 +1257,15 @@ const clients = [];
 let emptyPathDir;
 let rgShimDir;
 let rgShimInvocationLog;
+// Search-route invocations only: the analysis inventory's ignore-aware
+// `rg --files --hidden --color=never` workspace listing is not a search of
+// the requested target and is excluded from the "no ripgrep" comparisons.
+async function rgShimSearchInvocations() {
+  return (await fs.readFile(rgShimInvocationLog, 'utf8'))
+    .split('\n')
+    .filter((line) => !/^shim mode=\S+ --hidden --files --hidden --color=never /.test(line))
+    .join('\n');
+}
 try {
   assert(realRgPath, `default ripgrep client unavailable: ${realRgLookup.stderr?.trim() || 'rg was not found on PATH'}`);
   await write('package.json', JSON.stringify({ name: 'search-evidence-fixture', scripts: { test: 'node --test' } }, null, 2));
@@ -1653,14 +1662,14 @@ esac
     CODEXPRO_MAX_OUTPUT_BYTES: String(SHIM_MAX_OUTPUT_BYTES)
   });
   const shimSearch = makeSearch(shimClient, shimWorkspaceId);
-  const shimBeforeHiddenTarget = await fs.readFile(rgShimInvocationLog, 'utf8');
+  const shimBeforeHiddenTarget = await rgShimSearchInvocations();
   const shimHiddenTargetFalse = await shimSearch({ query: NEEDLE, intent: 'symbol', path: '.hidden-root.ts', include_tests: true, include_hidden: false });
   assertEmptyStructuredResult(shimHiddenTargetFalse, 'shim hidden root file include_hidden=false', 'ripgrep');
-  assert.equal(await fs.readFile(rgShimInvocationLog, 'utf8'), shimBeforeHiddenTarget, 'explicit hidden target unexpectedly spawned ripgrep');
-  const shimBeforeHiddenDirectoryTarget = await fs.readFile(rgShimInvocationLog, 'utf8');
+  assert.equal(await rgShimSearchInvocations(), shimBeforeHiddenTarget, 'explicit hidden target unexpectedly spawned ripgrep');
+  const shimBeforeHiddenDirectoryTarget = await rgShimSearchInvocations();
   const shimHiddenDirectoryFalse = await shimSearch({ query: NEEDLE, intent: 'symbol', path: 'src/.hidden', include_tests: true, include_hidden: false });
   assertEmptyStructuredResult(shimHiddenDirectoryFalse, 'shim hidden directory include_hidden=false', 'ripgrep');
-  assert.equal(await fs.readFile(rgShimInvocationLog, 'utf8'), shimBeforeHiddenDirectoryTarget, 'explicit hidden directory unexpectedly spawned ripgrep');
+  assert.equal(await rgShimSearchInvocations(), shimBeforeHiddenDirectoryTarget, 'explicit hidden directory unexpectedly spawned ripgrep');
   const limitedHiddenBackend = await shimSearch({ query: LIMIT_NEEDLE, intent: 'symbol', path: '.', include_hidden: false, max_results: 1 });
   assert.equal(limitedHiddenBackend.structuredContent.used, 'ripgrep');
   assert.equal(limitedHiddenBackend.structuredContent.truncated, false, 'hidden backend output incorrectly counted toward visible result limit');

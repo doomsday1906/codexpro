@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { parser as pythonParser } from "@lezer/python";
@@ -243,6 +244,39 @@ function resolveInternalImports(fromPath: string, statement: ParsedImportStateme
   return target ? [target] : [];
 }
 
+// Content-keyed memo for Python import parsing, an expensive pure derivation
+// of a source text (line-preserving redaction is memoized in redact.ts).
+// Workspace analysis is invalidated whenever any inventoried file changes, so
+// without this every re-analysis re-parsed thousands of unchanged files.
+// Entries are keyed by path plus a content digest and bounded by text bytes.
+const DERIVED_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+interface DerivedSourceFacts {
+  bytes: number;
+  pythonImports?: Map<number, ParsedImportStatement[]>;
+}
+const derivedSourceCache = new Map<string, DerivedSourceFacts>();
+let derivedSourceCacheBytes = 0;
+
+function derivedSourceFacts(filePath: string, text: string, bytes: number): DerivedSourceFacts {
+  const key = `${filePath}\0${createHash("sha256").update(text).digest("hex")}`;
+  const existing = derivedSourceCache.get(key);
+  if (existing) {
+    derivedSourceCache.delete(key);
+    derivedSourceCache.set(key, existing);
+    return existing;
+  }
+  const facts: DerivedSourceFacts = { bytes };
+  if (bytes > DERIVED_CACHE_MAX_BYTES) return facts;
+  derivedSourceCache.set(key, facts);
+  derivedSourceCacheBytes += bytes;
+  for (const [oldKey, oldFacts] of derivedSourceCache) {
+    if (derivedSourceCacheBytes <= DERIVED_CACHE_MAX_BYTES) break;
+    derivedSourceCache.delete(oldKey);
+    derivedSourceCacheBytes -= oldFacts.bytes;
+  }
+  return facts;
+}
+
 export async function extractWorkspaceFiles(
   config: CodexProConfig,
   guard: PathGuard,
@@ -280,8 +314,11 @@ export async function extractWorkspaceFiles(
     const symbols: AnalysisSymbol[] = [];
     const imports: string[] = [];
     const importRecords: ExtractedImport[] = [];
+    const derived = derivedSourceFacts(file.path, text, actualBytes);
     let redactedLines: string[] | undefined;
-    const pythonImports = file.language === "python" ? pythonImportStatements(text) : undefined;
+    const pythonImports = file.language === "python"
+      ? (derived.pythonImports ??= pythonImportStatements(text))
+      : undefined;
     const lines = text.split(/\r?\n/);
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index];

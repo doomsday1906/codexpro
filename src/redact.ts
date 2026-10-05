@@ -2,6 +2,7 @@
 // one policy implementation so source and diagnostic routes cannot drift.
 // @ts-ignore -- scripts/redaction-policy.mjs is intentionally plain ESM.
 import * as policy from "../scripts/redaction-policy.mjs";
+import { createHash } from "node:crypto";
 
 const {
   hasSecretValue: policyHasSecretValue,
@@ -72,8 +73,48 @@ export function redactSensitiveText(text: string, options: RedactionOptions | Re
   return policyRedactSensitiveText(text, options);
 }
 
+// Line-preserving source redaction is a pure function of (text, options) and
+// the dominant cost of search/analysis: every query re-redacted the same
+// unchanged files during scanning and hydration. Results for non-trivial
+// texts are memoized by content digest, bounded by retained bytes.
+// Only option shapes whose output is a pure function of (text, context,
+// language) are memoized: a sourcePath pulls live approval-registry state,
+// and the remaining policy options are caller-supplied overrides.
+const REDACTION_MEMO_MIN_CHARS = 1024;
+const REDACTION_MEMO_MAX_CHARS = 64 * 1024 * 1024;
+const redactionMemo = new Map<string, string>();
+let redactionMemoChars = 0;
+
+function redactionMemoKey(text: string, options: RedactionOptions | RedactionContext): string | undefined {
+  if (typeof options === "string") return `${options}\0\0${createHash("sha256").update(text).digest("hex")}`;
+  if (!options || typeof options !== "object") return undefined;
+  for (const key of Object.keys(options)) {
+    if (key !== "context" && key !== "language") return undefined;
+  }
+  return `${options.context ?? ""}\0${options.language ?? ""}\0${createHash("sha256").update(text).digest("hex")}`;
+}
+
 export function redactSensitiveTextPreservingLines(text: string, options: RedactionOptions | RedactionContext = {}): string {
-  return policyRedactSensitiveTextPreservingLines(text, options);
+  if (typeof text !== "string" || text.length < REDACTION_MEMO_MIN_CHARS || text.length > REDACTION_MEMO_MAX_CHARS / 4) {
+    return policyRedactSensitiveTextPreservingLines(text, options);
+  }
+  const key = redactionMemoKey(text, options);
+  if (key === undefined) return policyRedactSensitiveTextPreservingLines(text, options);
+  const cached = redactionMemo.get(key);
+  if (cached !== undefined) {
+    redactionMemo.delete(key);
+    redactionMemo.set(key, cached);
+    return cached;
+  }
+  const redacted: string = policyRedactSensitiveTextPreservingLines(text, options);
+  redactionMemo.set(key, redacted);
+  redactionMemoChars += redacted.length;
+  for (const [oldKey, oldValue] of redactionMemo) {
+    if (redactionMemoChars <= REDACTION_MEMO_MAX_CHARS) break;
+    redactionMemo.delete(oldKey);
+    redactionMemoChars -= oldValue.length;
+  }
+  return redacted;
 }
 
 /** Describe a blocked source candidate without echoing matched content. */

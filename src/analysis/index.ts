@@ -20,6 +20,7 @@ import type {
   WorkspaceAnalysis
 } from "./types.js";
 import { statusForDerivedSearchText, UNAVAILABLE_SEARCH_CONTEXT } from "./types.js";
+import { traceFact, tracePhase } from "../toolLog.js";
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const MAX_ADDITIONAL_OCCURRENCE_LINES = 16;
 const CONFIDENCE_RANK: Record<StructuredSearchMatch["confidence"], number> = { exact: 0, inferred: 1, strong: 2 };
@@ -194,12 +195,16 @@ function areasFor(files: WorkspaceAnalysis["files"]): WorkspaceAnalysis["areas"]
 
 export async function inspectWorkspace(config: CodexProConfig, guard: PathGuard, workspace: Workspace): Promise<WorkspaceAnalysis> {
   if (!config.analysisEnabled) throw new Error("Repository analysis is disabled by CODEXPRO_ANALYSIS=0.");
-  const inventory = await inventoryWorkspace(config, guard, workspace);
+  const inventory = await tracePhase("inventory", () => inventoryWorkspace(config, guard, workspace));
+  traceFact("inventory_files", inventory.files.length);
+  if (inventory.coverage.truncated) traceFact("inventory_truncated", true);
   const key = cacheKey(workspace, inventory.fingerprint, config);
   const cached = getCachedWorkspaceAnalysis(key);
+  traceFact("analysis_cache", cached ? "hit" : "miss");
   if (cached) return { ...cached, cache: { hit: true, key } };
 
-  const extraction = await extractWorkspaceFiles(config, guard, workspace, inventory.files);
+  const extraction = await tracePhase("extract", () => extractWorkspaceFiles(config, guard, workspace, inventory.files));
+  traceFact("analyzed_files", extraction.analyzedFiles);
   const symbols = extraction.files
     .flatMap((file) => file.symbols)
     .sort((a, b) => Number(isHiddenRelativePath(a.path)) - Number(isHiddenRelativePath(b.path)) || a.path.localeCompare(b.path) || a.line - b.line)

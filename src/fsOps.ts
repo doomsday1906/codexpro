@@ -2,10 +2,9 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
-import { minimatch } from "minimatch";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
-import { CodexProError, displayPath, normalizeRelPath, PathGuard } from "./guard.js";
+import { CodexProError, compiledGlob, displayPath, normalizeRelPath, PathGuard } from "./guard.js";
 import { hasSecretValue, redactSensitiveText, redactSensitiveTextPreservingLines, sourceLanguageForPath, sourceSafetyRefusalMessage } from "./redact.js";
 import {
   FIXED_SNAPSHOT_BYTES,
@@ -379,7 +378,7 @@ export function isHiddenRelativePath(relPath: string): boolean {
  */
 export function matchesSearchGlob(relativePath: string, glob?: string): boolean {
   if (!glob) return true;
-  return minimatch(normalizeRelPath(relativePath).replace(/^\.\//, ""), glob, { dot: true, matchBase: true });
+  return compiledGlob(glob, { dot: true, matchBase: true }).match(normalizeRelPath(relativePath).replace(/^\.\//, ""));
 }
 
 export async function repoTree(config: CodexProConfig, guard: PathGuard, workspace: Workspace, options: TreeOptions): Promise<TreeResult> {
@@ -448,6 +447,18 @@ export interface ListFilesOptions<TPrepared = never> {
    * capacity; an accepted value is retained for request-local reuse.
    */
   admitFile?: (candidate: ListFilesCandidate) => Promise<TPrepared | null | undefined>;
+  /**
+   * Optional precomputed admissible scope (for example the ignore-aware
+   * `rg --files` listing). When present, only listed files are admitted and
+   * directories that contain none of them are not descended into. Ordering,
+   * capacity and traversal facts are otherwise unchanged.
+   */
+  pathScope?: ListFilesPathScope;
+}
+
+export interface ListFilesPathScope {
+  files: ReadonlySet<string>;
+  directories: ReadonlySet<string>;
 }
 
 /**
@@ -535,8 +546,16 @@ export async function listFilesDetailed<TPrepared = never>(
     return result;
   }
 
+  const pathScope = options.pathScope;
+
+  function outsidePathScope(relPath: string, entry: fs.Dirent): boolean {
+    if (!pathScope) return false;
+    return entry.isDirectory() ? !pathScope.directories.has(relPath) : !pathScope.files.has(relPath);
+  }
+
   async function addFile(absFile: string): Promise<boolean> {
     const rel = displayPath(absFile, workspace.root);
+    if (pathScope && !pathScope.files.has(rel)) return false;
     if (guard.isBlockedRelativePath(rel)) return false;
     if (!options.includeHidden && isHiddenRelativePath(rel)) return false;
     if (!matchesSearchGlob(rel, options.glob)) return false;
@@ -560,6 +579,7 @@ export async function listFilesDetailed<TPrepared = never>(
       if (files.length >= options.maxFiles) return;
       const abs = path.join(absDir, entry.name);
       const rel = displayPath(abs, workspace.root);
+      if (outsidePathScope(rel, entry)) continue;
       if (guard.isBlockedRelativePath(rel)) continue;
       if (!options.includeHidden && isHiddenRelativePath(rel)) continue;
       if (entry.isDirectory()) await walkDefault(abs);
@@ -612,6 +632,7 @@ export async function listFilesDetailed<TPrepared = never>(
   }
 
   function canObserve(relPath: string, entry: fs.Dirent): boolean {
+    if (outsidePathScope(relPath, entry)) return false;
     if (guard.isBlockedRelativePath(relPath)) return false;
     if (!options.includeHidden && isHiddenRelativePath(relPath)) return false;
     return entry.isDirectory() || entry.isFile();

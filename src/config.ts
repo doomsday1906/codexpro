@@ -48,6 +48,8 @@ export interface CodexProConfig {
   delegationLegacyBridge: boolean;
   connectionTest: boolean;
   analysisEnabled: boolean;
+  /** Analysis inventory honors .gitignore/.ignore like lexical search (default true). */
+  analysisRespectIgnore?: boolean;
   analysisLimits: AnalysisLimits;
   containmentWrapper?: string[];
 }
@@ -425,6 +427,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     ),
     connectionTest: boolFrom(process.env.CODEXPRO_CONNECTION_TEST, false),
     analysisEnabled: boolFrom(process.env.CODEXPRO_ANALYSIS, true),
+    analysisRespectIgnore: boolFrom(process.env.CODEXPRO_ANALYSIS_RESPECT_IGNORE, true),
     analysisLimits: {
       maxInventoryFiles: numberFrom(process.env.CODEXPRO_ANALYSIS_MAX_INVENTORY_FILES, DEFAULT_ANALYSIS_LIMITS.maxInventoryFiles, 100, 100_000),
       maxAnalyzedFiles: numberFrom(process.env.CODEXPRO_ANALYSIS_MAX_ANALYZED_FILES, DEFAULT_ANALYSIS_LIMITS.maxAnalyzedFiles, 10, 50_000),
