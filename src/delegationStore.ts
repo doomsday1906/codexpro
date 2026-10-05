@@ -79,6 +79,10 @@ export interface DelegationAttempt {
    * Per-attempt output artifact provenance: which workdir-relative file THIS
    * attempt produced (or preoccupied). Attempt N never reuses attempt N-1's
    * file as its result; the read path surfaces only the recorded path.
+   * New artifacts always bind (run_id, attempt): the filename carries the
+   * short run id plus the attempt number, so two runs sharing one workdir
+   * can never cross-attribute. Legacy shared names are never created anew
+   * and never read as present without this record.
    */
   outputArtifact?: {
     /** Workdir-relative artifact path recorded at finalize. */
@@ -89,6 +93,16 @@ export interface DelegationAttempt {
     created: boolean;
     /** Unavailable reason when bytes is 0 or the file was preoccupied. */
     reason?: string;
+    /**
+     * Provenance verdict at finalize: "created" (this attempt exclusively
+     * created the file via O_EXCL), "worker" (a run-bound file the worker
+     * wrote during this attempt: run_id namespace plus write-after-attempt-
+     * start temporal proof), or "unavailable" (preoccupied, absent, or
+     * empty: never presented as present). Absent on records that predate
+     * this verdict (created:true still proves O_EXCL; created:false without
+     * a worker verdict reads unavailable under the current standard).
+     */
+    provenance?: "created" | "worker" | "unavailable";
   };
 }
 

@@ -1,0 +1,6 @@
+
+> codexpro@0.31.0 build
+> node scripts/build.mjs
+
+Built codexpro@0.31.0; source commit b3f97e5233c5bbadc4f71edf4e72d6a429fc4ce5 (dirty).
+EXIT_CODE=0

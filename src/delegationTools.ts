@@ -258,67 +258,111 @@ function okResult(text: string, structured: Record<string, unknown>): any {
 }
 
 /**
+ * Short run binding for artifact filenames: the last 8 hex chars of a
+ * run_<16hex> id. Unpredictable before launch (minted randomly per run), so
+ * a run-bound filename is a namespace only this run can occupy: two runs
+ * sharing one caller-chosen workdir can never cross-attribute, and a
+ * preoccupied run-bound file proves forgery, never worker output.
+ * Exported for the focused regression proof.
+ */
+export function shortRunId(runId: string): string {
+  const m = /^run_([0-9a-f]{16})$/.exec(String(runId ?? ""));
+  if (m) return m[1].slice(-8);
+  const clean = String(runId ?? "").replace(/[^A-Za-z0-9]/g, "").slice(-8);
+  return clean || "unknown";
+}
+
+/**
  * Persist one attempt's output artifact with provenance. Never overwrites:
- * the primary path is exclusively created (O_EXCL); an existing file —
+ * every candidate path is exclusively created (O_EXCL); an existing file —
  * including an existing EMPTY file (empty = unavailable, never a slot to
- * fill) — is left untouched. When the primary is preoccupied by an empty
- * file and retained output exists, the output goes to the attempt's own
- * fallback sibling instead. `retained === null` means "stat only, never
- * write" (codex owns its file via --output-last-message). Exported for the
- * focused regression proof.
+ * fill) AND an existing NONEMPTY file (preoccupied output is never claimed
+ * as this run's result, never bound with created:false) — is left
+ * untouched. A preoccupied primary diverts to the attempt's own run-bound
+ * fallback sibling; when every candidate is preoccupied the attempt records
+ * unavailable with a reason. `retained === null` means "stat only, never
+ * write" (codex owns its file via --output-last-message): the run-bound
+ * file is bound ONLY with namespace proof (the run_id-bound name) PLUS
+ * temporal proof (the worker wrote it at/after the attempt start); a
+ * pre-existing file (written before the attempt started) is never
+ * attributed to the new run. Without a run id the result is fail-closed
+ * unavailable: legacy shared names are never created anew. Exported for
+ * the focused regression proof.
  */
 export function persistAttemptArtifact(
   workdir: string,
   engine: DelegationEngine,
   attemptN: number,
-  retained: string | null
+  retained: string | null,
+  runId?: string,
+  attemptStartedAt?: string
 ): NonNullable<DelegationAttempt["outputArtifact"]> {
-  const primaryRel = lastMessageRelPathForAttempt(engine, attemptN);
-  let existingSize: number | null = null;
-  try {
-    const stat = fs.statSync(path.join(workdir, primaryRel));
-    if (stat.isFile()) existingSize = stat.size;
-  } catch { /* absent */ }
-  if (existingSize !== null && existingSize > 0) {
-    // The worker wrote this attempt's file itself (codex
-    // --output-last-message, or a worker-owned write): keep it, never
-    // touch it. Provenance binds it to this attempt.
-    return { relPath: primaryRel, bytes: existingSize, created: false };
+  const primaryRel = lastMessageRelPathForAttempt(engine, attemptN, runId);
+  if (!runId) {
+    return {
+      relPath: primaryRel, bytes: 0, created: false, provenance: "unavailable" as const,
+      reason: "run identity missing: no legacy shared artifact will be created or claimed without a run-bound name"
+    };
   }
   if (retained === null) {
-    // No finalize write for this engine: record only what the worker left.
-    return {
-      relPath: primaryRel, bytes: existingSize ?? 0, created: false,
-      ...(existingSize === 0
-        ? { reason: "worker left an empty file (empty = unavailable, never a slot to fill)" }
-        : { reason: "worker wrote no file for this attempt" })
-    };
+    // No finalize write for this engine: bind only what the worker proved.
+    let existingSize: number | null = null;
+    let existingMtimeMs: number | null = null;
+    try {
+      const stat = fs.statSync(path.join(workdir, primaryRel));
+      if (stat.isFile()) {
+        existingSize = stat.size;
+        existingMtimeMs = stat.mtimeMs;
+      }
+    } catch { /* absent */ }
+    if (existingSize === null) {
+      return {
+        relPath: primaryRel, bytes: 0, created: false, provenance: "unavailable" as const,
+        reason: `worker wrote no file for this attempt (no ${primaryRel})`
+      };
+    }
+    if (existingSize === 0) {
+      return {
+        relPath: primaryRel, bytes: 0, created: false, provenance: "unavailable" as const,
+        reason: `worker left an empty file at ${primaryRel} (empty = unavailable, never a slot to fill)`
+      };
+    }
+    // Nonempty run-bound file: temporal proof decides. The name is this
+    // run's namespace, but a file written BEFORE the attempt started is
+    // preoccupied (forged or stale), never worker output.
+    const startMs = attemptStartedAt ? Date.parse(attemptStartedAt) : NaN;
+    const mtimeOk = existingMtimeMs !== null &&
+      (!Number.isFinite(startMs) || existingMtimeMs >= startMs - 2000);
+    if (!mtimeOk) {
+      return {
+        relPath: primaryRel, bytes: existingSize, created: false, provenance: "unavailable" as const,
+        reason: `primary artifact ${primaryRel} is preoccupied (written before this attempt started); left untouched, never claimed as this run's output`
+      };
+    }
+    return { relPath: primaryRel, bytes: existingSize, created: false, provenance: "worker" as const };
   }
   if (!retained) {
     return {
-      relPath: primaryRel, bytes: existingSize ?? 0, created: false,
-      ...(existingSize === 0
-        ? { reason: `primary artifact ${primaryRel} is preoccupied by an empty file (left untouched); no retained output to persist elsewhere` }
-        : { reason: "worker produced no output; finalize created no file" })
+      relPath: primaryRel, bytes: 0, created: false, provenance: "unavailable" as const,
+      reason: "worker produced no output; finalize created no file"
     };
   }
-  const preoccupiedEmpty = existingSize === 0;
-  const candidates = preoccupiedEmpty
-    ? attemptArtifactFallbackPaths(engine, attemptN)
-    : [primaryRel, ...attemptArtifactFallbackPaths(engine, attemptN)];
+  const candidates = [primaryRel, ...attemptArtifactFallbackPaths(engine, attemptN, runId)];
   for (const rel of candidates) {
     if (exclusivelyCreateArtifact(workdir, rel, retained) !== null) {
+      const diverted = rel !== primaryRel;
       return {
         relPath: rel,
         bytes: Buffer.byteLength(retained, "utf8"),
         created: true,
-        ...(preoccupiedEmpty ? { reason: `primary artifact ${primaryRel} preoccupied by an empty file; left untouched, output persisted to ${rel}` } : {})
+        provenance: "created" as const,
+        ...(diverted ? { reason: `primary artifact ${primaryRel} preoccupied (left untouched); output persisted to the attempt's own ${rel}` } : {})
       };
     }
   }
   return {
-    relPath: primaryRel, bytes: existingSize ?? 0, created: false,
-    reason: `primary artifact ${primaryRel}${preoccupiedEmpty ? " (preoccupied by an empty file, left untouched)" : ""} and every fallback is preoccupied; nothing written`
+    relPath: primaryRel, bytes: 0, created: false, provenance: "unavailable" as const,
+    reason: `primary artifact ${primaryRel} and every run-bound fallback is preoccupied; nothing written, nothing claimed`
   };
 }
 
@@ -760,7 +804,7 @@ function launchCodexReal(
   isCanary: boolean,
   attemptN = 1
 ): ChildProcess {
-  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("codex", attemptN));
+  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("codex", attemptN, run.runId));
   return spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildPlannedArgv(plan, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary, attemptN);
 }
 
@@ -775,7 +819,7 @@ function launchOpenCodeReal(
   sessionId?: string,
   attemptN = 1
 ): ChildProcess {
-  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("opencode", attemptN));
+  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("opencode", attemptN, run.runId));
   return spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(), buildPlannedArgv(plan, prompt, lastMessagePath, sessionId), timeoutMs, lastMessagePath, isCanary, attemptN);
 }
 
@@ -1062,25 +1106,30 @@ function finalizeLiveRun(deps: DelegationToolDeps, bridgeDir: string, runId: str
     }
   }
   // Per-(run, attempt) output artifact, exclusively created and
-  // provenance-bound: attempt N's file is never an earlier attempt's file
-  // (attempt 1 keeps the legacy name; later attempts use suffixed names),
-  // existing files are never overwritten — including existing EMPTY files
-  // (empty = unavailable, never a slot to fill; the output goes to the
-  // attempt's own fallback sibling instead) — and the recorded relPath
-  // binds which attempt produced the artifact for the read path. Best
-  // effort and never throwing: an unavailable artifact stays explicitly
-  // unavailable in read evidence (never an implied pass). Output beyond
-  // the retained tail is reported via the stdoutTruncated flag below.
-  // Codex owns its file via --output-last-message (stat only here, never
-  // written); opencode/claude output is persisted from the retained live
-  // stdout buffer (newest up to the 64KiB live cap).
+  // provenance-bound: EVERY attempt's file binds (run_id, attempt)
+  // (<stem>-<shortRunId>-attempt-<N><ext>, including attempt 1 — legacy
+  // shared names are never created anew), so two runs sharing one
+  // caller-chosen workdir occupy disjoint namespaces and a continuation can
+  // never surface an earlier attempt's output file as the current result.
+  // Existing files are never overwritten, never claimed: a preoccupied
+  // file — empty or nonempty — is left untouched (retained output diverts
+  // to the attempt's own run-bound fallback; a preoccupied worker-owned
+  // file records unavailable with a reason). The recorded relPath plus the
+  // provenance verdict binds which attempt produced the artifact for the
+  // read path. Best effort and never throwing: an unavailable artifact
+  // stays explicitly unavailable in read evidence (never an implied pass).
+  // Output beyond the retained tail is reported via the stdoutTruncated
+  // flag below. Codex owns its file via --output-last-message (stat only
+  // here, never written, bound only with namespace + temporal proof);
+  // opencode/claude output is persisted from the retained live stdout
+  // buffer (newest up to the 64KiB live cap).
   const attemptN = live?.attemptN ?? latest?.n ?? 1;
   let outputArtifact: DelegationAttempt["outputArtifact"];
   try {
     const retained = live && (run.engine === "opencode" || run.engine === "claude")
       ? Buffer.concat(live.stdoutChunks).toString("utf8")
       : null;
-    outputArtifact = persistAttemptArtifact(run.workdir, run.engine, attemptN, retained);
+    outputArtifact = persistAttemptArtifact(run.workdir, run.engine, attemptN, retained, run.runId, latest?.startedAt);
   } catch { /* artifact stays unrecorded; read evidence reports it unavailable */ }
   let state = final.state;
   let summary = summarizeTerminal(final.state, final.exitCode, final.timedOut);
@@ -1307,7 +1356,7 @@ function launchCodexCanary(
   isCanary: boolean,
   attemptN = 1
 ): ChildProcess {
-  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("codex", attemptN));
+  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("codex", attemptN, run.runId));
   return spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildCodexCanaryArgv(profile, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary, attemptN);
 }
 
@@ -1322,7 +1371,7 @@ function launchOpenCodeCanary(
   sessionId?: string,
   attemptN = 1
 ): ChildProcess {
-  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("opencode", attemptN));
+  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("opencode", attemptN, run.runId));
   return spawnCanaryChild(deps, bridgeDir, run, resolveOpenCodeBinary(), buildOpenCodeCanaryArgv(model, prompt, sessionId), timeoutMs, lastMessagePath, isCanary, attemptN);
 }
 
@@ -1339,7 +1388,7 @@ function launchClaudeChild(
   // Claude runs non-interactive (-p --output-format json): worker JSON goes
   // to stdout (captured in the bounded live tails); the last-message path is
   // recorded for evidence-route parity with the other engines.
-  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("claude", attemptN));
+  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("claude", attemptN, run.runId));
   return spawnCanaryChild(deps, bridgeDir, run, resolveClaudeBinary(), argv, timeoutMs, lastMessagePath, isCanary, attemptN);
 }
 
@@ -1353,7 +1402,7 @@ function launchCodexResume(
   isCanary: boolean,
   attemptN = 1
 ): ChildProcess {
-  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("codex", attemptN));
+  const lastMessagePath = path.join(run.workdir, lastMessageRelPathForAttempt("codex", attemptN, run.runId));
   return spawnCanaryChild(deps, bridgeDir, run, resolveCodexBinary(), buildCodexResumeArgv(sessionId, prompt, lastMessagePath), timeoutMs, lastMessagePath, isCanary, attemptN);
 }
 
@@ -1450,28 +1499,48 @@ export function lastMessageRelPath(engine: DelegationEngine): string {
 }
 
 /**
- * Per-(run, attempt) output artifact path. Attempt 1 keeps the legacy
- * filename (existing evidence keeps working); every later attempt gets its
- * own suffixed file, so a continuation can never surface an earlier
- * attempt's output file as the current result. Exported for the focused
- * regression proof.
+ * Per-(run, attempt) output artifact path. New artifacts ALWAYS bind
+ * (run_id, attempt): `<stem>-<shortRunId>-attempt-<N><ext>` for EVERY
+ * attempt including attempt 1, so two runs sharing one caller-chosen
+ * workdir occupy disjoint namespaces and continuations never reuse an
+ * earlier attempt's file. Attempt-1 legacy shared names are NOT acceptable
+ * for new artifacts. WITHOUT a run id the legacy shape is returned
+ * (attempt 1 keeps the legacy name; later attempts are suffixed) for
+ * read-only back-compat with pre-binding run files ONLY — never for new
+ * writes. Exported for the focused regression proof.
  */
-export function lastMessageRelPathForAttempt(engine: DelegationEngine, attemptN: number): string {
+export function lastMessageRelPathForAttempt(engine: DelegationEngine, attemptN: number, runId?: string): string {
   const base = lastMessageRelPath(engine);
-  if (!Number.isSafeInteger(attemptN) || attemptN <= 1) return base;
   const dot = base.lastIndexOf(".");
   const stem = dot >= 0 ? base.slice(0, dot) : base;
   const ext = dot >= 0 ? base.slice(dot) : "";
+  const n = Number.isSafeInteger(attemptN) && attemptN >= 1 ? attemptN : 1;
+  if (typeof runId === "string" && runId) {
+    return `${stem}-${shortRunId(runId)}-attempt-${n}${ext}`;
+  }
+  if (!Number.isSafeInteger(attemptN) || attemptN <= 1) return base;
   return `${stem}-attempt-${attemptN}${ext}`;
 }
 
 /**
- * Ordered fallback siblings for an preoccupied artifact path: the first
- * absent file wins. Bounded (at most 4 fallbacks); when all are preoccupied
- * the attempt records unavailable rather than overwriting anything.
+ * Ordered run-bound fallback siblings for a preoccupied artifact path: the
+ * first absent file wins. Every fallback binds the same (run_id, attempt)
+ * as the primary (`<stem>-<short>-attempt-<N>-x<i><ext>`, at most 3); when
+ * all are preoccupied the attempt records unavailable rather than
+ * overwriting anything. WITHOUT a run id the legacy fallback shape is
+ * returned for read-only back-compat ONLY — never for new writes.
  * Exported for the focused regression proof.
  */
-export function attemptArtifactFallbackPaths(engine: DelegationEngine, attemptN: number): string[] {
+export function attemptArtifactFallbackPaths(engine: DelegationEngine, attemptN: number, runId?: string): string[] {
+  if (typeof runId === "string" && runId) {
+    const primary = lastMessageRelPathForAttempt(engine, attemptN, runId);
+    const pdot = primary.lastIndexOf(".");
+    const pstem = pdot >= 0 ? primary.slice(0, pdot) : primary;
+    const pext = pdot >= 0 ? primary.slice(pdot) : "";
+    const out: string[] = [];
+    for (let i = 1; i <= 3; i += 1) out.push(`${pstem}-x${i}${pext}`);
+    return out;
+  }
   const base = lastMessageRelPath(engine);
   const dot = base.lastIndexOf(".");
   const stem = dot >= 0 ? base.slice(0, dot) : base;
@@ -1523,39 +1592,67 @@ export function exclusivelyCreateArtifact(workdir: string, relPath: string, text
 
 /**
  * Describe one attempt's durable last-message artifact WITH provenance:
- * which attempt produced it and which relative path was recorded at
- * finalize. The recorded path binds the evidence (never the legacy shared
- * name by default); a run without recorded provenance falls back to the
- * attempt's primary path, and a legacy attempt-1 run without provenance
- * falls back to the legacy lookup. Empty or absent is explicitly
- * unavailable, never a pass.
+ * ONLY the recorded path from this run/attempt's finalize record is ever
+ * surfaced, and a nonempty file reads present ONLY with a provenance
+ * verdict that proves this run created it (O_EXCL `created:true`, or a
+ * `worker` verdict for a run-bound worker-written file). A preoccupied,
+ * shared, foreign, empty, or absent file is explicitly unavailable with a
+ * reason — never presented as this run's present result. WITHOUT a
+ * recorded path there is deliberately NO legacy-name fallback lookup: a
+ * preoccupied shared file must never surface as the current result.
+ * A bare string carries no creation proof and never reads present on a
+ * nonempty file (pass the structured finalize record instead); the string
+ * form is accepted only so pre-verdict callers fail closed with a reason
+ * instead of throwing.
  */
 export function describeAttemptArtifact(
   workdir: string,
   engine: DelegationEngine,
   attemptN: number,
-  recordedRelPath?: string
+  recordedRelPath?: string | Pick<NonNullable<DelegationAttempt["outputArtifact"]>, "relPath" | "created"> & { provenance?: "created" | "worker" | "unavailable"; reason?: string }
 ): EvidenceArtifactReport & { path?: string; attempt_n: number } {
-  const primary = lastMessageRelPathForAttempt(engine, attemptN);
-  const candidates = recordedRelPath && !recordedRelPath.includes("..") && !path.isAbsolute(recordedRelPath)
-    ? [recordedRelPath, primary]
-    : [primary];
-  for (const rel of candidates) {
-    try {
-      const stat = fs.statSync(path.join(workdir, rel));
-      if (!stat.isFile()) continue;
-      if (stat.size === 0) {
-        return {
-          path: rel, status: "unavailable", truncated: false, bytes: 0, attempt_n: attemptN,
-          reason: `attempt ${attemptN} artifact ${rel} is empty (empty = unavailable, never a slot to fill)`
-        };
-      }
-      return { path: rel, status: "present", truncated: false, bytes: stat.size, attempt_n: attemptN };
-    } catch { /* try the next candidate */ }
+  const recorded = typeof recordedRelPath === "string"
+    ? { relPath: recordedRelPath, created: false as const }
+    : recordedRelPath;
+  if (!recorded || !recorded.relPath || recorded.relPath.includes("..") || path.isAbsolute(recorded.relPath)) {
+    return {
+      status: "unavailable", truncated: false, attempt_n: attemptN,
+      reason: `attempt ${attemptN} has no recorded artifact provenance; a shared last-message file (if any) is never presented without this run's provenance`
+    };
   }
+  const rel = recorded.relPath;
+  try {
+    const stat = fs.statSync(path.join(workdir, rel));
+    if (!stat.isFile()) {
+      return {
+        path: undefined, status: "unavailable", truncated: false, bytes: 0, attempt_n: attemptN,
+        reason: `attempt ${attemptN} artifact ${rel} exists but is not a file`
+      };
+    }
+    if (stat.size === 0) {
+      return {
+        path: rel, status: "unavailable", truncated: false, bytes: 0, attempt_n: attemptN,
+        reason: `attempt ${attemptN} artifact ${rel} is empty (empty = unavailable, never a slot to fill)`
+      };
+    }
+    if (recorded.provenance === "unavailable") {
+      return {
+        path: rel, status: "unavailable", truncated: false, bytes: stat.size, attempt_n: attemptN,
+        reason: recorded.reason ?? `attempt ${attemptN} artifact ${rel} carries no this-run creation proof (preoccupied or unproven); never presented as present`
+      };
+    }
+    if (recorded.created === true || recorded.provenance === "created" || recorded.provenance === "worker") {
+      return { path: rel, status: "present", truncated: false, bytes: stat.size, attempt_n: attemptN };
+    }
+    return {
+      path: rel, status: "unavailable", truncated: false, bytes: stat.size, attempt_n: attemptN,
+      reason: `attempt ${attemptN} artifact ${rel} is a pre-existing file without this run's creation proof (never claimed as this run's output)${recorded.reason ? `; ${recorded.reason}` : ""}`
+    };
+  } catch { /* absent below */ }
+  void engine;
   return {
     status: "unavailable", truncated: false, attempt_n: attemptN,
-    reason: `attempt ${attemptN} artifact absent (no ${candidates.join(" nor ")}; the worker wrote none and finalize created none)`
+    reason: `attempt ${attemptN} artifact absent (no ${rel}; the worker wrote none and finalize created none)`
   };
 }
 
@@ -2024,7 +2121,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           } else if (engine === "opencode") {
             launchOpenCodeReal(deps, bridgeDir, run, plan, timeoutMs, prompt, isCanary, sessionId);
           } else {
-            launchClaudeChild(deps, bridgeDir, run, buildPlannedArgv(plan, prompt, path.join(run.workdir, "claude-last-message.json"), sessionId), timeoutMs, prompt, isCanary);
+            launchClaudeChild(deps, bridgeDir, run, buildPlannedArgv(plan, prompt, path.join(run.workdir, lastMessageRelPathForAttempt("claude", 1, run.runId)), sessionId), timeoutMs, prompt, isCanary);
           }
         } catch (error) {
           // Ambiguous post-spawn (child spawned OK, then identity-save
@@ -2150,10 +2247,19 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         const gated = gateLaunchRequest(args as Record<string, unknown>);
         if (!gated.ok) return failResult(gated.text, gated.structured);
         const plan = gated.plan;
-        const lastMessagePath = path.join(resolved.absPath,
-          plan.engine === "codex" ? "codex-last-message.md"
-          : plan.engine === "opencode" ? "opencode-last-message.json"
-          : "claude-last-message.json");
+        // Preview display template only (dry-run, never persisted, never
+        // spawned): the real artifact name binds (run_id, attempt) at
+        // launch as <stem>-<shortRunId>-attempt-<N><ext> for EVERY attempt.
+        // The "<run-id>" token marks the slot the launch mint fills; this
+        // template must never leak into persisted state as a real path.
+        const previewArtifactRel = (() => {
+          const base = lastMessageRelPath(plan.engine);
+          const dot = base.lastIndexOf(".");
+          const stem = dot >= 0 ? base.slice(0, dot) : base;
+          const ext = dot >= 0 ? base.slice(dot) : "";
+          return `${stem}-<run-id>-attempt-1${ext}`;
+        })();
+        const lastMessagePath = path.join(resolved.absPath, previewArtifactRel);
         // Claude always rides a stable --session-id (minted when omitted):
         // preview shows the explicit id or the mint placeholder, never a fake.
         const sessionForArgv = plan.engine === "claude"
@@ -2285,13 +2391,17 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         // terminal result (or empty tails) the evidence is explicitly
         // unavailable, never implied. The durable last-message file is
         // reported by presence + path (ordinary read route), never inlined,
-        // and is bound to the CURRENT attempt by recorded provenance (an
-        // earlier attempt's file is never surfaced as the current result).
+        // and is bound to the CURRENT attempt by recorded finalize
+        // provenance (the attempt's own outputArtifact record: O_EXCL
+        // creation or a run-bound worker-write verdict). A preoccupied,
+        // shared, or legacy file without this run's recorded provenance is
+        // never surfaced as present; a run with no recorded provenance (or
+        // no attempts at all) reports unavailable with a reason.
         const terminalStates = DELEGATION_TERMINAL_STATES.has(current.state);
         const currentAttempt = current.attempts.at(-1);
         const lastMessage = currentAttempt
-          ? describeAttemptArtifact(current.workdir, current.engine, currentAttempt.n, currentAttempt.outputArtifact?.relPath)
-          : describeLastMessageArtifact(current.workdir, current.engine);
+          ? describeAttemptArtifact(current.workdir, current.engine, currentAttempt.n, currentAttempt.outputArtifact)
+          : describeAttemptArtifact(current.workdir, current.engine, 0, undefined);
         const testEvidence = buildTestEvidence({
           terminal: terminalStates,
           state: current.state,
@@ -2747,7 +2857,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             // path is per-(run, attempt): a continuation never reuses an
             // earlier attempt's output file as its result.
             const lastMessagePath = path.join(run.workdir,
-              lastMessageRelPathForAttempt(run.engine, staged.attemptN));
+              lastMessageRelPathForAttempt(run.engine, staged.attemptN, run.runId));
             try {
               if (run.engine === "codex" && continuationLabel === "resumed" && resumeSessionId) {
                 child = launchCodexResume(deps, bridgeDir, run, resumeSessionId, staged.timeoutMs, staged.prompt, runIsCanary, staged.attemptN);
@@ -3119,12 +3229,117 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
             }
           );
         }
+        // Already-terminal runs NEVER report unconditional cleanup success:
+        // completed, failed, timed_out, and interrupted runs all re-verify
+        // live under the same evidence standard as the cancelled repeat
+        // path above (persisted descendant PID+starttime identities
+        // rechecked live + a fresh ownership-grounded tree walk + a
+        // windowed quiescence probe). Without grounding the verdict stays
+        // incomplete/unknown — never success. Legacy shared-service runs
+        // keep their label (never converted); the label rides along while
+        // the evidence decides the verdict.
         if (current.state === "completed" || current.state === "failed" ||
           current.state === "timed_out" || current.state === "interrupted") {
           if (reconciled.changed) saveDelegationRun(bridgeDir, current);
-          return okResult(`Run ${current.runId} is already ${current.state}; cancel is idempotent.`, {
-            run_id: current.runId, state: current.state, already_terminal: true, cleanup_finished: true
-          });
+          const termLatest = current.attempts.at(-1);
+          const termBefore = snapshotWorkdirMtimes(current.workdir);
+          const termStart = Date.now();
+          await sleepMs(QUIESCENCE_GRACE_MS);
+          const termFirst = findPostCancelWrites(current.workdir, termBefore, termStart);
+          await sleepMs(QUIESCENCE_VERIFY_WINDOW_MS);
+          const termSecond = findPostCancelWrites(current.workdir, termBefore, termStart);
+          const termQuiescence = mergeQuiescenceLegs(termFirst, termSecond);
+          const termPriorMembers: OwnedTreeMemberIdentity[] = Array.isArray(current.lastCancelVerification?.ownedTreeMembers)
+            ? current.lastCancelVerification.ownedTreeMembers.filter((m) =>
+              !!m && Number.isSafeInteger(m.pid) && (m.pid as number) > 0 && typeof m.startTime === "string" && !!(m.startTime as string))
+            : [];
+          const termMemberAlive = aliveTreeMembers(termPriorMembers);
+          const termRootWalk = termLatest?.pid === undefined
+            ? { staleRoot: true as const, members: [] as number[], baselines: new Map<number, string>() }
+            : collectOwnedTree(termLatest.pid, termLatest.processStartTime);
+          const termRootAlive = termRootWalk.staleRoot
+            ? []
+            : termRootWalk.members.filter((pid) => readProcessStartTime(pid) === termRootWalk.baselines.get(pid));
+          // The bare attempt root is liveness signal only, never grounding:
+          // a stale root with no enumerated descendant identities is
+          // UNVERIFIED (an exited root never hides a surviving reparented
+          // descendant). Only a live enumeration grounds cleanup.
+          const termLatestAlive = termLatest?.pid !== undefined && termLatest.processStartTime !== undefined &&
+            isProcessIdentityAlive(termLatest.pid, termLatest.processStartTime)
+            ? [termLatest.pid]
+            : [];
+          const termRemaining = [...new Set([...termMemberAlive, ...termRootAlive, ...termLatestAlive])];
+          const termGrounded = termPriorMembers.length > 0 || !termRootWalk.staleRoot;
+          const termClean = termRemaining.length === 0 && termGrounded;
+          const termQuiesced = termQuiescence.checked && termQuiescence.continued.length === 0;
+          const termComplete = termClean && termQuiesced;
+          const termOwnershipReason = termGrounded
+            ? undefined
+            : "ownership UNVERIFIED (no live owned-tree enumeration for this terminal run: a missing pid or stale root is never proof of cleanup)";
+          // Carry identities forward (plus any freshly enumerated while the
+          // root is alive) so a later cancel rechecks them too.
+          const termFreshMembers: OwnedTreeMemberIdentity[] = termRootWalk.staleRoot
+            ? []
+            : [...termRootWalk.baselines.entries()]
+              .filter(([pid]) => termRootWalk.members.includes(pid))
+              .map(([pid, startTime]) => ({ pid, startTime }));
+          const termMergedIdentities = new Map<number, string>();
+          for (const m of [...termPriorMembers, ...termFreshMembers]) {
+            if (!termMergedIdentities.has(m.pid)) termMergedIdentities.set(m.pid, m.startTime);
+          }
+          current.lastCancelVerification = {
+            at: new Date().toISOString(),
+            cleanupFinished: termClean,
+            verificationComplete: termComplete,
+            remainingPids: termRemaining,
+            quiesced: termQuiesced,
+            quiescenceChecked: termQuiescence.checked,
+            ownedTreeMembers: [...termMergedIdentities.entries()].map(([pid, startTime]) => ({ pid, startTime })),
+            ...([termOwnershipReason, termQuiescence.reason].some(Boolean)
+              ? { reason: [termOwnershipReason, termQuiescence.reason].filter(Boolean).join("; ") }
+              : {})
+          };
+          saveDelegationRun(bridgeDir, current);
+          const termVerification = {
+            rechecked: true as const,
+            pid_tree: {
+              remaining: termRemaining,
+              cleanup_finished: termClean,
+              ownership_verified: termGrounded
+            },
+            quiescence: {
+              checked: termQuiescence.checked,
+              quiesced: termQuiesced,
+              continued_writes: termQuiescence.continued,
+              ...(termQuiescence.truncated ? { truncated: true as const } : {}),
+              ...(termQuiescence.reason ? { reason: termQuiescence.reason } : {})
+            },
+            verification_complete: termComplete
+          };
+          const termRoute = current.engine === "opencode"
+            ? (() => {
+              const routeLabel = opencodeExecutionRoute(current);
+              return {
+                execution_route: routeLabel.route,
+                ...(routeLabel.legacy
+                  ? { execution_route_note: "legacy run predates the standalone route; labeled shared-service, never silently converted" }
+                  : {})
+              };
+            })()
+            : {};
+          return okResult(
+            termComplete
+              ? `Run ${current.runId} is already ${current.state}; re-verified: owned tree gone with a grounded enumeration, workdir quiet across the verification window.`
+              : `Run ${current.runId} is already ${current.state}; cancel re-verified INCOMPLETE: ${termRemaining.length > 0 ? `${termRemaining.length} owned process(es) still remain (${termRemaining.join(",")}). ` : ""}${!termGrounded ? "ownership UNVERIFIED (no live owned-tree enumeration; a missing pid or stale root is never proof of cleanup). " : ""}${!termQuiescence.checked ? `quiescence UNVERIFIABLE (${termQuiescence.reason ?? "workdir unreadable"}).` : termQuiescence.continued.length > 0 ? `quiescence FAILED: ${termQuiescence.continued.length} post-cancel write(s).` : ""}`,
+            {
+              run_id: current.runId, state: current.state, already_terminal: true, cancelled: false,
+              cleanup_finished: termClean,
+              remaining_pids: termRemaining,
+              cancel_verification: termVerification,
+              ...termRoute,
+              engine_qualification: engineQualification(current.engine)
+            }
+          );
         }
         // Quiescence baseline BEFORE signaling: any workdir write at/after
         // cancel-complete means the worker (or an orphan of it) kept going.

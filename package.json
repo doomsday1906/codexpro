@@ -142,6 +142,8 @@
     "delegation-repair-focus:smoke": "npm run build && node scripts/delegation-repair-focus-smoke.mjs",
     "delegation-identity:smoke": "npm run build && node scripts/delegation-identity-standalone-output-smoke.mjs",
     "delegation-cancel-artifact:smoke": "npm run build && node scripts/delegation-cancel-artifact-smoke.mjs",
+    "delegation-artifact-isolation:smoke": "npm run build && node scripts/delegation-artifact-isolation-smoke.mjs",
+    "delegation-terminal-cleanup:smoke": "npm run build && node scripts/delegation-terminal-cleanup-smoke.mjs",
     "connect": "node scripts/codexpro.mjs",
     "connect:setup": "node scripts/codexpro.mjs setup",
     "connect:local": "node scripts/codexpro.mjs --tunnel none",

@@ -1,0 +1,7 @@
+ok: B1 MCP (interrupted cancel without evidence stays incomplete/unknown; repeat rechecks live)
+ok: B2 MCP (timed_out cancel without evidence stays incomplete/unknown; repeat rechecks live)
+ok: B3 MCP (legacy shared-service cancel stays incomplete/unknown; label preserved, never converted)
+ok: B4 MCP (seeded cached success overturned by live recheck; no cached success)
+ok: B5 MCP (live owned tree verifies success; repeat stays success only when proven)
+delegation-terminal-cleanup-smoke: PASS (no live model calls; fake-binary results labeled shim)
+EXIT_CODE=0

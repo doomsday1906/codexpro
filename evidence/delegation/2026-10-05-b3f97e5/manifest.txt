@@ -1,0 +1,123 @@
+TESTED-SOURCE MANIFEST — codexpro binding leaf
+Dir: evidence/delegation/2026-10-05-b3f97e5/
+HEAD: b3f97e5233c5bbadc4f71edf4e72d6a429fc4ce5
+Date (UTC): 2026-10-05
+Base instruction: HEAD b3f97e5 with uncommitted delta, uncommitted only.
+
+1) git rev-parse HEAD
+b3f97e5233c5bbadc4f71edf4e72d6a429fc4ce5
+
+2) git status --short (tested-source binding, captured BEFORE evidence dir existed)
+ M package.json
+ M scripts/delegation-canary-smoke.mjs
+ M scripts/delegation-cancel-artifact-smoke.mjs
+ M scripts/delegation-identity-standalone-output-smoke.mjs
+ M src/delegationStore.ts
+ M src/delegationTools.ts
+?? fixture-a.txt
+?? fixture-b.txt
+?? scripts/delegation-artifact-isolation-smoke.mjs
+?? scripts/delegation-terminal-cleanup-smoke.mjs
+
+2b) git status --short (at manifest time; adds this leaf's own 11 proof .txt outputs)
+ M package.json
+ M scripts/delegation-canary-smoke.mjs
+ M scripts/delegation-cancel-artifact-smoke.mjs
+ M scripts/delegation-identity-standalone-output-smoke.mjs
+ M src/delegationStore.ts
+ M src/delegationTools.ts
+?? evidence/delegation/2026-10-05-b3f97e5/build.txt
+?? evidence/delegation/2026-10-05-b3f97e5/delegation-artifact-isolation-smoke.txt
+?? evidence/delegation/2026-10-05-b3f97e5/delegation-canary-smoke.txt
+?? evidence/delegation/2026-10-05-b3f97e5/delegation-cancel-artifact-smoke.txt
+?? evidence/delegation/2026-10-05-b3f97e5/delegation-followup-smoke.txt
+?? evidence/delegation/2026-10-05-b3f97e5/delegation-identity-standalone-output-smoke.txt
+?? evidence/delegation/2026-10-05-b3f97e5/delegation-repair-focus-smoke.txt
+?? evidence/delegation/2026-10-05-b3f97e5/delegation-routing-smoke.txt
+?? evidence/delegation/2026-10-05-b3f97e5/delegation-storage-smoke.txt
+?? evidence/delegation/2026-10-05-b3f97e5/delegation-terminal-cleanup-smoke.txt
+?? evidence/delegation/2026-10-05-b3f97e5/delegation-triengine-smoke.txt
+?? fixture-a.txt
+?? fixture-b.txt
+?? scripts/delegation-artifact-isolation-smoke.mjs
+?? scripts/delegation-terminal-cleanup-smoke.mjs
+Note: evidence/delegation/2026-10-05-b3f97e5/*.txt lines are THIS leaf's proof outputs, not tested source.
+Tested source = 6 modified tracked paths + 4 untracked strays (fixture-a.txt, fixture-b.txt, 2 smoke scripts).
+
+3) git write-tree (bare; binds INDEX only, not unstaged working tree)
+acb4324363885bba35d1806e3a582031d7b2b63e
+
+4) git rev-parse HEAD^{tree} + comparison
+HEAD^{tree}: acb4324363885bba35d1806e3a582031d7b2b63e
+write-tree:  acb4324363885bba35d1806e3a582031d7b2b63e
+write-tree EQUALS HEAD^{tree}: YES (equal)
+Explanation: all 6 tracked modifications are UNSTAGED (leading ' M' in status). Bare
+`git write-tree` writes the index, so it cannot reflect unstaged deltas and therefore
+equals HEAD^{tree} despite a dirty working tree. The task brief's expectation
+("expect NOT equal while delta uncommitted") is FALSE for unstaged deltas under bare
+write-tree. Binding for the unstaged delta is HEAD + status --short + git diff HEAD
+(see §2 and diff stat below), NOT write-tree inequality. No staging was performed
+(staging would have mutated the index; left untouched per uncommitted instruction).
+git diff HEAD --stat (working-tree delta not in write-tree):
+ package.json                                       |   2 +
+ scripts/delegation-canary-smoke.mjs                |   5 +-
+ scripts/delegation-cancel-artifact-smoke.mjs       | 121 ++++--
+ scripts/delegation-identity-standalone-output-smoke.mjs |  11 +-
+ src/delegationStore.ts                             |  14 +
+ src/delegationTools.ts                             | 421 ++++++++++++++++-----
+ 6 files changed, 443 insertions(+), 131 deletions(-)
+
+5) dist/build-identity.json (after `npm run build` rebuild at 2026-10-05; dist mtime 05:17:30 newer than src 05:03:27)
+{
+  "schema_version": 1,
+  "package_name": "codexpro",
+  "package_version": "0.31.0",
+  "source_commit": "b3f97e5233c5bbadc4f71edf4e72d6a429fc4ce5",
+  "source_state": "dirty"
+}
+Build log: evidence/delegation/2026-10-05-b3f97e5/build.txt (EXIT_CODE=0)
+
+6) Per-smoke exit codes (exact commands as specified; each log retains stdout+EXIT_CODE line)
+npm run build                                              -> 0 (build.txt)
+node scripts/delegation-artifact-isolation-smoke.mjs       -> 0 (delegation-artifact-isolation-smoke.txt)
+node scripts/delegation-terminal-cleanup-smoke.mjs         -> 0 (delegation-terminal-cleanup-smoke.txt)
+node scripts/delegation-cancel-artifact-smoke.mjs           -> 0 (delegation-cancel-artifact-smoke.txt)
+node scripts/delegation-identity-standalone-output-smoke.mjs -> 0 (delegation-identity-standalone-output-smoke.txt)
+node scripts/delegation-triengine-smoke.mjs                -> 0 (delegation-triengine-smoke.txt)
+node scripts/delegation-repair-focus-smoke.mjs              -> 0 (delegation-repair-focus-smoke.txt)
+node scripts/delegation-storage-smoke.mjs                   -> 0 (delegation-storage-smoke.txt)
+node scripts/delegation-followup-smoke.mjs                  -> 0 (delegation-followup-smoke.txt)
+node scripts/delegation-canary-smoke.mjs                    -> 0 (delegation-canary-smoke.txt)
+node scripts/delegation-routing-smoke.mjs                   -> 0 (delegation-routing-smoke.txt)
+OVERALL: 11/11 exit 0 — PASS (no nonzero; no FAIL mutation beyond logs)
+
+7) STALE-LABEL WARNING (explicit)
+dist/build-identity.json prints source_commit b3f97e5 + source_state "dirty".
+The "dirty" label is STALE-PRONE: two different working-tree deltas on the same base
+commit print the identical string "b3f97e5 (dirty)". The label alone does NOT bind
+which delta was tested. Only the triple HEAD + `git status --short` (+ `git diff HEAD`
+for unstaged content) + write-tree/index state binds the tested tree. Consumers must
+not accept build-identity.json or any "(dirty)" label as source binding without the
+status/diff recorded here. Additionally, bare write-tree binds the index only; for
+unstaged deltas the diff is the load-bearing binding (see §4).
+
+8) Legacy shared-name artifact check (new writes)
+grep "run-bound" in new smoke outputs:
+ - delegation-artifact-isolation-smoke.txt: A2/A3 "new run writes + reads its own run-bound file"
+ - delegation-cancel-artifact-smoke.txt: D2 "run-bound per-(run,attempt) paths, O_EXCL incl. preoccupied nonempty, provenance-bound reads"
+grep "shared": only hit is delegation-terminal-cleanup-smoke.txt B3 "legacy shared-service
+ cancel stays incomplete/unknown; label preserved, never converted" — i.e. legacy path is
+ terminally terminal (never converted to success), NOT a new-write target.
+grep "legacy" other hits (canary K8 LEGACY-COMPAT wire proof; storage S2/S3 migration +
+ opt-in; identity C2 honest legacy labels; triengine T7 wildcards) — none describe a new
+ write to a legacy shared name. No smoke output claims a new write to a shared/legacy
+ fixed name. Storage S1 explicitly: "NO repo .ai-bridge created".
+Verdict: no legacy shared-name artifact for new writes — PASS.
+
+9) Scope compliance
+- Writable scope only: evidence/delegation/2026-10-05-b3f97e5/ (13 files: 11 logs + manifest.txt + manifest.json; .txt/.json only, zero *.log).
+- src/, scripts/, package.json: NOT modified by this leaf (pre-existing delta left intact, uncommitted).
+- No commit performed.
+- fixture-a.txt (119 B, sha256 ce299a8d…) / fixture-b.txt (108 B, sha256 13aafb27…) strays: untouched (mtime 04:35:40, content unchanged).
+- missions/, leases, worktrees, docs/LIVE_STEERING_DESIGN.md: untouched.
+- No live model calls: smokes report shim/fake-binary or hermetic/loopback only; no model invocation by this leaf.

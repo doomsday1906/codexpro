@@ -361,15 +361,18 @@ try {
   assert(!read.isError, 'output run must be readable');
   const te = read.structuredContent.test_evidence;
   assert(te && te.stdout_tail_present === true, `bounded stdout tail must be present: ${JSON.stringify(te)}`);
-  assert(te.last_message && te.last_message.status === 'present' && te.last_message.path === 'opencode-last-message.json',
-    `last-message must be present with its path: ${JSON.stringify(te.last_message)}`);
-  const artifactAbs = path.join(wsRoot, 'oc-out-1', 'opencode-last-message.json');
+  const expectedOutRel = Tools.lastMessageRelPathForAttempt('opencode', 1, o2Id);
+  assert(te.last_message && te.last_message.status === 'present' && te.last_message.path === expectedOutRel && te.last_message.attempt_n === 1,
+    `last-message must be present with its run-bound path + provenance: ${JSON.stringify(te.last_message)}`);
+  const artifactAbs = path.join(wsRoot, 'oc-out-1', expectedOutRel);
   assert(fs.existsSync(artifactAbs), 'promised bounded output artifact must exist on disk');
   assert(fs.readFileSync(artifactAbs, 'utf8').includes('bounded worker output'),
     'persisted artifact must carry the bounded worker output');
+  assert(!fs.existsSync(path.join(wsRoot, 'oc-out-1', 'opencode-last-message.json')),
+    'no legacy shared artifact may be created for a new run');
   assert(read.structuredContent.execution_route === 'standalone', 'output run must ack the standalone route');
   const wd = read.structuredContent.workdir_evidence;
-  assert(wd && (wd.changed ?? []).some((c) => c.includes('opencode-last-message.json')),
+  assert(wd && (wd.changed ?? []).some((c) => c.includes('opencode-last-message-')),
     `persisted artifact must be attributed in change evidence: ${JSON.stringify(wd && wd.changed)}`);
   console.log('ok: C3 MCP (bounded OpenCode output artifact persisted, attributed, route acked)');
 }

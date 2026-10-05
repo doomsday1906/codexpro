@@ -35,6 +35,7 @@ function quoteArg(value) {
 
 const Engines = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationEngines.js')));
 const Store = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationStore.js')));
+const Tools = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationTools.js')));
 const Events = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationEvents.js')));
 function pathToFileUrl(p) { return `file://${p}`; }
 
@@ -730,7 +731,9 @@ console.log('fake agent completed ' + process.argv[taskIndex + 1]);
   assert(realTerminal.delegationGroup === 'e2e-real-1', 'run file must store the custom group');
   assert(realTerminal.result?.fixturesUnchanged === undefined, 'real tasks carry no fixture verdict');
   const realFiles = fs.readdirSync(path.join(realRootH2, 'e2e-real-1')).sort();
-  assert(!realFiles.includes('fixture-a.txt') && realFiles.includes('codex-last-message.md'), `real workdir stages no fixtures: ${realFiles.join(',')}`);
+  const expectedRealArtifact = Tools.lastMessageRelPathForAttempt('codex', 1, realRunId);
+  assert(!realFiles.includes('fixture-a.txt') && realFiles.includes(expectedRealArtifact), `real workdir stages no fixtures and binds the run-bound artifact: ${realFiles.join(',')}`);
+  assert(!realFiles.includes('codex-last-message.md'), 'no legacy shared artifact may be created for a new run');
   assert(realTerminal.result?.stdoutTail?.includes('REALTASK-NO-FIXTURES'), 'worker must observe the fixture-free workdir');
   const shaOf = (s) => createHash('sha256').update(s ?? '', 'utf8').digest('hex');
   const firstSha = shaOf(realTerminal.result?.stdoutTail);

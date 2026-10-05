@@ -1,0 +1,7 @@
+ok: D2 unit (run-bound per-(run,attempt) paths, O_EXCL incl. preoccupied nonempty, provenance-bound reads)
+ok: D1 unit (exited root + surviving descendant -> incomplete + non-empty remaining; stale never success)
+ok: D1 MCP (pid-less uncertain-dispatch cancel stays uncertain/incomplete, repeat included)
+ok: D2a MCP (second attempt cannot surface first attempt output; provenance attempt_n=2)
+ok: D2b MCP (empty preoccupied file untouched + unavailable; new attempt writes own path)
+delegation-cancel-artifact-smoke: PASS (no live model calls; fake-binary results labeled shim)
+EXIT_CODE=0

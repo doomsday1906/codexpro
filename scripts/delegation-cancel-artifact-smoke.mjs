@@ -42,18 +42,34 @@ const Engines = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationEn
 const Store = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationStore.js')));
 const Tools = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationTools.js')));
 
-// ---------- unit D1/D2: per-attempt paths + exclusive create ----------
+// ---------- unit D1/D2: run-bound per-attempt paths + exclusive create ----------
 {
+  // New artifacts ALWAYS bind (run_id, attempt) — including attempt 1.
+  // Legacy shared names are never created anew; the legacy shape survives
+  // read-only (no run id) for pre-binding run files only.
+  const RUN_A = 'run_aaaaaaaaaaaaaaaa';
+  const SHORT_A = Tools.shortRunId(RUN_A);
+  assert(SHORT_A === 'aaaaaaaa', `short run id binds the run: ${SHORT_A}`);
+  assert(Tools.lastMessageRelPathForAttempt('opencode', 1, RUN_A) === `opencode-last-message-${SHORT_A}-attempt-1.json`,
+    `attempt 1 binds run+attempt, never the legacy shared name: ${Tools.lastMessageRelPathForAttempt('opencode', 1, RUN_A)}`);
+  assert(Tools.lastMessageRelPathForAttempt('opencode', 0, RUN_A) === `opencode-last-message-${SHORT_A}-attempt-1.json`,
+    'non-positive attempt numbers clamp to attempt 1 within the run namespace');
+  assert(Tools.lastMessageRelPathForAttempt('opencode', 2, RUN_A) === `opencode-last-message-${SHORT_A}-attempt-2.json`,
+    `attempt 2 gets its own run-bound file: ${Tools.lastMessageRelPathForAttempt('opencode', 2, RUN_A)}`);
+  assert(Tools.lastMessageRelPathForAttempt('codex', 3, RUN_A) === `codex-last-message-${SHORT_A}-attempt-3.md`,
+    'codex attempts suffix before the extension inside the run namespace');
+  assert(Tools.lastMessageRelPathForAttempt('claude', 2, RUN_A) === `claude-last-message-${SHORT_A}-attempt-2.json`,
+    'claude attempts are per-(run, attempt) too');
+  const RUN_B = 'run_bbbbbbbbbbbbbbbb';
+  assert(Tools.lastMessageRelPathForAttempt('opencode', 1, RUN_A) !== Tools.lastMessageRelPathForAttempt('opencode', 1, RUN_B),
+    'attempt suffix alone is insufficient: different runs bind different files even in one shared workdir');
   assert(Tools.lastMessageRelPathForAttempt('opencode', 1) === 'opencode-last-message.json',
-    'attempt 1 keeps the legacy artifact name');
-  assert(Tools.lastMessageRelPathForAttempt('opencode', 0) === 'opencode-last-message.json',
-    'non-positive attempt numbers fall back to the legacy name');
+    'legacy shape without a run id is preserved read-only (never for new writes)');
   assert(Tools.lastMessageRelPathForAttempt('opencode', 2) === 'opencode-last-message-attempt-2.json',
-    `attempt 2 gets its own file: ${Tools.lastMessageRelPathForAttempt('opencode', 2)}`);
-  assert(Tools.lastMessageRelPathForAttempt('codex', 3) === 'codex-last-message-attempt-3.md',
-    'codex attempts suffix before the extension');
-  assert(Tools.lastMessageRelPathForAttempt('claude', 2) === 'claude-last-message-attempt-2.json',
-    'claude attempts are per-attempt too');
+    'legacy suffixed shape without a run id is preserved read-only');
+  assert(JSON.stringify(Tools.attemptArtifactFallbackPaths('opencode', 1, RUN_A)) === JSON.stringify(
+    [1, 2, 3].map((i) => `opencode-last-message-${SHORT_A}-attempt-1-x${i}.json`)),
+    `fallbacks bind the same (run, attempt): ${JSON.stringify(Tools.attemptArtifactFallbackPaths('opencode', 1, RUN_A))}`);
   const adir = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-artifact-excl-'));
   assert(Tools.exclusivelyCreateArtifact(adir, 'a.json', 'hello') === 'a.json',
     'exclusive create succeeds on an absent path');
@@ -65,25 +81,80 @@ const Tools = await import(pathToFileUrl(path.join(ROOT, 'dist', 'delegationTool
   assert(Tools.exclusivelyCreateArtifact(adir, 'empty.json', 'FILL') === null,
     'an existing EMPTY file is never filled (empty = unavailable, not a slot)');
   assert(fs.statSync(path.join(adir, 'empty.json')).size === 0, 'empty file must stay empty');
+  // A preoccupied LEGACY shared file is irrelevant to a run-bound attempt:
+  // the new run writes its own namespace and never claims the legacy file.
   const wdir = await fsp.mkdtemp(path.join(os.tmpdir(), 'codexpro-artifact-preocc-'));
   await fsp.writeFile(path.join(wdir, 'opencode-last-message.json'), '');
-  const rec = Tools.persistAttemptArtifact(wdir, 'opencode', 1, 'retained-output');
-  assert(rec.created === true && rec.relPath === 'opencode-last-message-attempt-1.json',
-    `preoccupied-empty primary must divert to the attempt's own path: ${JSON.stringify(rec)}`);
+  await fsp.writeFile(path.join(wdir, 'codex-last-message.md'), 'LEGACY-JUNK-FROM-ANOTHER-RUN');
+  const primaryA = Tools.lastMessageRelPathForAttempt('opencode', 1, RUN_A);
+  const rec = Tools.persistAttemptArtifact(wdir, 'opencode', 1, 'retained-output', RUN_A);
+  assert(rec.created === true && rec.provenance === 'created' && rec.relPath === primaryA,
+    `run-bound primary is created in its own namespace: ${JSON.stringify(rec)}`);
   assert(fs.statSync(path.join(wdir, 'opencode-last-message.json')).size === 0,
-    'pre-existing empty file must stay empty');
+    'pre-existing empty legacy file must stay empty (never a slot to fill)');
   assert(fs.readFileSync(path.join(wdir, rec.relPath), 'utf8') === 'retained-output',
-    'retained output must land in the attempt-owned fallback');
-  const desc = Tools.describeAttemptArtifact(wdir, 'opencode', 1, rec.relPath);
+    'retained output must land in the attempt-owned run-bound file');
+  const desc = Tools.describeAttemptArtifact(wdir, 'opencode', 1, rec);
   assert(desc.status === 'present' && desc.path === rec.relPath && desc.attempt_n === 1,
     `recorded provenance binds the read: ${JSON.stringify(desc)}`);
+  const descBareString = Tools.describeAttemptArtifact(wdir, 'opencode', 1, rec.relPath);
+  assert(descBareString.status === 'unavailable',
+    `a bare path without a creation verdict never reads present: ${JSON.stringify(descBareString)}`);
   const descLegacy = Tools.describeAttemptArtifact(wdir, 'opencode', 1);
   assert(descLegacy.status === 'unavailable',
-    `the preoccupied legacy file reads unavailable, never a pass: ${JSON.stringify(descLegacy)}`);
+    `no recorded provenance means unavailable, never a legacy lookup: ${JSON.stringify(descLegacy)}`);
   const descMissing = Tools.describeAttemptArtifact(wdir, 'opencode', 2);
   assert(descMissing.status === 'unavailable' && !('path' in descMissing) && descMissing.attempt_n === 2,
     `an attempt with no artifact reports unavailable with no path: ${JSON.stringify(descMissing)}`);
-  console.log('ok: D2 unit (per-attempt paths, O_EXCL incl. empty preoccupation, provenance-bound reads)');
+  // A nonempty preoccupied legacy file is never presented as this run's
+  // result — neither by lookup nor by an unproven record.
+  const descCross = Tools.describeAttemptArtifact(wdir, 'codex', 1);
+  assert(descCross.status === 'unavailable',
+    `legacy lookup without provenance stays unavailable: ${JSON.stringify(descCross)}`);
+  const descCrossRecord = Tools.describeAttemptArtifact(wdir, 'codex', 1, { relPath: 'codex-last-message.md', created: false });
+  assert(descCrossRecord.status === 'unavailable' && /without this run/.test(descCrossRecord.reason ?? ''),
+    `pre-existing file without a creation verdict is never claimed: ${JSON.stringify(descCrossRecord)}`);
+  // Forged run-bound preoccupation (junk at the exact bound primary) diverts
+  // to the attempt's own fallback, never claims the junk.
+  const RUN_C = 'run_cccccccccccccccc';
+  const forgedPrimary = Tools.lastMessageRelPathForAttempt('opencode', 1, RUN_C);
+  await fsp.writeFile(path.join(wdir, forgedPrimary), 'FORGED-JUNK');
+  const recForged = Tools.persistAttemptArtifact(wdir, 'opencode', 1, 'new-output', RUN_C);
+  assert(recForged.created === true && recForged.provenance === 'created' && recForged.relPath !== forgedPrimary &&
+    recForged.relPath.includes(Tools.shortRunId(RUN_C)),
+    `forged preoccupation diverts within the run namespace, never claimed: ${JSON.stringify(recForged)}`);
+  assert(fs.readFileSync(path.join(wdir, forgedPrimary), 'utf8') === 'FORGED-JUNK',
+    'forged file must stay untouched');
+  assert(fs.readFileSync(path.join(wdir, recForged.relPath), 'utf8') === 'new-output',
+    'new output must land in the attempt-owned fallback');
+  // Forged worker-owned preoccupation (junk written BEFORE the attempt
+  // started) is never attributed to the new run.
+  const RUN_D = 'run_dddddddddddddddd';
+  const codexPrimary = Tools.lastMessageRelPathForAttempt('codex', 1, RUN_D);
+  await fsp.writeFile(path.join(wdir, codexPrimary), 'STALE-JUNK');
+  fs.utimesSync(path.join(wdir, codexPrimary), new Date('2020-01-01T00:00:00Z'), new Date('2020-01-01T00:00:00Z'));
+  const recStale = Tools.persistAttemptArtifact(wdir, 'codex', 1, null, RUN_D, new Date().toISOString());
+  assert(recStale.created === false && recStale.provenance === 'unavailable' && /preoccupied/.test(recStale.reason ?? ''),
+    `pre-existing worker-owned file must record unavailable, never bound: ${JSON.stringify(recStale)}`);
+  const descStale = Tools.describeAttemptArtifact(wdir, 'codex', 1, recStale);
+  assert(descStale.status === 'unavailable' && /preoccupied/.test(descStale.reason ?? ''),
+    `pre-existing file reads unavailable with a reason: ${JSON.stringify(descStale)}`);
+  // A genuine worker write (during the attempt) binds the worker verdict.
+  const RUN_E = 'run_eeeeeeeeeeeeeeee';
+  const codexPrimaryE = Tools.lastMessageRelPathForAttempt('codex', 1, RUN_E);
+  const startE = new Date(Date.now() - 1000).toISOString();
+  await fsp.writeFile(path.join(wdir, codexPrimaryE), 'worker wrote this during the attempt');
+  const recWorker = Tools.persistAttemptArtifact(wdir, 'codex', 1, null, RUN_E, startE);
+  assert(recWorker.provenance === 'worker' && recWorker.created === false,
+    `worker-written run-bound file binds the worker verdict: ${JSON.stringify(recWorker)}`);
+  const descWorker = Tools.describeAttemptArtifact(wdir, 'codex', 1, recWorker);
+  assert(descWorker.status === 'present' && descWorker.path === codexPrimaryE,
+    `worker verdict reads present: ${JSON.stringify(descWorker)}`);
+  // No run identity: fail closed, never a legacy shared write.
+  const recNoRun = Tools.persistAttemptArtifact(wdir, 'opencode', 1, 'x');
+  assert(recNoRun.created === false && recNoRun.provenance === 'unavailable',
+    `missing run identity must fail closed: ${JSON.stringify(recNoRun)}`);
+  console.log('ok: D2 unit (run-bound per-(run,attempt) paths, O_EXCL incl. preoccupied nonempty, provenance-bound reads)');
 }
 
 // ---------- unit D1: exited root with surviving descendant ----------
@@ -258,8 +329,10 @@ const OC_TASK = 'Report readiness. Change nothing.';
   const runId = o1.structuredContent.run_id;
   await waitSettled(runId);
   const wd = path.join(wsRoot, 'ca-cont');
-  const a1Rel = 'opencode-last-message.json';
-  assert(fs.existsSync(path.join(wd, a1Rel)), 'attempt 1 must persist its legacy-named artifact');
+  const a1Rel = Tools.lastMessageRelPathForAttempt('opencode', 1, runId);
+  assert(!fs.existsSync(path.join(wd, 'opencode-last-message.json')),
+    'no legacy shared artifact may be created for a new run');
+  assert(fs.existsSync(path.join(wd, a1Rel)), `attempt 1 must persist its run-bound artifact: ${a1Rel}`);
   const a1content = fs.readFileSync(path.join(wd, a1Rel), 'utf8');
   assert(a1content.includes('OUTPUT-MARKER-'), `attempt 1 artifact must carry its marker: ${JSON.stringify(a1content)}`);
   const q = await call('delegation_followup', {
@@ -274,8 +347,9 @@ const OC_TASK = 'Report readiness. Change nothing.';
   assert(!a.isError && a.structuredContent.executed === true && a.structuredContent.attempt_n === 2,
     `answer must dispatch attempt 2: ${JSON.stringify(a.structuredContent)}`);
   await waitSettled(runId);
-  const a2Rel = 'opencode-last-message-attempt-2.json';
-  assert(fs.existsSync(path.join(wd, a2Rel)), 'attempt 2 must persist its OWN artifact path');
+  const a2Rel = Tools.lastMessageRelPathForAttempt('opencode', 2, runId);
+  assert(a2Rel !== a1Rel, 'continuation artifact must bind the new attempt number as well as the run');
+  assert(fs.existsSync(path.join(wd, a2Rel)), `attempt 2 must persist its OWN run-bound artifact path: ${a2Rel}`);
   const a2content = fs.readFileSync(path.join(wd, a2Rel), 'utf8');
   assert(a2content.includes('OUTPUT-MARKER-') && a2content !== a1content,
     `attempt 2 artifact must carry only its own output: ${JSON.stringify(a2content)} vs ${JSON.stringify(a1content)}`);
@@ -307,8 +381,9 @@ const OC_TASK = 'Report readiness. Change nothing.';
   await waitSettled(runId);
   assert(fs.statSync(path.join(preDir, 'opencode-last-message.json')).size === 0,
     'pre-existing empty artifact must stay empty (never a slot to fill)');
-  const ownRel = 'opencode-last-message-attempt-1.json';
-  assert(fs.existsSync(path.join(preDir, ownRel)), 'new attempt must write its own path');
+  const ownRel = Tools.lastMessageRelPathForAttempt('opencode', 1, runId);
+  assert(ownRel !== 'opencode-last-message.json', 'the new attempt must bind its run, never the legacy shared name');
+  assert(fs.existsSync(path.join(preDir, ownRel)), `new attempt must write its own run-bound path: ${ownRel}`);
   const ownContent = fs.readFileSync(path.join(preDir, ownRel), 'utf8');
   assert(ownContent.includes('OUTPUT-MARKER-'), 'owned path must carry the worker output');
   const read = await call('delegation_read_result', { workspace_id: wid, run_id: runId });

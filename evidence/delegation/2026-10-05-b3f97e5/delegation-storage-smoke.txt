@@ -1,0 +1,15 @@
+ok: S1 default user-data layout namespaced by (owner, workspace); NO repo .ai-bridge created
+ok: S2 deliberate migration (copy-only, counts/bytes verified, source intact, receipt, idempotent)
+ok: S2b interrupt after first run copied (retry copies missing only, all records verified, source intact)
+ok: S2c interrupt during sub copying (merge by id: legacy wins, dest-only preserved, source intact)
+ok: S2d interrupt before receipt publication (v1 ignored, differing run healed, v2 published last, source intact)
+ok: S2e post-completion dest run/checkpoint/delivery edit stays final (no legacy overwrite, legacy untouched)
+ok: S2f post-completion unsubscribe stays final (not resurrected, legacy untouched)
+ok: S2g post-completion subscription edit stays final (modification intact, legacy untouched)
+ok: S3 explicit legacy opt-in preserves the workspace .ai-bridge layout
+ok: S4a uncertain-dispatch predicate matrix (proven retryable vs ambiguous/initial-launch uncertain)
+ok: S4b live transition (spawn OK + identity-save failed => AmbiguousSpawnError with child pid)
+ok: S4c MCP retry behavior (uncertain/ambiguous+marker/initial-launch fail closed; proven dispatches once)
+
+delegation-storage-smoke: PASS (user-data layout + deliberate migration + S2b/S2c/S2d interruption recovery + S2e/S2f/S2g post-completion finality + legacy opt-in + spawn-failure truth)
+EXIT_CODE=0

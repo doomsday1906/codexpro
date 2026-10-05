@@ -1,0 +1,15 @@
+ok: 1 installed opencode v2.0.22 route qualified (help/version only, no model call)
+ok: 2a fast completion replayable via durable read (subscribe-before-launch optional)
+ok: 2b duplicate event delivery is identity-safe (deterministic webhook id)
+ok: 2c restart reconciles completed-awaiting-delivery vs interrupted honestly
+ok: 2d/2e expired + revoked subscriptions stop delivery (permanent, exposed, never retried)
+ok: 2f/2g closed-request rejection + attempt-budget refusal (not consumed, open, retryable)
+ok: 2h cancellation idempotent with truthful exact-tree ack (both engines)
+ok: 2i timeout truthful (clamped) + PID+starttime fail-closed, never PID alone
+ok: 2j workspace isolation (escape, blocked glob, symlink refusal)
+ok: 2k one active turn per session (busy refused, settled re-usable)
+ok: 2m session-busy refusal consumes nothing; unverified session is creation-labeled, never resumed
+ok: 2l approval-kind never widens the gate; live-race refused cleanly; validators + idempotent ack
+
+delegation-followup-smoke: PASS (edge matrix hermetic; model calls: none; loopback: delivery-identity only)
+EXIT_CODE=0

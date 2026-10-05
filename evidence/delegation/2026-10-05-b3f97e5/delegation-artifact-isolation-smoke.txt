@@ -1,0 +1,5 @@
+ok: A1 MCP (two runs sharing one workdir + continuations stay isolated; no cross-attribution)
+ok: A2 MCP (preoccupied empty file unavailable + untouched; new run writes + reads its own run-bound file)
+ok: A3 MCP (preoccupied nonempty file unavailable + reason + intact; new run writes + reads its own run-bound file)
+delegation-artifact-isolation-smoke: PASS (no live model calls; fake-binary results labeled shim)
+EXIT_CODE=0
