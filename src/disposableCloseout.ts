@@ -549,6 +549,8 @@ export function backupWorkdirToCentral(
 export interface PhysicalReleaseRecord {
   version: 1;
   binding: { runId: string; ownerIdHash: string; ownerKind: string; workdir: string; engine: string; sessionId: string | null; dirReal: string };
+  /** Exact directory identity bound at prepare time (st_dev + st_ino). Proves the removed target is the prepared target, not a recreated path. */
+  dirIdentity: { dev: number; ino: number };
   releasedAt: string;
   helpersSignalled: number[];
   backup: { fileCount: number; totalBytes: number; manifestSha256: string };
@@ -561,9 +563,21 @@ export interface PhysicalPreparedRecord {
   version: 1;
   phase: "prepared";
   binding: { runId: string; ownerIdHash: string; ownerKind: string; workdir: string; engine: string; sessionId: string | null; dirReal: string };
+  /** Exact directory identity at prepare time (st_dev + st_ino). Retry must prove the current target is this directory, not a recreated path. */
+  dirIdentity: { dev: number; ino: number };
   preparedAt: string;
   helpersSignalled: number[];
   backup: { fileCount: number; totalBytes: number; manifestSha256: string };
+}
+
+/** Canonical directory identity (st_dev + st_ino) for replacement detection. */
+export function statDirIdentity(dirReal: string): { dev: number; ino: number } | undefined {
+  try {
+    const st = fs.statSync(dirReal);
+    if (!st.isDirectory()) return undefined;
+    if (!Number.isSafeInteger(st.dev) || !Number.isSafeInteger(st.ino)) return undefined;
+    return { dev: st.dev, ino: st.ino };
+  } catch { return undefined; }
 }
 
 export function physicalReleasePath(bridgeDir: string, runId: string): string {
@@ -591,6 +605,8 @@ export function readPhysicalPreparedRecord(bridgeDir: string, runId: string): Ph
     const record = JSON.parse(text) as PhysicalPreparedRecord;
     if (!record || record.version !== 1 || record.phase !== "prepared" || !record.binding || typeof record.binding.runId !== "string") return undefined;
     if (record.binding.runId !== runId) return undefined;
+    if (!record.dirIdentity || !Number.isSafeInteger(record.dirIdentity.dev) || !Number.isSafeInteger(record.dirIdentity.ino)) return undefined;
+    if (!record.backup || typeof record.backup.manifestSha256 !== "string") return undefined;
     return record;
   } catch { return undefined; }
 }
@@ -629,6 +645,7 @@ export function readPhysicalReleaseRecord(bridgeDir: string, runId: string): Phy
     const record = JSON.parse(text) as PhysicalReleaseRecord;
     if (!record || record.version !== 1 || !record.binding || typeof record.binding.runId !== "string") return undefined;
     if (record.binding.runId !== runId) return undefined;
+    if (!record.dirIdentity || !Number.isSafeInteger(record.dirIdentity.dev) || !Number.isSafeInteger(record.dirIdentity.ino)) return undefined;
     return record;
   } catch { return undefined; }
 }
@@ -755,6 +772,7 @@ export async function releaseDisposableWorktree(
     const recovered: PhysicalReleaseRecord = {
       version: 1,
       binding: prepared.binding,
+      dirIdentity: prepared.dirIdentity,
       releasedAt: new Date().toISOString(),
       helpersSignalled: prepared.helpersSignalled,
       backup: prepared.backup,
@@ -801,30 +819,94 @@ export async function releaseDisposableWorktree(
   // transcript alone is not a backup of workdir files.
   const backup = backupWorkdirToCentral(bridgeDir, run.runId, dirReal, binding);
   if (!backup.ok) return fail(backup.reason, { helpersSignalled: signalled.signalled });
+  const backupSummary = { fileCount: backup.fileCount ?? 0, totalBytes: backup.totalBytes ?? 0, manifestSha256: backup.manifestSha256 ?? "" };
+  // Canonical directory identity at prepare time. Pathname equality alone
+  // is never sufficient: a recreated directory at the same path has a
+  // different (dev, ino) and must not be treated as the prepared target.
+  const currentIdentity = statDirIdentity(dirReal);
+  if (!currentIdentity) return fail("prepared-stat-failed", { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
   // Durable prepared intent BEFORE the destructive boundary. Binds run,
-  // owner, engine/session, exact directory identity, verified backup, and
-  // the signalled helper set, so any interruption around removal can be
-  // recovered truthfully. A conflicting prepared state fails closed without
-  // deleting anything additional.
-  const preparedRecord: PhysicalPreparedRecord = {
-    version: 1,
-    phase: "prepared",
-    binding: { ...binding, dirReal },
-    preparedAt: new Date().toISOString(),
-    helpersSignalled: signalled.signalled,
-    backup: { fileCount: backup.fileCount ?? 0, totalBytes: backup.totalBytes ?? 0, manifestSha256: backup.manifestSha256 ?? "" },
+  // owner, engine/session, exact directory identity (realpath + dev/ino),
+  // verified backup, and the signalled helper set, so any interruption
+  // around removal can be recovered truthfully.
+  //
+  // Reuse rule for `prepared + target still present`: an existing valid
+  // prepared transaction is validated (binding, directory identity, bound
+  // backup) and reused. Incidental metadata (preparedAt, helpersSignalled
+  // union) never blocks a legitimate retry. A mismatched, malformed,
+  // replaced-path, invalid-backup, or otherwise unproven prepared state
+  // fails closed without deleting anything further and without overwriting
+  // the conflicting record.
+  const bindingsEqual = (a: ReleaseRunBinding & { dirReal: string }, b: ReleaseRunBinding & { dirReal: string }): boolean =>
+    JSON.stringify({ ...a, dirReal: a.dirReal }) === JSON.stringify({ ...b, dirReal: b.dirReal });
+  const validateExistingPrepared = (existing: PhysicalPreparedRecord): { ok: boolean; reason?: string } => {
+    if (JSON.stringify({ ...existing.binding, dirReal: existing.binding.dirReal }) !== JSON.stringify({ ...binding, dirReal: existing.binding.dirReal })) return { ok: false, reason: "prepared-binding-mismatch" };
+    if (existing.binding.dirReal !== dirReal) return { ok: false, reason: "prepared-binding-mismatch" };
+    if (existing.dirIdentity.dev !== currentIdentity.dev || existing.dirIdentity.ino !== currentIdentity.ino) return { ok: false, reason: "prepared-identity-mismatch" };
+    if (existing.backup.manifestSha256 !== backupSummary.manifestSha256) return { ok: false, reason: "prepared-backup-mismatch" };
+    if (!verifyBackupManifest(bridgeDir, run.runId, existing.backup.manifestSha256)) return { ok: false, reason: "prepared-backup-unverified" };
+    return { ok: true };
   };
-  try {
-    atomicPublishFile(physicalPreparedPath(bridgeDir, run.runId), `${JSON.stringify(preparedRecord)}\n`);
-  } catch {
-    const conflicting = readPhysicalPreparedRecord(bridgeDir, run.runId);
-    if (!conflicting || JSON.stringify(conflicting) !== JSON.stringify(preparedRecord)) {
-      return fail("prepared-state-conflict", { helpersSignalled: signalled.signalled, backupFileCount: backup.fileCount, backupTotalBytes: backup.totalBytes });
+  let effectivePrepared: PhysicalPreparedRecord;
+  let effectiveHelpers: number[];
+  const mergeHelpers = (a: number[], b: number[]): number[] => [...new Set([...(a ?? []), ...(b ?? [])])].sort((x, y) => x - y);
+  const existingPrepared = readPhysicalPreparedRecord(bridgeDir, run.runId);
+  if (existingPrepared) {
+    const validation = validateExistingPrepared(existingPrepared);
+    if (!validation.ok) {
+      return fail(validation.reason as string, { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
+    }
+    effectivePrepared = existingPrepared;
+    effectiveHelpers = mergeHelpers(existingPrepared.helpersSignalled, signalled.signalled);
+  } else {
+    let preparedFileExists = false;
+    try { fs.lstatSync(physicalPreparedPath(bridgeDir, run.runId)); preparedFileExists = true; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code !== "ENOENT") {
+        return fail("prepared-state-unproven", { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
+      }
+    }
+    if (preparedFileExists) {
+      // File exists but is malformed/unreadable: fail closed, never overwrite.
+      return fail("prepared-state-unproven", { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
+    }
+    const fresh: PhysicalPreparedRecord = {
+      version: 1,
+      phase: "prepared",
+      binding: { ...binding, dirReal },
+      dirIdentity: currentIdentity,
+      preparedAt: new Date().toISOString(),
+      helpersSignalled: signalled.signalled,
+      backup: backupSummary,
+    };
+    try {
+      atomicPublishFile(physicalPreparedPath(bridgeDir, run.runId), `${JSON.stringify(fresh)}\n`);
+      effectivePrepared = fresh;
+      effectiveHelpers = [...fresh.helpersSignalled];
+    } catch {
+      // Publish race: another attempt won. Reuse the winner when valid,
+      // otherwise fail closed without deleting or overwriting.
+      const winner = readPhysicalPreparedRecord(bridgeDir, run.runId);
+      if (!winner) {
+        return fail("prepared-state-conflict", { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
+      }
+      const winnerValidation = validateExistingPrepared(winner);
+      if (!winnerValidation.ok) {
+        return fail(winnerValidation.reason as string, { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
+      }
+      effectivePrepared = winner;
+      effectiveHelpers = mergeHelpers(winner.helpersSignalled, signalled.signalled);
     }
   }
-  const preparedVerified = readPhysicalPreparedRecord(bridgeDir, run.runId);
-  if (!preparedVerified || JSON.stringify(preparedVerified) !== JSON.stringify(preparedRecord)) {
-    return fail("prepared-state-unverified", { helpersSignalled: signalled.signalled, backupFileCount: backup.fileCount, backupTotalBytes: backup.totalBytes });
+  const rereadPrepared = readPhysicalPreparedRecord(bridgeDir, run.runId);
+  if (!rereadPrepared || JSON.stringify(rereadPrepared) !== JSON.stringify(effectivePrepared)) {
+    return fail("prepared-state-unverified", { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
+  }
+  // Re-verify the current target is still exactly the prepared directory
+  // (realpath + identity) immediately before the destructive boundary.
+  const preRemoveIdentity = statDirIdentity(dirReal);
+  if (!preRemoveIdentity || preRemoveIdentity.dev !== effectivePrepared.dirIdentity.dev || preRemoveIdentity.ino !== effectivePrepared.dirIdentity.ino) {
+    return fail("prepared-identity-mismatch", { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
   }
   try {
     fs.rmSync(dirReal, { recursive: true, force: false });
@@ -832,12 +914,35 @@ export async function releaseDisposableWorktree(
     const code = (error as NodeJS.ErrnoException | null)?.code;
     if (code === "ENOENT") {
       const existingRace = readPhysicalReleaseRecord(bridgeDir, run.runId);
-      if (existingRace) {
+      if (existingRace && bindingsEqual(existingRace.binding, effectivePrepared.binding)) {
         return { ok: true, reason: "already_released", helpersSignalled: existingRace.helpersSignalled, helpersRemaining: [], dirClear: true, workdirRemoved: false, workdirRelease: "released", backupFileCount: existingRace.backup.fileCount, backupTotalBytes: existingRace.backup.totalBytes };
       }
-      return fail("workdir-absent-no-record", { helpersSignalled: signalled.signalled });
+      // Removal raced to absent without a final record: finalize from the
+      // still-valid prepared transaction when the bound backup verifies.
+      if (!verifyBackupManifest(bridgeDir, run.runId, effectivePrepared.backup.manifestSha256)) {
+        return fail("prepared-backup-unverified", { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
+      }
+      const raceFinal: PhysicalReleaseRecord = {
+        version: 1,
+        binding: effectivePrepared.binding,
+        dirIdentity: effectivePrepared.dirIdentity,
+        releasedAt: new Date().toISOString(),
+        helpersSignalled: effectiveHelpers,
+        backup: effectivePrepared.backup,
+        workdirRemoved: true,
+      };
+      try {
+        atomicPublishFile(physicalReleasePath(bridgeDir, run.runId), `${JSON.stringify(raceFinal)}\n`);
+      } catch {
+        return fail("physical-record-publish-failed", { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
+      }
+      const raceVerified = readPhysicalReleaseRecord(bridgeDir, run.runId);
+      if (!raceVerified || JSON.stringify(raceVerified) !== JSON.stringify(raceFinal)) {
+        return fail("physical-record-unverified", { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
+      }
+      return { ok: true, reason: "released", helpersSignalled: effectiveHelpers, helpersRemaining: [], dirClear: true, workdirRemoved: false, workdirRelease: "released", backupFileCount: effectivePrepared.backup.fileCount, backupTotalBytes: effectivePrepared.backup.totalBytes };
     }
-    return fail("workdir-remove-failed", { helpersSignalled: signalled.signalled });
+    return fail("workdir-remove-failed", { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
   }
   // Verify absence (and that we removed exactly the disposable dir).
   try { fs.lstatSync(dirReal); return fail("workdir-still-present", { helpersSignalled: signalled.signalled }); }
@@ -848,20 +953,21 @@ export async function releaseDisposableWorktree(
   }
   const record: PhysicalReleaseRecord = {
     version: 1,
-    binding: { ...binding, dirReal },
+    binding: effectivePrepared.binding,
+    dirIdentity: effectivePrepared.dirIdentity,
     releasedAt: new Date().toISOString(),
-    helpersSignalled: signalled.signalled,
-    backup: { fileCount: backup.fileCount ?? 0, totalBytes: backup.totalBytes ?? 0, manifestSha256: backup.manifestSha256 ?? "" },
+    helpersSignalled: effectiveHelpers,
+    backup: effectivePrepared.backup,
     workdirRemoved: true,
   };
   try {
     atomicPublishFile(physicalReleasePath(bridgeDir, run.runId), `${JSON.stringify(record)}\n`);
   } catch {
-    return fail("physical-record-publish-failed", { helpersSignalled: signalled.signalled, backupFileCount: backup.fileCount, backupTotalBytes: backup.totalBytes });
+    return fail("physical-record-publish-failed", { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
   }
   const verified = readPhysicalReleaseRecord(bridgeDir, run.runId);
   if (!verified || JSON.stringify(verified) !== JSON.stringify(record)) {
-    return fail("physical-record-unverified", { helpersSignalled: signalled.signalled, backupFileCount: backup.fileCount, backupTotalBytes: backup.totalBytes });
+    return fail("physical-record-unverified", { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
   }
-  return { ok: true, reason: "released", helpersSignalled: signalled.signalled, helpersRemaining: [], dirClear: true, workdirRemoved: true, workdirRelease: "released", backupFileCount: backup.fileCount, backupTotalBytes: backup.totalBytes };
+  return { ok: true, reason: "released", helpersSignalled: effectiveHelpers, helpersRemaining: [], dirClear: true, workdirRemoved: true, workdirRelease: "released", backupFileCount: effectivePrepared.backup.fileCount, backupTotalBytes: effectivePrepared.backup.totalBytes };
 }

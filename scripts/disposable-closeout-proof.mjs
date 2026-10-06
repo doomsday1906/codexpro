@@ -509,6 +509,8 @@ exit 2
   console.log('P8 crash window: removal happened, final publish interrupted, restart recovery finalized released with backup intact and unrelated preserved.');
 
   // P9: fail-closed prepared mismatch (tampered intent never finalizes).
+  // Well-formed but conflicting (wrong dirReal/identity/backup): must fail
+  // closed without reuse, without overwrite, and without deletion.
   const dispRel9 = `disposable-tamper-${Date.now()}`;
   const dispAbs9 = path.join(wsRoot, dispRel9);
   await fsp.mkdir(dispAbs9, { recursive: true });
@@ -520,10 +522,111 @@ exit 2
   const artDir9 = path.join(bridgeOf(runFileFor(run9)), 'delegation-artifacts', run9);
   await fsp.mkdir(artDir9, { recursive: true });
   const rec9 = JSON.parse(await fsp.readFile(runFileFor(run9), 'utf8'));
-  await fsp.writeFile(path.join(artDir9, 'physical-release-prepared.json'), `${JSON.stringify({ version: 1, phase: 'prepared', binding: { runId: run9, ownerIdHash: rec9.ownerIdHash, ownerKind: rec9.ownerKind, workdir: rec9.workdir, engine: rec9.engine, sessionId: rec9.session?.sessionId ?? null, dirReal: '/tmp/codexpro-dc-tampered-elsewhere' }, preparedAt: new Date().toISOString(), helpersSignalled: [], backup: { fileCount: 0, totalBytes: 0, manifestSha256: '0'.repeat(64) } })}\n`);
+  const tamperPrepared = { version: 1, phase: 'prepared', binding: { runId: run9, ownerIdHash: rec9.ownerIdHash, ownerKind: rec9.ownerKind, workdir: rec9.workdir, engine: rec9.engine, sessionId: rec9.session?.sessionId ?? null, dirReal: '/tmp/codexpro-dc-tampered-elsewhere' }, dirIdentity: { dev: 1, ino: 1 }, preparedAt: new Date().toISOString(), helpersSignalled: [], backup: { fileCount: 0, totalBytes: 0, manifestSha256: '0'.repeat(64) } };
+  const tamperText = `${JSON.stringify(tamperPrepared)}\n`;
+  await fsp.writeFile(path.join(artDir9, 'physical-release-prepared.json'), tamperText);
   const closeTamper = await callRest2('delegation_closeout', { workspace_id: workspaceId, run_id: run9, retire: true });
   assert(!closeTamper.isError && closeTamper.structuredContent.exported === true && closeTamper.structuredContent.workdir_release === 'blocked' && fs.existsSync(dispAbs9) && fs.existsSync(path.join(dispAbs9, 'keep.txt')) && !fs.existsSync(path.join(artDir9, 'physical-release.json')), `tamper blocked ${JSON.stringify(closeTamper.structuredContent)}`);
-  console.log('P9 tampered prepared intent: binding mismatch failed closed, directory and files retained, no final record.');
+  assert((await fsp.readFile(path.join(artDir9, 'physical-release-prepared.json'), 'utf8')) === tamperText, 'conflicting prepared record must not be overwritten');
+  console.log('P9 tampered prepared intent: binding mismatch failed closed, directory and files retained, no final record, prepared not overwritten.');
+
+  // P10: prepared + target still present is retryable (the exact reproduced
+  // sequence `prepared persisted -> removal fails -> target remains -> retry`
+  // must finish as released, not prepared-state-conflict). Faults rmSync
+  // AFTER prepared persistence; restarts; proves gates rerun via an
+  // intermediate ambiguous-session block; proves the existing prepared
+  // transaction is reused byte-identically (same preparedAt, no overwrite).
+  const dispRel10 = `disposable-retry-${Date.now()}`;
+  const dispAbs10 = path.join(wsRoot, dispRel10);
+  await fsp.mkdir(dispAbs10, { recursive: true });
+  const retryBytes = Buffer.from('prepared-retry file content\n');
+  await fsp.writeFile(path.join(dispAbs10, 'retry.txt'), retryBytes);
+  const launch10 = await launchRest2(dispRel10, true);
+  assert(!launch10.isError, 'launch10');
+  const run10 = launch10.structuredContent.run_id;
+  await waitSettledRest2(run10);
+  const runFile10 = runFileFor(run10);
+  const bridge10 = path.dirname(path.dirname(runFile10));
+  const artDir10 = path.join(bridge10, 'delegation-artifacts', run10);
+  const cgJs10 = path.join(await makeRoot('codexpro-dc-cg10-'), 'codegraph.js');
+  const owned10 = await spawnCodegraphHelper(cgJs10, dispAbs10, false);
+  const cgJs10other = path.join(await makeRoot('codexpro-dc-cg10other-'), 'codegraph.js');
+  const unrelated10 = await spawnCodegraphHelper(cgJs10other, await makeRoot('codexpro-dc-retry-other-'), false);
+  const nativeRm = fs.rmSync;
+  let rmBlocked = false;
+  fs.rmSync = function (target, ...rest) {
+    if (!rmBlocked && String(target).includes(dispRel10)) {
+      rmBlocked = true;
+      const err = new Error('fixture removal fault after prepare');
+      err.code = 'EIO';
+      throw err;
+    }
+    return nativeRm.call(fs, target, ...rest);
+  };
+  let closeRetryFail;
+  try { closeRetryFail = await callRest2('delegation_closeout', { workspace_id: workspaceId, run_id: run10, retire: true }); }
+  finally { fs.rmSync = nativeRm; }
+  assert(rmBlocked, 'fault must have intercepted physical removal');
+  assert(!closeRetryFail.isError && closeRetryFail.structuredContent.exported === true && closeRetryFail.structuredContent.workdir_release === 'blocked', `first retry blocked ${JSON.stringify(closeRetryFail.structuredContent)}`);
+  assert(fs.existsSync(dispAbs10) && fs.existsSync(path.join(dispAbs10, 'retry.txt')), 'workdir and files remain after failed removal');
+  const preparedPath10 = path.join(artDir10, 'physical-release-prepared.json');
+  const finalPath10 = path.join(artDir10, 'physical-release.json');
+  assert(fs.existsSync(preparedPath10), 'prepared record exists after failed removal');
+  assert(!fs.existsSync(finalPath10), 'final record absent after failed removal');
+  const preparedBytesBefore = await fsp.readFile(preparedPath10, 'utf8');
+  const preparedParsedBefore = JSON.parse(preparedBytesBefore);
+  assert(preparedParsedBefore.phase === 'prepared' && typeof preparedParsedBefore.preparedAt === 'string' && preparedParsedBefore.dirIdentity && Number.isSafeInteger(preparedParsedBefore.dirIdentity.dev), 'prepared binds directory identity');
+  await waitGone(owned10.pid, owned10.start, 'retry owned helper signalled before failed removal');
+  assert(readStart(unrelated10.pid) === unrelated10.start, 'unrelated helper untouched by failed removal');
+  // Restart recovery: recreate server/process state before retry.
+  try { await client.close(); } catch {}
+  try { await server.close(); } catch {}
+  ({ srv: server, cli: client } = await openServer());
+  const callRetry = async (name, args) => client.callTool({ name, arguments: args });
+  const openedRetry = await callRetry('open_workspace', { root: wsRoot });
+  assert(!openedRetry.isError, 'reopen after prepared-present interruption');
+  workspaceId = openedRetry.structuredContent.workspace_id;
+  const waitSettledRetry = async (runId, tries = 120) => {
+    for (let i = 0; i < tries; i += 1) {
+      const r = await callRetry('delegation_read_result', { workspace_id: workspaceId, run_id: runId });
+      assert(!r.isError, `read: ${JSON.stringify(r.structuredContent)}`);
+      if (!['queued','running'].includes(r.structuredContent.state)) return r;
+      await new Promise((r2) => setTimeout(r2, 100));
+    }
+    throw new Error(`ASSERT: run ${runId} did not settle`);
+  };
+  // Gates rerun proof: an ambiguous session must still block the prepared
+  // retry without touching the prepared record or the directory.
+  process.env.CLOSEOUT_SESSION_MODE = 'ambiguous';
+  let closeRetryGated;
+  try { closeRetryGated = await callRetry('delegation_closeout', { workspace_id: workspaceId, run_id: run10, retire: true }); }
+  finally { delete process.env.CLOSEOUT_SESSION_MODE; }
+  assert(!closeRetryGated.isError && closeRetryGated.structuredContent.exported === true && closeRetryGated.structuredContent.workdir_release === 'blocked' && fs.existsSync(dispAbs10), `gated retry blocked ${JSON.stringify(closeRetryGated.structuredContent)}`);
+  assert((await fsp.readFile(preparedPath10, 'utf8')) === preparedBytesBefore, 'gated retry must not replace the prepared transaction');
+  assert(!fs.existsSync(finalPath10), 'no final record after gated block');
+  // Clear retry reuses the existing prepared transaction and releases.
+  const closeRetryOk = await callRetry('delegation_closeout', { workspace_id: workspaceId, run_id: run10, retire: true });
+  assert(!closeRetryOk.isError && closeRetryOk.structuredContent.workdir_release === 'released' && closeRetryOk.structuredContent.dir_clear === true, `prepared retry released ${JSON.stringify(closeRetryOk.structuredContent)}`);
+  assert(!fs.existsSync(dispAbs10), 'workdir physically removed by prepared retry');
+  assert((await fsp.readFile(preparedPath10, 'utf8')) === preparedBytesBefore, 'prepared transaction reused byte-identically, not replaced/conflicted');
+  assert(fs.existsSync(finalPath10), 'final physical-release.json durably published by retry');
+  const finalParsed10 = JSON.parse(await fsp.readFile(finalPath10, 'utf8'));
+  assert(finalParsed10.version === 1 && finalParsed10.dirIdentity.dev === preparedParsedBefore.dirIdentity.dev && finalParsed10.dirIdentity.ino === preparedParsedBefore.dirIdentity.ino, 'final carries the prepared directory identity');
+  const readRetry = await callRetry('delegation_read_result', { workspace_id: workspaceId, run_id: run10 });
+  assert(!readRetry.isError && readRetry.structuredContent.closeout?.workdir_release === 'released' && readRetry.structuredContent.closeout?.cleanup_finished === true, `retry read truthful ${JSON.stringify(readRetry.structuredContent.closeout)}`);
+  const backedRetry = await fsp.readFile(path.join(artDir10, 'workdir-backup', 'retry.txt'));
+  assert(backedRetry.equals(retryBytes), 'backup readable after prepared retry');
+  const manifestRetry = JSON.parse(await fsp.readFile(path.join(artDir10, 'workdir-backup', 'backup-manifest.json'), 'utf8'));
+  const retryEntry = manifestRetry.files.find((f) => f.rel === 'retry.txt');
+  assert(retryEntry && createHash('sha256').update(backedRetry).digest('hex') === retryEntry.sha256, 'backup hash valid after prepared retry');
+  assert(readStart(unrelated10.pid) === unrelated10.start, 'unrelated helper survives prepared retry');
+  unrelated10.child.kill('SIGKILL');
+  // Rebind for the rest of the proof.
+  const callRest3 = callRetry;
+  workspaceId = workspaceId;
+  void callRest3;
+  await waitSettledRetry(run10);
+  console.log('P10 prepared+present retry: removal fault after prepare, restart, gated block proves gates rerun, cleared retry reused prepared byte-identically and released with backup intact and unrelated preserved.');
 
   // R0: read-only real-engine lifecycle evidence (no mutation, no shared-service contact).
   // Uses the installed opencode binary and live /proc only: session entries
@@ -559,7 +662,7 @@ exit 2
     console.log('R0 real-engine read-only: installed opencode binary not found, skipped without mutation.');
   }
 
-  console.log('PASS disposable isolated closeout proof: P1, P2, P2b, P3, P4, P5, P6, P7, P7b, P7c, P8, P9 plus R0 complete (fixture sections use the task-owned fake engine; R0 uses the installed engine read-only).');
+  console.log('PASS disposable isolated closeout proof: P1, P2, P2b, P3, P4, P5, P6, P7, P7b, P7c, P8, P9, P10 plus R0 complete (fixture sections use the task-owned fake engine; R0 uses the installed engine read-only).');
   await cleanup();
 } catch (e) {
   try { await cleanup(); } catch {}
