@@ -628,6 +628,78 @@ exit 2
   await waitSettledRetry(run10);
   console.log('P10 prepared+present retry: removal fault after prepare, restart, gated block proves gates rerun, cleared retry reused prepared byte-identically and released with backup intact and unrelated preserved.');
 
+  // P11: pathname replacement during backup must not authorize the
+  // replacement. A passes gates; during backup the pathname is atomically
+  // replaced by B (different dev/ino, distinct NEW content). Release must
+  // detect the identity change after backup/before prepared or deletion:
+  // blocked, B intact with NEW bytes, no final claims release, no fresh
+  // prepared authorizes B, stale OLD backup cannot release B.
+  const dispRel11 = `disposable-swap-${Date.now()}`;
+  const dispAbs11 = path.join(wsRoot, dispRel11);
+  await fsp.mkdir(dispAbs11, { recursive: true });
+  const oldBytes11 = Buffer.from('OLD\n');
+  const newBytes11 = Buffer.from('NEW\n');
+  await fsp.writeFile(path.join(dispAbs11, 'old.txt'), oldBytes11);
+  reqN += 1;
+  const launch11 = await callRetry('delegation_launch', {
+    workspace_id: workspaceId, engine: 'opencode', agent: 'implementer', model: 'test-model',
+    workdir: dispRel11, task: 'Report readiness. Change nothing.', delegation_group: 'team-disposable-proof',
+    request_id: `req-dc-${reqN}`, timeout_ms: 60000, disposable_workdir: true,
+  });
+  assert(!launch11.isError, 'launch11');
+  const run11 = launch11.structuredContent.run_id;
+  await waitSettledRetry(run11);
+  const runFile11 = runFileFor(run11);
+  const artDir11 = path.join(bridgeOf(runFile11), 'delegation-artifacts', run11);
+  const cgJs11other = path.join(await makeRoot('codexpro-dc-cg11other-'), 'codegraph.js');
+  const unrelated11 = await spawnCodegraphHelper(cgJs11other, await makeRoot('codexpro-dc-swap-other-'), false);
+  const nativeReadFile = fs.readFileSync;
+  let swapDone = false;
+  fs.readFileSync = function (p, ...rest) {
+    const ps = String(p);
+    if (!swapDone && ps === path.join(dispAbs11, 'old.txt')) {
+      const original = nativeReadFile.call(fs, p, ...rest);
+      // Atomically replace pathname A with directory B after the backup
+      // has observed A's OLD bytes: move A aside, create B with NEW.
+      fs.renameSync(dispAbs11, `${dispAbs11}.orig-A`);
+      fs.mkdirSync(dispAbs11, { mode: 0o700 });
+      fs.writeFileSync(path.join(dispAbs11, 'old.txt'), newBytes11);
+      swapDone = true;
+      return original;
+    }
+    return nativeReadFile.call(fs, p, ...rest);
+  };
+  let closeSwap;
+  try { closeSwap = await callRetry('delegation_closeout', { workspace_id: workspaceId, run_id: run11, retire: true }); }
+  finally { fs.readFileSync = nativeReadFile; }
+  assert(swapDone, 'swap must have occurred during backup');
+  assert(!closeSwap.isError && closeSwap.structuredContent.exported === true && closeSwap.structuredContent.workdir_release === 'blocked', `swap blocked ${JSON.stringify(closeSwap.structuredContent)}`);
+  // B at the same pathname remains intact with NEW content; A remains aside.
+  assert(fs.existsSync(dispAbs11), 'replacement directory B must remain');
+  const bBytes = await fsp.readFile(path.join(dispAbs11, 'old.txt'));
+  assert(bBytes.equals(newBytes11), 'B NEW file byte-identical, not deleted or overwritten');
+  assert(fs.existsSync(`${dispAbs11}.orig-A`), 'original directory A preserved aside, not deleted');
+  const aBytes = await fsp.readFile(path.join(`${dispAbs11}.orig-A`, 'old.txt'));
+  assert(aBytes.equals(oldBytes11), 'A OLD bytes preserved aside');
+  assert(!fs.existsSync(path.join(artDir11, 'physical-release.json')), 'no final record claims release of the replacement');
+  assert(!fs.existsSync(path.join(artDir11, 'physical-release-prepared.json')), 'no fresh prepared record authorizes the replacement');
+  try {
+    const manifestSwap = JSON.parse(await fsp.readFile(path.join(artDir11, 'workdir-backup', 'backup-manifest.json'), 'utf8'));
+    const swapEntry = manifestSwap.files.find((f) => f.rel === 'old.txt');
+    assert(swapEntry && swapEntry.sha256 !== createHash('sha256').update(newBytes11).digest('hex'), 'stale OLD backup cannot authorize B (NEW hash differs)');
+  } catch (e) {
+    if (e.message.startsWith('ASSERT:')) throw e;
+    // No backup manifest at all is also acceptable: nothing authorizes B.
+  }
+  assert(readStart(unrelated11.pid) === unrelated11.start, 'unrelated helper untouched by swap block');
+  unrelated11.child.kill('SIGKILL');
+  // Restore test hygiene without authorizing B: remove B and restore A so
+  // workspace cleanup stays ordinary (no closeout retried against B).
+  await fsp.rm(dispAbs11, { recursive: true, force: true });
+  await fsp.rename(`${dispAbs11}.orig-A`, dispAbs11);
+  assert((await fsp.readFile(path.join(dispAbs11, 'old.txt'))).equals(oldBytes11), 'workdir restored to A after swap proof');
+  console.log('P11 pathname replacement during backup: B untouched with NEW bytes, closeout blocked, no prepared/final authorizes B, stale backup cannot release B.');
+
   // R0: read-only real-engine lifecycle evidence (no mutation, no shared-service contact).
   // Uses the installed opencode binary and live /proc only: session entries
   // carry directory identity, and shared CodeGraph helpers serve non-tmp
@@ -662,7 +734,7 @@ exit 2
     console.log('R0 real-engine read-only: installed opencode binary not found, skipped without mutation.');
   }
 
-  console.log('PASS disposable isolated closeout proof: P1, P2, P2b, P3, P4, P5, P6, P7, P7b, P7c, P8, P9, P10 plus R0 complete (fixture sections use the task-owned fake engine; R0 uses the installed engine read-only).');
+  console.log('PASS disposable isolated closeout proof: P1, P2, P2b, P3, P4, P5, P6, P7, P7b, P7c, P8, P9, P10, P11 plus R0 complete (fixture sections use the task-owned fake engine; R0 uses the installed engine read-only).');
   await cleanup();
 } catch (e) {
   try { await cleanup(); } catch {}

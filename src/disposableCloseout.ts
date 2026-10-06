@@ -791,14 +791,41 @@ export async function releaseDisposableWorktree(
   }
   if (!check.disposable || !check.real) return fail(`not-disposable:${check.reason}`);
   const dirReal = check.real;
+  // Baseline directory identity for THIS release attempt, established
+  // immediately after canonical resolution and BEFORE any safety gate.
+  // Every later pathname-dependent step must prove the pathname still
+  // resolves to this exact (dev, ino). A replacement directory at the same
+  // pathname has a different identity and must never inherit the gates,
+  // backup, prepared state, or deletion authorized for the original.
+  const baselineIdentity = statDirIdentity(dirReal);
+  if (!baselineIdentity) return fail("prepared-stat-failed");
+  const sameTargetAsBaseline = (): { ok: boolean; reason?: string } => {
+    const re = checkDisposableWorkdir(run.workdir);
+    if (!re.disposable || !re.real) return { ok: false, reason: `not-disposable:${re.reason}` };
+    if (re.real !== dirReal) return { ok: false, reason: "dir-changed-before-remove" };
+    const id = statDirIdentity(dirReal);
+    if (!id) return { ok: false, reason: "prepared-stat-failed" };
+    if (id.dev !== baselineIdentity.dev || id.ino !== baselineIdentity.ino) return { ok: false, reason: "prepared-identity-mismatch" };
+    return { ok: true };
+  };
   const collected = collectDisposableHelpers(dirReal);
   if (collected.inconclusive) return fail(`collect-inconclusive:${collected.reason ?? "unknown"}`);
+  {
+    const same = sameTargetAsBaseline();
+    if (!same.ok) return fail(same.reason as string, { helpersRemaining: collected.members.map((m) => m.pid) });
+  }
   const preScan = scanDirUsers(dirReal, collected.members.map((m) => m.pid));
   if (!preScan.conclusive) return fail("dir-scan-inconclusive", { helpersRemaining: collected.members.map((m) => m.pid) });
   if (preScan.users.length > 0 || preScan.suspectUnknown.length > 0) {
     return fail("dir-users-present", {
       helpersRemaining: collected.members.map((m) => m.pid),
     });
+  }
+  {
+    // Prove the gated target survived to the signal boundary. Never signal
+    // a replacement directory as if it were the gated original.
+    const same = sameTargetAsBaseline();
+    if (!same.ok) return fail(same.reason as string, { helpersRemaining: collected.members.map((m) => m.pid) });
   }
   const signalled = await signalOwnedHelpers(collected.members, dirReal, opts.graceMs ?? 2000);
   if (signalled.remaining.length > 0 || !signalled.dirClear) {
@@ -810,21 +837,42 @@ export async function releaseDisposableWorktree(
   // Final revalidation before preservation: disposability, helpers gone, dir clear.
   const recheck = checkDisposableWorkdir(run.workdir);
   if (!recheck.disposable || recheck.real !== dirReal) return fail("dir-changed-before-remove", { helpersSignalled: signalled.signalled });
+  {
+    const same = sameTargetAsBaseline();
+    if (!same.ok) return fail(same.reason as string, { helpersSignalled: signalled.signalled });
+  }
   const recollect = collectDisposableHelpers(dirReal);
   if (recollect.inconclusive) return fail("recollect-inconclusive", { helpersSignalled: signalled.signalled, helpersRemaining: signalled.remaining });
   if (recollect.members.length > 0) return fail("helpers-reappeared", { helpersSignalled: signalled.signalled, helpersRemaining: recollect.members.map((m) => m.pid) });
   const finalScan = scanDirUsers(dirReal);
   if (!finalScan.conclusive || !finalScan.clear) return fail("dir-not-clear-before-remove", { helpersSignalled: signalled.signalled });
+  {
+    // Gated target identity == identity entering backup. The backup below
+    // must read this exact directory, not a replacement.
+    const same = sameTargetAsBaseline();
+    if (!same.ok) return fail(same.reason as string, { helpersSignalled: signalled.signalled });
+  }
   // Preserve every workdir file centrally BEFORE deletion. The session
   // transcript alone is not a backup of workdir files.
   const backup = backupWorkdirToCentral(bridgeDir, run.runId, dirReal, binding);
   if (!backup.ok) return fail(backup.reason, { helpersSignalled: signalled.signalled });
   const backupSummary = { fileCount: backup.fileCount ?? 0, totalBytes: backup.totalBytes ?? 0, manifestSha256: backup.manifestSha256 ?? "" };
-  // Canonical directory identity at prepare time. Pathname equality alone
+  {
+    // Backed-up target identity must equal the gated target identity.
+    // If the pathname was replaced during backup (even partially read),
+    // stop here: no prepared transaction may authorize the replacement,
+    // and no destructive operation against the new target may occur.
+    // Any partial backup artifacts remain non-authoritative and can never
+    // release the replacement.
+    const same = sameTargetAsBaseline();
+    if (!same.ok) return fail(same.reason as string, { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
+  }
+  // Canonical directory identity for this attempt. Pathname equality alone
   // is never sufficient: a recreated directory at the same path has a
   // different (dev, ino) and must not be treated as the prepared target.
-  const currentIdentity = statDirIdentity(dirReal);
-  if (!currentIdentity) return fail("prepared-stat-failed", { helpersSignalled: signalled.signalled, backupFileCount: backupSummary.fileCount, backupTotalBytes: backupSummary.totalBytes });
+  // Established before backup (baselineIdentity) and verified unchanged
+  // after backup above, so gated == backed-up == prepared holds.
+  const currentIdentity = baselineIdentity;
   // Durable prepared intent BEFORE the destructive boundary. Binds run,
   // owner, engine/session, exact directory identity (realpath + dev/ino),
   // verified backup, and the signalled helper set, so any interruption
