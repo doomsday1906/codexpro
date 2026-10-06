@@ -1,6 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
+import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { TextDecoder } from "node:util";
 import type { CodexProConfig } from "./config.js";
@@ -449,6 +451,15 @@ interface GitRepositorySnapshot {
   /** Complete local ref and repository-local config snapshots, base64 encoded. */
   readonly localRefs: string;
   readonly localConfig: string;
+  /** Ignored-window proof; null when this snapshot skipped the window scan. */
+  readonly ignoredWindow: IgnoredWindowScan | null;
+}
+
+export interface IgnoredSnapshotRequest {
+  readonly markerPath: string;
+  readonly markerCtimeMs: number;
+  readonly maxEntries?: number;
+  readonly scanner?: "auto" | "find" | "node";
 }
 
 interface GitBranchState {
@@ -598,115 +609,403 @@ function assertPreparedSnapshotPreserved(
 }
 
 /**
- * Bounded ignored-content census.
+ * Two-tier ignored-tree preservation: bounded metadata window-scan.
  *
- * Collapsed `status --ignored=matching` entries keep the census small
- * (38 entries in AgentWorkspace vs 180k expanded files / 21 MiB output),
- * but directory entries alone cannot prove that files inside ignored
- * directories were not changed by hooks. This census walks only the ignored
- * directory roots returned by collapsed status and records exact per-file
- * worktree states (kind/mode/size/content-hash/link-target, same model as
- * tracked preservation) for every file/symlink/dir underneath.
+ * Root-cause analysis on the production AgentWorkspace (read-only
+ * characterization, no mutation):
+ * - 38 collapsed `status --ignored=matching` entries (34 ignored dirs);
+ * - ~873k ignored files + ~127k dirs + ~2k symlinks under those roots;
+ * - ~61 GiB total ignored file bytes;
+ * - full content hashing per preservation checkpoint: minutes (60 GiB read);
+ * - sequential per-file census walk: ~107s; parallel Node walk: ~27s;
+ * - single C-speed stat-only traversal (`find`): ~4.4s.
  *
- * Properties:
- * - deterministic (sorted walk, no shell, no stdout accumulation);
- * - bounded memory (incremental per-file hashing via inspectWorktreeState,
- *   worktree Map bounded by file-count limit);
- * - bounded time/resources via explicit file-count and total-bytes limits
- *   enforced during the walk before any content reads;
- * - safely handles files/symlinks/directories/other and path replacement
- *   (kind/mode/size/hash/link-target compared, symlinked dirs never
- *   descended, missing entries from races recorded as missing);
- * - task-owned temp state: none (no spool files; Map only, cleaned via GC;
- *   no leftover artifacts on any path).
+ * Conclusion: per-checkpoint full content hashing or full per-file state
+ * materialization is the wrong cost architecture for AgentWorkspace-scale
+ * trees. The required invariant is narrower: nothing under ignored roots may
+ * change *during this operation's window* (baseline -> postcondition),
+ * because the only in-model mutators in that window are synchronous Git
+ * hooks spawned by our own commit plus cooperative writers (whose ignored
+ * changes must equally fail preservation).
  *
- * If the census exceeds its explicit safety bound, fail closed with
- * `snapshot-too-large` rather than silently reducing coverage.
+ * Tier 1 — bounded window-scan (this code): at operation start record a
+ * task-owned marker file's ctime (free, no walk). At each proof checkpoint
+ * report every ignored entry whose ctime OR mtime is newer than the marker.
+ * Any content modification, same-size rewrite, same-path replacement (new
+ * inode), file<->dir/symlink replacement, symlink target change, nested
+ * mutation, or entry add/remove updates ctime on POSIX (utimens mtime-reset
+ * also updates ctime), so all are flagged. Unchanged huge trees cost exactly
+ * one stat-only traversal with zero content reads and zero stdout
+ * accumulation (streaming, NUL-delimited, bounded stored hits).
+ *
+ * Tier 2 — content proof when needed: individually-listed ignored files
+ * (top-level entries already present in collapsed status) keep exact
+ * per-file worktree states in the normal snapshot maps. A metadata hit is
+ * itself the preservation failure (fail closed: postcondition on the success
+ * path, recovery-required on failure paths) — no content read is required to
+ * justify failing, so Tier 2 never forces bulk hashing.
+ *
+ * Explicitly reasoned limits (documented, not silently stronger):
+ * - timestamp resolution: detection needs change-time > marker-ctime. POSIX
+ *   nanosecond ctime makes same-window changes detectable; filesystems with
+ *   coarse mtime granularity and no POSIX ctime-update semantics (FAT-class)
+ *   degrade to mtime-only detection and cannot catch timestamp-restoring
+ *   actors — stated here, not hidden.
+ * - ctime trust: an actor able to manipulate the system clock or raw
+ *   filesystem metadata to backdate ctime is outside the supported
+ *   concurrency model (RepoConnect-owned writers, lock-cooperative writers,
+ *   synchronous cooperative hooks) and is not claimed detectable.
+ * - races: an external write landing after the scan passed its path but
+ *   before the verdict is the same race class as the prior sequential
+ *   snapshot readers; hooks cannot act there (they are children of the
+ *   already-exited commit). Fail closed on any observed hit.
+ * - engines: `find -newercc` acceleration where a POSIX find exists
+ *   (probed at runtime; argv-array, no shell), with a correct portable Node
+ *   fallback (Dirent + parallel stat). Forced per-engine in tests.
  */
-const IGNORED_CENSUS_MAX_FILES = 20000;
-const IGNORED_CENSUS_MAX_TOTAL_FILE_BYTES = 200 * 1024 * 1024;
+export const IGNORED_WINDOW_MAX_ENTRIES = 5_000_000;
+export const IGNORED_WINDOW_MAX_HITS_STORED = 64;
+const IGNORED_WINDOW_MAX_SCAN_MS = 120_000;
+const IGNORED_WINDOW_NODE_CONCURRENCY = 64;
 
-async function collectIgnoredInnerPaths(
+export interface IgnoredWindowScan {
+  readonly scanned: boolean;
+  readonly startMs: number;
+  readonly engine: "find" | "node" | "none";
+  readonly entries: number;
+  readonly hitCount: number;
+  readonly hits: readonly string[];
+}
+
+export interface IgnoredWindowScanOptions {
+  readonly maxEntries?: number;
+  readonly scanner?: "auto" | "find" | "node";
+}
+
+function resolveIgnoredDirRoots(
   workspace: Workspace,
   statuses: ReadonlyMap<string, string>
-): Promise<{ readonly paths: readonly string[]; readonly fileCount: number; readonly totalFileBytes: number }> {
+): { readonly roots: readonly string[]; readonly valid: boolean } {
   const dirRoots: string[] = [];
   for (const [relPath, status] of statuses) {
     if (!status.startsWith("!")) continue;
     // Strip trailing slash for resolution; `a/` and `a` resolve identically.
     const stripped = relPath.endsWith("/") && relPath.length > 1 ? relPath.slice(0, -1) : relPath;
-    if (!stripped || stripped === "/" || CONTROL_CHARACTER_PATTERN.test(stripped)) continue;
+    if (!stripped || stripped === "/" || CONTROL_CHARACTER_PATTERN.test(stripped)) return { roots: [], valid: false };
     const absPath = path.resolve(workspace.root, ...stripped.split("/"));
-    if (!isSubpath(absPath, workspace.root)) continue;
-    let stat: Awaited<ReturnType<typeof fsp.lstat>>;
-    try {
-      stat = await fsp.lstat(absPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR") continue;
-      return fail("execution");
-    }
-    if (stat.isDirectory() && !stat.isSymbolicLink()) {
-      dirRoots.push(stripped);
-    }
+    if (!isSubpath(absPath, workspace.root)) return { roots: [], valid: false };
+    dirRoots.push(stripped);
   }
   dirRoots.sort();
-  const collected: string[] = [];
-  let fileCount = 0;
-  let totalFileBytes = 0;
-  const seen = new Set<string>();
-  const visitDir = async (dirRel: string): Promise<void> => {
-    const dirAbs = path.resolve(workspace.root, ...dirRel.split("/"));
-    let entries: string[];
+  return { roots: dirRoots, valid: true };
+}
+
+async function ignoredRootIsRealDir(workspace: Workspace, stripped: string): Promise<boolean> {
+  const absPath = path.resolve(workspace.root, ...stripped.split("/"));
+  try {
+    const stat = await fsp.lstat(absPath);
+    return stat.isDirectory() && !stat.isSymbolicLink();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    // A root that vanished mid-operation is itself a preservation change;
+    // report it as unscannable via the entries path: treat as not-a-dir so
+    // the caller can decide (missing root => window failure, not silent ok).
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
+    throw error;
+  }
+}
+
+/** Task-owned window marker: creation is free (no walk); its ctime is T0. Exported for deterministic tests. */
+export async function createIgnoredWindowMarker(): Promise<{ readonly markerPath: string; readonly ctimeMs: number }> {
+  const markerPath = path.join(os.tmpdir(), `codexpro-git-commit-ignored-${process.pid}-${randomBytes(8).toString("hex")}`);
+  try {
+    await fsp.writeFile(markerPath, "ignored-window", { flag: "wx", mode: 0o600 });
+  } catch {
+    return fail("execution");
+  }
+  try {
+    const stat = await fsp.stat(markerPath);
+    if (!Number.isFinite(stat.ctimeMs)) return fail("execution");
+    return { markerPath, ctimeMs: stat.ctimeMs };
+  } catch {
+    return fail("execution");
+  }
+}
+
+export async function removeIgnoredWindowMarker(markerPath: string): Promise<void> {
+  try {
+    await fsp.rm(markerPath, { force: true });
+  } catch {
+    // Task-owned temp cleanup is best-effort; never fail the operation for it.
+  }
+}
+
+let findNewerccProbe: boolean | undefined;
+async function findSupportsNewercc(): Promise<boolean> {
+  if (findNewerccProbe !== undefined) return findNewerccProbe;
+  const probeDir = await fsp.mkdtemp(path.join(os.tmpdir(), "codexpro-find-probe-"));
+  const marker = path.join(probeDir, "marker");
+  try {
+    await fsp.writeFile(marker, "x");
+    const supported = await new Promise<boolean>((resolve) => {
+      const child = spawn("find", [probeDir, "-maxdepth", "0", "-newercc", marker], { shell: false, stdio: ["ignore", "ignore", "ignore"] });
+      let done = false;
+      const finish = (value: boolean): void => {
+        if (done) return;
+        done = true;
+        resolve(value);
+      };
+      const timer = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Kill failure just resolves through exit handling.
+        }
+        finish(false);
+      }, 10_000);
+      timer.unref?.();
+      child.on("error", () => {
+        clearTimeout(timer);
+        finish(false);
+      });
+      child.on("exit", (code) => {
+        clearTimeout(timer);
+        finish(code === 0);
+      });
+    });
+    findNewerccProbe = supported;
+    return supported;
+  } catch {
+    findNewerccProbe = false;
+    return false;
+  } finally {
+    await fsp.rm(probeDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+function validateWindowHit(workspace: Workspace, relPath: string): string | undefined {
+  if (!relPath || relPath === "/" || CONTROL_CHARACTER_PATTERN.test(relPath)) return undefined;
+  if (relPath.length > GIT_COMMIT_MAX_PATH_BYTES || Buffer.byteLength(relPath, "utf8") > GIT_COMMIT_MAX_PATH_BYTES) {
+    return undefined;
+  }
+  const absPath = path.resolve(workspace.root, ...relPath.replace(/\/+$/u, "").split("/"));
+  if (!isSubpath(absPath, workspace.root)) return undefined;
+  return relPath;
+}
+
+async function scanIgnoredWindowViaFind(
+  workspace: Workspace,
+  dirRoots: readonly string[],
+  markerPath: string
+): Promise<IgnoredWindowScan | undefined> {
+  const startMs = Date.now();
+  const roots = dirRoots.map((root) => path.resolve(workspace.root, ...root.split("/")));
+  const stored: string[] = [];
+  let hitCount = 0;
+  const outcome = await new Promise<{ readonly ok: boolean; readonly timeout: boolean }>((resolve) => {
+    let child;
     try {
-      entries = await fsp.readdir(dirAbs);
+      // No shell, argv-array only; NUL-delimited output (no name parsing).
+      child = spawn("find", [...roots, "-newercc", markerPath, "-print0"], {
+        shell: false,
+        stdio: ["ignore", "pipe", "ignore"]
+      });
+    } catch {
+      resolve({ ok: false, timeout: false });
+      return;
+    }
+    let done = false;
+    const finish = (value: { readonly ok: boolean; readonly timeout: boolean }): void => {
+      if (done) return;
+      done = true;
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Kill failure resolves through exit handling.
+      }
+      finish({ ok: false, timeout: true });
+    }, IGNORED_WINDOW_MAX_SCAN_MS);
+    timer.unref?.();
+    let pending = Buffer.alloc(0);
+    child.stdout?.on("data", (chunk: Buffer) => {
+      const buffer = Buffer.concat([pending, chunk]);
+      let cursor = 0;
+      while (true) {
+        const nul = buffer.indexOf(0, cursor);
+        if (nul === -1) break;
+        const absHit = buffer.toString("utf8", cursor, nul);
+        cursor = nul + 1;
+        const rel = path.relative(workspace.root, absHit) || ".";
+        const valid = validateWindowHit(workspace, rel.split(path.sep).join("/"));
+        hitCount += 1;
+        if (valid !== undefined && stored.length < IGNORED_WINDOW_MAX_HITS_STORED) stored.push(valid);
+      }
+      pending = buffer.subarray(cursor);
+    });
+    child.on("error", () => {
+      clearTimeout(timer);
+      finish({ ok: false, timeout: false });
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      finish({ ok: code === 0, timeout: false });
+    });
+  });
+  if (!outcome.ok) {
+    // find error (not timeout/bound): let the caller fall back to Node once.
+    if (outcome.timeout) return fail("snapshot-too-large");
+    return undefined;
+  }
+  // Resource safety for the find engine comes from single-pass streaming
+  // (O(1) memory plus capped stored hits) and the scan timeout above: a full
+  // traversal always completes in bounded time/memory, so no entry-count
+  // bound is needed here. `entries` reports NUL records processed (= hits);
+  // the Node engine reports visited entries against IGNORED_WINDOW_MAX_ENTRIES.
+  stored.sort();
+  return { scanned: true, startMs, engine: "find", entries: hitCount, hitCount, hits: stored };
+}
+
+async function scanIgnoredWindowViaNode(
+  workspace: Workspace,
+  dirRoots: readonly string[],
+  markerCtimeMs: number,
+  maxEntries: number
+): Promise<IgnoredWindowScan> {
+  const startMs = Date.now();
+  const stored: string[] = [];
+  let hitCount = 0;
+  let entries = 0;
+  const queue: string[] = [...dirRoots];
+  const deadline = startMs + IGNORED_WINDOW_MAX_SCAN_MS;
+  const hit = (relPath: string): void => {
+    const valid = validateWindowHit(workspace, relPath);
+    hitCount += 1;
+    if (valid !== undefined && stored.length < IGNORED_WINDOW_MAX_HITS_STORED) stored.push(valid);
+  };
+  const checkEntry = (relPath: string, stat: { readonly ctimeMs: number; readonly mtimeMs: number }): void => {
+    entries += 1;
+    if (entries > maxEntries) return fail("snapshot-too-large");
+    if (stat.ctimeMs > markerCtimeMs || stat.mtimeMs > markerCtimeMs) hit(relPath);
+  };
+  // The roots themselves are part of the window (add/remove under them
+  // updates their own times); stat them once each (cheap: tens of roots).
+  for (const root of dirRoots) {
+    if (Date.now() > deadline) return fail("snapshot-too-large");
+    const absPath = path.resolve(workspace.root, ...root.split("/"));
+    try {
+      const stat = await fsp.lstat(absPath);
+      checkEntry(root.endsWith("/") ? root : `${root}/`, stat);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ENOTDIR") return;
-      return fail("execution");
+      if (code !== "ENOENT" && code !== "ENOTDIR") return fail("execution");
+      // A root that vanished mid-operation is a window change, not silent ok.
+      hitCount += 1;
     }
-    entries.sort();
-    for (const entry of entries) {
-      if (!entry || entry === "." || entry === ".." || CONTROL_CHARACTER_PATTERN.test(entry)) {
-        return fail("execution");
-      }
-      const childRel = `${dirRel}/${entry}`;
-      if (childRel.length > GIT_COMMIT_MAX_PATH_BYTES || Buffer.byteLength(childRel, "utf8") > GIT_COMMIT_MAX_PATH_BYTES) {
-        return fail("snapshot-too-large");
-      }
-      const childAbs = path.resolve(workspace.root, ...childRel.split("/"));
-      if (!isSubpath(childAbs, workspace.root)) return fail("execution");
-      let childStat: Awaited<ReturnType<typeof fsp.lstat>>;
-      try {
-        childStat = await fsp.lstat(childAbs);
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code === "ENOENT" || code === "ENOTDIR") continue;
-        return fail("execution");
-      }
-      const key = childStat.isDirectory() && !childStat.isSymbolicLink() ? `${childRel}/` : childRel;
-      // Count every walked entry (files/dirs/symlinks/other) toward the file-count bound.
-      fileCount += 1;
-      if (fileCount > IGNORED_CENSUS_MAX_FILES) return fail("snapshot-too-large");
-      if (childStat.isFile() && !childStat.isSymbolicLink()) {
-        totalFileBytes += childStat.size;
-        if (totalFileBytes > IGNORED_CENSUS_MAX_TOTAL_FILE_BYTES) return fail("snapshot-too-large");
-      }
-      if (!seen.has(key)) {
-        seen.add(key);
-        // Record dirs with trailing slash to distinguish from files, matching
-        // collapsed-status style; files/symlinks/other without slash.
-        collected.push(key);
-      }
-      if (childStat.isDirectory() && !childStat.isSymbolicLink()) {
-        await visitDir(childRel);
+  }
+  const worker = async (): Promise<void> => {
+    while (queue.length > 0) {
+      if (Date.now() > deadline) return fail("snapshot-too-large");
+      const batch = queue.splice(0, 8);
+      for (const dirRel of batch) {
+        const dirAbs = path.resolve(workspace.root, ...dirRel.split("/"));
+        let dirents;
+        try {
+          dirents = await fsp.readdir(dirAbs, { withFileTypes: true });
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "ENOENT" || code === "ENOTDIR") {
+            hitCount += 1;
+            continue;
+          }
+          return fail("execution");
+        }
+        const needStat: string[] = [];
+        for (const dirent of dirents) {
+          const name = dirent.name;
+          if (!name || name === "." || name === ".." || CONTROL_CHARACTER_PATTERN.test(name)) return fail("execution");
+          const childRel = `${dirRel}/${name}`;
+          if (childRel.length > GIT_COMMIT_MAX_PATH_BYTES || Buffer.byteLength(childRel, "utf8") > GIT_COMMIT_MAX_PATH_BYTES) {
+            return fail("snapshot-too-large");
+          }
+          if (dirent.isDirectory() && !dirent.isSymbolicLink()) {
+            queue.push(childRel);
+          } else {
+            needStat.push(name);
+          }
+        }
+        for (let index = 0; index < needStat.length; index += 256) {
+          if (Date.now() > deadline) return fail("snapshot-too-large");
+          const chunk = needStat.slice(index, index + 256);
+          const stats = await Promise.all(
+            chunk.map((name) =>
+              fsp.lstat(path.join(dirAbs, name)).then(
+                (stat) => ({ name, stat }) as const,
+                () => null
+              )
+            )
+          );
+          for (const result of stats) {
+            if (result === null) {
+              // Vanished mid-scan: window change, not silent ok.
+              hitCount += 1;
+              entries += 1;
+              if (entries > maxEntries) return fail("snapshot-too-large");
+              continue;
+            }
+            checkEntry(`${dirRel}/${result.name}`, result.stat);
+          }
+        }
       }
     }
   };
-  for (const root of dirRoots) {
-    await visitDir(root);
+  await Promise.all(Array.from({ length: IGNORED_WINDOW_NODE_CONCURRENCY }, () => worker()));
+  stored.sort();
+  return { scanned: true, startMs, engine: "node", entries, hitCount, hits: stored };
+}
+
+/**
+ * Window scan with find acceleration when available. Same contract as the
+ * portable Node scan; engine reported in the result for proof transparency.
+ */
+export async function scanIgnoredWindowWithMarker(
+  workspace: Workspace,
+  statuses: ReadonlyMap<string, string>,
+  markerPath: string,
+  markerCtimeMs: number,
+  options: IgnoredWindowScanOptions = {}
+): Promise<IgnoredWindowScan> {
+  if (!Number.isFinite(markerCtimeMs)) return fail("execution");
+  const maxEntries = options.maxEntries ?? IGNORED_WINDOW_MAX_ENTRIES;
+  const { roots, valid } = resolveIgnoredDirRoots(workspace, statuses);
+  if (!valid) return fail("execution");
+  const realRoots: string[] = [];
+  for (const root of roots) {
+    try {
+      if (await ignoredRootIsRealDir(workspace, root)) realRoots.push(root);
+    } catch {
+      return fail("execution");
+    }
   }
-  collected.sort();
-  return { paths: collected, fileCount, totalFileBytes };
+  const scanner = options.scanner ?? process.env.CODEXPRO_GIT_COMMIT_IGNORED_SCANNER ?? "auto";
+  if (scanner !== "auto" && scanner !== "find" && scanner !== "node") return fail("invalid-input");
+  if ((scanner === "auto" || scanner === "find") && realRoots.length > 0) {
+    let supported = false;
+    try {
+      supported = await findSupportsNewercc();
+    } catch {
+      supported = false;
+    }
+    if (supported || scanner === "find") {
+      const viaFind = await scanIgnoredWindowViaFind(workspace, realRoots, markerPath);
+      if (viaFind !== undefined) return viaFind;
+      if (scanner === "find") return fail("execution");
+      // Auto mode: find error falls back to portable Node once.
+    }
+  }
+  return scanIgnoredWindowViaNode(workspace, realRoots, markerCtimeMs, maxEntries);
 }
 
 /**
@@ -725,14 +1024,22 @@ async function assertPreAdvanceStatePreserved(
   workspace: Workspace,
   preflight: GitCommitPreflight,
   baseline: GitRepositorySnapshot,
-  baselineRemoteRefs: string
+  baselineRemoteRefs: string,
+  ignoredMarker?: IgnoredSnapshotRequest
 ): Promise<void> {
   try {
-    const current = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+    const current = await captureRepositorySnapshot(
+      config,
+      workspace,
+      preflight.objectFormat,
+      undefined,
+      ignoredMarker
+    );
     if (
       !sameSnapshotMetadata(baseline, current) ||
       !assertUnselectedSnapshotPreserved(baseline, current, new Set(preflight.request.paths)) ||
-      (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs
+      (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs ||
+      (current.ignoredWindow !== null && current.ignoredWindow.hitCount !== 0)
     ) {
       return fail("recovery-required");
     }
@@ -746,7 +1053,8 @@ async function captureRepositorySnapshot(
   config: GitCommitConfig,
   workspace: Workspace,
   format: "sha1" | "sha256",
-  indexScope?: GitIndexScope
+  indexScope?: GitIndexScope,
+  ignoredScan?: IgnoredSnapshotRequest
 ): Promise<GitRepositorySnapshot> {
   // Keep the census readers ordered. Git's split-index implementation can
   // materialize/normalize index metadata while a reader is starting; sibling
@@ -758,17 +1066,11 @@ async function captureRepositorySnapshot(
   // remains bounded; larger repositories fail closed with `snapshot-too-large`
   // instead of the opaque generic `execution` reason.
   //
-  // Ignored-content preservation uses collapsed `status --ignored=matching`
-  // roots (small, e.g. 38 entries vs 180k expanded files / 21 MiB output) to
-  // locate ignored directories, then walks those directories with sorted,
-  // streaming, bounded filesystem observation and records exact per-file
-  // worktree states (kind/mode/size/content-hash/link-target, same model as
-  // tracked preservation) for every file/symlink/dir underneath. Hook
-  // mutations to existing ignored files (including nested files) therefore
-  // change the preservation snapshot and cannot receive clean success.
-  // The walk enforces explicit file-count and total-bytes bounds before any
-  // content reads; exceeding either fails closed with `snapshot-too-large`
-  // rather than silently reducing coverage or accumulating unbounded stdout.
+  // Ignored-content preservation is a window-scan, not a per-file census
+  // (see the two-tier note above): intermediate snapshots skip it entirely
+  // (ignoredWindow null) and only proof checkpoints request the scan. The
+  // collapsed status entries stay small (38 entries vs ~1M ignored files /
+  // ~61 GiB in AgentWorkspace) while hook mutations remain detectable.
   const snapshotConfig: GitCommitConfig = {
     ...config,
     maxOutputBytes: 8 * 1024 * 1024
@@ -814,22 +1116,24 @@ async function captureRepositorySnapshot(
     const inspected = await inspectWorktreeState(config, workspace, relativePath, format, false);
     worktree.set(relativePath, inspected.state);
   }
-  // Extend preservation with exact ignored-inner content states. Top-level
-  // ignored files are already in `statuses`/`worktree` above; this adds files
-  // (including nested files) inside collapsed ignored directories, which
-  // collapsed status alone would leave invisible.
-  const ignoredInner = await collectIgnoredInnerPaths(workspace, statuses);
-  for (const relativePath of ignoredInner.paths) {
-    if (worktree.has(relativePath)) continue;
-    const inspected = await inspectWorktreeState(config, workspace, relativePath, format, false);
-    worktree.set(relativePath, inspected.state);
+  // Ignored-window proof on request only. Top-level individually-listed
+  // ignored files are already in `statuses`/`worktree` above with exact
+  // states; files inside collapsed ignored directories are covered by the
+  // window scan (ctime/mtime newer than the operation marker).
+  let ignoredWindow: IgnoredWindowScan | null = null;
+  if (ignoredScan !== undefined) {
+    ignoredWindow = await scanIgnoredWindowWithMarker(workspace, statuses, ignoredScan.markerPath, ignoredScan.markerCtimeMs, {
+      maxEntries: ignoredScan.maxEntries,
+      scanner: ignoredScan.scanner
+    });
   }
   return {
     index,
     statuses,
     worktree,
     localRefs: refsResult.copyStdoutBytes().toString("base64"),
-    localConfig: configResult.copyStdoutBytes().toString("base64")
+    localConfig: configResult.copyStdoutBytes().toString("base64"),
+    ignoredWindow
   };
 }
 
@@ -2099,10 +2403,11 @@ async function commitFailureRestoration(
   baseline: GitRepositorySnapshot,
   baselineRemoteRefs: string,
   baselineIndex: GitIndexBaseline,
-  receipts: readonly GitIntentReceipt[]
+  receipts: readonly GitIntentReceipt[],
+  ignoredMarker?: IgnoredSnapshotRequest
 ): Promise<void> {
   try {
-    const current = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+    const current = await captureRepositorySnapshot(config, workspace, preflight.objectFormat, undefined, ignoredMarker);
     const states = await selectedWorktreeStates(config, workspace, preflight);
     const branch = await currentBranchState(config, workspace, preflight.objectFormat);
     if (
@@ -2110,7 +2415,8 @@ async function commitFailureRestoration(
       branch.ref !== `refs/heads/${preflight.branch}` ||
       branch.head !== preflight.head ||
       (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs ||
-      !sameSnapshotMetadata(baseline, current)
+      !sameSnapshotMetadata(baseline, current) ||
+      (current.ignoredWindow !== null && current.ignoredWindow.hitCount !== 0)
     ) {
       return fail("recovery-required");
     }
@@ -2133,7 +2439,8 @@ async function verifyCommitPostconditions(
   preflight: GitCommitPreflight,
   baseline: GitRepositorySnapshot,
   baselineRemoteRefs: string,
-  expectedChanges: ReadonlyMap<string, GitRawDiffEntry>
+  expectedChanges: ReadonlyMap<string, GitRawDiffEntry>,
+  ignoredMarker: IgnoredSnapshotRequest
 ): Promise<GitCommitResult> {
   try {
     const branch = await currentBranchState(config, workspace, preflight.objectFormat);
@@ -2181,13 +2488,15 @@ async function verifyCommitPostconditions(
       }
     }
 
-    const after = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+    const after = await captureRepositorySnapshot(config, workspace, preflight.objectFormat, undefined, ignoredMarker);
     const selectedPaths = new Set(preflight.request.paths);
     if (
       !assertUnselectedSnapshotPreserved(baseline, after, selectedPaths) ||
       [...after.statuses.keys()].some((relativePath) => selectedPaths.has(relativePath)) ||
       (await remoteRefsSnapshot(config, workspace)) !== baselineRemoteRefs ||
       after.localConfig !== baseline.localConfig ||
+      after.ignoredWindow === null ||
+      after.ignoredWindow.hitCount !== 0 ||
       !localRefsChangedOnlyForBranch(
         baseline,
         after,
@@ -2254,7 +2563,15 @@ export async function gitCommit(
   rawInput: unknown
 ): Promise<GitCommitResult> {
   return withGitCommitLocks(config, guard, workspace, rawInput, async (preflight) => {
-    const baseline = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
+    // Ignored-window marker first: its ctime is T0 for the whole operation.
+    // Task-owned temp file in os.tmpdir, removed on all paths below.
+    const ignoredMarkerSource = await createIgnoredWindowMarker();
+    const ignoredMarker: IgnoredSnapshotRequest = {
+      markerPath: ignoredMarkerSource.markerPath,
+      markerCtimeMs: ignoredMarkerSource.ctimeMs
+    };
+    try {
+      const baseline = await captureRepositorySnapshot(config, workspace, preflight.objectFormat);
     const baselineIndexPath = await actualGitIndexPath(config, workspace, preflight);
     const baselineIndex = await readIndexBaseline(baselineIndexPath);
     const baselineRemoteRefs = await remoteRefsSnapshot(config, workspace);
@@ -2320,19 +2637,22 @@ export async function gitCommit(
           ...preflight.request.paths
         ]);
       } catch (error) {
-        await commitFailureRestoration(config, workspace, preflight, baseline, baselineRemoteRefs, baselineIndex, receipts);
+        await commitFailureRestoration(config, workspace, preflight, baseline, baselineRemoteRefs, baselineIndex, receipts, ignoredMarker);
         if (error instanceof GitCommitError) throw error;
         return fail("execution");
       }
-      return await verifyCommitPostconditions(config, workspace, preflight, baseline, baselineRemoteRefs, expectedChanges);
+      return await verifyCommitPostconditions(config, workspace, preflight, baseline, baselineRemoteRefs, expectedChanges, ignoredMarker);
     } catch (error) {
       if (!commitAttempted && receipts.length > 0) {
         await restoreOwnedIntentEntries(config, workspace, preflight, baseline, baselineRemoteRefs, baselineIndex, receipts);
       }
       if (!commitAttempted) {
-        await assertPreAdvanceStatePreserved(config, workspace, preflight, baseline, baselineRemoteRefs);
+        await assertPreAdvanceStatePreserved(config, workspace, preflight, baseline, baselineRemoteRefs, ignoredMarker);
       }
       throw error;
+    }
+    } finally {
+      await removeIgnoredWindowMarker(ignoredMarker.markerPath);
     }
   });
 }
