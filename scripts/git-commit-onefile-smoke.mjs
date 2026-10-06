@@ -121,8 +121,122 @@ try {
   });
   assert.equal(mediumResult.old_head, mediumBase);
   assert.deepEqual(mediumResult.committed_paths, ["tracked-0000.txt"]);
+  // Ignored tree remains byte-identical after clean commit (spot-check + collapsed status still present).
+  assert.equal((await readFile(path.join(medium0, "ignored-dir", "ignored-0000.txt"), "utf8")), "ignored 0\n");
+  assert.equal((await readFile(path.join(medium0, "ignored-dir", "ignored-1999.txt"), "utf8")), "ignored 1999\n");
   console.log(`RAW_OBSERVATION: medium repo (1200 tracked + 2000 collapsed ignored) one-file commit ${mediumBase} -> ${mediumResult.new_head} succeeded.`);
   console.log("PASS medium census still proves preservation");
+
+  // P-hook-ignored: exact Hestia reproduction — hook mutates existing ignored
+  // file inside collapsed directory while committing unrelated tracked file.
+  // Helper must NOT report clean success while MUTATED survives.
+  const hookRepo0 = path.join(fixture, "hook-ignored");
+  await mkdir(hookRepo0, { recursive: true });
+  initRepo(hookRepo0, "Hook Ignored");
+  await writeFile(path.join(hookRepo0, "selected.txt"), "selected base\n");
+  await writeFile(path.join(hookRepo0, ".gitignore"), "ignored-dir/\n");
+  await mkdir(path.join(hookRepo0, "ignored-dir"));
+  const hookKeep = path.join(hookRepo0, "ignored-dir", "keep.txt");
+  await writeFile(hookKeep, "ORIGINAL\n");
+  const hookBase = commitAll(hookRepo0, "hook ignored base");
+  const hookHooks = path.join(hookRepo0, ".githooks");
+  await mkdir(hookHooks);
+  await writeFile(path.join(hookHooks, "pre-commit"), `#!/bin/sh\nprintf 'MUTATED\\n' > '${hookKeep}'\nexit 0\n`);
+  await chmod(path.join(hookHooks, "pre-commit"), 0o700);
+  git(hookRepo0, ["config", "core.hooksPath", ".githooks"]);
+  await writeFile(path.join(hookRepo0, "selected.txt"), "selected changed\n");
+  const hookRoot = await realpath(hookRepo0);
+  const hookWsId = `ws_${createHash("sha256").update(hookRoot).digest("hex").slice(0, 24)}`;
+  const hookWorkspace = { id: hookWsId, root: hookRoot, openedAt: new Date().toISOString() };
+  let hookErr;
+  try {
+    await gitCommit(config, guard, hookWorkspace, {
+      workspace_id: hookWsId,
+      paths: ["selected.txt"],
+      message: "hook ignored repro",
+      expected_head: hookBase
+    });
+  } catch (e) {
+    hookErr = e;
+  }
+  assert.ok(hookErr, "hook ignored mutation must not succeed");
+  assert.equal(hookErr.name, "GitCommitError");
+  // Successful hook (exit 0) advances HEAD, then preservation must reject as postcondition (existing contract).
+  assert.equal(hookErr.reason, "postcondition");
+  assert.equal((await readFile(hookKeep, "utf8")), "MUTATED\n", "ignored mutation must survive for inspection");
+  assert.notEqual(git(hookRoot, ["rev-parse", "HEAD"]), hookBase, "successful hook advances HEAD before postcondition rejection");
+  console.log(`RAW_OBSERVATION: hook ignored keep.txt ORIGINAL->MUTATED during selected.txt commit correctly rejected with reason=${hookErr.reason}; HEAD advanced but helper did not report success.`);
+  console.log("PASS P-hook-ignored top-level collapsed file");
+
+  // Nested ignored file (not only directory marker).
+  const nestedRepo0 = path.join(fixture, "hook-nested");
+  await mkdir(nestedRepo0, { recursive: true });
+  initRepo(nestedRepo0, "Hook Nested");
+  await writeFile(path.join(nestedRepo0, "selected.txt"), "selected base\n");
+  await writeFile(path.join(nestedRepo0, ".gitignore"), "ignored-dir/\n");
+  await mkdir(path.join(nestedRepo0, "ignored-dir", "sub"), { recursive: true });
+  const nestedKeep = path.join(nestedRepo0, "ignored-dir", "sub", "nested.txt");
+  await writeFile(nestedKeep, "NESTED_ORIGINAL\n");
+  const nestedBase = commitAll(nestedRepo0, "nested base");
+  const nestedHooks = path.join(nestedRepo0, ".githooks");
+  await mkdir(nestedHooks);
+  await writeFile(path.join(nestedHooks, "pre-commit"), `#!/bin/sh\nprintf 'NESTED_MUTATED\\n' > '${nestedKeep}'\nexit 0\n`);
+  await chmod(path.join(nestedHooks, "pre-commit"), 0o700);
+  git(nestedRepo0, ["config", "core.hooksPath", ".githooks"]);
+  await writeFile(path.join(nestedRepo0, "selected.txt"), "selected changed\n");
+  const nestedRoot = await realpath(nestedRepo0);
+  const nestedWsId = `ws_${createHash("sha256").update(nestedRoot).digest("hex").slice(0, 24)}`;
+  const nestedWorkspace = { id: nestedWsId, root: nestedRoot, openedAt: new Date().toISOString() };
+  let nestedErr;
+  try {
+    await gitCommit(config, guard, nestedWorkspace, {
+      workspace_id: nestedWsId,
+      paths: ["selected.txt"],
+      message: "nested repro",
+      expected_head: nestedBase
+    });
+  } catch (e) {
+    nestedErr = e;
+  }
+  assert.ok(nestedErr, "nested ignored mutation must not succeed");
+  assert.equal(nestedErr.reason, "postcondition");
+  assert.equal((await readFile(nestedKeep, "utf8")), "NESTED_MUTATED\n");
+  console.log(`RAW_OBSERVATION: nested ignored sub/nested.txt mutation correctly rejected with reason=${nestedErr.reason}.`);
+  console.log("PASS P-hook-ignored nested file");
+
+  // Bounded-failure: exceeding explicit ignored-census safety bound must return
+  // snapshot-too-large, not generic execution / success with incomplete coverage.
+  const huge0 = path.join(fixture, "huge-bound");
+  await mkdir(huge0, { recursive: true });
+  initRepo(huge0, "Huge Bound");
+  await writeFile(path.join(huge0, "selected.txt"), "selected base\n");
+  await writeFile(path.join(huge0, ".gitignore"), "ignored-dir/\n");
+  await mkdir(path.join(huge0, "ignored-dir"));
+  // 21000 small ignored files exceeds IGNORED_CENSUS_MAX_FILES=20000 (total bytes small, file-count bound triggers).
+  for (let i = 0; i < 21000; i++) {
+    await writeFile(path.join(huge0, "ignored-dir", `f-${String(i).padStart(5, "0")}.txt`), "x\n");
+  }
+  const hugeBase = commitAll(huge0, "huge base");
+  const hugeRoot = await realpath(huge0);
+  const hugeWsId = `ws_${createHash("sha256").update(hugeRoot).digest("hex").slice(0, 24)}`;
+  const hugeWorkspace = { id: hugeWsId, root: hugeRoot, openedAt: new Date().toISOString() };
+  await writeFile(path.join(huge0, "selected.txt"), "selected changed\n");
+  let hugeErr;
+  try {
+    await gitCommit(config, guard, hugeWorkspace, {
+      workspace_id: hugeWsId,
+      paths: ["selected.txt"],
+      message: "huge bound probe",
+      expected_head: hugeBase
+    });
+  } catch (e) {
+    hugeErr = e;
+  }
+  assert.ok(hugeErr, "exceeding census bound must fail");
+  assert.equal(hugeErr.reason, "snapshot-too-large");
+  assert.match(hugeErr.message, /bounded|too large/iu);
+  console.log(`RAW_OBSERVATION: 21000 ignored files correctly rejected with reason=${hugeErr.reason} (explicit bound, not generic execution).`);
+  console.log("PASS bounded snapshot-too-large");
 
   console.log("ONEFILE: PASS");
 } finally {

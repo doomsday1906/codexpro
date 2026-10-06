@@ -598,6 +598,118 @@ function assertPreparedSnapshotPreserved(
 }
 
 /**
+ * Bounded ignored-content census.
+ *
+ * Collapsed `status --ignored=matching` entries keep the census small
+ * (38 entries in AgentWorkspace vs 180k expanded files / 21 MiB output),
+ * but directory entries alone cannot prove that files inside ignored
+ * directories were not changed by hooks. This census walks only the ignored
+ * directory roots returned by collapsed status and records exact per-file
+ * worktree states (kind/mode/size/content-hash/link-target, same model as
+ * tracked preservation) for every file/symlink/dir underneath.
+ *
+ * Properties:
+ * - deterministic (sorted walk, no shell, no stdout accumulation);
+ * - bounded memory (incremental per-file hashing via inspectWorktreeState,
+ *   worktree Map bounded by file-count limit);
+ * - bounded time/resources via explicit file-count and total-bytes limits
+ *   enforced during the walk before any content reads;
+ * - safely handles files/symlinks/directories/other and path replacement
+ *   (kind/mode/size/hash/link-target compared, symlinked dirs never
+ *   descended, missing entries from races recorded as missing);
+ * - task-owned temp state: none (no spool files; Map only, cleaned via GC;
+ *   no leftover artifacts on any path).
+ *
+ * If the census exceeds its explicit safety bound, fail closed with
+ * `snapshot-too-large` rather than silently reducing coverage.
+ */
+const IGNORED_CENSUS_MAX_FILES = 20000;
+const IGNORED_CENSUS_MAX_TOTAL_FILE_BYTES = 200 * 1024 * 1024;
+
+async function collectIgnoredInnerPaths(
+  workspace: Workspace,
+  statuses: ReadonlyMap<string, string>
+): Promise<{ readonly paths: readonly string[]; readonly fileCount: number; readonly totalFileBytes: number }> {
+  const dirRoots: string[] = [];
+  for (const [relPath, status] of statuses) {
+    if (!status.startsWith("!")) continue;
+    // Strip trailing slash for resolution; `a/` and `a` resolve identically.
+    const stripped = relPath.endsWith("/") && relPath.length > 1 ? relPath.slice(0, -1) : relPath;
+    if (!stripped || stripped === "/" || CONTROL_CHARACTER_PATTERN.test(stripped)) continue;
+    const absPath = path.resolve(workspace.root, ...stripped.split("/"));
+    if (!isSubpath(absPath, workspace.root)) continue;
+    let stat: Awaited<ReturnType<typeof fsp.lstat>>;
+    try {
+      stat = await fsp.lstat(absPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR") continue;
+      return fail("execution");
+    }
+    if (stat.isDirectory() && !stat.isSymbolicLink()) {
+      dirRoots.push(stripped);
+    }
+  }
+  dirRoots.sort();
+  const collected: string[] = [];
+  let fileCount = 0;
+  let totalFileBytes = 0;
+  const seen = new Set<string>();
+  const visitDir = async (dirRel: string): Promise<void> => {
+    const dirAbs = path.resolve(workspace.root, ...dirRel.split("/"));
+    let entries: string[];
+    try {
+      entries = await fsp.readdir(dirAbs);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return;
+      return fail("execution");
+    }
+    entries.sort();
+    for (const entry of entries) {
+      if (!entry || entry === "." || entry === ".." || CONTROL_CHARACTER_PATTERN.test(entry)) {
+        return fail("execution");
+      }
+      const childRel = `${dirRel}/${entry}`;
+      if (childRel.length > GIT_COMMIT_MAX_PATH_BYTES || Buffer.byteLength(childRel, "utf8") > GIT_COMMIT_MAX_PATH_BYTES) {
+        return fail("snapshot-too-large");
+      }
+      const childAbs = path.resolve(workspace.root, ...childRel.split("/"));
+      if (!isSubpath(childAbs, workspace.root)) return fail("execution");
+      let childStat: Awaited<ReturnType<typeof fsp.lstat>>;
+      try {
+        childStat = await fsp.lstat(childAbs);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ENOTDIR") continue;
+        return fail("execution");
+      }
+      const key = childStat.isDirectory() && !childStat.isSymbolicLink() ? `${childRel}/` : childRel;
+      // Count every walked entry (files/dirs/symlinks/other) toward the file-count bound.
+      fileCount += 1;
+      if (fileCount > IGNORED_CENSUS_MAX_FILES) return fail("snapshot-too-large");
+      if (childStat.isFile() && !childStat.isSymbolicLink()) {
+        totalFileBytes += childStat.size;
+        if (totalFileBytes > IGNORED_CENSUS_MAX_TOTAL_FILE_BYTES) return fail("snapshot-too-large");
+      }
+      if (!seen.has(key)) {
+        seen.add(key);
+        // Record dirs with trailing slash to distinguish from files, matching
+        // collapsed-status style; files/symlinks/other without slash.
+        collected.push(key);
+      }
+      if (childStat.isDirectory() && !childStat.isSymbolicLink()) {
+        await visitDir(childRel);
+      }
+    }
+  };
+  for (const root of dirRoots) {
+    await visitDir(root);
+  }
+  collected.sort();
+  return { paths: collected, fileCount, totalFileBytes };
+}
+
+/**
  * Before a ref advance, an ordinary failure under the supported concurrency
  * model (RepoConnect-owned writers, ordinary Git-lock-cooperative writers,
  * and synchronous cooperative hooks) may leave selected-path drift
@@ -646,15 +758,17 @@ async function captureRepositorySnapshot(
   // remains bounded; larger repositories fail closed with `snapshot-too-large`
   // instead of the opaque generic `execution` reason.
   //
-  // Ignored worktree coverage comes from the collapsed
-  // `status --ignored=matching` entries (small) rather than the expanded
-  // `ls-files --others --ignored` enumeration (unbounded: 180k+ files and
-  // tens of megabytes in large workspaces). Individually listed ignored files
-  // (for example top-level `*.ignored`) remain in `statuses` and keep exact
-  // per-file worktree preservation; collapsed ignored directories are tracked
-  // as directory entries only. This keeps ordinary one-file commits usable in
-  // large workspaces without weakening tracked/selected/status preservation
-  // or hook/config/ref safety.
+  // Ignored-content preservation uses collapsed `status --ignored=matching`
+  // roots (small, e.g. 38 entries vs 180k expanded files / 21 MiB output) to
+  // locate ignored directories, then walks those directories with sorted,
+  // streaming, bounded filesystem observation and records exact per-file
+  // worktree states (kind/mode/size/content-hash/link-target, same model as
+  // tracked preservation) for every file/symlink/dir underneath. Hook
+  // mutations to existing ignored files (including nested files) therefore
+  // change the preservation snapshot and cannot receive clean success.
+  // The walk enforces explicit file-count and total-bytes bounds before any
+  // content reads; exceeding either fails closed with `snapshot-too-large`
+  // rather than silently reducing coverage or accumulating unbounded stdout.
   const snapshotConfig: GitCommitConfig = {
     ...config,
     maxOutputBytes: 8 * 1024 * 1024
@@ -697,6 +811,16 @@ async function captureRepositorySnapshot(
   const allPaths = mapKeys(index, statuses);
   const worktree = new Map<string, GitWorktreeEntryState>();
   for (const relativePath of allPaths) {
+    const inspected = await inspectWorktreeState(config, workspace, relativePath, format, false);
+    worktree.set(relativePath, inspected.state);
+  }
+  // Extend preservation with exact ignored-inner content states. Top-level
+  // ignored files are already in `statuses`/`worktree` above; this adds files
+  // (including nested files) inside collapsed ignored directories, which
+  // collapsed status alone would leave invisible.
+  const ignoredInner = await collectIgnoredInnerPaths(workspace, statuses);
+  for (const relativePath of ignoredInner.paths) {
+    if (worktree.has(relativePath)) continue;
     const inspected = await inspectWorktreeState(config, workspace, relativePath, format, false);
     worktree.set(relativePath, inspected.state);
   }
