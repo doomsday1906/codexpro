@@ -33,6 +33,7 @@ import { gitLogStructured, gitMergeBase, gitResolveRef, gitShowCommit } from "./
 import { HistoricalBlobError, readAtRef } from "./gitHistoricalBlob.js";
 import { GIT_COMMIT_MAX_MESSAGE_BYTES, GIT_COMMIT_MAX_PATH_BYTES, GIT_COMMIT_MAX_PATHS, gitCommit } from "./gitCommit.js";
 import { gitPush } from "./gitPush.js";
+import { gitPromote } from "./gitPromote.js";
 import { gitRetireRemoteBranch } from "./gitRetireRemoteBranch.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { buildProContext, exportProContext } from "./proContext.js";
@@ -45,6 +46,7 @@ import { hasSecretValue, hasSecretValueInUnifiedDiff, redactDiagnosticStructured
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { createDiagnosticContext, type CodexProDiagnosticContext } from "./diagnosticContext.js";
 import { normalizeGitPushPolicy, sanitizeGitPushPolicy } from "./gitPushPolicy.js";
+import { normalizeGitPromotePolicy, sanitizeGitPromotePolicy } from "./gitPromotePolicy.js";
 import { runLoggedToolCall, traceFact } from "./toolLog.js";
 export type { CodexProDiagnosticContext, DiagnosticContextOptions, DiagnosticTransportKind, HttpDiagnosticCurrentRequest, HttpDiagnosticCurrentSession, HttpDiagnosticSnapshot } from "./diagnosticContext.js";
 
@@ -620,6 +622,103 @@ const GIT_PUSH_PUBLIC_SCHEMA = z.object(GIT_PUSH_ARGUMENTS_SCHEMA.shape).strict(
 GIT_PUSH_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_PUSH_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_PUSH_PUBLIC_SCHEMA.safeParse;
 GIT_PUSH_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_PUSH_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_PUSH_PUBLIC_SCHEMA.safeParseAsync;
 
+const GIT_PROMOTE_ARGUMENTS_SCHEMA = z.object({
+  workspace_id: REVIEW_WORKSPACE_ID_SCHEMA,
+  remote: z.string()
+    .min(1)
+    .max(256)
+    .describe("Exact configured Git remote name; endpoint and credentials are policy-owned."),
+  branch: z.string()
+    .min(1)
+    .max(256)
+    .describe("Exact canonical destination branch name, normally main."),
+  source_commit: z.string()
+    .max(64)
+    .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu, "source_commit must be a full commit SHA.")
+    .describe("Exact full qualified integration commit SHA to promote."),
+  expected_remote_head: z.string()
+    .max(64)
+    .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu, "expected_remote_head must be a full commit SHA.")
+    .describe("Exact full current canonical remote branch SHA the integration lane was based on.")
+}).strict();
+
+const GIT_PROMOTE_FIELD_NAMES = new Set([
+  "workspace_id",
+  "remote",
+  "branch",
+  "source_commit",
+  "expected_remote_head"
+]);
+
+function boundedGitPromoteValidationError(issues: readonly z.ZodIssue[]): z.ZodError {
+  const safeIssues: z.ZodIssue[] = [];
+  const seenMessages = new Set<string>();
+  for (const issue of issues) {
+    if (issue.code === "unrecognized_keys") {
+      if (!seenMessages.has("Unknown keys are not allowed.")) {
+        safeIssues.push({ code: "custom", path: [], message: "Unknown keys are not allowed." });
+        seenMessages.add("Unknown keys are not allowed.");
+      }
+      continue;
+    }
+
+    const field = issue.path.length === 1 && typeof issue.path[0] === "string" && GIT_PROMOTE_FIELD_NAMES.has(issue.path[0])
+      ? issue.path[0]
+      : undefined;
+    const message = field === "workspace_id" && issue.code === "invalid_type" && issue.received === "undefined"
+      ? "Workspace id is required."
+      : field
+        ? "Invalid value."
+        : "Schema constraints were not satisfied.";
+    const path = field ? [field] : [];
+    const key = `${path.join(".")}:${message}`;
+    if (seenMessages.has(key)) continue;
+    seenMessages.add(key);
+    safeIssues.push({ code: "custom", path, message });
+  }
+
+  if (safeIssues.length === 0) {
+    safeIssues.push({ code: "custom", path: [], message: "Schema constraints were not satisfied." });
+  }
+  return new z.ZodError(safeIssues);
+}
+
+// The SDK uses the published Zod object for tools/list and transport-level
+// tools/call validation. Keep the transport envelope permissive so hostile
+// unknown property names/values cannot be copied into SDK-generated errors;
+// the strict runtime schema remains the source of truth in validateToolArgs.
+const GIT_PROMOTE_TRANSPORT_SCHEMA = z.object({
+  workspace_id: z.unknown().optional(),
+  remote: z.unknown().optional(),
+  branch: z.unknown().optional(),
+  source_commit: z.unknown().optional(),
+  expected_remote_head: z.unknown().optional()
+}).passthrough();
+const rawGitPromoteSafeParse = GIT_PROMOTE_ARGUMENTS_SCHEMA.safeParse.bind(GIT_PROMOTE_ARGUMENTS_SCHEMA);
+GIT_PROMOTE_ARGUMENTS_SCHEMA.safeParse = ((args: unknown) => {
+  const parsed = rawGitPromoteSafeParse(args);
+  return parsed.success
+    ? parsed
+    : { success: false, error: boundedGitPromoteValidationError(parsed.error.issues) };
+}) as typeof GIT_PROMOTE_ARGUMENTS_SCHEMA.safeParse;
+const rawGitPromoteSafeParseAsync = GIT_PROMOTE_ARGUMENTS_SCHEMA.safeParseAsync.bind(GIT_PROMOTE_ARGUMENTS_SCHEMA);
+GIT_PROMOTE_ARGUMENTS_SCHEMA.safeParseAsync = (async (args: unknown) => {
+  const parsed = await rawGitPromoteSafeParseAsync(args);
+  return parsed.success
+    ? parsed
+    : { success: false, error: boundedGitPromoteValidationError(parsed.error.issues) };
+}) as typeof GIT_PROMOTE_ARGUMENTS_SCHEMA.safeParseAsync;
+const GIT_PROMOTE_PUBLIC_SCHEMA = z.object(GIT_PROMOTE_ARGUMENTS_SCHEMA.shape).strict();
+GIT_PROMOTE_PUBLIC_SCHEMA.safeParse = ((args: unknown) => GIT_PROMOTE_TRANSPORT_SCHEMA.safeParse(args)) as typeof GIT_PROMOTE_PUBLIC_SCHEMA.safeParse;
+GIT_PROMOTE_PUBLIC_SCHEMA.safeParseAsync = ((args: unknown) => GIT_PROMOTE_TRANSPORT_SCHEMA.safeParseAsync(args)) as typeof GIT_PROMOTE_PUBLIC_SCHEMA.safeParseAsync;
+
+const GIT_PROMOTE_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  openWorldHint: true,
+  idempotentHint: false
+} as const;
+
 const GIT_RETIRE_REMOTE_BRANCH_SHA_SCHEMA = z.string()
   .max(64)
   .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu, "value must be a full object-format commit SHA.");
@@ -1113,6 +1212,23 @@ function errorText(error: unknown): string {
   return redactDiagnosticText(String(error));
 }
 
+function errorReason(error: unknown): string | undefined {
+  const candidate = (error as { reason?: unknown })?.reason;
+  if (typeof candidate === "string" && /^[a-z0-9][a-z0-9_-]{0,63}$/iu.test(candidate)) return candidate;
+  try {
+    const json = (error as { toJSON?: unknown })?.toJSON;
+    if (typeof json === "function") {
+      const parsed = (json as () => unknown).call(error) as { reason?: unknown } | undefined;
+      if (parsed && typeof parsed.reason === "string" && /^[a-z0-9][a-z0-9_-]{0,63}$/iu.test(parsed.reason)) {
+        return parsed.reason;
+      }
+    }
+  } catch {
+    // A failing toJSON cannot contribute a bounded reason.
+  }
+  return undefined;
+}
+
 function compactStructuredContent<T>(value: T, depth = 0): T {
   if (depth > 8 || value === null || value === undefined) return value;
   if (typeof value === "string") {
@@ -1480,9 +1596,12 @@ function ptyTextResult(result: PtyRunResult): string {
 
 function errorResult(error: unknown): any {
   const message = errorText(error);
+  const reason = errorReason(error);
+  const text = reason === undefined ? message : `${message} Reason: ${reason}.`;
+  const structured = reason === undefined ? { error: message } : { error: message, reason };
   return {
     isError: true,
-    ...diagnosticTextResult(message, { error: message })
+    ...diagnosticTextResult(text, structured)
   };
 }
 
@@ -1676,7 +1795,7 @@ const SUPERTOOL_NAME = "codexpro";
 // through the loose, general-purpose supertool wrapper. Keep the explicit
 // registration visible to mode/configuration reporting while excluding it
 // from wrapper actions and the wrapper handler map.
-const SUPERTOOL_EXCLUDED_ACTIONS = new Set<string>(["git_commit", "git_push", "git_retire_remote_branch"]);
+const SUPERTOOL_EXCLUDED_ACTIONS = new Set<string>(["git_commit", "git_push", "git_promote", "git_retire_remote_branch"]);
 const SUPERTOOL_ACTION_ALIASES: Record<string, string> = {
   actions: "list_actions",
   config: "server_config",
@@ -1695,6 +1814,16 @@ function hasEnabledGitPushPolicy(config: CodexProConfig): boolean {
   if (config.toolMode !== "full" || config.writeMode !== "workspace") return false;
   try {
     const policy = normalizeGitPushPolicy(config.gitPushPolicy);
+    return policy.enabled === true && policy.rules.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function hasEnabledGitPromotePolicy(config: CodexProConfig): boolean {
+  if (config.toolMode !== "full" || config.writeMode !== "workspace") return false;
+  try {
+    const policy = normalizeGitPromotePolicy(config.gitPromotePolicy);
     return policy.enabled === true && policy.rules.length > 0;
   } catch {
     return false;
@@ -1881,6 +2010,7 @@ const FULL_TOOL_NAMES = [
   "git_diff_range",
   "git_commit",
   "git_push",
+  "git_promote",
   "git_retire_remote_branch",
   "git_status",
   "git_diff",
@@ -1915,6 +2045,7 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "import_file",
   "git_commit",
   "git_push",
+  "git_promote",
   "git_retire_remote_branch",
   "bash",
   "pty_run",
@@ -1973,7 +2104,7 @@ function toolNamesForMode(config: CodexProConfig): string[] {
     }
   }
   if (config.writeMode !== "workspace") {
-    for (const writeTool of ["write", "edit", "apply_patch", "import_file", "git_commit", "git_push", "git_retire_remote_branch"]) {
+    for (const writeTool of ["write", "edit", "apply_patch", "import_file", "git_commit", "git_push", "git_promote", "git_retire_remote_branch"]) {
       const toolIndex = names.indexOf(writeTool);
       if (toolIndex !== -1) names.splice(toolIndex, 1);
     }
@@ -1983,6 +2114,10 @@ function toolNamesForMode(config: CodexProConfig): string[] {
       const remoteWriteIndex = names.indexOf(remoteWriteTool);
       if (remoteWriteIndex !== -1) names.splice(remoteWriteIndex, 1);
     }
+  }
+  if (!hasEnabledGitPromotePolicy(config)) {
+    const promoteIndex = names.indexOf("git_promote");
+    if (promoteIndex !== -1) names.splice(promoteIndex, 1);
   }
   if (config.writeMode === "handoff" && !names.includes("handoff_to_agent")) names.push("handoff_to_agent");
   if (!aiBridgeEnabled(config)) {
@@ -2029,6 +2164,7 @@ function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
   if ((name === "write" || name === "edit" || name === "apply_patch" || name === "import_file") && config.writeMode !== "workspace") return false;
   if (name === "git_commit" && (config.toolMode !== "full" || config.writeMode !== "workspace")) return false;
   if ((name === "git_push" || name === "git_retire_remote_branch") && !hasEnabledGitPushPolicy(config)) return false;
+  if (name === "git_promote" && !hasEnabledGitPromotePolicy(config)) return false;
   if (name === "codex_sessions") return config.codexSessions !== "off";
   if (name === "read_codex_session") return config.codexSessions === "read";
   if (name === "inspect_workspace" && !config.analysisEnabled) return false;
@@ -2081,7 +2217,7 @@ function serverInstructions(config: CodexProConfig, diagnosticContext?: CodexPro
     "Preferred workflow:",
     `1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects. ${transportGuidance}`,
     "2. list_workspaces is session-local, not a process-global workspace directory. When continuity is unclear, call session_workspace_diagnostics; it reports runtime/session/catalog truth and can classify an explicit workspace_id without selecting or opening it. A valid explicit-ID recovery targets that workspace without changing ambient or global selection.",
-    "3. For correctness-sensitive Git tools (git_commit, git_push, git_retire_remote_branch, git_resolve_ref, git_merge_base, git_log, git_show_commit, read_at_ref, git_diff_range), always pass the explicit workspace_id returned by open_current_workspace/open_workspace. Harmless reads may omit it when ambient selection is clear.",
+    "3. For correctness-sensitive Git tools (git_commit, git_push, git_promote, git_retire_remote_branch, git_resolve_ref, git_merge_base, git_log, git_show_commit, read_at_ref, git_diff_range), always pass the explicit workspace_id returned by open_current_workspace/open_workspace. Harmless reads may omit it when ambient selection is clear.",
     "4. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
     "5. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
     editInstruction.replace(/^5\./u, "6."),
@@ -3278,6 +3414,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         toolCards: config.toolCards,
         aiBridgeEnabled: aiBridgeEnabled(config),
         gitPushPolicy: sanitizeGitPushPolicy(config.gitPushPolicy),
+        gitPromotePolicy: sanitizeGitPromotePolicy(config.gitPromotePolicy),
         connectionTest: config.connectionTest,
         analysisEnabled: config.analysisEnabled,
         analysisLimits: config.analysisLimits,
@@ -3748,6 +3885,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         write_mode: config.writeMode,
         tool_mode: config.toolMode,
         git_push_policy: sanitizeGitPushPolicy(config.gitPushPolicy),
+        git_promote_policy: sanitizeGitPromotePolicy(config.gitPromotePolicy),
         skills: inventory.skills,
         skill_count: inventory.skills.length,
         mcp_servers: inventory.mcpServers,
@@ -4918,6 +5056,41 @@ ${activeCount} active; ${jobs.length} retained in generation ${verificationManag
         `Remote HEAD: ${result.remote_head}`,
         `Push attempts: ${result.push_attempts}`,
         "Status: pushed"
+      ].join("\n");
+      return textResult(text, { ...result });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "git_promote",
+    {
+      title: "Git Promote",
+      description: "Promote one already-qualified local integration commit to a configured canonical remote branch without checking that canonical branch out. Provide the exact integration source_commit SHA and the exact expected_remote_head SHA the lane was based on. Promotion is fast-forward only with compare-and-swap protection, performs no merge/rebase/cherry-pick/force, and never infers authority from ordinary git_push permission; it requires explicit Git promote policy. Available only in full tool mode with CODEXPRO_WRITE_MODE=workspace and an enabled Git promote policy. The endpoint, lease, refspec, and push options are internally controlled.",
+      inputSchema: GIT_PROMOTE_PUBLIC_SCHEMA,
+      runtimeInputSchema: GIT_PROMOTE_ARGUMENTS_SCHEMA,
+      annotations: GIT_PROMOTE_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Promoting one qualified integration commit...",
+        "openai/toolInvocation/invoked": "Canonical promotion completed"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(args.workspace_id);
+      const result = await gitPromote(config, workspace, args);
+      const text = [
+        "# Git Promote",
+        "",
+        `Workspace: ${result.root}`,
+        `Remote: ${result.remote}`,
+        `Branch: ${result.branch}`,
+        `Destination: ${result.destination_ref}`,
+        `Source commit: ${result.source_commit}`,
+        `Expected remote HEAD: ${result.expected_remote_head}`,
+        `Remote HEAD: ${result.remote_head}`,
+        `Push attempts: ${result.push_attempts}`,
+        "Status: promoted"
       ].join("\n");
       return textResult(text, { ...result });
     }

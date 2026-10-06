@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULT_ANALYSIS_LIMITS, type AnalysisLimits } from "./analysis/types.js";
 import { parseGitPushPolicy, type GitPushPolicy } from "./gitPushPolicy.js";
+import { parseGitPromotePolicy, type GitPromotePolicy } from "./gitPromotePolicy.js";
 
 export type BashMode = "off" | "safe" | "full";
 export type BashTranscriptMode = "compact" | "full";
@@ -44,6 +45,7 @@ export interface CodexProConfig {
   contextDir: string;
   toolCards: boolean;
   gitPushPolicy: GitPushPolicy;
+  gitPromotePolicy: GitPromotePolicy;
   delegationDir: string;
   delegationLegacyBridge: boolean;
   connectionTest: boolean;
@@ -351,6 +353,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
           ? ((args as Record<string, unknown>).aiBridge ? "on" : "off")
           : undefined;
   const gitPushPolicyArg = typeof args["git-push-policy"] === "string" ? args["git-push-policy"] : undefined;
+  const gitPromotePolicyArg = typeof args["git-promote-policy"] === "string" ? args["git-promote-policy"] : undefined;
   const delegationDirArg = typeof args["delegation-dir"] === "string" ? args["delegation-dir"] : undefined;
   const delegationLegacyBridgeArg =
     args["delegation-legacy-bridge"] === true
@@ -421,6 +424,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     contextDir: contextDirFrom(process.env.CODEXPRO_CONTEXT_DIR),
     toolCards: boolFrom(toolCardsArg ?? process.env.CODEXPRO_TOOL_CARDS, false),
     gitPushPolicy: parseGitPushPolicy(gitPushPolicyArg ?? process.env.CODEXPRO_GIT_PUSH_POLICY),
+    gitPromotePolicy: parseGitPromotePolicy(gitPromotePolicyArg ?? process.env.CODEXPRO_GIT_PROMOTE_POLICY),
     delegationDir: delegationDirFrom(delegationDirArg ?? process.env.CODEXPRO_DELEGATION_DIR),
     delegationLegacyBridge: delegationLegacyBridgeFrom(
       delegationLegacyBridgeArg ?? process.env.CODEXPRO_DELEGATION_LEGACY_BRIDGE

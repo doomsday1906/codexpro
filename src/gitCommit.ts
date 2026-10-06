@@ -38,6 +38,7 @@ export type GitCommitFailureReason =
   | "unsupported-path"
   | "malformed-output"
   | "execution"
+  | "snapshot-too-large"
   | "preflight-changed"
   | "no-changes"
   | "postcondition"
@@ -61,6 +62,7 @@ const FAILURE_MESSAGES: Record<GitCommitFailureReason, string> = {
   "unsupported-path": "Git commit path has an unsupported filesystem type.",
   "malformed-output": "Git returned malformed commit preflight output.",
   execution: "Git commit preflight failed during local Git execution.",
+  "snapshot-too-large": "Git commit repository snapshot exceeds its bounded size; repository too large for safe preservation proof.",
   "preflight-changed": "Git commit preflight changed while waiting for its locks; retry.",
   "no-changes": "Git commit selection has no tree changes.",
   postcondition: "Git commit postcondition could not be proven; recovery is required.",
@@ -637,33 +639,62 @@ async function captureRepositorySnapshot(
   // Keep the census readers ordered. Git's split-index implementation can
   // materialize/normalize index metadata while a reader is starting; sibling
   // readers would otherwise race and make a stable raw index appear to drift.
-  const indexResult = await runGitChecked(
-    config,
-    workspace,
-    ["ls-files", "--debug", "--stage", "-z"],
-    indexScope,
-    "passive-observation"
-  );
-  const statusResult = await runGitChecked(
-    config,
-    workspace,
-    ["status", "--porcelain=v2", "-z", "--ignored=matching", "--untracked-files=all"],
-    indexScope,
-    "passive-observation"
-  );
-  const ignoredResult = await runGitChecked(
-    config,
-    workspace,
-    ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
-    indexScope,
-    "passive-observation"
-  );
-  const refsResult = await runGitChecked(config, workspace, ["for-each-ref", "--format=%(refname)=%(objectname)"], indexScope);
-  const configResult = await runGitChecked(config, workspace, ["config", "--local", "--null", "--list"], indexScope);
+  //
+  // Preservation snapshots use a larger bounded census ceiling than ordinary
+  // tool output (8 MiB) so medium repositories with a few thousand tracked
+  // files do not overflow the default 120 KiB tool-output bound. The ceiling
+  // remains bounded; larger repositories fail closed with `snapshot-too-large`
+  // instead of the opaque generic `execution` reason.
+  //
+  // Ignored worktree coverage comes from the collapsed
+  // `status --ignored=matching` entries (small) rather than the expanded
+  // `ls-files --others --ignored` enumeration (unbounded: 180k+ files and
+  // tens of megabytes in large workspaces). Individually listed ignored files
+  // (for example top-level `*.ignored`) remain in `statuses` and keep exact
+  // per-file worktree preservation; collapsed ignored directories are tracked
+  // as directory entries only. This keeps ordinary one-file commits usable in
+  // large workspaces without weakening tracked/selected/status preservation
+  // or hook/config/ref safety.
+  const snapshotConfig: GitCommitConfig = {
+    ...config,
+    maxOutputBytes: 8 * 1024 * 1024
+  };
+  const runSnapshot = async (args: readonly string[]): Promise<GitExecutionResult> => {
+    try {
+      return await runGitMutation(
+        snapshotConfig,
+        workspace,
+        [...PASSIVE_OBSERVATION_GIT_ARGS, ...args],
+        indexScope === undefined ? undefined : { indexFile: indexScope.indexFile }
+      );
+    } catch (error) {
+      if (error instanceof GitExecutionError) {
+        if (error.failure === "stdout-overflow" || error.failure === "stderr-overflow" || error.failure === "timeout") {
+          return fail("snapshot-too-large");
+        }
+        return fail("execution");
+      }
+      if (error instanceof GitCommitError) throw error;
+      return fail("execution");
+    }
+  };
+  let indexResult: GitExecutionResult;
+  let statusResult: GitExecutionResult;
+  let refsResult: GitExecutionResult;
+  let configResult: GitExecutionResult;
+  try {
+    indexResult = await runSnapshot(["ls-files", "--debug", "--stage", "-z"]);
+    statusResult = await runSnapshot(["status", "--porcelain=v2", "-z", "--ignored=matching", "--untracked-files=all"]);
+    refsResult = await runSnapshot(["for-each-ref", "--format=%(refname)=%(objectname)"]);
+    configResult = await runSnapshot(["config", "--local", "--null", "--list"]);
+  } catch (error) {
+    if (error instanceof GitCommitError && error.reason === "snapshot-too-large") throw error;
+    if (error instanceof GitCommitError) throw error;
+    return fail("execution");
+  }
   const index = parseDebugIndexEntries(indexResult.copyStdoutBytes(), format);
   const statuses = parseStatusPaths(statusResult.copyStdoutBytes());
-  const ignoredFiles = nulPathList(ignoredResult.copyStdoutBytes());
-  const allPaths = mapKeys(index, statuses, new Map(ignoredFiles.map((relativePath) => [relativePath, true])));
+  const allPaths = mapKeys(index, statuses);
   const worktree = new Map<string, GitWorktreeEntryState>();
   for (const relativePath of allPaths) {
     const inspected = await inspectWorktreeState(config, workspace, relativePath, format, false);
