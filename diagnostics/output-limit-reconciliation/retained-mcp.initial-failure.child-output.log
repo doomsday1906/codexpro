@@ -1,0 +1,46 @@
+
+> codexpro@0.31.0 git-commit-mcp:smoke
+> npm run build && node scripts/git-commit-mcp-smoke.mjs
+
+
+> codexpro@0.31.0 build
+> node scripts/build.mjs
+
+Built codexpro@0.31.0; source commit a0e907ce4fe51bfec839b771bccfd3a7a9f9fcd8 (dirty).
+AUTHORITY: MISSION_ANCHOR.md A001 Public Contract/Laws 001, 004, 005, 013, 014, plus MISSION_PLAN.md P001 TASK-005 AP-009/AP-010.
+TARGET_PRODUCER_ROUTE: persistent real MCP HTTP server, WorkspaceManager process-known identity, and direct gitCommit mutation in disposable target=/tmp/codexpro-git-commit-mcp-tDChsF/allowed-parent/explicit-target; ambient default=/tmp/codexpro-git-commit-mcp-tDChsF/ambient-default.
+TARGET_EVIDENCE: complete JSON-RPC tools/list/tools/call envelopes plus direct target/default refs, status, bytes, and commit tree inspection.
+RAW_OBSERVATION: default HEAD=d399f09113b1c566c489fc94d846fe8c9b942eea contains AMBIENT_DEFAULT_SENTINEL_7X9; target HEAD=6e27c358b89f1f1c6bc1cb491c923a9802c4e6ac contains EXPLICIT_TARGET_SENTINEL_7X9 baseline and is not the default root.
+SANITY_VERDICT: MATCH — direct fixture refs and bytes establish distinct ambient and explicit targets before mutation.
+PREDICATE: TRUE — session A will save the deterministic target workspace identity from the target root, independently verified by the same canonical-root hash formula.
+RAW_OBSERVATION: full-mode codexpro list_actions omitted git_commit and its hostile wrapper call returned a complete error envelope with both target/default refs unchanged.
+SANITY_VERDICT: MATCH — the strict mutation remained directly listed while the general wrapper neither advertised nor invoked it.
+PREDICATE: TRUE — wrapper action identity and independent pre-call repository snapshots establish the no-wrapper-mutation condition before judging the rejection.
+RAW_OBSERVATION: success envelope={"result":{"_meta":{},"content":[{"type":"text","text":"# Git Commit\n\nWorkspace: /tmp/codexpro-git-commit-mcp-tDChsF/allowed-parent/explicit-target\nBranch: master\nOld HEAD: 6e27c358b89f1f1c6bc1cb491c923a9802c4e6ac\nNew HEAD: 173b548fb6763232cbec213f57696db855d1dcc6\nPaths committed: 1/1"}],"structuredContent":{"codexpro_tool":"git_commit","codexpro_title":"Git Commit","schema_version":1,"workspace_id":"ws_226c3b4c6360bb2c2196f57a","root":"/tmp/codexpro-git-commit-mcp-tDChsF/allowed-parent/explicit-target","branch":"master","old_head":"6e27c358b89f1f1c6bc1cb491c923a9802c4e6ac","new_head":"173b548fb6763232cbec213f57696db855d1dcc6","requested_path_count":1,"committed_path_count":1,"committed_paths":["selected.txt"]}},"jsonrpc":"2.0","id":4}; target refs moved 6e27c358b89f1f1c6bc1cb491c923a9802c4e6ac -> 173b548fb6763232cbec213f57696db855d1dcc6; direct parent=6e27c358b89f1f1c6bc1cb491c923a9802c4e6ac; changed paths=[{"status":"M","path":"selected.txt"}]; remote-tracking origin/master remained 6e27c358b89f1f1c6bc1cb491c923a9802c4e6ac; default HEAD remained d399f09113b1c566c489fc94d846fe8c9b942eea.
+SANITY_VERDICT: MATCH — the real HTTP call advanced only the explicit target branch by one commit with one selected path; ambient default refs and bytes stayed unchanged.
+PREDICATE: TRUE — independent pre-call ambient listing selected the default, while the supplied target ID mapped to the target root and direct post-call refs show only that root advanced.
+RAW_OBSERVATION: public target HEAD=173b548fb6763232cbec213f57696db855d1dcc6 tree contains both exact path identities; direct worktree bytes are literal-public and slash-public modifications; raw status is non-empty.
+RAW_OBSERVATION: public tools/call advanced target HEAD=6bb8988ac60d60cf891f8a4d158f545a7f43ecc2; direct parent=parent 173b548fb6763232cbec213f57696db855d1dcc6; raw diff-tree=[{"status":"M","path":"a\\b.txt"}]; literal tree/worktree settled while slash lookalike tree stayed baseline and remained dirty.
+SANITY_VERDICT: MATCH — raw Git proves the real MCP call committed only the exact literal backslash path; decoded request and response fields are supporting transport oracles.
+PASS HIGH-PATH-001 public MCP JSON transport preserves one literal backslash and commits only that exact target identity.
+node:internal/modules/run_main:123
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:
+
+  assert.ok(afterSelectionResult.structuredContent.workspaces.some((workspace) => workspace.id === targetWorkspaceId && workspace.root === targetCanonicalRoot))
+
+    at file:///home/andrew/AgentWorkspace/worktrees/repoconnect/hestia-output-limit-a0-reconcile-20261006/primary/scripts/git-commit-mcp-smoke.mjs:547:12
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async withHttpServer (file:///home/andrew/AgentWorkspace/worktrees/repoconnect/hestia-output-limit-a0-reconcile-20261006/primary/scripts/git-commit-mcp-smoke.mjs:315:12)
+    at async file:///home/andrew/AgentWorkspace/worktrees/repoconnect/hestia-output-limit-a0-reconcile-20261006/primary/scripts/git-commit-mcp-smoke.mjs:366:3 {
+  generatedMessage: true,
+  code: 'ERR_ASSERTION',
+  actual: false,
+  expected: true,
+  operator: '==',
+  diff: 'simple'
+}
+
+Node.js v22.22.2

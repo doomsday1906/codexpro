@@ -1,0 +1,5 @@
+
+> codexpro@0.31.0 build
+> node scripts/build.mjs
+
+Built codexpro@0.31.0; source commit a0e907ce4fe51bfec839b771bccfd3a7a9f9fcd8 (dirty).

@@ -1,0 +1,12 @@
+
+> codexpro@0.31.0 git-promote-policy:smoke
+> npm run build && node scripts/git-promote-policy-smoke.mjs
+
+
+> codexpro@0.31.0 build
+> node scripts/build.mjs
+
+Built codexpro@0.31.0; source commit a0e907ce4fe51bfec839b771bccfd3a7a9f9fcd8 (dirty).
+RAW_OBSERVATION: promote policy evaluates exact canonical branches; hostile/file endpoints rejected; push-only does not grant promote; tool visibility separates push vs promote.
+SANITY_VERDICT: MATCH
+PROMOTE_POLICY: PASS

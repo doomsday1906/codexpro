@@ -368,7 +368,7 @@ try {
     allowedRoots: [defaultCanonicalRoot, path.dirname(targetCanonicalRoot)],
     toolMode: "full",
     writeMode: "workspace",
-    extraEnv: { GIT_TRACE: hostileGitTracePath, GIT_TRACE2: hostileGitTrace2Path }
+    extraEnv: { CODEXPRO_HTTP_SESSION_MODE: "retained", GIT_TRACE: hostileGitTracePath, GIT_TRACE2: hostileGitTrace2Path }
   }, async (mcpUrl) => {
     sessionA = await connectClient(mcpUrl, "session-a");
     const listingA = await sessionA.client.listTools();
@@ -611,7 +611,7 @@ try {
     { toolMode: "standard", writeMode: "workspace", label: "standard" },
     { toolMode: "minimal", writeMode: "workspace", label: "minimal" },
     { toolMode: "full", writeMode: "off", label: "full-write-off" },
-    { toolMode: "full", writeMode: "handoff", label: "full-write-handoff" }
+    { toolMode: "full", writeMode: "handoff", label: "full-write-handoff", extraEnv: { CODEXPRO_AI_BRIDGE: "1" } }
   ]) {
     await withHttpServer({ defaultRoot, allowedRoots: [defaultCanonicalRoot, path.dirname(targetCanonicalRoot)], ...boundary }, async (mcpUrl) => {
       const session = await connectClient(mcpUrl, boundary.label);

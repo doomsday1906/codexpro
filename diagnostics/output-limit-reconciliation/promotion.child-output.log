@@ -1,0 +1,26 @@
+
+> codexpro@0.31.0 git-promote:smoke
+> npm run build && node scripts/git-promote-smoke.mjs
+
+
+> codexpro@0.31.0 build
+> node scripts/build.mjs
+
+Built codexpro@0.31.0; source commit a0e907ce4fe51bfec839b771bccfd3a7a9f9fcd8 (dirty).
+RAW_OBSERVATION: P1 canonical A=5aee57211c7b0cd911f80a233ca872bcf4686d05 integration B=08da70dfb2853ea8e212e32b4f3ee452a4ba0259 promoted while HEAD=integration-1; remote main now 08da70dfb2853ea8e212e32b4f3ee452a4ba0259; local main still 5aee57211c7b0cd911f80a233ca872bcf4686d05.
+SANITY_VERDICT: MATCH — promotion from integration worktree without checking out main.
+RAW_OBSERVATION: local refs/heads/main refreshed to B via fetch while HEAD stayed integration-1.
+PASS P1 happy path + mirror refresh
+RAW_OBSERVATION: P2 stale expected A=82a9563dfe284a2b3194930f9474ec4c04040bff but remote is C=22a621547d8b573bf405501eb3d00fa2136fd28d; promote B=8677434413e6ac9ba01afdceaa0226b78172c6c1 refused; remote still C.
+PASS P2 stale lease
+RAW_OBSERVATION: P3 source B=5748f472a0c8c36b0d963222b6e35b2e09633fad does not descend from current C=8b3a0974cdc5cd8aaa013bdf0b647e6bdd8301ce; promotion refused; remote still C.
+PASS P3 non-fast-forward
+RAW_OBSERVATION: P4 push-only permission refused promote with policy-disabled; explicit promote authority succeeded.
+PASS P4 policy boundary
+RAW_OBSERVATION: P5 attached-branch guard branch-mismatch preserved; ordinary feature push succeeded.
+PASS P5 push regression
+P1: PASS
+P2: PASS
+P3: PASS
+P4: PASS
+P5: PASS
