@@ -189,7 +189,7 @@ import {
 } from "./delegationEvents.js";
 
 import { archiveRetiredSession, closeoutReceipt, hasCloseoutIntent, readCloseoutExport, OPENCODE_CLOSEOUT_BLOCKER } from "./sessionHelpers.js";
-import { checkDisposableWorkdir, checkNoOtherEngineSessions, releaseDisposableWorktree } from "./disposableCloseout.js";
+import { checkDisposableWorkdir, checkNoOtherEngineSessions, releaseDisposableWorktree, statDirIdentity } from "./disposableCloseout.js";
 
 export interface DelegationToolDeps {
   config: CodexProConfig;
@@ -3636,6 +3636,25 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           return blockedAfterArchive(disposableCheck.reason);
         }
         const dirReal = disposableCheck.real;
+        // Caller-bound target identity: the exact directory that the
+        // sharing and session gates below are evaluated against. The
+        // release function must prove this same identity before any
+        // destructive work; a replacement at the same pathname must never
+        // inherit caller-level checks performed on the original.
+        const callerIdentity = statDirIdentity(dirReal);
+        if (!callerIdentity) {
+          return blockedAfterArchive("caller-identity-unproven");
+        }
+        const callerTarget = { dirReal, dev: callerIdentity.dev, ino: callerIdentity.ino };
+        const revalidateCallerTarget = (): { ok: boolean; reason?: string } => {
+          const re = checkDisposableWorkdir(run.workdir);
+          if (!re.disposable || !re.real) return { ok: false, reason: `not-disposable:${re.reason}` };
+          if (re.real !== callerTarget.dirReal) return { ok: false, reason: "caller-identity-mismatch" };
+          const id = statDirIdentity(callerTarget.dirReal);
+          if (!id) return { ok: false, reason: "caller-identity-unproven" };
+          if (id.dev !== callerTarget.dev || id.ino !== callerTarget.ino) return { ok: false, reason: "caller-identity-mismatch" };
+          return { ok: true };
+        };
         // Sharing gate: no other adapter runs may share this canonical dir.
         let sharedBy: string[] = [];
         try {
@@ -3652,14 +3671,32 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         if (sharedBy.length > 0) {
           return blockedAfterArchive("shared-workdir", { shared_workdir_holders: sharedBy });
         }
+        {
+          // The sharing gate applied to the caller-bound target above.
+          // Prove the pathname still resolves to that same directory
+          // before the session gate evaluates it.
+          const same = revalidateCallerTarget();
+          if (!same.ok) {
+            return blockedAfterArchive(same.reason ?? "caller-identity-mismatch");
+          }
+        }
         const engineSessions = checkNoOtherEngineSessions(resolveOpenCodeBinary(), dirReal, run.session?.sessionId, args.timeout_ms ?? 10000);
         if (!engineSessions.ok) {
           return blockedAfterArchive(engineSessions.reason, { engine_other_sessions: engineSessions.otherSessionIds });
         }
+        {
+          // The session gate applied to the caller-bound target above.
+          // Prove the same directory survived to the release handoff.
+          // Never invoke destructive release against a replacement.
+          const same = revalidateCallerTarget();
+          if (!same.ok) {
+            return blockedAfterArchive(same.reason ?? "caller-identity-mismatch");
+          }
+        }
         const release = await releaseDisposableWorktree(bridgeDir, {
           runId: run.runId, ownerIdHash: run.ownerIdHash, ownerKind: run.ownerKind,
           workdir: run.workdir, engine: run.engine, sessionId: run.session?.sessionId ?? null,
-        }, {});
+        }, { expectedTarget: callerTarget });
         const merged = {
           run_id: run.runId, state: run.state, ...result,
           dir_clear: release.dirClear,

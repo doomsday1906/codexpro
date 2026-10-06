@@ -742,10 +742,16 @@ export interface ReleaseRunBinding {
   sessionId: string | null;
 }
 
+export interface ReleaseExpectedTarget {
+  dirReal: string;
+  dev: number;
+  ino: number;
+}
+
 export async function releaseDisposableWorktree(
   bridgeDir: string,
   run: ReleaseRunBinding,
-  opts: { graceMs?: number } = {},
+  opts: { graceMs?: number; expectedTarget?: ReleaseExpectedTarget } = {},
 ): Promise<DisposableReleaseResult> {
   const fail = (reason: string, partial?: Partial<DisposableReleaseResult>): DisposableReleaseResult => ({
     ok: false, reason, helpersSignalled: [], helpersRemaining: [], dirClear: false,
@@ -791,14 +797,34 @@ export async function releaseDisposableWorktree(
   }
   if (!check.disposable || !check.real) return fail(`not-disposable:${check.reason}`);
   const dirReal = check.real;
+  // Caller-bound continuity: when the caller already gated an exact
+  // directory identity, never silently establish a new baseline for a
+  // replacement. Require the current target to be the caller-gated target
+  // before any destructive work; otherwise fail closed and leave the
+  // replacement untouched.
+  if (opts.expectedTarget) {
+    if (!Number.isSafeInteger(opts.expectedTarget.dev) || !Number.isSafeInteger(opts.expectedTarget.ino) || typeof opts.expectedTarget.dirReal !== "string") {
+      return fail("caller-identity-unproven");
+    }
+    if (dirReal !== opts.expectedTarget.dirReal) return fail("caller-identity-mismatch");
+    const callerCurrent = statDirIdentity(dirReal);
+    if (!callerCurrent) return fail("caller-identity-unproven");
+    if (callerCurrent.dev !== opts.expectedTarget.dev || callerCurrent.ino !== opts.expectedTarget.ino) return fail("caller-identity-mismatch");
+  }
   // Baseline directory identity for THIS release attempt, established
   // immediately after canonical resolution and BEFORE any safety gate.
-  // Every later pathname-dependent step must prove the pathname still
-  // resolves to this exact (dev, ino). A replacement directory at the same
-  // pathname has a different identity and must never inherit the gates,
-  // backup, prepared state, or deletion authorized for the original.
+  // When a caller-bound identity was supplied and verified above, the
+  // baseline below is that same caller-gated identity (never a fresh one
+  // for a replacement). Every later pathname-dependent step must prove the
+  // pathname still resolves to this exact (dev, ino). A replacement
+  // directory at the same pathname has a different identity and must never
+  // inherit the gates, backup, prepared state, or deletion authorized for
+  // the original.
   const baselineIdentity = statDirIdentity(dirReal);
   if (!baselineIdentity) return fail("prepared-stat-failed");
+  if (opts.expectedTarget && (baselineIdentity.dev !== opts.expectedTarget.dev || baselineIdentity.ino !== opts.expectedTarget.ino)) {
+    return fail("caller-identity-mismatch");
+  }
   const sameTargetAsBaseline = (): { ok: boolean; reason?: string } => {
     const re = checkDisposableWorkdir(run.workdir);
     if (!re.disposable || !re.real) return { ok: false, reason: `not-disposable:${re.reason}` };

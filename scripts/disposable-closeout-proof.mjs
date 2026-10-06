@@ -117,6 +117,18 @@ if [ "$1" = "session" ] && [ "$2" = "list" ]; then
     unresolvable) echo '[{"id":"ses_unresolvable_dir","directory":"/tmp/codexpro-dc-no-such-dir-000000"}]'; exit 0 ;;
     truncated) python3 -c "import json; print(json.dumps([{'id':'ses_trunc_%03d'%i,'directory':'/tmp/codexpro-dc-trunc-%03d'%i} for i in range(100)]))"; exit 0 ;;
     conflict) echo "[{\\"id\\":\\"ses_other_in_dir\\",\\"directory\\":\\"$wsRoot/PLACEHOLDER\\"}]"; exit 0 ;;
+    swap-handoff)
+      swapdir="$CLOSEOUT_SWAP_DIR"
+      if [ -n "$swapdir" ] && [ -f "$swapdir/handoff.txt" ]; then
+        if grep -q '^OLD$' "$swapdir/handoff.txt" 2>/dev/null; then
+          mv "$swapdir" "$swapdir.orig-A"
+          mkdir -p "$swapdir"
+          chmod 700 "$swapdir"
+          printf 'NEW\\n' > "$swapdir/handoff.txt"
+        fi
+      fi
+      echo '[]'
+      exit 0 ;;
   esac
   echo '[]'
   exit 0
@@ -700,6 +712,74 @@ exit 2
   assert((await fsp.readFile(path.join(dispAbs11, 'old.txt'))).equals(oldBytes11), 'workdir restored to A after swap proof');
   console.log('P11 pathname replacement during backup: B untouched with NEW bytes, closeout blocked, no prepared/final authorizes B, stale backup cannot release B.');
 
+  // P12: caller/release handoff replacement. A passes caller sharing gate;
+  // the engine-session gate (fake session list) atomically replaces A with
+  // B (different dev/ino, NEW bytes) before release begins. The caller chain
+  // must refuse B, and a direct release call with the stale caller-bound
+  // identity must also refuse B before destructive work. B stays intact.
+  const dispRel12 = `disposable-handoff-${Date.now()}`;
+  const dispAbs12 = path.join(wsRoot, dispRel12);
+  await fsp.mkdir(dispAbs12, { recursive: true });
+  const oldBytes12 = Buffer.from('OLD\n');
+  const newBytes12 = Buffer.from('NEW\n');
+  await fsp.writeFile(path.join(dispAbs12, 'handoff.txt'), oldBytes12);
+  reqN += 1;
+  const launch12 = await callRetry('delegation_launch', {
+    workspace_id: workspaceId, engine: 'opencode', agent: 'implementer', model: 'test-model',
+    workdir: dispRel12, task: 'Report readiness. Change nothing.', delegation_group: 'team-disposable-proof',
+    request_id: `req-dc-${reqN}`, timeout_ms: 60000, disposable_workdir: true,
+  });
+  assert(!launch12.isError, 'launch12');
+  const run12 = launch12.structuredContent.run_id;
+  await waitSettledRetry(run12);
+  const runFile12 = runFileFor(run12);
+  const bridge12 = path.dirname(path.dirname(runFile12));
+  const artDir12 = path.join(bridge12, 'delegation-artifacts', run12);
+  const cgJs12other = path.join(await makeRoot('codexpro-dc-cg12other-'), 'codegraph.js');
+  const unrelated12 = await spawnCodegraphHelper(cgJs12other, await makeRoot('codexpro-dc-handoff-other-'), false);
+  const aStat12 = fs.statSync(dispAbs12);
+  const aReal12 = fs.realpathSync(dispAbs12);
+  const staleCallerTarget = { dirReal: aReal12, dev: aStat12.dev, ino: aStat12.ino };
+  process.env.CLOSEOUT_SWAP_DIR = dispAbs12;
+  process.env.CLOSEOUT_SESSION_MODE = 'swap-handoff';
+  let closeHandoff;
+  try { closeHandoff = await callRetry('delegation_closeout', { workspace_id: workspaceId, run_id: run12, retire: true }); }
+  finally { delete process.env.CLOSEOUT_SESSION_MODE; delete process.env.CLOSEOUT_SWAP_DIR; }
+  assert(!closeHandoff.isError && closeHandoff.structuredContent.exported === true && closeHandoff.structuredContent.workdir_release === 'blocked', `handoff blocked ${JSON.stringify(closeHandoff.structuredContent)}`);
+  assert(fs.existsSync(dispAbs12), 'replacement B must remain at the pathname');
+  assert((await fsp.readFile(path.join(dispAbs12, 'handoff.txt'))).equals(newBytes12), 'B NEW file byte-identical');
+  assert(fs.existsSync(`${dispAbs12}.orig-A`), 'original A preserved aside');
+  assert((await fsp.readFile(path.join(`${dispAbs12}.orig-A`, 'handoff.txt'))).equals(oldBytes12), 'A OLD bytes preserved aside');
+  assert(!fs.existsSync(path.join(artDir12, 'physical-release.json')), 'no final claims B released');
+  assert(!fs.existsSync(path.join(artDir12, 'physical-release-prepared.json')), 'no fresh prepared authorizes B');
+  try {
+    const manifestHandoff = JSON.parse(await fsp.readFile(path.join(artDir12, 'workdir-backup', 'backup-manifest.json'), 'utf8'));
+    const handoffEntry = manifestHandoff.files.find((f) => f.rel === 'handoff.txt');
+    assert(!handoffEntry || handoffEntry.sha256 !== createHash('sha256').update(newBytes12).digest('hex'), 'no backup proves B');
+  } catch (e) {
+    if (e.message.startsWith('ASSERT:')) throw e;
+  }
+  assert(readStart(unrelated12.pid) === unrelated12.start, 'unrelated helper untouched by handoff block');
+  // Release-side defense in depth: a direct release call carrying the stale
+  // caller-bound identity (A) while B sits at the pathname must refuse
+  // before backup/prepared/deletion and leave B intact.
+  const { releaseDisposableWorktree: releaseDirect } = await import(fileUrl(path.join(ROOT, 'dist', 'disposableCloseout.js')));
+  const rec12 = JSON.parse(await fsp.readFile(runFile12, 'utf8'));
+  const directRefusal = await releaseDirect(bridge12, {
+    runId: run12, ownerIdHash: rec12.ownerIdHash, ownerKind: rec12.ownerKind,
+    workdir: rec12.workdir, engine: rec12.engine, sessionId: rec12.session?.sessionId ?? null,
+  }, { expectedTarget: staleCallerTarget });
+  assert(directRefusal.ok === false && directRefusal.workdirRelease === 'blocked' && String(directRefusal.reason).includes('caller-identity-mismatch'), `direct release refuses stale caller identity ${JSON.stringify(directRefusal)}`);
+  assert((await fsp.readFile(path.join(dispAbs12, 'handoff.txt'))).equals(newBytes12), 'B still intact after direct release refusal');
+  assert(!fs.existsSync(path.join(artDir12, 'physical-release.json')), 'direct refusal creates no final');
+  assert(!fs.existsSync(path.join(artDir12, 'physical-release-prepared.json')), 'direct refusal creates no prepared for B');
+  assert(readStart(unrelated12.pid) === unrelated12.start, 'unrelated helper survives direct refusal');
+  unrelated12.child.kill('SIGKILL');
+  await fsp.rm(dispAbs12, { recursive: true, force: true });
+  await fsp.rename(`${dispAbs12}.orig-A`, dispAbs12);
+  assert((await fsp.readFile(path.join(dispAbs12, 'handoff.txt'))).equals(oldBytes12), 'workdir restored to A after handoff proof');
+  console.log('P12 caller handoff: A gated, B swapped during session gate, public closeout blocked with B intact NEW, direct release with stale caller identity refused before destructive work.');
+
   // R0: read-only real-engine lifecycle evidence (no mutation, no shared-service contact).
   // Uses the installed opencode binary and live /proc only: session entries
   // carry directory identity, and shared CodeGraph helpers serve non-tmp
@@ -734,7 +814,7 @@ exit 2
     console.log('R0 real-engine read-only: installed opencode binary not found, skipped without mutation.');
   }
 
-  console.log('PASS disposable isolated closeout proof: P1, P2, P2b, P3, P4, P5, P6, P7, P7b, P7c, P8, P9, P10, P11 plus R0 complete (fixture sections use the task-owned fake engine; R0 uses the installed engine read-only).');
+  console.log('PASS disposable isolated closeout proof: P1, P2, P2b, P3, P4, P5, P6, P7, P7b, P7c, P8, P9, P10, P11, P12 plus R0 complete (fixture sections use the task-owned fake engine; R0 uses the installed engine read-only).');
   await cleanup();
 } catch (e) {
   try { await cleanup(); } catch {}
