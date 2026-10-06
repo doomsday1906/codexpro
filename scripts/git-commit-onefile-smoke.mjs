@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, writeFile, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, stat, writeFile, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
+
+const NUL = String.fromCharCode(0);
 
 function git(root, args) {
   const r = spawnSync("git", args, { cwd: root, encoding: "utf8" });
@@ -27,7 +29,12 @@ function initRepo(root, name) {
 const fixture = await mkdtemp(path.join(os.tmpdir(), "codexpro-git-commit-onefile-"));
 try {
   const { PathGuard } = await import("../dist/guard.js");
-  const { gitCommit, GitCommitError } = await import("../dist/gitCommit.js");
+  const { gitCommit } = await import("../dist/gitCommit.js");
+  const {
+    scanIgnoredWindowWithMarker,
+    createIgnoredWindowMarker,
+    removeIgnoredWindowMarker
+  } = await import("../dist/gitCommit.js");
 
   // Exact ordinary one-file commit with hooks enabled (native Git accepts normally).
   const repoRoot0 = path.join(fixture, "onefile");
@@ -93,150 +100,302 @@ try {
   console.log(`RAW_OBSERVATION: stale expected_head correctly rejected with reason=${staleErr.reason}.`);
   console.log("PASS bounded reason surfaced");
 
-  // Medium repository with many tracked + collapsed ignored entries must still
-  // allow an ordinary one-file commit (previous 120 KiB census overflow).
-  const medium0 = path.join(fixture, "medium");
-  await mkdir(medium0, { recursive: true });
-  initRepo(medium0, "Medium");
-  // 1200 tracked files (~300 KiB index, above old 120 KiB bound but within 8 MiB census).
-  for (let i = 0; i < 1200; i++) {
-    await writeFile(path.join(medium0, `tracked-${String(i).padStart(4, "0")}.txt`), `tracked ${i}\n`);
+  // Window-scan regression matrix P1--P5. Each case commits an unrelated
+  // tracked file while a synchronous pre-commit hook mutates ignored content.
+  // The helper must NOT report clean success; preservation fails as
+  // postcondition (successful hook advanced HEAD) per existing contract.
+  // Every case runs on BOTH scan engines (find acceleration + portable Node)
+  // to prove engine equivalence.
+  async function mkHookRepo(dirName, keepRel, keepOriginal, hookScriptFor) {
+    const r0 = path.join(fixture, dirName);
+    await mkdir(r0, { recursive: true });
+    initRepo(r0, dirName);
+    await writeFile(path.join(r0, "selected.txt"), "selected base\n");
+    await writeFile(path.join(r0, ".gitignore"), "ignored-dir/\n");
+    await mkdir(path.join(r0, path.dirname(keepRel)), { recursive: true });
+    await writeFile(path.join(r0, keepRel), keepOriginal);
+    const base = commitAll(r0, `${dirName} base`);
+    const root = await realpath(r0);
+    const hooks = path.join(root, ".githooks");
+    await mkdir(hooks);
+    await writeFile(path.join(hooks, "pre-commit"), hookScriptFor(path.join(root, keepRel)));
+    await chmod(path.join(hooks, "pre-commit"), 0o700);
+    git(root, ["config", "core.hooksPath", ".githooks"]);
+    await writeFile(path.join(root, "selected.txt"), "selected changed\n");
+    const id = `ws_${createHash("sha256").update(root).digest("hex").slice(0, 24)}`;
+    return { root, wsId: id, workspace: { id, root, openedAt: new Date().toISOString() }, base };
   }
-  await writeFile(path.join(medium0, ".gitignore"), "ignored-dir/\n");
-  await mkdir(path.join(medium0, "ignored-dir"));
-  // 2000 ignored files inside one collapsed directory (expanded would be large, collapsed is one status entry).
-  for (let i = 0; i < 2000; i++) {
-    await writeFile(path.join(medium0, "ignored-dir", `ignored-${String(i).padStart(4, "0")}.txt`), `ignored ${i}\n`);
-  }
-  const mediumBase = commitAll(medium0, "medium base");
-  const mediumRoot = await realpath(medium0);
-  const mediumWsId = `ws_${createHash("sha256").update(mediumRoot).digest("hex").slice(0, 24)}`;
-  const mediumWorkspace = { id: mediumWsId, root: mediumRoot, openedAt: new Date().toISOString() };
-  await writeFile(path.join(medium0, "tracked-0000.txt"), "tracked 0 changed\n");
-  const mediumResult = await gitCommit(config, guard, mediumWorkspace, {
-    workspace_id: mediumWsId,
-    paths: ["tracked-0000.txt"],
-    message: "medium one-file",
-    expected_head: mediumBase
-  });
-  assert.equal(mediumResult.old_head, mediumBase);
-  assert.deepEqual(mediumResult.committed_paths, ["tracked-0000.txt"]);
-  // Ignored tree remains byte-identical after clean commit (spot-check + collapsed status still present).
-  assert.equal((await readFile(path.join(medium0, "ignored-dir", "ignored-0000.txt"), "utf8")), "ignored 0\n");
-  assert.equal((await readFile(path.join(medium0, "ignored-dir", "ignored-1999.txt"), "utf8")), "ignored 1999\n");
-  console.log(`RAW_OBSERVATION: medium repo (1200 tracked + 2000 collapsed ignored) one-file commit ${mediumBase} -> ${mediumResult.new_head} succeeded.`);
-  console.log("PASS medium census still proves preservation");
 
-  // P-hook-ignored: exact Hestia reproduction — hook mutates existing ignored
-  // file inside collapsed directory while committing unrelated tracked file.
-  // Helper must NOT report clean success while MUTATED survives.
-  const hookRepo0 = path.join(fixture, "hook-ignored");
-  await mkdir(hookRepo0, { recursive: true });
-  initRepo(hookRepo0, "Hook Ignored");
-  await writeFile(path.join(hookRepo0, "selected.txt"), "selected base\n");
-  await writeFile(path.join(hookRepo0, ".gitignore"), "ignored-dir/\n");
-  await mkdir(path.join(hookRepo0, "ignored-dir"));
-  const hookKeep = path.join(hookRepo0, "ignored-dir", "keep.txt");
-  await writeFile(hookKeep, "ORIGINAL\n");
-  const hookBase = commitAll(hookRepo0, "hook ignored base");
-  const hookHooks = path.join(hookRepo0, ".githooks");
-  await mkdir(hookHooks);
-  await writeFile(path.join(hookHooks, "pre-commit"), `#!/bin/sh\nprintf 'MUTATED\\n' > '${hookKeep}'\nexit 0\n`);
-  await chmod(path.join(hookHooks, "pre-commit"), 0o700);
-  git(hookRepo0, ["config", "core.hooksPath", ".githooks"]);
-  await writeFile(path.join(hookRepo0, "selected.txt"), "selected changed\n");
-  const hookRoot = await realpath(hookRepo0);
-  const hookWsId = `ws_${createHash("sha256").update(hookRoot).digest("hex").slice(0, 24)}`;
-  const hookWorkspace = { id: hookWsId, root: hookRoot, openedAt: new Date().toISOString() };
-  let hookErr;
-  try {
-    await gitCommit(config, guard, hookWorkspace, {
-      workspace_id: hookWsId,
-      paths: ["selected.txt"],
-      message: "hook ignored repro",
-      expected_head: hookBase
-    });
-  } catch (e) {
-    hookErr = e;
+  async function withScanner(engine, fn) {
+    const prev = process.env.CODEXPRO_GIT_COMMIT_IGNORED_SCANNER;
+    process.env.CODEXPRO_GIT_COMMIT_IGNORED_SCANNER = engine;
+    try {
+      return await fn();
+    } finally {
+      if (prev === undefined) delete process.env.CODEXPRO_GIT_COMMIT_IGNORED_SCANNER;
+      else process.env.CODEXPRO_GIT_COMMIT_IGNORED_SCANNER = prev;
+    }
   }
-  assert.ok(hookErr, "hook ignored mutation must not succeed");
-  assert.equal(hookErr.name, "GitCommitError");
-  // Successful hook (exit 0) advances HEAD, then preservation must reject as postcondition (existing contract).
-  assert.equal(hookErr.reason, "postcondition");
-  assert.equal((await readFile(hookKeep, "utf8")), "MUTATED\n", "ignored mutation must survive for inspection");
-  assert.notEqual(git(hookRoot, ["rev-parse", "HEAD"]), hookBase, "successful hook advances HEAD before postcondition rejection");
-  console.log(`RAW_OBSERVATION: hook ignored keep.txt ORIGINAL->MUTATED during selected.txt commit correctly rejected with reason=${hookErr.reason}; HEAD advanced but helper did not report success.`);
-  console.log("PASS P-hook-ignored top-level collapsed file");
 
-  // Nested ignored file (not only directory marker).
-  const nestedRepo0 = path.join(fixture, "hook-nested");
-  await mkdir(nestedRepo0, { recursive: true });
-  initRepo(nestedRepo0, "Hook Nested");
-  await writeFile(path.join(nestedRepo0, "selected.txt"), "selected base\n");
-  await writeFile(path.join(nestedRepo0, ".gitignore"), "ignored-dir/\n");
-  await mkdir(path.join(nestedRepo0, "ignored-dir", "sub"), { recursive: true });
-  const nestedKeep = path.join(nestedRepo0, "ignored-dir", "sub", "nested.txt");
-  await writeFile(nestedKeep, "NESTED_ORIGINAL\n");
-  const nestedBase = commitAll(nestedRepo0, "nested base");
-  const nestedHooks = path.join(nestedRepo0, ".githooks");
-  await mkdir(nestedHooks);
-  await writeFile(path.join(nestedHooks, "pre-commit"), `#!/bin/sh\nprintf 'NESTED_MUTATED\\n' > '${nestedKeep}'\nexit 0\n`);
-  await chmod(path.join(nestedHooks, "pre-commit"), 0o700);
-  git(nestedRepo0, ["config", "core.hooksPath", ".githooks"]);
-  await writeFile(path.join(nestedRepo0, "selected.txt"), "selected changed\n");
-  const nestedRoot = await realpath(nestedRepo0);
-  const nestedWsId = `ws_${createHash("sha256").update(nestedRoot).digest("hex").slice(0, 24)}`;
-  const nestedWorkspace = { id: nestedWsId, root: nestedRoot, openedAt: new Date().toISOString() };
-  let nestedErr;
-  try {
-    await gitCommit(config, guard, nestedWorkspace, {
-      workspace_id: nestedWsId,
-      paths: ["selected.txt"],
-      message: "nested repro",
-      expected_head: nestedBase
+  async function expectHookRejection(label, keepRel, keepOriginal, hookScriptFor, engine, extraChecks) {
+    return withScanner(engine, async () => {
+      const repo = await mkHookRepo(`${label}-${engine}`, keepRel, keepOriginal, hookScriptFor);
+      const t0 = Date.now();
+      let err;
+      try {
+        await gitCommit(config, guard, repo.workspace, {
+          workspace_id: repo.wsId,
+          paths: ["selected.txt"],
+          message: `${label} ${engine}`,
+          expected_head: repo.base
+        });
+      } catch (e) {
+        err = e;
+      }
+      const ms = Date.now() - t0;
+      assert.ok(err, `${label}/${engine}: hook mutation must not succeed`);
+      assert.equal(err.name, "GitCommitError");
+      assert.equal(err.reason, "postcondition");
+      assert.notEqual(git(repo.root, ["rev-parse", "HEAD"]), repo.base);
+      if (extraChecks) await extraChecks(repo);
+      console.log(`RAW_OBSERVATION: ${label} engine=${engine} rejected reason=${err.reason} commitMs=${ms}; HEAD advanced but no clean success.`);
     });
-  } catch (e) {
-    nestedErr = e;
   }
-  assert.ok(nestedErr, "nested ignored mutation must not succeed");
-  assert.equal(nestedErr.reason, "postcondition");
-  assert.equal((await readFile(nestedKeep, "utf8")), "NESTED_MUTATED\n");
-  console.log(`RAW_OBSERVATION: nested ignored sub/nested.txt mutation correctly rejected with reason=${nestedErr.reason}.`);
-  console.log("PASS P-hook-ignored nested file");
 
-  // Bounded-failure: exceeding explicit ignored-census safety bound must return
-  // snapshot-too-large, not generic execution / success with incomplete coverage.
-  const huge0 = path.join(fixture, "huge-bound");
-  await mkdir(huge0, { recursive: true });
-  initRepo(huge0, "Huge Bound");
-  await writeFile(path.join(huge0, "selected.txt"), "selected base\n");
-  await writeFile(path.join(huge0, ".gitignore"), "ignored-dir/\n");
-  await mkdir(path.join(huge0, "ignored-dir"));
-  // 21000 small ignored files exceeds IGNORED_CENSUS_MAX_FILES=20000 (total bytes small, file-count bound triggers).
-  for (let i = 0; i < 21000; i++) {
-    await writeFile(path.join(huge0, "ignored-dir", `f-${String(i).padStart(5, "0")}.txt`), "x\n");
+  // P1 — exact Hestia reproduction: keep.txt ORIGINAL -> MUTATED.
+  for (const engine of ["find", "node"]) {
+    await expectHookRejection("p1-top", "ignored-dir/keep.txt", "ORIGINAL\n",
+      (absKeep) => `#!/bin/sh\nprintf 'MUTATED\n' > '${absKeep}'\nexit 0\n`,
+      engine, async (repo) => {
+        assert.equal(await readFile(path.join(repo.root, "ignored-dir/keep.txt"), "utf8"), "MUTATED\n");
+      });
   }
-  const hugeBase = commitAll(huge0, "huge base");
-  const hugeRoot = await realpath(huge0);
-  const hugeWsId = `ws_${createHash("sha256").update(hugeRoot).digest("hex").slice(0, 24)}`;
-  const hugeWorkspace = { id: hugeWsId, root: hugeRoot, openedAt: new Date().toISOString() };
-  await writeFile(path.join(huge0, "selected.txt"), "selected changed\n");
-  let hugeErr;
-  try {
-    await gitCommit(config, guard, hugeWorkspace, {
-      workspace_id: hugeWsId,
-      paths: ["selected.txt"],
-      message: "huge bound probe",
-      expected_head: hugeBase
+  console.log("PASS P1 exact ignored hook mutation (both engines)");
+
+  // P2 — nested ignored file.
+  for (const engine of ["find", "node"]) {
+    await expectHookRejection("p2-nested", "ignored-dir/sub/nested.txt", "NESTED_ORIGINAL\n",
+      (absKeep) => `#!/bin/sh\nprintf 'NESTED_MUTATED\n' > '${absKeep}'\nexit 0\n`,
+      engine, async (repo) => {
+        assert.equal(await readFile(path.join(repo.root, "ignored-dir/sub/nested.txt"), "utf8"), "NESTED_MUTATED\n");
+      });
+  }
+  console.log("PASS P2 nested ignored mutation (both engines)");
+
+  // P3 — same-size rewrite (9 bytes -> 9 different bytes).
+  for (const engine of ["find", "node"]) {
+    await expectHookRejection("p3-samesize", "ignored-dir/keep.txt", "ORIGINAL\n",
+      (absKeep) => `#!/bin/sh\nprintf 'MUTATED!\n' > '${absKeep}'\nexit 0\n`,
+      engine, async (repo) => {
+        const content = await readFile(path.join(repo.root, "ignored-dir/keep.txt"), "utf8");
+        assert.equal(content, "MUTATED!\n");
+        assert.equal(Buffer.byteLength(content), Buffer.byteLength("ORIGINAL\n"), "same byte length");
+      });
+  }
+  console.log("PASS P3 same-size rewrite detected (both engines)");
+
+  // P4 — same-path replacement with a new inode, similar size/mode.
+  for (const engine of ["find", "node"]) {
+    await withScanner(engine, async () => {
+      const repo = await mkHookRepo(`p4-replace-${engine}`, "ignored-dir/keep.txt", "ORIGINAL\n", () => "#!/bin/sh\nexit 0\n");
+      const before = await lstat(path.join(repo.root, "ignored-dir/keep.txt"));
+      await writeFile(path.join(repo.root, ".githooks/pre-commit"),
+        `#!/bin/sh\nrm '${path.join(repo.root, "ignored-dir/keep.txt")}'\nprintf 'REPLACED\n' > '${path.join(repo.root, "ignored-dir/keep.txt")}'\nexit 0\n`);
+      let err;
+      try {
+        await gitCommit(config, guard, repo.workspace, {
+          workspace_id: repo.wsId, paths: ["selected.txt"], message: `p4 ${engine}`, expected_head: repo.base
+        });
+      } catch (e) {
+        err = e;
+      }
+      assert.ok(err, `p4/${engine} must not succeed`);
+      assert.equal(err.reason, "postcondition");
+      const afterStat = await lstat(path.join(repo.root, "ignored-dir/keep.txt"));
+      assert.equal(await readFile(path.join(repo.root, "ignored-dir/keep.txt"), "utf8"), "REPLACED\n");
+      assert.equal(afterStat.size, before.size, "similar size preserved");
+      // Freed inodes may be immediately reused, so replacement is proven by
+      // new identity OR advanced ctime (a fresh create always sets ctime=now).
+      assert.ok(afterStat.ino !== before.ino || afterStat.ctimeMs > before.ctimeMs, "replacement must change identity or ctime");
+      console.log(`RAW_OBSERVATION: p4 engine=${engine} rejected; ino ${before.ino} -> ${afterStat.ino} same size ${afterStat.size} ctime advanced=${afterStat.ctimeMs > before.ctimeMs}.`);
     });
-  } catch (e) {
-    hugeErr = e;
   }
-  assert.ok(hugeErr, "exceeding census bound must fail");
-  assert.equal(hugeErr.reason, "snapshot-too-large");
-  assert.match(hugeErr.message, /bounded|too large/iu);
-  console.log(`RAW_OBSERVATION: 21000 ignored files correctly rejected with reason=${hugeErr.reason} (explicit bound, not generic execution).`);
-  console.log("PASS bounded snapshot-too-large");
+  console.log("PASS P4 same-path replacement detected (both engines)");
+
+  // P5 — timestamp-resistant: hook restores mtime after modifying. Detection
+  // must come from ctime (utimens updates ctime); demonstrate explicitly.
+  for (const engine of ["find", "node"]) {
+    await expectHookRejection("p5-mtime", "ignored-dir/keep.txt", "ORIGINAL\n",
+      (absKeep) => `#!/bin/sh\nprintf 'MUTATED\n' > '${absKeep}'\ntouch -m -d '2001-01-01 00:00:00' '${absKeep}'\nexit 0\n`,
+      engine, async (r) => {
+        const s = await lstat(path.join(r.root, "ignored-dir/keep.txt"));
+        assert.equal(await readFile(path.join(r.root, "ignored-dir/keep.txt"), "utf8"), "MUTATED\n");
+        assert.ok(s.mtimeMs < Date.now() - 30 * 86400 * 1000, `mtime must look restored/old (got ${new Date(s.mtimeMs).toISOString()})`);
+        assert.ok(s.ctimeMs > s.mtimeMs, `ctime (${new Date(s.ctimeMs).toISOString()}) must be newer than restored mtime`);
+        console.log(`RAW_OBSERVATION: p5 engine=${engine} mtime=${new Date(s.mtimeMs).toISOString()} ctime=${new Date(s.ctimeMs).toISOString()} -> ctime is the detecting field.`);
+      });
+  }
+  console.log("PASS P5 mtime-reset still detected via ctime (both engines)");
+
+  // P6 — large-tree positive fixture: same algorithm class as production
+  // (one collapsed ignored dir), 25000 ignored files (exceeds the old 20000
+  // full-census bound), 1500 tracked files, one tracked file changed, hooks
+  // clean. Must succeed with byte-identical ignored tree, bounded runtime.
+  for (const engine of ["find", "node"]) {
+    await withScanner(engine, async () => {
+      const large0 = path.join(fixture, `large-${engine}`);
+      await mkdir(large0, { recursive: true });
+      initRepo(large0, `Large ${engine}`);
+      for (let i = 0; i < 1500; i++) {
+        await writeFile(path.join(large0, `tracked-${String(i).padStart(4, "0")}.txt`), `tracked ${i}\n`);
+      }
+      await writeFile(path.join(large0, ".gitignore"), "ignored-dir/\n");
+      await mkdir(path.join(large0, "ignored-dir"));
+      for (let i = 0; i < 25000; i++) {
+        await writeFile(path.join(large0, "ignored-dir", `ignored-${String(i).padStart(5, "0")}.txt`), `ignored ${i}\n`);
+      }
+      const largeBase = commitAll(large0, `large base ${engine}`);
+      const largeRoot = await realpath(large0);
+      const largeWsId = `ws_${createHash("sha256").update(largeRoot).digest("hex").slice(0, 24)}`;
+      const largeWorkspace = { id: largeWsId, root: largeRoot, openedAt: new Date().toISOString() };
+      await writeFile(path.join(large0, "tracked-0000.txt"), "tracked 0 changed\n");
+      const t0 = Date.now();
+      const largeResult = await gitCommit(config, guard, largeWorkspace, {
+        workspace_id: largeWsId, paths: ["tracked-0000.txt"], message: `large one-file ${engine}`, expected_head: largeBase
+      });
+      const ms = Date.now() - t0;
+      assert.equal(largeResult.old_head, largeBase);
+      assert.deepEqual(largeResult.committed_paths, ["tracked-0000.txt"]);
+      assert.equal(await readFile(path.join(large0, "ignored-dir", "ignored-00000.txt"), "utf8"), "ignored 0\n");
+      assert.equal(await readFile(path.join(large0, "ignored-dir", "ignored-24999.txt"), "utf8"), "ignored 24999\n");
+      console.log(`RAW_OBSERVATION: P6 engine=${engine} 1500 tracked + 25000 ignored one-file commit ${largeBase} -> ${largeResult.new_head} commitMs=${ms}, ignored tree byte-identical.`);
+    });
+  }
+  console.log("PASS P6 large-tree positive (both engines)");
+
+  // P7 — real AgentWorkspace non-mutating probe. Read-only apart from
+  // task-owned temp marker/locks: no commit is created; the helper no-change
+  // path plus a direct window scan prove the preservation snapshot completes
+  // on production scale (must NOT return snapshot-too-large). Retried: the
+  // live workstation has concurrent writers, so a single attempt may observe
+  // genuine mid-operation drift; the probe passes when a quiescent attempt
+  // completes with no-changes and HEAD unchanged.
+  {
+    const prodRoot = "/home/andrew/AgentWorkspace";
+    let prodPresent = false;
+    try {
+      await stat(path.join(prodRoot, ".git"));
+      prodPresent = true;
+    } catch {
+      prodPresent = false;
+    }
+    if (!prodPresent) {
+      console.log("SKIP P7 real AgentWorkspace probe (repository absent)");
+    } else {
+      const prodReal = await realpath(prodRoot);
+      const prodWsId = `ws_${createHash("sha256").update(prodReal).digest("hex").slice(0, 24)}`;
+      const prodWorkspace = { id: prodWsId, root: prodReal, openedAt: new Date().toISOString() };
+      const prodGuard = new PathGuard({ blockedGlobs: [".git", ".git/**"] });
+      const prodHead0 = git(prodRoot, ["rev-parse", "HEAD"]);
+      const candidates = ["README.md", "AGENTS.md"];
+      let probeFile;
+      for (const candidate of candidates) {
+        const tracked = spawnSync("git", ["ls-files", "--error-unmatch", candidate], { cwd: prodRoot, encoding: "utf8" });
+        const dirty = spawnSync("git", ["status", "--porcelain", "--", candidate], { cwd: prodRoot, encoding: "utf8" }).stdout.trim();
+        if (tracked.status === 0 && dirty === "") {
+          probeFile = candidate;
+          break;
+        }
+      }
+      assert.ok(probeFile, "P7 needs one clean tracked probe file");
+      let probeErr;
+      let probeMs = 0;
+      let attempts = 0;
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        attempts = attempt;
+        const head = git(prodRoot, ["rev-parse", "HEAD"]);
+        const t0 = Date.now();
+        try {
+          await gitCommit(config, prodGuard, prodWorkspace, {
+            workspace_id: prodWsId, paths: [probeFile], message: "p7 non-mutating probe", expected_head: head
+          });
+        } catch (e) {
+          probeErr = e;
+        }
+        probeMs = Date.now() - t0;
+        if (probeErr && probeErr.reason === "no-changes") break;
+        console.log(`RAW_OBSERVATION: P7 probe attempt ${attempt} -> ${probeErr ? probeErr.reason : "SUCCESS?!" } (live-workstation drift, retrying quiescent window).`);
+        probeErr = probeErr && probeErr.reason === "no-changes" ? probeErr : undefined;
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+      assert.ok(probeErr, "P7 probe must fail (no changes)");
+      assert.equal(probeErr.reason, "no-changes", `P7 snapshot must complete, got ${probeErr.reason} after ${attempts} attempts`);
+      assert.equal(git(prodRoot, ["rev-parse", "HEAD"]), prodHead0, "P7 must not advance HEAD");
+      console.log(`RAW_OBSERVATION: P7 no-change helper probe on real AgentWorkspace -> reason=${probeErr.reason} probeMs=${probeMs} attempts=${attempts}, HEAD unchanged ${prodHead0}.`);
+
+      // Direct window scan on the real ignored roots, both engines.
+      const statusOut = spawnSync("git", ["-c", "core.fsmonitor=false", "--no-pager", "status", "--porcelain=v2", "-z", "--ignored=matching", "--untracked-files=all"], { cwd: prodRoot, encoding: "buffer", maxBuffer: 64 * 1024 * 1024 });
+      assert.equal(statusOut.status, 0);
+      const statuses = new Map();
+      for (const entry of statusOut.stdout.toString("utf8").split(NUL)) {
+        if (entry.startsWith("! ")) statuses.set(entry.slice(2), "! ignored");
+        else if (entry.startsWith("? ")) statuses.set(entry.slice(2), "? untracked");
+        else if (entry) statuses.set(entry, entry.slice(0, 1));
+      }
+      for (const engine of ["find", "node"]) {
+        const marker = await createIgnoredWindowMarker();
+        try {
+          const s0 = Date.now();
+          const scan = await scanIgnoredWindowWithMarker(prodWorkspace, statuses, marker.markerPath, marker.ctimeMs, { scanner: engine });
+          const scanMs = Date.now() - s0;
+          assert.equal(scan.scanned, true);
+          assert.equal(scan.engine, engine);
+          console.log(`RAW_OBSERVATION: P7 direct window scan engine=${scan.engine} entries=${scan.entries} hitCount=${scan.hitCount} scanMs=${scanMs}${scan.hitCount > 0 ? ` firstHits=${JSON.stringify(scan.hits.slice(0, 3))} (background activity, completion still proven)` : ""}.`);
+        } finally {
+          await removeIgnoredWindowMarker(marker.markerPath);
+        }
+      }
+      console.log("PASS P7 real AgentWorkspace non-mutating probe (no snapshot-too-large)");
+    }
+  }
+
+  // P8 — genuinely pathological bound: injected tiny entry bound on a 300-file
+  // fixture must return snapshot-too-large (node engine enforces entry bound;
+  // find engine is timeout/streaming-bounded). Proves fail-closed, not silent
+  // reduced coverage.
+  {
+    const bound0 = path.join(fixture, "bound");
+    await mkdir(bound0, { recursive: true });
+    initRepo(bound0, "Bound");
+    await writeFile(path.join(bound0, "selected.txt"), "selected base\n");
+    await writeFile(path.join(bound0, ".gitignore"), "ignored-dir/\n");
+    await mkdir(path.join(bound0, "ignored-dir"));
+    for (let i = 0; i < 300; i++) {
+      await writeFile(path.join(bound0, "ignored-dir", `f-${String(i).padStart(3, "0")}.txt`), "x\n");
+    }
+    commitAll(bound0, "bound base");
+    const boundRoot = await realpath(bound0);
+    const boundWs = { id: `ws_${createHash("sha256").update(boundRoot).digest("hex").slice(0, 24)}`, root: boundRoot, openedAt: new Date().toISOString() };
+    const statuses = new Map([["ignored-dir/", "! ignored"]]);
+    const marker = await createIgnoredWindowMarker();
+    try {
+      let boundErr;
+      try {
+        await scanIgnoredWindowWithMarker(boundWs, statuses, marker.markerPath, marker.ctimeMs, { scanner: "node", maxEntries: 50 });
+      } catch (e) {
+        boundErr = e;
+      }
+      assert.ok(boundErr, "pathological bound must fail");
+      assert.equal(boundErr.reason, "snapshot-too-large");
+      console.log(`RAW_OBSERVATION: P8 node maxEntries=50 on 300-file tree -> reason=${boundErr.reason}.`);
+      const okScan = await scanIgnoredWindowWithMarker(boundWs, statuses, marker.markerPath, marker.ctimeMs, { scanner: "node" });
+      assert.equal(okScan.hitCount, 0, "same tree within production bound must be clean");
+      console.log(`RAW_OBSERVATION: P8 same tree production bound entries=${okScan.entries} hits=0.`);
+    } finally {
+      await removeIgnoredWindowMarker(marker.markerPath);
+    }
+    console.log("PASS P8 pathological bound fail-closed");
+  }
 
   console.log("ONEFILE: PASS");
 } finally {
