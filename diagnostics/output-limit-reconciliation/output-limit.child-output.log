@@ -6,8 +6,8 @@
 > codexpro@0.31.0 build
 > node scripts/build.mjs
 
-Built codexpro@0.31.0; source commit a0e907ce4fe51bfec839b771bccfd3a7a9f9fcd8 (dirty).
-RAW_SUCCESS: index_census_bytes=3278636; display_cap=120000; internal_cap=8388608; selected_paths=selected-new-a.txt,selected-new-b.txt; unrelated_staged=preserved; unrelated_unstaged=preserved; unrelated_untracked=preserved
-RAW_OVERFLOW: index_census_bytes=11064123; internal_cap=8388608; display_cap=12000000; failure_stage=snapshot; failure_category=index-census; failure_reason=census-overflow; HEAD_unchanged=true; index_unchanged=true
-RAW_STATUS_OVERFLOW: status_census_bytes=9440126; internal_cap=8388608; display_cap=12000000; failure_stage=snapshot; failure_category=status-census; failure_reason=census-overflow; HEAD_unchanged=true; index_unchanged=true
-PASS git_commit index and status censuses preserve their independent 8 MiB limit, allow larger output than the display budget, and fail closed beyond the internal cap.
+Built codexpro@0.31.0; source commit 9ba141bd19f9203a2c1becd94e24864d2cb40cc7 (dirty).
+RAW_SUCCESS: index_census_bytes=3278764; local_ref_snapshot_bytes=195059; local_config_snapshot_bytes=332164; PASS git_commit_succeeded; PASS unrelated_state_preserved
+RAW_OVERFLOW: index_census_bytes=11064377; PASS bounded_failure; PASS HEAD_unchanged; PASS index_unchanged
+RAW_STATUS_OVERFLOW: status_census_bytes=9440126; PASS bounded_failure; PASS HEAD_unchanged; PASS index_unchanged
+PASS git_commit internal snapshot stdout limits and overflow behavior.

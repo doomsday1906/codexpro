@@ -713,8 +713,8 @@ async function captureRepositorySnapshot(
   // materialize/normalize index metadata while a reader is starting; sibling
   // readers would otherwise race and make a stable raw index appear to drift.
   //
-  // Census output has a fixed internal ceiling independent of the display
-  // budget. A larger user-facing output setting cannot raise this limit.
+  // Every snapshot command has a fixed internal stdout ceiling independent
+  // of the display budget. A larger user-facing setting cannot raise it.
   //
   // Ignored state under collapsed directories is not commit-owned (see the
   // preservation-boundary note above): no traversal and no per-file states
@@ -732,7 +732,7 @@ async function captureRepositorySnapshot(
         [...PASSIVE_OBSERVATION_GIT_ARGS, ...args],
         {
           ...(indexScope === undefined ? {} : { indexFile: indexScope.indexFile }),
-          ...(census ? { stdoutMaxBytes: GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES } : {})
+          stdoutMaxBytes: GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES
         }
       );
     } catch (error) {

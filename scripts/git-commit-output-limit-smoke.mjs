@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -9,13 +9,14 @@ const realGit = spawnSync("which", ["git"], { encoding: "utf8", stdio: ["ignore"
 if (!realGit) throw new Error("unable to locate Git for disposable fixtures");
 const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", LC_ALL: "C", LANG: "C" };
 
-function git(root, args, { allowFailure = false } = {}) {
+function git(root, args, { allowFailure = false, input } = {}) {
   const result = spawnSync(realGit, args, {
     cwd: root,
     env: gitEnv,
-    encoding: "buffer",
+    encoding: null,
     maxBuffer: 16_000_000,
-    stdio: ["ignore", "pipe", "pipe"]
+    input,
+    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"]
   });
   if (!allowFailure && (result.error || result.status !== 0)) {
     throw new Error(`fixture Git failed: ${args[0]} status=${result.status}`);
@@ -49,6 +50,24 @@ async function makeCensusFiles(root, count, labelLength) {
   }
 }
 
+async function makeSnapshotFixtures(root, head) {
+  const refCount = 2_500;
+  const refInput = Array.from({ length: refCount }, (_, index) =>
+    `create refs/heads/output-limit-fixture/${String(index).padStart(4, "0")} ${head}\n`
+  ).join("");
+  git(root, ["update-ref", "--stdin"], { input: refInput });
+
+  const configPath = path.join(root, ".git", "config");
+  const configEntries = Array.from({ length: 4_000 }, (_, index) =>
+    `snapshotFixture${String(index).padStart(4, "0")} = ${"x".repeat(32)}\n`
+  ).join("");
+  await appendFile(configPath, `\n[codexpro-output-limit-fixture]\n${configEntries}`);
+  return {
+    refBytes: git(root, ["for-each-ref", "--format=%(refname)=%(objectname)"]).length,
+    configBytes: git(root, ["config", "--local", "--null", "--list"]).length
+  };
+}
+
 async function run() {
   const { PathGuard } = await import("../dist/guard.js");
   const { GitCommitError, gitCommit } = await import("../dist/gitCommit.js");
@@ -63,10 +82,15 @@ async function run() {
   await writeFile(path.join(successRoot, "unrelated-unstaged.txt"), "unstaged base\n");
   await makeCensusFiles(successRoot, 8_000, 220);
   const base = commitAll(successRoot, "large census base");
+  const { refBytes, configBytes } = await makeSnapshotFixtures(successRoot, base);
   const censusBytes = git(successRoot, ["ls-files", "--debug", "--stage", "-z"]).length;
   assert.ok(censusBytes > 2_000_000, `fixture census ${censusBytes} did not exceed the rejected 2 MB implementation choice`);
   assert.ok(censusBytes > config.maxOutputBytes, `fixture census ${censusBytes} did not exceed display cap`);
   assert.ok(censusBytes < GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES, `fixture census ${censusBytes} exceeded internal cap ${GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES}`);
+  assert.ok(refBytes > config.maxOutputBytes, `fixture refs ${refBytes} did not exceed display cap`);
+  assert.ok(refBytes < GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES, `fixture refs ${refBytes} exceeded internal cap ${GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES}`);
+  assert.ok(configBytes > config.maxOutputBytes, `fixture config ${configBytes} did not exceed display cap`);
+  assert.ok(configBytes < GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES, `fixture config ${configBytes} exceeded internal cap ${GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES}`);
 
   await writeFile(path.join(successRoot, "unrelated-staged.txt"), "staged index content\n");
   git(successRoot, ["add", "--", "unrelated-staged.txt"]);
@@ -105,7 +129,7 @@ async function run() {
   assert.deepEqual(await fs.readFile(path.join(successRoot, "unrelated-unstaged.txt")), unrelatedBefore.unstagedWorktree);
   assert.deepEqual(await fs.readFile(path.join(successRoot, "unrelated-untracked.txt")), unrelatedBefore.untrackedBytes);
   assert.equal(text(successRoot, ["status", "--porcelain=v2", "--", "unrelated-untracked.txt"]).startsWith("? "), true);
-  console.log(`RAW_SUCCESS: index_census_bytes=${censusBytes}; display_cap=${config.maxOutputBytes}; internal_cap=${GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES}; selected_paths=${result.committed_paths.join(",")}; unrelated_staged=preserved; unrelated_unstaged=preserved; unrelated_untracked=preserved`);
+  console.log(`RAW_SUCCESS: index_census_bytes=${censusBytes}; local_ref_snapshot_bytes=${refBytes}; local_config_snapshot_bytes=${configBytes}; PASS git_commit_succeeded; PASS unrelated_state_preserved`);
 
   const overflowRoot = path.join(fixtureRoot, "overflow");
   await mkdir(overflowRoot);
@@ -146,7 +170,7 @@ async function run() {
   assert.equal(text(overflowRoot, ["rev-parse", "HEAD"]), overflowBase, "overflow rejection advanced HEAD");
   assert.equal(git(overflowRoot, ["diff", "--cached", "--binary"]).length, 0, "overflow rejection changed the index");
   assert.equal(text(overflowRoot, ["diff", "--name-only"]).trim(), "selected.txt", "overflow rejection changed selected worktree bytes");
-  console.log(`RAW_OVERFLOW: index_census_bytes=${overBudgetBytes}; internal_cap=${GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES}; display_cap=${highDisplayConfig.maxOutputBytes}; failure_stage=${failure.stage}; failure_category=${failure.category}; failure_reason=${failure.reason}; HEAD_unchanged=true; index_unchanged=true`);
+  console.log(`RAW_OVERFLOW: index_census_bytes=${overBudgetBytes}; PASS bounded_failure; PASS HEAD_unchanged; PASS index_unchanged`);
 
   const statusOverflowRoot = path.join(fixtureRoot, "status-overflow");
   await mkdir(statusOverflowRoot);
@@ -178,12 +202,12 @@ async function run() {
   assert.equal(text(statusOverflowRoot, ["rev-parse", "HEAD"]), statusBase, "status overflow rejection advanced HEAD");
   assert.equal(git(statusOverflowRoot, ["diff", "--cached", "--binary"]).length, 0, "status overflow rejection changed the index");
   assert.equal(text(statusOverflowRoot, ["diff", "--name-only"]).trim(), "selected.txt", "status overflow rejection changed selected worktree bytes");
-  console.log(`RAW_STATUS_OVERFLOW: status_census_bytes=${statusBytes}; internal_cap=${GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES}; display_cap=${highDisplayConfig.maxOutputBytes}; failure_stage=${statusFailure.stage}; failure_category=${statusFailure.category}; failure_reason=${statusFailure.reason}; HEAD_unchanged=true; index_unchanged=true`);
+  console.log(`RAW_STATUS_OVERFLOW: status_census_bytes=${statusBytes}; PASS bounded_failure; PASS HEAD_unchanged; PASS index_unchanged`);
 }
 
 try {
   await run();
-  console.log("PASS git_commit index and status censuses preserve their independent 8 MiB limit, allow larger output than the display budget, and fail closed beyond the internal cap.");
+  console.log("PASS git_commit internal snapshot stdout limits and overflow behavior.");
 } finally {
   await rm(fixtureRoot, { recursive: true, force: true });
 }
