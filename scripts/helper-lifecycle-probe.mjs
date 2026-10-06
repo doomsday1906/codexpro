@@ -29,7 +29,7 @@ operations.sort((a, b) => a.operationId.localeCompare(b.operationId));
 const found = new Set(operations.map((item) => item.operationId));
 const missing = [...requested].filter((name) => !found.has(name));
 process.stdout.write(JSON.stringify({
-  version: doc.info?.version,
+  catalogVersion: doc.info?.version,
   operations,
   sessionsResponse: doc.components?.schemas?.SessionsResponse,
   missing
