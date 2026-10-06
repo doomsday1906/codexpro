@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { centralArtifactsDirForRun, type DelegationRunRecord } from "./delegationStore.js";
+import { readPhysicalReleaseRecord } from "./disposableCloseout.js";
 
 /** Shared helpers are engine/project resources, including on --standalone.
  * The qualified engine exposes no atomic project exclusion + helper disposal
@@ -150,12 +151,16 @@ export interface SessionCloseoutResult {
   engine_exit_code?: number | null;
   engine_signal?: string | null;
   engine_error?: string;
-  dir_clear: false;
-  cleanup_finished: false;
+  dir_clear: boolean;
+  cleanup_finished: boolean;
   session_deleted: false;
   helpers_signalled: number[];
-  workdir_release: "blocked";
-  blocker: string;
+  helpers_remaining?: number[];
+  workdir_release: "blocked" | "released" | "already_removed";
+  blocker?: string;
+  physical_release_at?: string;
+  backup_file_count?: number;
+  backup_total_bytes?: number;
 }
 
 export function closeoutReceipt(bridgeDir: string, run: DelegationRunRecord): SessionCloseoutResult {
@@ -181,9 +186,43 @@ export function closeoutReceipt(bridgeDir: string, run: DelegationRunRecord): Se
       reason = (error as NodeJS.ErrnoException).code === "ENOENT" ? "export-pending" : "closeout-artifact-unverified";
     }
   }
-  return { retired, exported, ...(exportBytes !== undefined ? { export_bytes: exportBytes } : {}),
-    reason, dir_clear: false, cleanup_finished: false, session_deleted: false,
-    helpers_signalled: [], workdir_release: "blocked", blocker: OPENCODE_CLOSEOUT_BLOCKER };
+  const blockedReceipt = (extraReason?: string): SessionCloseoutResult => ({
+    retired, exported, ...(exportBytes !== undefined ? { export_bytes: exportBytes } : {}),
+    reason: extraReason ?? reason, dir_clear: false, cleanup_finished: false, session_deleted: false,
+    helpers_signalled: [], workdir_release: "blocked", blocker: OPENCODE_CLOSEOUT_BLOCKER,
+  });
+  if (!retired || !exported) return blockedReceipt();
+  // Archival is confirmed. Reconcile a persisted physical release so
+  // ordinary reads, retries, and restart recovery report the actual outcome.
+  // Archival success and physical success stay distinct: exported reflects
+  // the session preservation; workdir_release reflects the directory fate.
+  let physical: ReturnType<typeof readPhysicalReleaseRecord>;
+  try { physical = readPhysicalReleaseRecord(bridgeDir, run.runId); }
+  catch { return blockedReceipt("closeout-artifact-unverified"); }
+  if (!physical) return blockedReceipt();
+  const expectedBinding = {
+    runId: run.runId, ownerIdHash: run.ownerIdHash, ownerKind: run.ownerKind,
+    workdir: run.workdir, engine: run.engine, sessionId: run.session?.sessionId ?? null,
+    dirReal: physical.binding.dirReal,
+  };
+  if (JSON.stringify(physical.binding) !== JSON.stringify(expectedBinding)) {
+    return blockedReceipt("closeout-artifact-unverified");
+  }
+  let dirAbsent = false;
+  try {
+    fs.lstatSync(physical.binding.dirReal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") dirAbsent = true;
+    else return blockedReceipt("closeout-artifact-unverified");
+  }
+  if (!dirAbsent) return blockedReceipt("closeout-artifact-unverified");
+  return {
+    retired, exported, ...(exportBytes !== undefined ? { export_bytes: exportBytes } : {}),
+    reason: "archived-and-released", dir_clear: true, cleanup_finished: true, session_deleted: false,
+    helpers_signalled: physical.helpersSignalled, workdir_release: "released",
+    physical_release_at: physical.releasedAt,
+    backup_file_count: physical.backup.fileCount, backup_total_bytes: physical.backup.totalBytes,
+  };
 }
 
 /** Called only by the owner-authorized explicit public closeout handler after

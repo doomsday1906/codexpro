@@ -2662,6 +2662,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     task: z.string().max(9000).optional().describe("Real worker input (bounded to 8000 chars after control-strip, validated, never empty). Omit for the legacy read-only canary slice (requires canary=true; codex/opencode only)."),
     delegation_group: z.string().max(64).optional().describe("Delegation group id (bounded, validated /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/; default hestia-cli-canary). Scopes subscription filters and events."),
     workdir: z.string().min(1).max(1024).describe("Explicit workspace-relative working directory for the disposable canary run."),
+    disposable_workdir: z.boolean().optional().describe("Explicit per-run disposable-workdir authority (default false): when true, the caller authorizes a future delegation_closeout to physically release this exact workdir after durable archival plus exclusive-use gates plus central backup of its files. The workdir must be provably disposable at launch (under OS tmp, confirmed outside any Git repository); inconclusive probes refuse the launch. Absent/false workdirs are never removed."),
     request_id: z.string().min(1).max(128).optional().describe("Idempotency key. Repeating it returns the existing run without spawning a second worker."),
     canary: z.boolean().optional().describe("Must be true when no task is supplied (legacy read-only canary slice, codex/opencode only). Ignored when task is present."),
     timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms. Canary clamps to 5 minutes; real tasks clamp to 30 minutes; 10s minimum. The clamped value is truthfully acked."),
@@ -2686,6 +2687,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
     task: z.string().max(9000).optional().describe("Real worker input (bounded, validated). Omit for the legacy read-only canary slice (requires canary=true; codex/opencode only)."),
     delegation_group: z.string().max(64).optional().describe("Delegation group id (default hestia-cli-canary)."),
     workdir: z.string().min(1).max(1024).describe("Explicit workspace-relative working directory that would host the run."),
+    disposable_workdir: z.boolean().optional().describe("Preview the explicit disposable-workdir authority for this workdir (same launch-time path checks, no state created)."),
     canary: z.boolean().optional().describe("Must be true when no task is supplied (legacy read-only canary slice, codex/opencode only)."),
     timeout_ms: z.number().int().positive().optional().describe("Explicit bounded attempt timeout in ms (clamped + truthfully acked like launch)."),
     steerable: z.boolean().optional().describe("DEFERRED FOR THIS RELEASE: steerable=true previews are refused pre-state (steer_deferred, nothing created). Omit steerable for normal standalone/ephemeral preview; use delegation_followup or delegation_cancel + relaunch with steerable omitted (standalone/ephemeral) — follow-up and cancel/relaunch are not live steering.")
@@ -2725,7 +2727,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
   const closeoutArgs = z.object({
     run_id: RUN_ID,
     workspace_id: WORKSPACE_ID.optional(),
-    retire: z.literal(true).describe("Explicitly retire this run from future adapter follow-ups. Does not delete the engine session or authorize workdir removal."),
+    retire: z.literal(true).describe("Explicitly retire this run from future adapter follow-ups and preserve its session export. When the run was launched with explicit disposable_workdir authority, retire also authorizes physical release of that exact workdir after durable archival plus exclusive-use gates plus central backup of its files; otherwise the workdir, session, helpers, and service are retained and release stays blocked."),
     timeout_ms: z.number().int().min(1000).max(20000).optional()
   }).strict();
   const closeoutReadArgs = z.object({
@@ -2922,6 +2924,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
         const runId = newRunId();
         const owner = ownerIdFor(deps.config.authToken, localOwnerId(deps.config));
         const now = new Date().toISOString();
+        const workdirExistedBeforeLaunch = fs.existsSync(resolved.absPath);
         fs.mkdirSync(resolved.absPath, { recursive: true, mode: 0o700 });
         // Canary runs stage the read-only fixtures; real tasks stage nothing.
         if (isCanary) {
@@ -2945,6 +2948,30 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           workdirBaseline = captureWorkdirBaseline(resolved.absPath);
         } catch {
           workdirBaseline = {};
+        }
+        // Explicit disposable-workdir authority (owner opt-in at launch).
+        // Validated AFTER mkdir so the path exists for realpath/git probes;
+        // inconclusive probes refuse the launch rather than recording a
+        // weaker authority. Pre-existing files are allowed but must be
+        // preserved via central backup before any future removal.
+        let workdirDisposable: DelegationRunRecord["workdirDisposable"];
+        if ((args as Record<string, unknown>).disposable_workdir === true) {
+          const pathCheck = checkDisposableWorkdir(resolved.absPath);
+          if (!pathCheck.disposable || !pathCheck.real) {
+            if (!workdirExistedBeforeLaunch) {
+              try {
+                const leftover = fs.readdirSync(resolved.absPath);
+                if (leftover.length === 0) fs.rmdirSync(resolved.absPath);
+              } catch { /* best effort; launch is refused regardless */ }
+            }
+            return failResult(`Disposable workdir rejected: ${pathCheck.reason}. Nothing spawned, no run created.`, { error: "disposable_workdir_rejected", reason: pathCheck.reason });
+          }
+          workdirDisposable = {
+            authorized: true,
+            at: now,
+            createdNew: !workdirExistedBeforeLaunch,
+            baselineSnapshot: [...(workdirBaseline.snapshot ?? [])],
+          };
         }
         const session: DelegationSessionBinding = engine === "codex"
           ? {
@@ -3013,6 +3040,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           ...(engine === "claude" ? { agent, ...(model ? { model } : {}), ...(plan.permissionMode ? { permissionMode: plan.permissionMode } : {}), ...(plan.effort ? { effort: plan.effort } : {}), ...(plan.allowedTools ? { allowedTools: plan.allowedTools } : {}), ...(plan.disallowedTools ? { disallowedTools: plan.disallowedTools } : {}), requestedSessionId: plan.requestedSessionId, ...(plan.disableGitkrakenHooks ? { disableGitkrakenHooks: true as const } : {}) } : {}),
           ...(isCanary ? { isCanary: true } : { isCanary: false, task: taskText }),
           workdirBaseline,
+          ...(workdirDisposable ? { workdirDisposable } : {}),
           executable: plan.executable,
           binaryOverridden: engineBinaryOverridden(engine),
           session,
@@ -3568,17 +3596,31 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           const body = { run_id: run.runId, state: run.state, ...result, closeout_read_tool: "delegation_read_closeout" };
           return failResult("Closeout archival incomplete; retry delegation_closeout. Workdir release BLOCKED; engine history, shared helpers and directory retained.", { ...body, error: result.reason });
         }
-        // Durable preservation is confirmed. Attempt exact disposable release;
-        // shared, ambiguous, or unverifiable targets stay blocked.
+        // Durable preservation is confirmed. Physical release additionally
+        // requires explicit launch-time disposable authority for this exact
+        // workdir; without it the workdir, session, helpers, and service are
+        // retained and release stays blocked.
+        const blockedAfterArchive = (note: string, extra?: Record<string, unknown>) => {
+          const body = { run_id: run.runId, state: run.state, ...result, closeout_read_tool: "delegation_read_closeout" };
+          return okResult(`Run retired and session export durably preserved. Workdir release BLOCKED (${note}); engine history, shared helpers and directory retained.`, {
+            ...body, workdir_release: "blocked", blocker: OPENCODE_CLOSEOUT_BLOCKER, ...extra,
+          });
+        };
+        if (run.workdirDisposable?.authorized !== true) {
+          return blockedAfterArchive("no-disposable-authority", { disposable_authority: "absent" });
+        }
         const disposableCheck = checkDisposableWorkdir(run.workdir);
         if (!disposableCheck.disposable || !disposableCheck.real) {
-          const body = { run_id: run.runId, state: run.state, ...result, closeout_read_tool: "delegation_read_closeout" };
           if (disposableCheck.reason === "workdir-absent") {
-            return okResult("Run retired and session export durably preserved. Disposable workdir already absent; central archive retained.", {
-              ...body, dir_clear: true, cleanup_finished: true, workdir_release: "already_removed", helpers_signalled: [],
-            });
+            const reread = closeoutReceipt(bridgeDir, run);
+            if (reread.workdir_release === "released" && reread.dir_clear && reread.cleanup_finished) {
+              return okResult("Run retired and session export durably preserved. Disposable workdir already absent; central archive and backup retained.", {
+                run_id: run.runId, state: run.state, ...reread, closeout_read_tool: "delegation_read_closeout",
+              });
+            }
+            return blockedAfterArchive("workdir-absent-no-record");
           }
-          return okResult("Run retired and session export durably preserved. Workdir release BLOCKED; engine history, shared helpers and directory retained.", body);
+          return blockedAfterArchive(disposableCheck.reason);
         }
         const dirReal = disposableCheck.real;
         // Sharing gate: no other adapter runs may share this canonical dir.
@@ -3595,19 +3637,16 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           }
         } catch { sharedBy = ["unverifiable"]; }
         if (sharedBy.length > 0) {
-          const body = { run_id: run.runId, state: run.state, ...result, closeout_read_tool: "delegation_read_closeout" };
-          return okResult("Run retired and session export durably preserved. Workdir release BLOCKED; engine history, shared helpers and directory retained.", {
-            ...body, workdir_release: "blocked", blocker: OPENCODE_CLOSEOUT_BLOCKER, shared_workdir_holders: sharedBy,
-          });
+          return blockedAfterArchive("shared-workdir", { shared_workdir_holders: sharedBy });
         }
         const engineSessions = checkNoOtherEngineSessions(resolveOpenCodeBinary(), dirReal, run.session?.sessionId, args.timeout_ms ?? 10000);
         if (!engineSessions.ok) {
-          const body = { run_id: run.runId, state: run.state, ...result, closeout_read_tool: "delegation_read_closeout" };
-          return okResult("Run retired and session export durably preserved. Workdir release BLOCKED; engine history, shared helpers and directory retained.", {
-            ...body, workdir_release: "blocked", blocker: OPENCODE_CLOSEOUT_BLOCKER, engine_session_gate: engineSessions.reason, engine_other_sessions: engineSessions.otherSessionIds,
-          });
+          return blockedAfterArchive(engineSessions.reason, { engine_other_sessions: engineSessions.otherSessionIds });
         }
-        const release = await releaseDisposableWorktree(run.workdir, {});
+        const release = await releaseDisposableWorktree(bridgeDir, {
+          runId: run.runId, ownerIdHash: run.ownerIdHash, ownerKind: run.ownerKind,
+          workdir: run.workdir, engine: run.engine, sessionId: run.session?.sessionId ?? null,
+        }, {});
         const merged = {
           run_id: run.runId, state: run.state, ...result,
           dir_clear: release.dirClear,
@@ -3617,6 +3656,8 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           workdir_release: release.workdirRelease,
           disposable_release_reason: release.reason,
           workdir_removed: release.workdirRemoved,
+          backup_file_count: release.backupFileCount,
+          backup_total_bytes: release.backupTotalBytes,
           closeout_read_tool: "delegation_read_closeout",
         };
         if (release.ok) {

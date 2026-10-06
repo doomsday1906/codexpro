@@ -395,6 +395,22 @@ export interface DelegationRunRecord {
     gitHeadReason?: string;
   };
   /**
+   * Explicit per-run disposable-workdir authority (owner opt-in at launch).
+   * Present only when the caller passed disposable_workdir=true and the
+   * launch-time path checks passed (under OS tmp, confirmed outside any Git
+   * repository, inconclusive probes refused). Closeout physically releases
+   * this exact workdir only when this marker is present with authorized=true
+   * plus durable archival, exclusive-use gates, central backup, and verified
+   * removal. Absent on all runs that predate this field and on every run
+   * launched without the explicit opt-in; those workdirs are never removed.
+   */
+  workdirDisposable?: {
+    authorized: boolean;
+    at: string;
+    createdNew: boolean;
+    baselineSnapshot: string[];
+  };
+  /**
    * Explicit session id supplied at launch (opencode ses-id or claude UUID),
    * "" when the caller omitted one (claude mints a stable UUID afterwards;
    * opencode leaves minting to the worker). Present on runs launched after
