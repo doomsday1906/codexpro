@@ -1870,6 +1870,7 @@ const FULL_TOOL_NAMES = [
   "bash",
   "pty_run",
   "start_verification",
+  "list_verification_jobs",
   "wait_verification",
   "cancel_verification",
   "git_resolve_ref",
