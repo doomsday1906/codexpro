@@ -189,6 +189,7 @@ import {
 } from "./delegationEvents.js";
 
 import { archiveRetiredSession, closeoutReceipt, hasCloseoutIntent, readCloseoutExport, OPENCODE_CLOSEOUT_BLOCKER } from "./sessionHelpers.js";
+import { checkDisposableWorkdir, checkNoOtherEngineSessions, releaseDisposableWorktree } from "./disposableCloseout.js";
 
 export interface DelegationToolDeps {
   config: CodexProConfig;
@@ -3530,7 +3531,7 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
       name: "delegation_closeout",
       options: {
         title: "Delegation Closeout",
-        description: "Explicit owner-authorized retirement of a settled OpenCode run from adapter follow-ups. Preserves its session export in central run storage with verified identity and durable readback. Workdir release is BLOCKED: the engine's published disposal operations do not establish atomic exclusion of concurrent project users. Never deletes a session/directory or signals a shared helper/service. Repeated calls retry safe archival; read the archive via delegation_read_closeout.",
+        description: "Explicit owner-authorized retirement of a settled OpenCode run from adapter follow-ups. Preserves its session export in central run storage with verified identity and durable readback. Disposable isolated workdirs with exact ownership are physically released after durable archival (owned CodeGraph helpers stopped, directory removed); shared, ambiguous, or unverifiable targets stay blocked. Never deletes a session/directory or signals a shared helper/service except for the exact disposable release. Repeated calls retry safe archival and idempotent release; read the archive via delegation_read_closeout.",
         inputSchema: publicSchemaFrom(closeoutArgs), runtimeInputSchema: closeoutArgs, annotations: { ...DESTRUCTIVE, idempotentHint: true }
       },
       handler: async (args) => {
@@ -3563,10 +3564,67 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
           return failResult("Session has another active adapter turn; closeout refused.", { error: "session_busy", run_id: run.runId });
         }
         const result = archiveRetiredSession(bridgeDir, run, resolveOpenCodeBinary(), args.timeout_ms ?? 10000);
-        const body = { run_id: run.runId, state: run.state, ...result, closeout_read_tool: "delegation_read_closeout" };
-        return result.exported
-          ? okResult("Run retired and session export durably preserved. Workdir release BLOCKED; engine history, shared helpers and directory retained.", body)
-          : failResult("Closeout archival incomplete; retry delegation_closeout. Workdir release BLOCKED; engine history, shared helpers and directory retained.", { ...body, error: result.reason });
+        if (!result.exported) {
+          const body = { run_id: run.runId, state: run.state, ...result, closeout_read_tool: "delegation_read_closeout" };
+          return failResult("Closeout archival incomplete; retry delegation_closeout. Workdir release BLOCKED; engine history, shared helpers and directory retained.", { ...body, error: result.reason });
+        }
+        // Durable preservation is confirmed. Attempt exact disposable release;
+        // shared, ambiguous, or unverifiable targets stay blocked.
+        const disposableCheck = checkDisposableWorkdir(run.workdir);
+        if (!disposableCheck.disposable || !disposableCheck.real) {
+          const body = { run_id: run.runId, state: run.state, ...result, closeout_read_tool: "delegation_read_closeout" };
+          if (disposableCheck.reason === "workdir-absent") {
+            return okResult("Run retired and session export durably preserved. Disposable workdir already absent; central archive retained.", {
+              ...body, dir_clear: true, cleanup_finished: true, workdir_release: "already_removed", helpers_signalled: [],
+            });
+          }
+          return okResult("Run retired and session export durably preserved. Workdir release BLOCKED; engine history, shared helpers and directory retained.", body);
+        }
+        const dirReal = disposableCheck.real;
+        // Sharing gate: no other adapter runs may share this canonical dir.
+        let sharedBy: string[] = [];
+        try {
+          const allRuns = listDelegationRuns(bridgeDir);
+          for (const other of allRuns) {
+            if (other.runId === run.runId) continue;
+            if (!other.workdir) continue;
+            let otherReal: string | undefined;
+            try { otherReal = fs.realpathSync(other.workdir); }
+            catch { continue; }
+            if (otherReal === dirReal) sharedBy.push(other.runId);
+          }
+        } catch { sharedBy = ["unverifiable"]; }
+        if (sharedBy.length > 0) {
+          const body = { run_id: run.runId, state: run.state, ...result, closeout_read_tool: "delegation_read_closeout" };
+          return okResult("Run retired and session export durably preserved. Workdir release BLOCKED; engine history, shared helpers and directory retained.", {
+            ...body, workdir_release: "blocked", blocker: OPENCODE_CLOSEOUT_BLOCKER, shared_workdir_holders: sharedBy,
+          });
+        }
+        const engineSessions = checkNoOtherEngineSessions(resolveOpenCodeBinary(), dirReal, run.session?.sessionId, args.timeout_ms ?? 10000);
+        if (!engineSessions.ok) {
+          const body = { run_id: run.runId, state: run.state, ...result, closeout_read_tool: "delegation_read_closeout" };
+          return okResult("Run retired and session export durably preserved. Workdir release BLOCKED; engine history, shared helpers and directory retained.", {
+            ...body, workdir_release: "blocked", blocker: OPENCODE_CLOSEOUT_BLOCKER, engine_session_gate: engineSessions.reason, engine_other_sessions: engineSessions.otherSessionIds,
+          });
+        }
+        const release = await releaseDisposableWorktree(run.workdir, {});
+        const merged = {
+          run_id: run.runId, state: run.state, ...result,
+          dir_clear: release.dirClear,
+          cleanup_finished: release.ok && release.dirClear,
+          helpers_signalled: release.helpersSignalled,
+          helpers_remaining: release.helpersRemaining,
+          workdir_release: release.workdirRelease,
+          disposable_release_reason: release.reason,
+          workdir_removed: release.workdirRemoved,
+          closeout_read_tool: "delegation_read_closeout",
+        };
+        if (release.ok) {
+          return okResult("Run retired, session export durably preserved, and disposable workdir physically released (owned helpers stopped, directory removed). Central archive retained.", merged);
+        }
+        return okResult("Run retired and session export durably preserved. Disposable release incomplete; retry delegation_closeout. Shared helpers, sessions, and central archive retained.", {
+          ...merged, workdir_release: "blocked", blocker: OPENCODE_CLOSEOUT_BLOCKER,
+        });
       }
     },
     {
