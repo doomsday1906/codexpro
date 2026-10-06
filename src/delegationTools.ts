@@ -3618,7 +3618,20 @@ export function delegationToolDefs(deps: DelegationToolDeps): DelegationToolDef[
                 run_id: run.runId, state: run.state, ...reread, closeout_read_tool: "delegation_read_closeout",
               });
             }
-            return blockedAfterArchive("workdir-absent-no-record");
+            // Possible crash-window recovery: prepared intent + absent target
+            // + valid bound backup finalizes as released inside the release
+            // owner. Anything unproven stays blocked with nothing deleted.
+            const recovery = await releaseDisposableWorktree(bridgeDir, {
+              runId: run.runId, ownerIdHash: run.ownerIdHash, ownerKind: run.ownerKind,
+              workdir: run.workdir, engine: run.engine, sessionId: run.session?.sessionId ?? null,
+            }, {});
+            if (recovery.ok) {
+              const rereadRecovery = closeoutReceipt(bridgeDir, run);
+              return okResult("Run retired, session export durably preserved, and interrupted disposable release safely recovered to released. Central archive and backup retained.", {
+                run_id: run.runId, state: run.state, ...rereadRecovery, closeout_read_tool: "delegation_read_closeout",
+              });
+            }
+            return blockedAfterArchive(recovery.reason);
           }
           return blockedAfterArchive(disposableCheck.reason);
         }

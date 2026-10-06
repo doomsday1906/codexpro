@@ -428,6 +428,103 @@ exit 2
   assert(!retry7c.isError && retry7c.structuredContent.workdir_release === 'released' && !fs.existsSync(dispAbs7c), `retry7c released ${JSON.stringify(retry7c.structuredContent)}`);
   console.log('P7c unresolvable session directory: unproven identity blocked, cleared retry released.');
 
+  // P8: crash window after physical removal but before final publication.
+  // Fault injection blocks only the final physical-release.json link while
+  // allowing backup, prepared intent, helper signals, and removal. Restart
+  // recovery via a brand-new server/client must finalize to released from
+  // prepared + absent target + valid bound backup.
+  const dispRel8 = `disposable-crash-${Date.now()}`;
+  const dispAbs8 = path.join(wsRoot, dispRel8);
+  await fsp.mkdir(dispAbs8, { recursive: true });
+  const crashBytes = Buffer.from('crash-window file content\n');
+  await fsp.writeFile(path.join(dispAbs8, 'crash.txt'), crashBytes);
+  const launch8 = await launchRest(dispRel8, true);
+  assert(!launch8.isError, 'launch8');
+  const run8 = launch8.structuredContent.run_id;
+  await waitSettledRest(run8);
+  const runFile8 = runFileFor(run8);
+  const bridge8 = path.dirname(path.dirname(runFile8));
+  const cgJs8 = path.join(await makeRoot('codexpro-dc-cg8-'), 'codegraph.js');
+  const owned8 = await spawnCodegraphHelper(cgJs8, dispAbs8, false);
+  const cgJs8other = path.join(await makeRoot('codexpro-dc-cg8other-'), 'codegraph.js');
+  const unrelated8 = await spawnCodegraphHelper(cgJs8other, await makeRoot('codexpro-dc-crash-other-'), false);
+  const nativeLink = fs.linkSync;
+  let finalBlocked = false;
+  fs.linkSync = function (source, destination, ...rest) {
+    if (String(destination).endsWith('physical-release.json') && !finalBlocked) {
+      finalBlocked = true;
+      throw new Error('fixture interruption before final release publication');
+    }
+    return nativeLink.call(fs, source, destination, ...rest);
+  };
+  let closeCrash;
+  try { closeCrash = await callRest('delegation_closeout', { workspace_id: workspaceId, run_id: run8, retire: true }); }
+  finally { fs.linkSync = nativeLink; }
+  assert(finalBlocked, 'fault must have intercepted the final publication');
+  assert(!closeCrash.isError && closeCrash.structuredContent.exported === true && closeCrash.structuredContent.workdir_release === 'blocked', `crash interrupted ${JSON.stringify(closeCrash.structuredContent)}`);
+  assert(!fs.existsSync(dispAbs8), 'workdir was physically removed before the interruption');
+  assert(!fs.existsSync(path.join(bridge8, 'delegation-artifacts', run8, 'physical-release.json')), 'final record absent after interruption');
+  assert(fs.existsSync(path.join(bridge8, 'delegation-artifacts', run8, 'physical-release-prepared.json')), 'prepared intent durable after interruption');
+  await waitGone(owned8.pid, owned8.start, 'crash owned helper');
+  assert(readStart(unrelated8.pid) === unrelated8.start, 'unrelated helper untouched by interruption');
+  // Restart: recreate server/process state, then reconcile.
+  try { await client.close(); } catch {}
+  try { await server.close(); } catch {}
+  ({ srv: server, cli: client } = await openServer());
+  const callCrash = async (name, args) => client.callTool({ name, arguments: args });
+  const openedCrash = await callCrash('open_workspace', { root: wsRoot });
+  assert(!openedCrash.isError, 'reopen after crash');
+  const widCrash = openedCrash.structuredContent.workspace_id;
+  const readCrash = await callCrash('delegation_read_result', { workspace_id: widCrash, run_id: run8 });
+  assert(!readCrash.isError && readCrash.structuredContent.closeout?.exported === true, 'archival preserved across restart');
+  const retryCrash = await callCrash('delegation_closeout', { workspace_id: widCrash, run_id: run8, retire: true });
+  assert(!retryCrash.isError && retryCrash.structuredContent.workdir_release === 'released' && retryCrash.structuredContent.dir_clear === true, `crash recovery released ${JSON.stringify(retryCrash.structuredContent)}`);
+  assert(fs.existsSync(path.join(bridge8, 'delegation-artifacts', run8, 'physical-release.json')), 'final record published by recovery');
+  const backedCrash = await fsp.readFile(path.join(bridge8, 'delegation-artifacts', run8, 'workdir-backup', 'crash.txt'));
+  assert(backedCrash.equals(crashBytes), 'backup readable and hash-valid after recovery');
+  assert(readStart(unrelated8.pid) === unrelated8.start, 'unrelated helper survives recovery');
+  unrelated8.child.kill('SIGKILL');
+  // Rebind for the rest of the proof.
+  const callRest2 = callCrash;
+  workspaceId = widCrash;
+  const waitSettledRest2 = async (runId, tries = 120) => {
+    for (let i = 0; i < tries; i += 1) {
+      const r = await callRest2('delegation_read_result', { workspace_id: workspaceId, run_id: runId });
+      assert(!r.isError, `read: ${JSON.stringify(r.structuredContent)}`);
+      if (!['queued','running'].includes(r.structuredContent.state)) return r;
+      await new Promise((r2) => setTimeout(r2, 100));
+    }
+    throw new Error(`ASSERT: run ${runId} did not settle`);
+  };
+  const launchRest2 = async (workdirRel, disposable) => {
+    reqN += 1;
+    const r = await callRest2('delegation_launch', {
+      workspace_id: workspaceId, engine: 'opencode', agent: 'implementer', model: 'test-model',
+      workdir: workdirRel, task: 'Report readiness. Change nothing.', delegation_group: 'team-disposable-proof',
+      request_id: `req-dc-${reqN}`, timeout_ms: 60000,
+      ...(disposable ? { disposable_workdir: true } : {}),
+    });
+    return r;
+  };
+  console.log('P8 crash window: removal happened, final publish interrupted, restart recovery finalized released with backup intact and unrelated preserved.');
+
+  // P9: fail-closed prepared mismatch (tampered intent never finalizes).
+  const dispRel9 = `disposable-tamper-${Date.now()}`;
+  const dispAbs9 = path.join(wsRoot, dispRel9);
+  await fsp.mkdir(dispAbs9, { recursive: true });
+  await fsp.writeFile(path.join(dispAbs9, 'keep.txt'), 'tamper test content\n');
+  const launch9 = await launchRest2(dispRel9, true);
+  assert(!launch9.isError, 'launch9');
+  const run9 = launch9.structuredContent.run_id;
+  await waitSettledRest2(run9);
+  const artDir9 = path.join(bridgeOf(runFileFor(run9)), 'delegation-artifacts', run9);
+  await fsp.mkdir(artDir9, { recursive: true });
+  const rec9 = JSON.parse(await fsp.readFile(runFileFor(run9), 'utf8'));
+  await fsp.writeFile(path.join(artDir9, 'physical-release-prepared.json'), `${JSON.stringify({ version: 1, phase: 'prepared', binding: { runId: run9, ownerIdHash: rec9.ownerIdHash, ownerKind: rec9.ownerKind, workdir: rec9.workdir, engine: rec9.engine, sessionId: rec9.session?.sessionId ?? null, dirReal: '/tmp/codexpro-dc-tampered-elsewhere' }, preparedAt: new Date().toISOString(), helpersSignalled: [], backup: { fileCount: 0, totalBytes: 0, manifestSha256: '0'.repeat(64) } })}\n`);
+  const closeTamper = await callRest2('delegation_closeout', { workspace_id: workspaceId, run_id: run9, retire: true });
+  assert(!closeTamper.isError && closeTamper.structuredContent.exported === true && closeTamper.structuredContent.workdir_release === 'blocked' && fs.existsSync(dispAbs9) && fs.existsSync(path.join(dispAbs9, 'keep.txt')) && !fs.existsSync(path.join(artDir9, 'physical-release.json')), `tamper blocked ${JSON.stringify(closeTamper.structuredContent)}`);
+  console.log('P9 tampered prepared intent: binding mismatch failed closed, directory and files retained, no final record.');
+
   // R0: read-only real-engine lifecycle evidence (no mutation, no shared-service contact).
   // Uses the installed opencode binary and live /proc only: session entries
   // carry directory identity, and shared CodeGraph helpers serve non-tmp
@@ -462,7 +559,7 @@ exit 2
     console.log('R0 real-engine read-only: installed opencode binary not found, skipped without mutation.');
   }
 
-  console.log('PASS disposable isolated closeout proof: P1, P2, P2b, P3, P4, P5, P6, P7, P7b, P7c plus R0 complete (fixture sections use the task-owned fake engine; R0 uses the installed engine read-only).');
+  console.log('PASS disposable isolated closeout proof: P1, P2, P2b, P3, P4, P5, P6, P7, P7b, P7c, P8, P9 plus R0 complete (fixture sections use the task-owned fake engine; R0 uses the installed engine read-only).');
   await cleanup();
 } catch (e) {
   try { await cleanup(); } catch {}
