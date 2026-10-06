@@ -125,9 +125,18 @@ interface GitMutationOptions {
    * transaction. This is deliberately not a general environment override.
    */
   readonly indexFile?: string;
+  /** Fixed internal census budget; ordinary output remains maxOutputBytes. */
+  readonly stdoutMaxBytes?: number;
   /** Clear repository push.pushOption values for the fixed push mutation. */
   readonly clearPushOptions?: boolean;
 }
+
+/**
+ * Hard ceiling for internal mutation-route captures that need a full census.
+ * This is independent of maxOutputBytes: internal snapshots may exceed the
+ * public display budget, but a larger display setting never raises this cap.
+ */
+export const GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES = 2_000_000;
 
 export function gitReviewerEnvironment(overrides?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   // Git has a large and growing environment surface for repository routing,
@@ -332,10 +341,14 @@ export async function runGitMutation(
   options?: GitMutationOptions
 ): Promise<GitExecutionResult> {
   const maxOutputBytes = Number.isFinite(config.maxOutputBytes) ? Math.max(1, Math.floor(config.maxOutputBytes)) : 1;
+  const requestedStdoutMaxBytes = options?.stdoutMaxBytes;
+  const stdoutMaxBytes = Number.isFinite(requestedStdoutMaxBytes)
+    ? Math.max(1, Math.min(GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES, Math.floor(requestedStdoutMaxBytes as number)))
+    : maxOutputBytes;
   const timeoutMs = Number.isFinite(config.maxGitTimeoutMs)
     ? Math.max(1, Math.min(300_000, Math.floor(config.maxGitTimeoutMs)))
     : 60_000;
-  const stdout = new BoundedGitOutput(maxOutputBytes);
+  const stdout = new BoundedGitOutput(stdoutMaxBytes);
   const stderr = new BoundedGitOutput(maxOutputBytes);
   const environment: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {

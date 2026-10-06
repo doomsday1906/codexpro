@@ -5,7 +5,7 @@ import path from "node:path";
 import { TextDecoder } from "node:util";
 import type { CodexProConfig } from "./config.js";
 import { withFileWriteLocks } from "./fsOps.js";
-import { GitExecutionError, runGitMutation, type GitExecutionResult } from "./gitOps.js";
+import { GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES, GitExecutionError, runGitMutation, type GitExecutionResult } from "./gitOps.js";
 import { CodexProError, isSubpath, type PathGuard, type Workspace } from "./guard.js";
 
 /** Internal bounds shared by the preflight and the later public schema. */
@@ -38,6 +38,7 @@ export type GitCommitFailureReason =
   | "unsupported-path"
   | "malformed-output"
   | "execution"
+  | "census-overflow"
   | "preflight-changed"
   | "no-changes"
   | "postcondition"
@@ -60,22 +61,47 @@ const FAILURE_MESSAGES: Record<GitCommitFailureReason, string> = {
   ignored: "Git commit does not force-add ignored untracked paths.",
   "unsupported-path": "Git commit path has an unsupported filesystem type.",
   "malformed-output": "Git returned malformed commit preflight output.",
-  execution: "Git commit preflight failed during local Git execution.",
+  execution: "Git commit failed during local Git execution.",
+  "census-overflow": "Git commit internal census exceeded its bounded byte limit.",
   "preflight-changed": "Git commit preflight changed while waiting for its locks; retry.",
   "no-changes": "Git commit selection has no tree changes.",
   postcondition: "Git commit postcondition could not be proven; recovery is required.",
   "recovery-required": "Git commit failure left state that requires manual recovery."
 };
 
+export type GitCommitFailureStage = "preflight" | "snapshot";
+export type GitCommitFailureCategory =
+  | "index-census"
+  | "status-census"
+  | "ignored-path-census"
+  | "local-ref-snapshot"
+  | "local-config-snapshot"
+  | "unmerged-index"
+  | "selected-index"
+  | "selected-status";
+
 /** Constant-message, JSON-safe internal failure. Caller data is never echoed. */
 export class GitCommitError extends CodexProError {
-  constructor(readonly reason: GitCommitFailureReason) {
-    super(FAILURE_MESSAGES[reason]);
+  constructor(
+    readonly reason: GitCommitFailureReason,
+    readonly stage?: GitCommitFailureStage,
+    readonly category?: GitCommitFailureCategory
+  ) {
+    const stageMessage = stage && category && (reason === "execution" || reason === "census-overflow")
+      ? `Git commit ${stage} ${category} ${reason === "census-overflow" ? `exceeded the ${GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES}-byte internal census limit` : "failed during local Git execution"}.`
+      : FAILURE_MESSAGES[reason];
+    super(stageMessage);
     this.name = "GitCommitError";
   }
 
   toJSON(): object {
-    return { name: this.name, message: this.message, reason: this.reason };
+    return {
+      name: this.name,
+      message: this.message,
+      reason: this.reason,
+      ...(this.stage === undefined ? {} : { stage: this.stage }),
+      ...(this.category === undefined ? {} : { category: this.category })
+    };
   }
 }
 
@@ -140,8 +166,8 @@ const GIT_HISTORY_MARKERS = [
   "sequencer"
 ] as const;
 
-function fail(reason: GitCommitFailureReason): never {
-  throw new GitCommitError(reason);
+function fail(reason: GitCommitFailureReason, stage?: GitCommitFailureStage, category?: GitCommitFailureCategory): never {
+  throw new GitCommitError(reason, stage, category);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -295,7 +321,8 @@ async function runGitChecked(
   workspace: Workspace,
   args: readonly string[],
   indexScope?: GitIndexScope,
-  mode?: GitCheckedMode
+  mode?: GitCheckedMode,
+  failureContext?: { readonly stage: GitCommitFailureStage; readonly category: GitCommitFailureCategory; readonly census?: boolean }
 ): Promise<GitExecutionResult> {
   try {
     const checkedArgs = mode === undefined ? args : [...PASSIVE_OBSERVATION_GIT_ARGS, ...args];
@@ -303,12 +330,20 @@ async function runGitChecked(
       config,
       workspace,
       checkedArgs,
-      indexScope === undefined ? undefined : { indexFile: indexScope.indexFile }
+      {
+        ...(indexScope === undefined ? {} : { indexFile: indexScope.indexFile }),
+        ...(failureContext?.census === true ? { stdoutMaxBytes: GIT_MUTATION_MAX_INTERNAL_STDOUT_BYTES } : {})
+      }
     );
   } catch (error) {
     if (error instanceof GitCommitError) throw error;
-    if (error instanceof GitExecutionError) return fail("execution");
-    return fail("execution");
+    if (error instanceof GitExecutionError) {
+      if (failureContext?.census === true && error.failure === "stdout-overflow") {
+        return fail("census-overflow", failureContext.stage, failureContext.category);
+      }
+      return fail("execution", failureContext?.stage, failureContext?.category);
+    }
+    return fail("execution", failureContext?.stage, failureContext?.category);
   }
 }
 
@@ -642,24 +677,33 @@ async function captureRepositorySnapshot(
     workspace,
     ["ls-files", "--debug", "--stage", "-z"],
     indexScope,
-    "passive-observation"
+    "passive-observation",
+    { stage: "snapshot", category: "index-census", census: true }
   );
   const statusResult = await runGitChecked(
     config,
     workspace,
     ["status", "--porcelain=v2", "-z", "--ignored=matching", "--untracked-files=all"],
     indexScope,
-    "passive-observation"
+    "passive-observation",
+    { stage: "snapshot", category: "status-census", census: true }
   );
   const ignoredResult = await runGitChecked(
     config,
     workspace,
     ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
     indexScope,
-    "passive-observation"
+    "passive-observation",
+    { stage: "snapshot", category: "ignored-path-census", census: true }
   );
-  const refsResult = await runGitChecked(config, workspace, ["for-each-ref", "--format=%(refname)=%(objectname)"], indexScope);
-  const configResult = await runGitChecked(config, workspace, ["config", "--local", "--null", "--list"], indexScope);
+  const refsResult = await runGitChecked(config, workspace, ["for-each-ref", "--format=%(refname)=%(objectname)"], indexScope, undefined, {
+    stage: "snapshot",
+    category: "local-ref-snapshot"
+  });
+  const configResult = await runGitChecked(config, workspace, ["config", "--local", "--null", "--list"], indexScope, undefined, {
+    stage: "snapshot",
+    category: "local-config-snapshot"
+  });
   const index = parseDebugIndexEntries(indexResult.copyStdoutBytes(), format);
   const statuses = parseStatusPaths(statusResult.copyStdoutBytes());
   const ignoredFiles = nulPathList(ignoredResult.copyStdoutBytes());
@@ -1070,7 +1114,8 @@ export async function preflightGitCommit(
     workspace,
     ["ls-files", "--unmerged", "-z"],
     undefined,
-    "passive-observation"
+    "passive-observation",
+    { stage: "preflight", category: "unmerged-index" }
   );
   if (nulFields(unmerged.copyStdoutBytes()).length > 0) return fail("unmerged");
 
@@ -1083,7 +1128,8 @@ export async function preflightGitCommit(
     workspace,
     ["ls-files", "--debug", "--stage", "-z", "--", ...request.paths],
     undefined,
-    "passive-observation"
+    "passive-observation",
+    { stage: "preflight", category: "selected-index" }
   );
   const indexEntries = parseDebugIndexEntries(indexOutput.copyStdoutBytes(), objectFormat, selected);
   const statusOutput = await runGitChecked(
@@ -1091,7 +1137,8 @@ export async function preflightGitCommit(
     workspace,
     ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--", ...request.paths],
     undefined,
-    "passive-observation"
+    "passive-observation",
+    { stage: "preflight", category: "selected-status" }
   );
   const statuses = parseStatusPaths(statusOutput.copyStdoutBytes());
   const headEntries = await treeEntries(config, workspace, head, request.paths, objectFormat);
