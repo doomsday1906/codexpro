@@ -60,8 +60,12 @@ const PRIVATE_PARTIAL_PATTERN = new RegExp(`-----BEGIN\\s+(?:${PRIVATE_KEY_LABEL
 const REFERENCE_CALL = '[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*\\s*\\([^;()=\\r\\n]*\\)';
 const CREDENTIAL_LABEL = '[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}';
 const CREDENTIAL_LABEL_PATTERN = new RegExp(`^${CREDENTIAL_LABEL}$`, 'i');
-const CREDENTIAL_PARENTHESIZED_VALUE = `\\((?:${REFERENCE_CALL}|[^()=]{1,1024})\\)`;
-const CREDENTIAL_VALUE = `(?:"[^"\\r\\n]*"|'[^'\\r\\n]*'|\\x60[^\\x60\\r\\n]*\\x60|${CREDENTIAL_PARENTHESIZED_VALUE}|(?:${REFERENCE_CALL})(?=[\\s,;})\\]]|$)|[^\\s"'\\x60<>\\[\\]{},;()]+(?![A-Za-z0-9_$])(?!(?:[ \\t]*\\()))`;
+// A credential literal owns its escaped/triple/template body through the
+// closing delimiter (or EOF), including every concatenated literal.
+const CREDENTIAL_STRING_VALUE = String.raw`(?:[rubf]{0,2})(?:"""(?:\\[\s\S]|(?!""")[^\\])*(?:"""|$)|'''(?:\\[\s\S]|(?!''')[^\\])*(?:'''|$)|(?!""")"(?:\\[\s\S]|[^"\\])*(?:"|$)|(?!''')'(?:\\[\s\S]|[^'\\])*(?:'|$)|\x60(?:\\[\s\S]|[^\x60\\])*(?:\x60|$))`;
+const CREDENTIAL_PARENTHESIZED_VALUE = `\\((?:${REFERENCE_CALL}|(?:${CREDENTIAL_STRING_VALUE}|[^()="'\\x60]){1,1024})\\)`;
+const CREDENTIAL_VALUE_ATOM = `(?:${CREDENTIAL_STRING_VALUE}|${CREDENTIAL_PARENTHESIZED_VALUE}|(?:${REFERENCE_CALL})(?=[\\s,;})\\]]|$)|[^\\s"'\\x60<>\\[\\]{},;()+]+(?![A-Za-z0-9_$])(?!(?:[ \\t]*\\()))`;
+const CREDENTIAL_VALUE = `(?:${CREDENTIAL_STRING_VALUE}(?:(?:\\s*\\+\\s*${CREDENTIAL_VALUE_ATOM})|(?:[ \\t]+${CREDENTIAL_STRING_VALUE})|(?:[ \\t]*\\\\\\r?\\n[ \\t]*${CREDENTIAL_STRING_VALUE}))*|${CREDENTIAL_VALUE_ATOM})`;
 const CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(`\\b(${CREDENTIAL_LABEL}\\s*=\\s*)(${CREDENTIAL_VALUE})`, 'gi');
 // Generic bracketed targets/PEP695 aliases are anchored to a statement start.
 // Without that boundary, `Token[str] = ...` inside an annotated declaration
@@ -382,6 +386,42 @@ function redactMalformedCredentialParentheses(text) {
   const start = unmatchedCredentialParenthesisStart(source);
   if (start < 0) return source;
   return `${source.slice(0, start)}${REDACTED_SECRET}${source.slice(start).replace(/[^\r\n]/gu, '')}`;
+}
+
+function quotedLiteralEnd(text, start, depth = 0) {
+  if (depth > MAX_GENERIC_TAIL_DEPTH) return text.length;
+  const quote = text[start];
+  const delimiter = quote !== '`' && text.startsWith(quote.repeat(3), start) ? quote.repeat(3) : quote;
+  for (let index = start + delimiter.length; index < text.length; index += 1) {
+    if (text[index] === '\\') { index += 1; continue; }
+    if (text.startsWith(delimiter, index)) return index + delimiter.length;
+    if (quote !== '`' || !text.startsWith('${', index)) continue;
+    let braces = 1;
+    index += 2;
+    for (; index < text.length && braces; index += 1) {
+      if (text.startsWith('//', index)) {
+        const end = text.indexOf('\n', index + 2);
+        if (end < 0) return text.length;
+        index = end;
+      } else if (text.startsWith('/*', index)) {
+        const end = text.indexOf('*/', index + 2);
+        if (end < 0) return text.length;
+        index = end + 1;
+      } else if ('"\'`'.includes(text[index])) {
+        index = quotedLiteralEnd(text, index, depth + 1) - 1;
+      } else if (text[index] === '{') braces += 1;
+      else if (text[index] === '}') braces -= 1;
+    }
+    if (braces) return text.length;
+    index -= 1;
+  }
+  return text.length;
+}
+
+function credentialLiteralSpanEnd(text, valueEnd, valueStart) {
+  const source = String(text ?? '');
+  const prefix = source.slice(valueStart).match(/^[rubf]{0,2}(?=["'`])/iu);
+  return prefix ? Math.max(valueEnd, quotedLiteralEnd(source, valueStart + prefix[0].length)) : valueEnd;
 }
 
 function credentialValueSpanEnd(text, valueEnd) {
@@ -893,10 +933,12 @@ function collectCredentialMatches(text, pattern, context, syntax, priority) {
       continue;
     }
     const prefix = match[1] ?? '';
-    const value = match[2] ?? '';
-    const replacement = redactCredentialAssignment(match[0], prefix, value, text, match.index, context, syntax);
-    const valueEnd = match.index + prefix.length + value.length;
-    const end = replacement === match[0] ? match.index + match[0].length : credentialValueSpanEnd(text, valueEnd);
+    const valueStart = match.index + prefix.length;
+    const valueEnd = credentialLiteralSpanEnd(text, match.index + match[0].length, valueStart);
+    const value = text.slice(valueStart, valueEnd);
+    const fullMatch = text.slice(match.index, valueEnd);
+    const replacement = redactCredentialAssignment(fullMatch, prefix, value, text, match.index, context, syntax);
+    const end = replacement === fullMatch ? valueEnd : credentialValueSpanEnd(text, valueEnd);
     matches.push({ start: match.index, end, replacement, priority });
   }
   return matches;
@@ -1033,9 +1075,10 @@ function collectUnsafeCredentialSpans(text, pattern, context, syntax = undefined
       continue;
     }
     const prefix = match[1] ?? '';
-    const value = match[2] ?? match[0].slice(prefix.length);
+    const valueEnd = credentialLiteralSpanEnd(text, match.index + match[0].length, match.index + prefix.length);
+    const value = text.slice(match.index + prefix.length, valueEnd);
     if (!safeCredentialReference(value, text, match.index, context, prefix, syntax)) {
-      spans.push({ start: match.index, end: match.index + match[0].length });
+      spans.push({ start: match.index, end: credentialValueSpanEnd(text, valueEnd) });
     }
   }
   return spans;
@@ -1064,9 +1107,6 @@ export function scanSecretValues(text, options = {}) {
   const privateKeyScanner = createPrivateKeyScanner();
   privateKeyScanner.push(source, true);
   spans.push(...privateKeyScanner.spans());
-  PRIVATE_PARTIAL_PATTERN.lastIndex = 0;
-  const partialPrivate = PRIVATE_PARTIAL_PATTERN.exec(source);
-  if (partialPrivate) spans.push({ start: partialPrivate.index, end: source.length });
   const unmatchedParenthesis = unmatchedCredentialParenthesisStart(source);
   if (unmatchedParenthesis >= 0) spans.push({ start: unmatchedParenthesis, end: source.length });
   for (const pattern of [TYPED_DECLARATION_ASSIGNMENT_PATTERN, CREDENTIAL_ALIAS_ASSIGNMENT_PATTERN,

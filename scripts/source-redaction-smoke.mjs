@@ -2299,7 +2299,20 @@ try {
       'SYNTHETIC_PY_OLD_VALUE_5912',
       'SYNTHETIC_PY_NEW_VALUE_8264',
       ['SYNTHETIC_PY_OLD_VALUE_5912', 'SYNTHETIC_PY_NEW_VALUE_8264']
-    ]
+    ],
+    ...[
+      ['template.ts', 'const API_KEY = `SYNTHETIC_LITERAL_OLD_58372\nSYNTHETIC_LITERAL_TAIL_64719`;\n'],
+      ['triple.py', 'API_KEY = """SYNTHETIC_LITERAL_OLD_58372\nSYNTHETIC_LITERAL_TAIL_64719"""\n'],
+      ['call-triple.py', 'send(token="""SYNTHETIC_LITERAL_OLD_58372\nSYNTHETIC_LITERAL_TAIL_64719""")\n'],
+      ['escaped.ts', 'const API_KEY = "prefix\\"SYNTHETIC_LITERAL_OLD_58372";\n'],
+      ['concat.ts', 'const API_KEY = "prefix" + "SYNTHETIC_LITERAL_OLD_58372";\n'],
+      ['concat.py', 'API_KEY = "prefix" "SYNTHETIC_LITERAL_OLD_58372"\n'],
+      ['paren.py', 'API_KEY = ("prefix(" "SYNTHETIC_LITERAL_OLD_58372")\n'],
+      ['continued.py', 'API_KEY = "prefix" \\\n "SYNTHETIC_LITERAL_OLD_58372"\n'],
+      ['nested-template.ts', 'const API_KEY = `prefix${String(`nested`)}SYNTHETIC_LITERAL_OLD_58372`;\n']
+    ].map(([name, source]) => [name, 'edit-literal-' + name, source,
+      'SYNTHETIC_LITERAL_OLD_58372', 'SYNTHETIC_LITERAL_NEW_95428',
+      ['SYNTHETIC_LITERAL_OLD_58372', 'SYNTHETIC_LITERAL_NEW_95428', 'SYNTHETIC_LITERAL_TAIL_64719']])
   ]) {
     await fs.writeFile(path.join(tmp, pathName), before, 'utf8');
     const response = await client.request('tools/call', {
@@ -2344,6 +2357,45 @@ try {
   const disjointReplaceAfter = disjointReplaceBefore.replaceAll('const TARGET = 1', 'const TARGET = 2');
   assert.equal(await fs.readFile(path.join(tmp, disjointReplacePath), 'utf8'), disjointReplaceAfter, 'disjoint safe replacements changed unexpected bytes');
   assert.equal(JSON.stringify(disjointReplace).includes(disjointReplaceToken), false, 'disjoint safe replacement diff disclosed the untouched credential');
+
+  const closedPrivateKey = '-----BEGIN PRIVATE KEY-----\nSYNTHETIC_CLOSED_KEY_95372\n-----END PRIVATE KEY-----';
+  for (const [name, before, oldText, newText, count, hidden] of [
+    ['key-after.txt', closedPrivateKey + '\nmarker=1\n', 'marker=1', 'marker=2', 1, 'SYNTHETIC_CLOSED_KEY_95372'],
+    ['key-around.txt', 'marker=1\n' + closedPrivateKey + '\nmarker=1\n', 'marker=1', 'marker=22', 2, 'SYNTHETIC_CLOSED_KEY_95372'],
+    ['key-boundary.txt', closedPrivateKey + '\nmarker=1\n', '\nmarker=1\n', '', 1, 'SYNTHETIC_CLOSED_KEY_95372'],
+    ['value-boundary.ts', 'const API_KEY="SYNTHETIC_BOUNDARY_37295";\n', ';', '', 1, 'SYNTHETIC_BOUNDARY_37295']
+  ]) {
+    const pathName = 'edit-safe-boundary-' + name;
+    await fs.writeFile(path.join(tmp, pathName), before);
+    const response = assertToolSuccess(await client.request('tools/call', {
+      name: 'edit', arguments: { workspace_id: workspaceId, path: pathName,
+        old_text: oldText, new_text: newText, replace_all: count > 1, expected_replacements: count }
+    }), name + ' safe edit outside exact sensitive span');
+    assert.deepEqual(await fs.readFile(path.join(tmp, pathName)), Buffer.from(before.split(oldText).join(newText)));
+    assert.equal(JSON.stringify(response).includes(hidden), false, name + ' disclosed untouched sensitive bytes');
+  }
+
+  for (const [name, source, hidden] of [
+    ['template.ts', 'const API_KEY = `SYNTHETIC_NEIGHBOR_58372\nSYNTHETIC_NEIGHBOR_64719`;\n', ['SYNTHETIC_NEIGHBOR_58372', 'SYNTHETIC_NEIGHBOR_64719']],
+    ['escaped.ts', 'const API_KEY = "prefix\\"SYNTHETIC_NEIGHBOR_58372";\n', ['SYNTHETIC_NEIGHBOR_58372']],
+    ['dollar.ts', 'const ordinary = "before";\n', []]
+  ]) {
+    const before = 'let marker=1;\n' + source + 'let marker=1;\n';
+    const pathName = 'edit-safe-literal-' + name;
+    await fs.writeFile(path.join(tmp, pathName), before);
+    const newText = 'marker="literal $& $` $\' $$"';
+    for (const replaceAll of [false, true]) {
+      // One match exercises the same literal replacement in both modes.
+      const uniqueBefore = before.replace('let marker=1;', 'let firstMarker=1;');
+      await fs.writeFile(path.join(tmp, pathName), uniqueBefore);
+      const response = assertToolSuccess(await client.request('tools/call', {
+        name: 'edit', arguments: { workspace_id: workspaceId, path: pathName,
+          old_text: 'marker=1', new_text: newText, replace_all: replaceAll, expected_replacements: 1 }
+      }), name + ' literal replacement beside untouched sensitive content');
+      assert.deepEqual(await fs.readFile(path.join(tmp, pathName)), Buffer.from(uniqueBefore.split('marker=1').join(newText)));
+      for (const value of hidden) assert.equal(JSON.stringify(response).includes(value), false, name + ' disclosed a neighboring sensitive value');
+    }
+  }
 
   await checkPythonCallKeywordAsync('ordinary MCP write accepts complete call-keyword references', async () => {
     const written = assertToolSuccess(await client.request('tools/call', {

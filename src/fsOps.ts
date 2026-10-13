@@ -1080,9 +1080,9 @@ function hasSecretValueInChangedEdit(before: string, after: string, sourceOption
   const beforeScan = scanSecretValues(before, sourceOptions);
   const afterScan = scanSecretValues(after, sourceOptions);
   if (!beforeScan.complete || !afterScan.complete) return true;
-  // Empty insertions at either boundary of a sensitive span count as touching.
+  // A deletion at a span boundary is safe only if the untouched classification stays identical.
   const touches = (span: { start: number; end: number }, start: number, end: number) =>
-    start === end ? span.start <= start && start <= span.end : span.start < end && span.end > start;
+    start === end ? span.start < start && start < span.end : span.start < end && span.end > start;
   if (beforeScan.spans.some((span) => edits.some((edit) => touches(span, edit.beforeStart, edit.beforeEnd)))) return true;
   if (afterScan.spans.some((span) => edits.some((edit) => touches(span, edit.afterStart, edit.afterEnd)))) return true;
 
@@ -1138,7 +1138,7 @@ export async function editTextFile(
       if (occurrences !== 1) {
         throw new CodexProError(`old_text matched ${occurrences} times. Provide a more specific old_text or set replace_all=true.`);
       }
-      after = before.replace(oldText, newText);
+      after = before.split(oldText).join(newText);
       replacements = 1;
     }
 
