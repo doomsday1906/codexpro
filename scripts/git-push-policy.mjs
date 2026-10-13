@@ -275,8 +275,8 @@ function normalizePolicyObject(value) {
 
   const rules = [];
   const seen = new Set();
-  const seenPrefixesByRemote = new Map();
-  const seenBranchesByRemote = new Map();
+  const seenPrefixesByEndpoint = new Map();
+  const seenBranchesByEndpoint = new Map();
   for (const rawRule of rawRules) {
     if (!isRecord(rawRule)) invalidPolicy("each rule must be an object.");
     for (const key of Object.keys(rawRule)) {
@@ -284,6 +284,7 @@ function normalizePolicyObject(value) {
     }
     const remote = remoteName(rawRule.remote);
     const endpoint = canonicalEndpoint(rawRule.endpoint);
+    const scope = `${remote}\u0000${endpoint}`;
     if (rawRule.branches !== undefined && !Array.isArray(rawRule.branches)) {
       invalidPolicy("branches must be an array when provided.");
     }
@@ -294,7 +295,7 @@ function normalizePolicyObject(value) {
     for (const rawBranch of rawRule.branches ?? []) {
       const branch = branchName(rawBranch);
       if (branches.includes(branch)) invalidPolicy("duplicate exact branch in one rule.");
-      const key = `${remote}\u0000${branch}`;
+      const key = `${scope}\u0000${branch}`;
       if (seen.has(key)) invalidPolicy("duplicate remote and branch rule is ambiguous.");
       seen.add(key);
       branches.push(branch);
@@ -318,8 +319,8 @@ function normalizePolicyObject(value) {
       invalidPolicy("each rule must contain one or more exact branches or literal branch_prefixes.");
     }
 
-    const remoteBranches = seenBranchesByRemote.get(remote) ?? [];
-    const remotePrefixes = seenPrefixesByRemote.get(remote) ?? [];
+    const remoteBranches = seenBranchesByEndpoint.get(scope) ?? [];
+    const remotePrefixes = seenPrefixesByEndpoint.get(scope) ?? [];
     for (const branch of branches) {
       if (remotePrefixes.some((prefix) => branch.startsWith(prefix))) {
         invalidPolicy("exact branch overlaps a branch_prefix for the same remote and is ambiguous.");
@@ -345,8 +346,8 @@ function normalizePolicyObject(value) {
         }
       }
     }
-    seenBranchesByRemote.set(remote, [...remoteBranches, ...branches]);
-    seenPrefixesByRemote.set(remote, [...remotePrefixes, ...branchPrefixes]);
+    seenBranchesByEndpoint.set(scope, [...remoteBranches, ...branches]);
+    seenPrefixesByEndpoint.set(scope, [...remotePrefixes, ...branchPrefixes]);
 
     const normalizedRule = { remote, endpoint, branches };
     if (rawRule.branch_prefixes !== undefined) normalizedRule.branch_prefixes = branchPrefixes;
@@ -564,18 +565,20 @@ export function evaluateGitPushPolicy(repoRoot, policy, remote, branch, options 
       (rule.branch_prefixes ?? []).some((prefix) => safeBranch.startsWith(prefix))
     )
   );
-  if (matches.length !== 1) return { allowed: false, reason: matches.length === 0 ? "remote-or-branch-not-allowlisted" : "ambiguous-policy-rule" };
+  if (matches.length === 0) return { allowed: false, reason: "remote-or-branch-not-allowlisted" };
   const effective = resolveEffectivePushEndpoint(repoRoot, safeRemote, options);
   if (!effective.ok) return { allowed: false, reason: effective.reason, endpoint: effective.endpoint };
-  if (effective.identity !== matches[0].endpoint) {
+  const endpointMatches = matches.filter((rule) => rule.endpoint === effective.identity);
+  if (endpointMatches.length === 0) {
     return { allowed: false, reason: "effective-endpoint-not-allowlisted", endpoint: effective.identity };
   }
+  if (endpointMatches.length !== 1) return { allowed: false, reason: "ambiguous-policy-rule" };
   return {
     allowed: true,
     remote: safeRemote,
     branch: safeBranch,
     endpoint: effective.identity,
-    rule: matches[0]
+    rule: endpointMatches[0]
   };
 }
 
@@ -602,21 +605,23 @@ export function evaluateGitRetirementPolicy(repoRoot, policy, remote, branch, op
       (retirement.branch_prefixes ?? []).some((prefix) => safeBranch.startsWith(prefix))
     );
   });
-  if (matches.length !== 1) return { allowed: false, reason: matches.length === 0 ? "remote-or-branch-not-allowlisted" : "ambiguous-policy-rule" };
+  if (matches.length === 0) return { allowed: false, reason: "remote-or-branch-not-allowlisted" };
   const effective = resolveEffectivePushEndpoint(repoRoot, safeRemote, options);
   if (!effective.ok) return { allowed: false, reason: effective.reason, endpoint: effective.endpoint };
   const effectiveRetirement = retirementEndpoint(effective.endpoint);
   if (!effectiveRetirement.ok) return { allowed: false, reason: effectiveRetirement.reason };
-  if (effective.identity !== matches[0].endpoint) {
+  const endpointMatches = matches.filter((rule) => rule.endpoint === effective.identity);
+  if (endpointMatches.length === 0) {
     return { allowed: false, reason: "effective-endpoint-not-allowlisted", endpoint: effective.identity };
   }
+  if (endpointMatches.length !== 1) return { allowed: false, reason: "ambiguous-policy-rule" };
   return {
     allowed: true,
     remote: safeRemote,
     branch: safeBranch,
     endpoint: effective.identity,
-    canonical_branches: matches[0].retirement.canonical_branches,
-    rule: matches[0]
+    canonical_branches: endpointMatches[0].retirement.canonical_branches,
+    rule: endpointMatches[0]
   };
 }
 

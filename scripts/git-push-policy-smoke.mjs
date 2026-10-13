@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   evaluateGitPushPolicy,
+  evaluateGitRetirementPolicy,
   inspectGitPushEndpoint,
   normalizeGitPushPolicy,
   resolveEffectivePushEndpoint,
@@ -164,6 +165,44 @@ try {
   assert.equal(evaluateGitPushPolicy(fixture, safePolicy, "origin", "feature/release").allowed, true, "second exact branch was rejected");
   assert.equal(evaluateGitPushPolicy(fixture, safePolicy, "upstream", "main").allowed, false, "wrong remote was allowed");
   assert.equal(evaluateGitPushPolicy(fixture, safePolicy, "origin", "release/*").allowed, false, "glob branch was allowed");
+
+  const endpointPolicy = {
+    enabled: true,
+    rules: ["https://github.com/acme/repo.git", "https://github.com/acme/other.git"].map((endpoint, index) => ({
+      remote: "origin", endpoint, branches: ["integration", `only-${index}`], branch_prefixes: ["aw/"],
+      retirement: { branches: ["retired"], branch_prefixes: ["aw/"], canonical_branches: [index === 0 ? "main" : "integration"] }
+    }))
+  };
+  assert.deepEqual(normalizeGitPushPolicy(endpointPolicy), endpointPolicy, "independent endpoint rules were rejected");
+  for (const [index, rule] of endpointPolicy.rules.entries()) {
+    git(fixture, ["config", "remote.origin.pushurl", rule.endpoint]);
+    for (const branch of ["integration", "aw/task", `only-${index}`]) {
+      const decision = evaluateGitPushPolicy(fixture, endpointPolicy, "origin", branch);
+      assert.equal(decision.allowed, true, "endpoint-scoped push was rejected");
+      assert.deepEqual(decision.rule, rule, "push selected another repository's rule");
+    }
+    assert.equal(evaluateGitPushPolicy(fixture, endpointPolicy, "origin", `only-${1 - index}`).allowed, false, "push permission crossed repository endpoints");
+    for (const branch of ["retired", "aw/task"]) {
+      const decision = evaluateGitRetirementPolicy(fixture, endpointPolicy, "origin", branch);
+      assert.equal(decision.allowed, true, "endpoint-scoped retirement was rejected");
+      assert.deepEqual(decision.rule, rule, "retirement selected another repository's rule");
+      assert.deepEqual(decision.canonical_branches, rule.retirement.canonical_branches);
+    }
+  }
+  git(fixture, ["config", "remote.origin.pushurl", "https://github.com/acme/unapproved.git"]);
+  for (const evaluate of [evaluateGitPushPolicy, evaluateGitRetirementPolicy]) {
+    const decision = evaluate(fixture, endpointPolicy, "origin", "aw/task");
+    assert.equal(decision.allowed, false, "unapproved endpoint was allowed");
+    assert.equal(decision.reason, "effective-endpoint-not-allowlisted");
+  }
+  git(fixture, ["config", "--unset-all", "remote.origin.pushurl"]);
+  for (const endpoint of [endpointPolicy.rules[0].endpoint, "https://GITHUB.COM/acme/repo.git"]) {
+    assert.throws(() => normalizeGitPushPolicy({ enabled: true, rules: [endpointPolicy.rules[0], { ...endpointPolicy.rules[1], endpoint }] }), /ambiguous/u, "duplicate rules on the same canonical endpoint were accepted");
+  }
+  for (const overlapping of [{ branches: ["aw/task"] }, { branch_prefixes: ["aw/sub/"] }]) {
+    assert.throws(() => normalizeGitPushPolicy({ enabled: true, rules: [endpointPolicy.rules[0], { remote: "origin", endpoint: endpointPolicy.rules[0].endpoint, ...overlapping }] }), /ambiguous/u, "overlapping permissions on the same endpoint were accepted");
+    assert.doesNotThrow(() => normalizeGitPushPolicy({ enabled: true, rules: [endpointPolicy.rules[0], { remote: "origin", endpoint: endpointPolicy.rules[1].endpoint, ...overlapping }] }), "independent endpoint permissions were rejected");
+  }
 
   git(fixture, ["config", "remote.origin.pushurl", "https://other.example/acme/repo.git"]);
   const substituted = evaluateGitPushPolicy(fixture, safePolicy, "origin", "main");
