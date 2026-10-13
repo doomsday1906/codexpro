@@ -2213,6 +2213,65 @@ try {
   assert.ok(looksPythonEdit.structuredContent, 'looks-Python lawful edit omitted structured output');
   assert.equal(looksPythonEdit.structuredContent.diff.includes('ACTUAL_LITERAL_SECRET_8Y9'), true, 'looks-Python lawful edit diff was re-redacted after path-aware policy');
 
+  const syntheticEditToken = ['sk-', 'synthetic-edit-check-0000000000'].join('');
+  const unrelatedSyntheticSecretPath = 'edit-unrelated-synthetic-secret.ts';
+  const unrelatedSyntheticSecretBefore = 'const API_KEY = "' + syntheticEditToken + '";\nconst TARGET = 1;\n';
+  await fs.writeFile(path.join(tmp, unrelatedSyntheticSecretPath), unrelatedSyntheticSecretBefore, 'utf8');
+  const unrelatedSyntheticSecretEdit = assertToolSuccess(await client.request('tools/call', {
+    name: 'edit',
+    arguments: {
+      workspace_id: workspaceId,
+      path: unrelatedSyntheticSecretPath,
+      old_text: 'const TARGET = 1;',
+      new_text: 'const TARGET = 2;',
+      expected_replacements: 1
+    }
+  }), 'narrow edit accepts unchanged secret-looking content elsewhere in the file');
+  assert.equal(
+    await fs.readFile(path.join(tmp, unrelatedSyntheticSecretPath), 'utf8'),
+    'const API_KEY = "' + syntheticEditToken + '";\nconst TARGET = 2;\n',
+    'narrow edit changed unexpected bytes'
+  );
+  assert.equal(resultText(unrelatedSyntheticSecretEdit).includes(syntheticEditToken), false, 'narrow edit diff disclosed unchanged synthetic secret');
+
+  const newSyntheticDisclosurePath = 'edit-new-synthetic-disclosure.ts';
+  const newSyntheticDisclosureBefore = 'const TARGET = 1;\n';
+  await fs.writeFile(path.join(tmp, newSyntheticDisclosurePath), newSyntheticDisclosureBefore, 'utf8');
+  const newSyntheticDisclosure = await client.request('tools/call', {
+    name: 'edit',
+    arguments: {
+      workspace_id: workspaceId,
+      path: newSyntheticDisclosurePath,
+      old_text: 'const TARGET = 1;',
+      new_text: 'const API_KEY = "' + syntheticEditToken + '";',
+      expected_replacements: 1
+    }
+  });
+  assert.match(resultText(newSyntheticDisclosure), /Secret-looking content is blocked from edit/);
+  assert.equal(resultText(newSyntheticDisclosure).includes(syntheticEditToken), false, 'blocked edit disclosed synthetic secret');
+  assert.equal(await fs.readFile(path.join(tmp, newSyntheticDisclosurePath), 'utf8'), newSyntheticDisclosureBefore, 'blocked disclosure changed file bytes');
+
+  const syntheticSecretModificationPath = 'edit-modify-synthetic-secret.ts';
+  const syntheticSecretModificationBefore = 'const API_KEY = "' + syntheticEditToken + '";\nconst TARGET = 1;\n';
+  await fs.writeFile(path.join(tmp, syntheticSecretModificationPath), syntheticSecretModificationBefore, 'utf8');
+  const syntheticSecretModification = await client.request('tools/call', {
+    name: 'edit',
+    arguments: {
+      workspace_id: workspaceId,
+      path: syntheticSecretModificationPath,
+      old_text: 'const API_KEY = "' + syntheticEditToken + '";',
+      new_text: 'const API_KEY = "replacement-placeholder";',
+      expected_replacements: 1
+    }
+  });
+  assert.match(resultText(syntheticSecretModification), /Secret-looking content is blocked from edit/);
+  assert.equal(resultText(syntheticSecretModification).includes(syntheticEditToken), false, 'blocked modification disclosed synthetic secret');
+  assert.equal(
+    await fs.readFile(path.join(tmp, syntheticSecretModificationPath), 'utf8'),
+    syntheticSecretModificationBefore,
+    'blocked secret modification changed file bytes'
+  );
+
   await checkPythonCallKeywordAsync('ordinary MCP write accepts complete call-keyword references', async () => {
     const written = assertToolSuccess(await client.request('tools/call', {
       name: 'write',
@@ -2273,11 +2332,10 @@ try {
     assert.equal(edited.structuredContent.sha256, sha256(pythonCallKeywordTypedEditAfter), 'typed-reference edit returned a different source hash');
   });
 
-  await checkPythonCallKeywordAsync('ordinary MCP typed credential refusal preserves file identity', async () => {
+  await checkPythonCallKeywordAsync('ordinary MCP typed credential file permits a narrow edit and redacts the unchanged credential', async () => {
     const target = path.join(tmp, pythonCallKeywordTypedHostilePath);
-    const before = await fs.readFile(target);
-    const beforeStat = await fs.stat(target, { bigint: true });
-    const refused = assertToolError(await client.request('tools/call', {
+    const expected = pythonCallKeywordTypedHostileSource.replace('# marker: before', '# marker: after');
+    const edited = assertToolSuccess(await client.request('tools/call', {
       name: 'edit',
       arguments: {
         workspace_id: workspaceId,
@@ -2286,26 +2344,10 @@ try {
         new_text: '# marker: after',
         expected_replacements: 1
       }
-    }), 'Python typed credential edit');
-    assert.match(resultText(refused), /Secret-looking content is blocked/);
-    expectNoHostileResponseFields(refused, [pythonCallKeywordSyntheticCredential], 'Python typed credential edit refusal');
-    const after = await fs.readFile(target);
-    const afterStat = await fs.stat(target, { bigint: true });
-    assert.deepEqual({
-      bytes: after.toString('utf8'),
-      hash: sha256(after),
-      dev: afterStat.dev.toString(),
-      ino: afterStat.ino.toString(),
-      size: afterStat.size.toString(),
-      mtimeNs: afterStat.mtimeNs.toString()
-    }, {
-      bytes: before.toString('utf8'),
-      hash: sha256(before),
-      dev: beforeStat.dev.toString(),
-      ino: beforeStat.ino.toString(),
-      size: beforeStat.size.toString(),
-      mtimeNs: beforeStat.mtimeNs.toString()
-    }, 'typed credential edit refusal changed bytes or file identity');
+    }), 'Python typed credential narrow edit');
+    assert.equal(await fs.readFile(target, 'utf8'), expected, 'typed credential narrow edit changed unexpected bytes');
+    expectNoHostileResponseFields(edited, [pythonCallKeywordSyntheticCredential], 'Python typed credential narrow edit');
+    assert.equal(resultText(edited).includes(pythonCallKeywordSyntheticCredential), false, 'typed credential edit diff disclosed unchanged credential');
   });
 
   await checkPythonCallKeywordAsync('ordinary MCP malformed-source write refuses without creating a file', async () => {
@@ -2367,8 +2409,8 @@ try {
     }, pythonCallKeywordHostileIdentity, 'refused hostile write changed bytes, inode, metadata, or hash');
   });
 
-  await checkPythonCallKeywordAsync('ordinary MCP edit refuses hostile sibling without changing bytes or metadata', async () => {
-    const refused = assertToolError(await client.request('tools/call', {
+  await checkPythonCallKeywordAsync('ordinary MCP edit permits a narrow edit beside a redacted hostile sibling', async () => {
+    const edited = assertToolSuccess(await client.request('tools/call', {
       name: 'edit',
       arguments: {
         workspace_id: workspaceId,
@@ -2377,19 +2419,11 @@ try {
         new_text: '# marker: after',
         expected_replacements: 1
       }
-    }), 'Python call-keyword hostile edit');
-    assert.match(resultText(refused), /Secret-looking content is blocked/);
-    expectNoHostileResponseFields(refused, [pythonCallKeywordMarker], 'Python call-keyword hostile edit refusal');
-    const bytes = await fs.readFile(pythonCallKeywordHostileTarget);
-    const stat = await fs.stat(pythonCallKeywordHostileTarget, { bigint: true });
-    assert.deepEqual({
-      bytes: bytes.toString('utf8'),
-      hash: sha256(bytes),
-      dev: stat.dev.toString(),
-      ino: stat.ino.toString(),
-      size: stat.size.toString(),
-      mtimeNs: stat.mtimeNs.toString()
-    }, pythonCallKeywordHostileIdentity, 'refused hostile edit changed bytes, inode, metadata, or hash');
+    }), 'Python call-keyword hostile sibling narrow edit');
+    const expected = pythonCallKeywordHostileSource.replace('# marker: before', '# marker: after');
+    assert.equal(await fs.readFile(pythonCallKeywordHostileTarget, 'utf8'), expected, 'hostile sibling narrow edit changed unexpected bytes');
+    expectNoHostileResponseFields(edited, [pythonCallKeywordMarker], 'Python call-keyword hostile sibling narrow edit');
+    assert.equal(resultText(edited).includes('send(token_ref)'), false, 'hostile sibling narrow edit diff included unchanged secret-bearing context');
   });
 
   for (const [relativePath, source] of Object.entries(looksPythonHostileFixtures)) {
@@ -4283,11 +4317,7 @@ try {
     'Python function return annotation edit changed more than the harmless body value'
   );
 
-  const pythonReturnAnnotationCredentialFieldBefore = await fs.readFile(
-    path.join(tmp, pythonReturnAnnotationCredentialFieldEditPath),
-    'utf8'
-  );
-  const blockedReturnAnnotationCredentialField = assertToolError(await client.request('tools/call', {
+  const returnAnnotationCredentialFieldEdit = assertToolSuccess(await client.request('tools/call', {
     name: 'edit',
     arguments: {
       workspace_id: workspaceId,
@@ -4296,20 +4326,20 @@ try {
       new_text: 'return CampaignHeadToken("still_harmless")',
       expected_replacements: 1
     }
-  }), 'credential field after Python return annotation edit');
-  assert.match(resultText(blockedReturnAnnotationCredentialField), /Secret-looking content is blocked from edit/);
-  assert.equal(resultText(blockedReturnAnnotationCredentialField).includes('QZ7'), false, 'blocked composite edit leaked its synthetic value');
+  }), 'narrow edit beside Python return annotation credential field');
   assert.equal(
     await fs.readFile(path.join(tmp, pythonReturnAnnotationCredentialFieldEditPath), 'utf8'),
-    pythonReturnAnnotationCredentialFieldBefore,
-    'credential field after Python return annotation edit mutated the source'
+    pythonReturnAnnotationCredentialField.replace('return CampaignHeadToken("harmless")', 'return CampaignHeadToken("still_harmless")'),
+    'narrow return-annotation edit changed unexpected source bytes'
   );
+  assert.equal(resultText(returnAnnotationCredentialFieldEdit).includes('QZ7'), false, 'narrow edit disclosed synthetic credential field');
+  expectNoHostileResponseFields(returnAnnotationCredentialFieldEdit, ['QZ7'], 'narrow return-annotation credential-field edit');
 
   for (const [label, pathName, before] of [
     ['multiline assignment', pythonMultilineAssignmentEditPath, pythonMultilineAssignmentEditBefore],
     ['multiline field', pythonMultilineFieldEditPath, pythonMultilineFieldEditBefore]
   ]) {
-    const blocked = assertToolError(await client.request('tools/call', {
+    const edited = assertToolSuccess(await client.request('tools/call', {
       name: 'edit',
       arguments: {
         workspace_id: workspaceId,
@@ -4318,10 +4348,14 @@ try {
         new_text: '# marker: after',
         expected_replacements: 1
       }
-    }), `Python ${label} credential edit`);
-    assert.match(resultText(blocked), /Secret-looking content is blocked from edit/);
-    assert.equal(resultText(blocked).includes('QZ7'), false, `Python ${label} edit leaked its synthetic value`);
-    assert.equal(await fs.readFile(path.join(tmp, pathName), 'utf8'), before, `Python ${label} edit mutated the source`);
+    }), `Python ${label} safe narrow edit`);
+    assert.equal(
+      await fs.readFile(path.join(tmp, pathName), 'utf8'),
+      before.replace('# marker: before', '# marker: after'),
+      `Python ${label} narrow edit changed unexpected source bytes`
+    );
+    assert.equal(resultText(edited).includes('QZ7'), false, `Python ${label} edit disclosed its synthetic value`);
+    expectNoHostileResponseFields(edited, ['QZ7'], `Python ${label} safe narrow edit`);
   }
 
   const malformedAnnotationBefore = await fs.readFile(path.join(tmp, pythonMalformedAnnotationEditPath), 'utf8');
@@ -5053,7 +5087,7 @@ try {
     assert.equal(/\brule\b/i.test(resultText(matrixWholePatchRefusal)), false, 'consistency-matrix whole-file apply_patch inferred a detector rule name');
     expectNoHostileResponseFields(matrixWholePatchRefusal, [matrixWholeValue], 'consistency-matrix whole-file apply_patch refusal');
     assert.deepEqual(await fs.readFile(path.join(tmp, matrixWholePath)), matrixWholeBefore, 'consistency-matrix whole-file apply_patch partially mutated the file');
-    const matrixWholeEdit = assertToolError(await client.request('tools/call', {
+    const matrixWholeEdit = assertToolSuccess(await client.request('tools/call', {
       name: 'edit',
       arguments: {
         workspace_id: workspaceId,
@@ -5062,10 +5096,14 @@ try {
         new_text: '# tail marker\n# appended note\n',
         expected_replacements: 1
       }
-    }), 'consistency-matrix whole-file edit');
-    assert.ok(resultText(matrixWholeEdit).includes(`Path ${matrixWholePath}; source line(s) 2; matched content omitted`), 'consistency-matrix whole-file edit disagreed with apply_patch diagnostics');
-    expectNoHostileResponseFields(matrixWholeEdit, [matrixWholeValue], 'consistency-matrix whole-file edit refusal');
-    assert.deepEqual(await fs.readFile(path.join(tmp, matrixWholePath)), matrixWholeBefore, 'consistency-matrix whole-file edit mutated the file');
+    }), 'consistency-matrix narrow edit beside unchanged secret-looking content');
+    assert.equal(
+      (await fs.readFile(path.join(tmp, matrixWholePath), 'utf8')),
+      matrixWholeBefore.toString('utf8').replace('# tail marker\n', '# tail marker\n# appended note\n'),
+      'consistency-matrix narrow edit changed unexpected bytes'
+    );
+    expectNoHostileResponseFields(matrixWholeEdit, [matrixWholeValue], 'consistency-matrix narrow edit');
+    assert.equal(resultText(matrixWholeEdit).includes(matrixWholeValue), false, 'consistency-matrix narrow edit disclosed unchanged synthetic value');
 
     // Language handling: .cs and .txt have no dedicated parser (undefined
     // language) and must still block hostile content without crashing, while
@@ -5638,12 +5676,13 @@ try {
   const fstringValues = ['f"scope-{token_ref}"', 'f"count-{count:04d}"', 'f"batch-{batch:02d}"'];
   const fstringLiterals = ['scope-', 'count-', 'batch-', 'FSTRING_MARK'];
   await fs.writeFile(fstringAbsolutePath, fstringSource, { encoding: 'utf8', flag: 'wx' });
-  const fstringBeforeEnrollment = await approvalSnapshot(fstringAbsolutePath);
+  const fstringBeforeSafeEdit = await approvalSnapshot(fstringAbsolutePath);
   const unapprovedFstringRead = assertToolSuccess(await client.request('tools/call', {
     name: 'read', arguments: { workspace_id: workspaceId, path: fstringRelativePath }
   }), 'unapproved f-string source read');
   assert.equal(typeof unapprovedFstringRead.structuredContent.text, 'string', 'unenrolled f-string source read omitted its typed text result');
-  const unapprovedFstringEdit = assertToolError(await client.request('tools/call', {
+  assert.deepEqual(await approvalSnapshot(fstringAbsolutePath), fstringBeforeSafeEdit, 'unenrolled f-string read mutated bytes or metadata');
+  const unapprovedFstringEdit = assertToolSuccess(await client.request('tools/call', {
     name: 'edit',
     arguments: {
       workspace_id: workspaceId,
@@ -5652,11 +5691,13 @@ try {
       new_text: '# fstring approval marker: after',
       expected_replacements: 1
     }
-  }), 'unenrolled f-string unrelated edit');
-  assert.match(resultText(unapprovedFstringEdit), /Secret-looking content is blocked/);
-  assert.deepEqual(await approvalSnapshot(fstringAbsolutePath), fstringBeforeEnrollment, 'unenrolled f-string edit changed bytes or metadata');
+  }), 'unenrolled f-string unrelated narrow edit');
+  assert.equal(await fs.readFile(fstringAbsolutePath, 'utf8'), fstringAfterMarker, 'unenrolled f-string narrow edit changed unexpected bytes');
+  expectNoHostileResponseFields(unapprovedFstringEdit, fstringLiterals, 'unenrolled f-string narrow edit');
+  assert.equal(resultText(unapprovedFstringEdit).includes('scope-'), false, 'unenrolled f-string narrow edit disclosed interpolated value');
+  const fstringBeforeEnrollment = await approvalSnapshot(fstringAbsolutePath);
 
-  const fstringEnrollment = runApprovalCommand(fstringAbsolutePath, sha256(fstringSource));
+  const fstringEnrollment = runApprovalCommand(fstringAbsolutePath, sha256(fstringAfterMarker));
   assert.equal(fstringEnrollment.error?.code ?? null, null, 'f-string owner enrollment command could not start');
   assert.equal(fstringEnrollment.status, 0, `owner CLI rejected complete parser-owned f-string values: ${fstringEnrollment.stderr || fstringEnrollment.stdout}`);
   expectNoHostileResponseFields({ stdout: fstringEnrollment.stdout, stderr: fstringEnrollment.stderr }, fstringLiterals, 'f-string owner enrollment');
@@ -5664,7 +5705,7 @@ try {
   const fstringRegistry = JSON.parse(fstringRegistryBytes.toString('utf8'));
   const fstringEntry = fstringRegistry.files.find((entry) => entry.path === path.resolve(fstringAbsolutePath));
   assert.ok(fstringEntry, 'owner registry omitted the exact f-string source path');
-  assert.equal(fstringEntry.source_sha256, sha256(fstringSource), 'f-string registry entry omitted its enrollment source hash');
+  assert.equal(fstringEntry.source_sha256, sha256(fstringAfterMarker), 'f-string registry entry omitted its enrollment source hash');
   const expectedFstringRows = [
     ['token', 'send', fstringValues[0]],
     ['work_token', 'send', fstringValues[1]],
@@ -5678,23 +5719,24 @@ try {
   const fstringRead = assertToolSuccess(await client.request('tools/call', {
     name: 'read', arguments: { workspace_id: workspaceId, path: fstringRelativePath }
   }), 'approved f-string source read');
-  assert.equal(fstringRead.structuredContent.text, numbered(fstringSource), 'approved f-string read changed exact source bytes');
+  assert.equal(fstringRead.structuredContent.text, numbered(fstringAfterMarker), 'approved f-string read changed exact source bytes');
   const fstringWrite = assertToolSuccess(await client.request('tools/call', {
-    name: 'write', arguments: { workspace_id: workspaceId, path: fstringRelativePath, content: fstringSource }
+    name: 'write', arguments: { workspace_id: workspaceId, path: fstringRelativePath, content: fstringAfterMarker }
   }), 'approved f-string ordinary MCP write');
-  assert.equal(fstringWrite.structuredContent.sha256, sha256(fstringSource), 'approved f-string write returned an incorrect hash');
+  assert.equal(fstringWrite.structuredContent.sha256, sha256(fstringAfterMarker), 'approved f-string write returned an incorrect hash');
   const fstringMarkerEdit = assertToolSuccess(await client.request('tools/call', {
     name: 'edit',
     arguments: {
       workspace_id: workspaceId,
       path: fstringRelativePath,
-      old_text: '# fstring approval marker: before',
-      new_text: '# fstring approval marker: after',
+      old_text: '# fstring approval marker: after',
+      new_text: '# fstring approval marker: approved',
       expected_replacements: 1
     }
   }), 'approved f-string unrelated MCP edit');
-  assert.equal(await fs.readFile(fstringAbsolutePath, 'utf8'), fstringAfterMarker, 'approved f-string edit changed unexpected bytes');
-  assert.equal(fstringMarkerEdit.structuredContent.sha256, sha256(fstringAfterMarker), 'approved f-string edit returned an incorrect hash');
+  const fstringApprovedMarker = fstringAfterMarker.replace('# fstring approval marker: after', '# fstring approval marker: approved');
+  assert.equal(await fs.readFile(fstringAbsolutePath, 'utf8'), fstringApprovedMarker, 'approved f-string edit changed unexpected bytes');
+  assert.equal(fstringMarkerEdit.structuredContent.sha256, sha256(fstringApprovedMarker), 'approved f-string edit returned an incorrect hash');
   assert.deepEqual(await fs.readFile(approvalRegistryPath), fstringRegistryBytes, 'unrelated f-string edit rewrote approval rows');
 
   const dottedFstringRelativePath = 'source-approval-fstring-dotted.py';
