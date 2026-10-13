@@ -5,7 +5,7 @@ import { createHash, randomBytes } from "node:crypto";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, compiledGlob, displayPath, normalizeRelPath, PathGuard } from "./guard.js";
-import { createPrivateKeyScanner, hasSecretValue, redactSensitiveText, redactSensitiveTextPreservingLines, sourceLanguageForPath, sourceSafetyRefusalMessage } from "./redact.js";
+import { hasSecretValue, scanSecretValues, redactSensitiveText, redactSensitiveTextPreservingLines, sourceLanguageForPath, sourceSafetyRefusalMessage } from "./redact.js";
 import {
   FIXED_SNAPSHOT_BYTES,
   LINE_FRAG_CAP_BYTES,
@@ -309,62 +309,48 @@ export function projectPublicSourceText(input: PublicSourceProjectionInput): Rea
   );
 }
 
-export function makeUnifiedDiff(oldText: string, newText: string, relPath: string, maxChars = 60_000): DiffResult {
+export function makeUnifiedDiff(oldText: string, newText: string, relPath: string, maxChars = 60_000, sourcePath?: string): DiffResult {
   if (oldText === newText) {
     return { diff: `No changes in ${relPath}.`, additions: 0, deletions: 0, changed: false };
   }
 
-  const oldLines = splitLines(oldText);
-  const newLines = splitLines(newText);
-  let prefix = 0;
-  while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) {
-    prefix += 1;
+  const sourceOptions = { context: "source" as const, language: sourceLanguageForPath(relPath), sourcePath };
+  const oldProjection = redactSensitiveTextPreservingLines(oldText, sourceOptions);
+  const newProjection = redactSensitiveTextPreservingLines(newText, sourceOptions);
+  const oldScan = scanSecretValues(oldProjection, sourceOptions);
+  const newScan = scanSecretValues(newProjection, sourceOptions);
+  if (!oldScan.complete || !newScan.complete || oldScan.spans.length || newScan.spans.length) {
+    return { diff: `Source diff omitted because a safe projection is unavailable for ${relPath}.`, additions: 0, deletions: 0, changed: true };
   }
 
+  const oldLines = splitLines(oldProjection);
+  const newLines = splitLines(newProjection);
+  let prefix = 0;
+  while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) prefix += 1;
+
   let suffix = 0;
-  while (
-    suffix < oldLines.length - prefix &&
-    suffix < newLines.length - prefix &&
-    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
-  ) {
-    suffix += 1;
-  }
+  while (suffix < oldLines.length - prefix && suffix < newLines.length - prefix
+    && oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]) suffix += 1;
 
   const coreOldStart = prefix;
   const coreOldEnd = oldLines.length - suffix;
   const coreNewStart = prefix;
   const coreNewEnd = newLines.length - suffix;
-  const sourceOptions = { context: "source" as const, language: sourceLanguageForPath(relPath) };
-  // If either complete file is secret-bearing, omit unchanged context from
-  // the returned diff. The line redactor can be context-sensitive, so a
-  // narrow edit must not echo neighboring secret-looking source through its
-  // response even when the changed lines themselves passed the edit gate.
-  const context = hasSecretValue(oldText, sourceOptions) || hasSecretValue(newText, sourceOptions) ? 0 : 3;
+  const context = 3;
   const oldStart = Math.max(0, coreOldStart - context);
   const oldEnd = Math.min(oldLines.length, coreOldEnd + context);
   const newStart = Math.max(0, coreNewStart - context);
   const newEnd = Math.min(newLines.length, coreNewEnd + context);
-
   const additions = Math.max(0, coreNewEnd - coreNewStart);
   const deletions = Math.max(0, coreOldEnd - coreOldStart);
-
   const out: string[] = [`--- a/${relPath}`, `+++ b/${relPath}`, `@@ -${oldStart + 1},${oldEnd - oldStart} +${newStart + 1},${newEnd - newStart} @@`];
-
   for (let i = oldStart; i < coreOldStart; i += 1) out.push(` ${oldLines[i]}`);
   for (let i = coreOldStart; i < coreOldEnd; i += 1) out.push(`-${oldLines[i]}`);
   for (let i = coreNewStart; i < coreNewEnd; i += 1) out.push(`+${newLines[i]}`);
   for (let i = coreOldEnd; i < oldEnd; i += 1) out.push(` ${oldLines[i]}`);
-
   let diff = out.join("\n");
-  if (diff.length > maxChars) {
-    diff = diff.slice(0, maxChars) + `\n...[diff truncated to ${maxChars} chars]`;
-  }
-  return {
-    diff: redactSensitiveText(diff, { context: "source", language: sourceLanguageForPath(relPath) }),
-    additions,
-    deletions,
-    changed: true
-  };
+  if (diff.length > maxChars) diff = diff.slice(0, maxChars) + `\n...[diff truncated to ${maxChars} chars]`;
+  return { diff, additions, deletions, changed: true };
 }
 
 function isHiddenName(name: string): boolean {
@@ -1065,7 +1051,7 @@ export async function writeTextFile(
       await fsp.mkdir(path.dirname(resolved.absPath), { recursive: true });
     }
 
-    const diff = makeUnifiedDiff(oldText, content, resolved.relPath);
+    const diff = makeUnifiedDiff(oldText, content, resolved.relPath, 60_000, resolved.absPath);
     await writeText(resolved.absPath, content, existed ? oldText : undefined, resolved.relPath);
     return { path: resolved.relPath, bytes: contentBytes, sha256: sha256(content), existed, diff };
   } finally {
@@ -1077,90 +1063,49 @@ function hasSecretValueInChangedEdit(before: string, after: string, sourceOption
   context: "source";
   language: ReturnType<typeof sourceLanguageForPath>;
   sourcePath: string;
+  oldText: string;
+  newText: string;
 }): boolean {
-  // When neither complete candidate contains a detected secret, avoid
-  // reclassifying a lawful Python fragment without its enclosing AST context.
-  if (!hasSecretValue(before, sourceOptions) && !hasSecretValue(after, sourceOptions)) return false;
+  const edits: Array<{ beforeStart: number; beforeEnd: number; afterStart: number; afterEnd: number }> = [];
+  let searchFrom = 0;
+  let delta = 0;
+  while (searchFrom <= before.length) {
+    const start = before.indexOf(sourceOptions.oldText, searchFrom);
+    if (start < 0) break;
+    edits.push({ beforeStart: start, beforeEnd: start + sourceOptions.oldText.length,
+      afterStart: start + delta, afterEnd: start + delta + sourceOptions.newText.length });
+    delta += sourceOptions.newText.length - sourceOptions.oldText.length;
+    searchFrom = start + sourceOptions.oldText.length;
+  }
+  const beforeScan = scanSecretValues(before, sourceOptions);
+  const afterScan = scanSecretValues(after, sourceOptions);
+  if (!beforeScan.complete || !afterScan.complete) return true;
+  // Empty insertions at either boundary of a sensitive span count as touching.
+  const touches = (span: { start: number; end: number }, start: number, end: number) =>
+    start === end ? span.start <= start && start <= span.end : span.start < end && span.end > start;
+  if (beforeScan.spans.some((span) => edits.some((edit) => touches(span, edit.beforeStart, edit.beforeEnd)))) return true;
+  if (afterScan.spans.some((span) => edits.some((edit) => touches(span, edit.afterStart, edit.afterEnd)))) return true;
 
-  const beforeLines = splitLines(before);
-  const afterLines = splitLines(after);
-  let prefix = 0;
-  while (prefix < beforeLines.length && prefix < afterLines.length && beforeLines[prefix] === afterLines[prefix]) {
-    prefix += 1;
+  // Exact untouched chunks and their sensitive classifications must map
+  // one-to-one across every disjoint replacement.
+  let beforeCursor = 0;
+  let afterCursor = 0;
+  for (const edit of edits) {
+    if (before.slice(beforeCursor, edit.beforeStart) !== after.slice(afterCursor, edit.afterStart)) return true;
+    const beforeSpans = beforeScan.spans.filter((span) => span.start >= beforeCursor && span.end <= edit.beforeStart)
+      .map((span) => [span.start - beforeCursor, span.end - beforeCursor]);
+    const afterSpans = afterScan.spans.filter((span) => span.start >= afterCursor && span.end <= edit.afterStart)
+      .map((span) => [span.start - afterCursor, span.end - afterCursor]);
+    if (JSON.stringify(beforeSpans) !== JSON.stringify(afterSpans)) return true;
+    beforeCursor = edit.beforeEnd;
+    afterCursor = edit.afterEnd;
   }
-
-  let suffix = 0;
-  while (
-    suffix < beforeLines.length - prefix &&
-    suffix < afterLines.length - prefix &&
-    beforeLines[beforeLines.length - 1 - suffix] === afterLines[afterLines.length - 1 - suffix]
-  ) {
-    suffix += 1;
-  }
-
-  const beforeChanged = beforeLines.slice(prefix, beforeLines.length - suffix);
-  const afterChanged = afterLines.slice(prefix, afterLines.length - suffix);
-  const redactedBeforeLines = splitLines(redactSensitiveTextPreservingLines(before, sourceOptions));
-  const redactedAfterLines = splitLines(redactSensitiveTextPreservingLines(after, sourceOptions));
-
-  let charPrefix = 0;
-  while (charPrefix < before.length && charPrefix < after.length && before[charPrefix] === after[charPrefix]) {
-    charPrefix += 1;
-  }
-  let charSuffix = 0;
-  while (
-    charSuffix < before.length - charPrefix &&
-    charSuffix < after.length - charPrefix &&
-    before[before.length - 1 - charSuffix] === after[after.length - 1 - charSuffix]
-  ) {
-    charSuffix += 1;
-  }
-  const privateKeyTouched = (text: string, start: number, end: number): boolean => {
-    const scanner = createPrivateKeyScanner();
-    scanner.push(text, true);
-    return scanner.spans().some((span) => span.start < end && span.end > start);
-  };
-  if (
-    privateKeyTouched(before, charPrefix, before.length - charSuffix) ||
-    privateKeyTouched(after, charPrefix, after.length - charSuffix)
-  ) {
-    return true;
-  }
-
-  if (redactedBeforeLines.length !== beforeLines.length || redactedAfterLines.length !== afterLines.length) {
-    // Some source constructs redact across physical newlines. In that case we
-    // cannot map the full projection line-for-line, so inspect the exact
-    // changed source instead of treating unrelated multiline content as touched.
-    return hasSecretValue(beforeChanged.join("\n"), sourceOptions) ||
-      hasSecretValue(afterChanged.join("\n"), sourceOptions);
-  }
-
-  // Preserve the full-file detector's context sensitivity: if the edit
-  // changes how an otherwise unchanged line is classified, fail closed.
-  for (let index = 0; index < prefix; index += 1) {
-    if (redactedBeforeLines[index] !== redactedAfterLines[index]) return true;
-  }
-  for (let offset = 0; offset < suffix; offset += 1) {
-    const beforeIndex = beforeLines.length - suffix + offset;
-    const afterIndex = afterLines.length - suffix + offset;
-    if (redactedBeforeLines[beforeIndex] !== redactedAfterLines[afterIndex]) return true;
-  }
-
-  // Redact against the complete source so multiline constructs and source
-  // context keep their existing semantics, but only reject matches on lines
-  // actually replaced. Unchanged sensitive-looking lines elsewhere in the
-  // file are preserved byte-for-byte by the exact edit.
-  for (let index = prefix; index < beforeLines.length - suffix; index += 1) {
-    if (beforeLines[index] !== redactedBeforeLines[index]) return true;
-  }
-  for (let index = prefix; index < afterLines.length - suffix; index += 1) {
-    if (afterLines[index] !== redactedAfterLines[index]) return true;
-  }
-
-  // Keep the detector itself as a fail-closed backstop for changed snippets
-  // whose classification does not produce a line-preserving redaction.
-  return hasSecretValue(beforeChanged.join("\n"), sourceOptions) ||
-    hasSecretValue(afterChanged.join("\n"), sourceOptions);
+  if (before.slice(beforeCursor) !== after.slice(afterCursor)) return true;
+  const beforeSpans = beforeScan.spans.filter((span) => span.start >= beforeCursor)
+    .map((span) => [span.start - beforeCursor, span.end - beforeCursor]);
+  const afterSpans = afterScan.spans.filter((span) => span.start >= afterCursor)
+    .map((span) => [span.start - afterCursor, span.end - afterCursor]);
+  return JSON.stringify(beforeSpans) !== JSON.stringify(afterSpans);
 }
 
 export async function editTextFile(
@@ -1206,12 +1151,12 @@ export async function editTextFile(
       throw new CodexProError(`Edited file would be too large (${afterBytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
     }
     const sourceOptions = { context: "source" as const, language: sourceLanguageForPath(resolved.relPath), sourcePath: resolved.absPath };
-    if (hasSecretValueInChangedEdit(before, after, sourceOptions)) {
+    if (hasSecretValueInChangedEdit(before, after, { ...sourceOptions, oldText, newText })) {
       const redacted = redactSensitiveTextPreservingLines(after, sourceOptions);
       throw new CodexProError(sourceSafetyRefusalMessage("edit", resolved.relPath, after, redacted));
     }
 
-    const diff = makeUnifiedDiff(before, after, resolved.relPath);
+    const diff = makeUnifiedDiff(before, after, resolved.relPath, 60_000, resolved.absPath);
     await writeText(resolved.absPath, after, before, resolved.relPath);
     return { path: resolved.relPath, replacements, bytes: afterBytes, sha256: sha256(after), diff };
   } finally {

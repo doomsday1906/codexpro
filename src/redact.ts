@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 
 const {
   hasSecretValue: policyHasSecretValue,
+  scanSecretValues: policyScanSecretValues,
   hasSecretValueInUnifiedDiff: policyHasSecretValueInUnifiedDiff,
   redactDiagnosticText: policyRedactDiagnosticText,
   redactSearchQuery: policyRedactSearchQuery,
@@ -17,6 +18,11 @@ const {
   truncateUtf8: policyTruncateUtf8,
   createPrivateKeyScanner: policyCreatePrivateKeyScanner
 } = policy;
+
+export interface SecretScanResult {
+  readonly spans: readonly { readonly start: number; readonly end: number }[];
+  readonly complete: boolean;
+}
 
 export interface PrivateKeyScanner {
   push(input?: string, final?: boolean): string;
@@ -59,6 +65,10 @@ export function sourceLanguageForPath(filePath: string | undefined): SourceLangu
 
 export function hasSecretValue(text: string, options: RedactionOptions | RedactionContext = {}): boolean {
   return policyHasSecretValue(text, options);
+}
+
+export function scanSecretValues(text: string, options: RedactionOptions | RedactionContext = {}): SecretScanResult {
+  return policyScanSecretValues(text, options) as SecretScanResult;
 }
 
 export function hasSecretValueInUnifiedDiff(

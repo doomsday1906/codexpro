@@ -7,6 +7,7 @@ import path from 'node:path';
 
 const {
   hasSecretValue,
+  scanSecretValues,
   hasSecretValueInUnifiedDiff,
   extractDiffFileBlocks,
   redactDiagnosticText,
@@ -17,6 +18,16 @@ const {
 } = await import('../dist/redact.js');
 const { createPythonProvenance } = await import('../scripts/python-provenance.mjs');
 const pythonPolicy = { context: 'source', language: 'python' };
+
+const utf16SensitiveSource = 'const lead = "😀";\nconst API_KEY = "SYNTHETIC_UTF16_SPAN_6482";\n';
+const utf16Scan = scanSecretValues(utf16SensitiveSource);
+assert.equal(utf16Scan.complete, true, 'TypeScript scan reported incomplete detector coverage');
+assert.equal(utf16Scan.spans.some((span) =>
+  span.start <= utf16SensitiveSource.indexOf('API_KEY') &&
+  span.end >= utf16SensitiveSource.indexOf('SYNTHETIC_UTF16_SPAN_6482') + 'SYNTHETIC_UTF16_SPAN_6482'.length
+), true, 'source-coordinate scan did not cover the full classified assignment in UTF-16 offsets');
+const invalidPythonScan = scanSecretValues('def incomplete(:\n    pass\n', pythonPolicy);
+assert.equal(invalidPythonScan.complete, false, 'invalid Python source incorrectly claimed complete parser coverage');
 
 class McpStdioClient {
   constructor(command, args, options) {
@@ -2271,6 +2282,68 @@ try {
     syntheticSecretModificationBefore,
     'blocked secret modification changed file bytes'
   );
+
+  for (const [label, pathName, before, oldText, newText, values] of [
+    [
+      'multiline TypeScript credential value edit',
+      'edit-multiline-ts-credential.ts',
+      'const API_KEY =\n "SYNTHETIC_TS_OLD_VALUE_7319";\n',
+      'SYNTHETIC_TS_OLD_VALUE_7319',
+      'SYNTHETIC_TS_NEW_VALUE_2846',
+      ['SYNTHETIC_TS_OLD_VALUE_7319', 'SYNTHETIC_TS_NEW_VALUE_2846']
+    ],
+    [
+      'multiline Python credential value edit',
+      'edit-multiline-python-credential.py',
+      'send(token=\n "SYNTHETIC_PY_OLD_VALUE_5912"\n)\n',
+      'SYNTHETIC_PY_OLD_VALUE_5912',
+      'SYNTHETIC_PY_NEW_VALUE_8264',
+      ['SYNTHETIC_PY_OLD_VALUE_5912', 'SYNTHETIC_PY_NEW_VALUE_8264']
+    ]
+  ]) {
+    await fs.writeFile(path.join(tmp, pathName), before, 'utf8');
+    const response = await client.request('tools/call', {
+      name: 'edit',
+      arguments: { workspace_id: workspaceId, path: pathName, old_text: oldText, new_text: newText, expected_replacements: 1 }
+    });
+    const serialized = JSON.stringify(response);
+    assert.equal(response.isError, true, label + ' unexpectedly succeeded');
+    assert.equal(serialized.includes('Secret-looking content is blocked from edit'), true, label + ' lacked the generic refusal');
+    for (const value of values) assert.equal(serialized.includes(value), false, label + ' disclosed a synthetic value');
+    assert.equal(await fs.readFile(path.join(tmp, pathName), 'utf8'), before, label + ' mutated the source');
+  }
+
+  const renamedMultilinePath = 'edit-multiline-classification-rename.ts';
+  const renamedMultilineBefore = 'const TARGET =\n "SYNTHETIC_RENAMED_CLASSIFICATION_9371";\n';
+  await fs.writeFile(path.join(tmp, renamedMultilinePath), renamedMultilineBefore, 'utf8');
+  const renamedMultiline = await client.request('tools/call', {
+    name: 'edit',
+    arguments: { workspace_id: workspaceId, path: renamedMultilinePath, old_text: 'TARGET', new_text: 'API_KEY', expected_replacements: 1 }
+  });
+  const renamedMultilineSerialized = JSON.stringify(renamedMultiline);
+  assert.equal(renamedMultiline.isError, true, 'renaming a multiline value into a credential assignment unexpectedly succeeded');
+  assert.equal(renamedMultilineSerialized.includes('Secret-looking content is blocked from edit'), true, 'classification rename lacked the generic refusal');
+  assert.equal(renamedMultilineSerialized.includes('SYNTHETIC_RENAMED_CLASSIFICATION_9371'), false, 'classification rename refusal disclosed the synthetic value');
+  assert.equal(await fs.readFile(path.join(tmp, renamedMultilinePath), 'utf8'), renamedMultilineBefore, 'classification rename refusal mutated the source');
+
+  const disjointReplacePath = 'edit-disjoint-replacements.ts';
+  const disjointReplaceToken = 'SYNTHETIC_UNTOUCHED_MIDDLE_CREDENTIAL_5082';
+  const disjointReplaceBefore = 'const TARGET = 1;\nconst API_KEY = "' + disjointReplaceToken + '";\nconst TARGET = 1;\n';
+  await fs.writeFile(path.join(tmp, disjointReplacePath), disjointReplaceBefore, 'utf8');
+  const disjointReplace = assertToolSuccess(await client.request('tools/call', {
+    name: 'edit',
+    arguments: {
+      workspace_id: workspaceId,
+      path: disjointReplacePath,
+      old_text: 'const TARGET = 1',
+      new_text: 'const TARGET = 2',
+      replace_all: true,
+      expected_replacements: 2
+    }
+  }), 'disjoint narrow replacements preserve an untouched credential between them');
+  const disjointReplaceAfter = disjointReplaceBefore.replaceAll('const TARGET = 1', 'const TARGET = 2');
+  assert.equal(await fs.readFile(path.join(tmp, disjointReplacePath), 'utf8'), disjointReplaceAfter, 'disjoint safe replacements changed unexpected bytes');
+  assert.equal(JSON.stringify(disjointReplace).includes(disjointReplaceToken), false, 'disjoint safe replacement diff disclosed the untouched credential');
 
   await checkPythonCallKeywordAsync('ordinary MCP write accepts complete call-keyword references', async () => {
     const written = assertToolSuccess(await client.request('tools/call', {

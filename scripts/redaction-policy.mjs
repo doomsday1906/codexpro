@@ -1020,8 +1020,9 @@ export function redactDiagnosticText(text) {
   return redactSensitiveText(text, { context: 'diagnostic' });
 }
 
-function hasUnsafeCredentialMatch(text, pattern, context, syntax = undefined) {
+function collectUnsafeCredentialSpans(text, pattern, context, syntax = undefined) {
   pattern.lastIndex = 0;
+  const spans = [];
   let match;
   while ((match = pattern.exec(text)) !== null) {
     const returnTypeColonEnd = pattern === CREDENTIAL_FIELD_PATTERN
@@ -1033,25 +1034,46 @@ function hasUnsafeCredentialMatch(text, pattern, context, syntax = undefined) {
     }
     const prefix = match[1] ?? '';
     const value = match[2] ?? match[0].slice(prefix.length);
-    if (!safeCredentialReference(value, text, match.index, context, prefix, syntax)) return true;
+    if (!safeCredentialReference(value, text, match.index, context, prefix, syntax)) {
+      spans.push({ start: match.index, end: match.index + match[0].length });
+    }
   }
-  return false;
+  return spans;
 }
 
-export function hasSecretValue(text, options = {}) {
+function mergeSensitiveSpans(spans) {
+  spans.sort((left, right) => left.start - right.start || left.end - right.end);
+  const merged = [];
+  for (const span of spans) {
+    const previous = merged.at(-1);
+    if (previous && span.start <= previous.end) previous.end = Math.max(previous.end, span.end);
+    else merged.push({ start: span.start, end: span.end });
+  }
+  return merged;
+}
+
+/** Scan a complete source snapshot and return conservative UTF-16 source spans.
+ * complete is false when trusted Python parser coverage was required but unavailable.
+ */
+export function scanSecretValues(text, options = {}) {
   const source = String(text ?? '');
   const normalized = normalizeOptions(options);
   const { context } = normalized;
   const syntax = context === 'source' ? createSourceSyntax(source, normalized) : undefined;
-  PRIVATE_BEGIN_PATTERN.lastIndex = 0;
-  if (PRIVATE_BEGIN_PATTERN.test(source) || PRIVATE_PARTIAL_PATTERN.test(source)) return true;
-  if (unmatchedCredentialParenthesisStart(source) >= 0) return true;
-  if (hasUnsafeCredentialMatch(source, TYPED_DECLARATION_ASSIGNMENT_PATTERN, context, syntax)) return true;
-  if (hasUnsafeCredentialMatch(source, CREDENTIAL_ALIAS_ASSIGNMENT_PATTERN, context, syntax)) return true;
-  if (hasUnsafeCredentialMatch(source, CREDENTIAL_SUBSCRIPT_ASSIGNMENT_PATTERN, context, syntax)) return true;
-  if (hasUnsafeCredentialMatch(source, CREDENTIAL_DESTRUCTURED_ASSIGNMENT_PATTERN, context, syntax)) return true;
-  if (hasUnsafeCredentialMatch(source, CREDENTIAL_ASSIGNMENT_PATTERN, context, syntax)) return true;
-  if (hasUnsafeCredentialMatch(source, CREDENTIAL_FIELD_PATTERN, context, syntax)) return true;
+  const spans = [];
+  const privateKeyScanner = createPrivateKeyScanner();
+  privateKeyScanner.push(source, true);
+  spans.push(...privateKeyScanner.spans());
+  PRIVATE_PARTIAL_PATTERN.lastIndex = 0;
+  const partialPrivate = PRIVATE_PARTIAL_PATTERN.exec(source);
+  if (partialPrivate) spans.push({ start: partialPrivate.index, end: source.length });
+  const unmatchedParenthesis = unmatchedCredentialParenthesisStart(source);
+  if (unmatchedParenthesis >= 0) spans.push({ start: unmatchedParenthesis, end: source.length });
+  for (const pattern of [TYPED_DECLARATION_ASSIGNMENT_PATTERN, CREDENTIAL_ALIAS_ASSIGNMENT_PATTERN,
+    CREDENTIAL_SUBSCRIPT_ASSIGNMENT_PATTERN, CREDENTIAL_DESTRUCTURED_ASSIGNMENT_PATTERN,
+    CREDENTIAL_ASSIGNMENT_PATTERN, CREDENTIAL_FIELD_PATTERN]) {
+    spans.push(...collectUnsafeCredentialSpans(source, pattern, context, syntax));
+  }
 
   AUTHORIZATION_PATTERN.lastIndex = 0;
   let match;
@@ -1061,22 +1083,28 @@ export function hasSecretValue(text, options = {}) {
       AUTHORIZATION_PATTERN.lastIndex = sourceEnd;
       continue;
     }
-    if (!isExactPlaceholder(authorizationValue(match[2]))) return true;
+    if (!isExactPlaceholder(authorizationValue(match[2]))) spans.push({ start: match.index, end: match.index + match[0].length });
   }
   for (const pattern of [CLI_TOKEN_PATTERN, QUERY_TOKEN_PATTERN, CREDENTIAL_URL_PATTERN]) {
     pattern.lastIndex = 0;
     while ((match = pattern.exec(source)) !== null) {
-      const value = pattern === CREDENTIAL_URL_PATTERN ? match[2] : pattern === QUERY_TOKEN_PATTERN ? match[2] : match[2];
-      if (!isExactPlaceholder(value)) return true;
+      if (!isExactPlaceholder(match[2])) spans.push({ start: match.index, end: match.index + match[0].length });
     }
   }
   for (const pattern of [OPENAI_SECRET_PATTERN, COMMON_TOKEN_PATTERN, JWT_TOKEN_PATTERN]) {
     pattern.lastIndex = 0;
     while ((match = pattern.exec(source)) !== null) {
-      if (!isExactPlaceholder(match[0])) return true;
+      if (!isExactPlaceholder(match[0])) spans.push({ start: match.index, end: match.index + match[0].length });
     }
   }
-  return false;
+  const pythonSides = syntax?.pythonProvenance?.segments?.flatMap((segment) => segment.sides ?? [segment]) ?? [];
+  const complete = !(context === 'source' && syntax?.language === 'python'
+    && (!syntax.pythonProvenance?.available || pythonSides.some((side) => !side.parse?.valid)));
+  return { spans: mergeSensitiveSpans(spans), complete };
+}
+
+export function hasSecretValue(text, options = {}) {
+  return scanSecretValues(text, options).spans.length > 0;
 }
 
 function trustedDiffLanguage(languageForPath, path, present, pathDiscoveryValid) {
