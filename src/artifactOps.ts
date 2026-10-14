@@ -1,9 +1,10 @@
-import fsp from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import fsp, { type FileHandle } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
-import { CodexProError, PathGuard } from "./guard.js";
+import { CodexProError, isSubpath, PathGuard } from "./guard.js";
 
 export interface WorkspaceArtifact {
   path: string;
@@ -113,26 +114,58 @@ export function detectArtifactMimeType(buffer: Buffer, relPath: string): string 
   return "application/octet-stream";
 }
 
-/** Read at most `cap` bytes; exceeding the cap fails closed (source grew mid-read). */
-async function readBoundedBytes(absPath: string, cap: number): Promise<Buffer> {
-  const handle = await fsp.open(absPath, "r");
-  try {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    const slab = Buffer.allocUnsafe(64 * 1024);
-    for (;;) {
-      const { bytesRead } = await handle.read(slab, 0, slab.length, null);
-      if (bytesRead === 0) break;
-      total += bytesRead;
-      if (total > cap) {
-        throw new CodexProError("File grew during read. Read the file again.");
-      }
-      chunks.push(Buffer.from(slab.subarray(0, bytesRead)));
+async function openCanonicalArtifact(root: string, target: string): Promise<FileHandle> {
+  if (!isSubpath(target, root)) throw new CodexProError("Artifact path escapes workspace root.");
+  if (process.platform !== "linux") {
+    const expected = await fsp.lstat(target);
+    if (!expected.isFile() || await fsp.realpath(target) !== target) {
+      throw new CodexProError("Artifact path changed before opening.");
     }
-    return Buffer.concat(chunks);
-  } finally {
-    await handle.close().catch(() => undefined);
+    const handle = await fsp.open(target, "r");
+    try {
+      const opened = await handle.stat();
+      const current = await fsp.lstat(target);
+      if (await fsp.realpath(target) !== target || current.isSymbolicLink() ||
+          opened.dev !== expected.dev || opened.ino !== expected.ino ||
+          opened.dev !== current.dev || opened.ino !== current.ino) {
+        throw new CodexProError("Artifact path changed while opening.");
+      }
+      return handle;
+    } catch (error) {
+      await handle.close();
+      throw error;
+    }
   }
+  const rootParts = path.relative(path.parse(root).root, root).split(path.sep).filter(Boolean);
+  const targetParts = path.relative(root, target).split(path.sep).filter(Boolean);
+  let directory = await fsp.open(path.parse(root).root, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
+  try {
+    for (const part of [...rootParts, ...targetParts.slice(0, -1)]) {
+      const next = await fsp.open(`/proc/self/fd/${directory.fd}/${part}`, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      await directory.close();
+      directory = next;
+    }
+    return await fsp.open(`/proc/self/fd/${directory.fd}/${targetParts.at(-1) ?? "."}`, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } finally {
+    await directory.close();
+  }
+}
+
+/** Read at most `cap` bytes; exceeding the cap fails closed (source grew mid-read). */
+async function readBoundedBytes(handle: FileHandle, cap: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const slab = Buffer.allocUnsafe(64 * 1024);
+  for (;;) {
+    const { bytesRead } = await handle.read(slab, 0, slab.length, null);
+    if (bytesRead === 0) break;
+    total += bytesRead;
+    if (total > cap) {
+      throw new CodexProError("File grew during read. Read the file again.");
+    }
+    chunks.push(Buffer.from(slab.subarray(0, bytesRead)));
+  }
+  return Buffer.concat(chunks);
 }
 
 export async function readWorkspaceArtifact(
@@ -143,24 +176,31 @@ export async function readWorkspaceArtifact(
   maxBytes?: number
 ): Promise<WorkspaceArtifact> {
   const resolved = guard.resolve(workspace, filePath);
-  let preStat;
+  let handle: FileHandle;
   try {
-    preStat = await fsp.stat(resolved.absPath);
-  } catch {
-    throw new CodexProError(`File not found: ${resolved.relPath}`);
+    const canonical = guard.resolve(workspace, await fsp.realpath(resolved.absPath));
+    handle = await openCanonicalArtifact(workspace.root, canonical.absPath);
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+      throw new CodexProError(`File not found: ${resolved.relPath}`);
+    }
+    throw error;
   }
-  if (!preStat.isFile()) throw new CodexProError(`Not a file: ${resolved.relPath}`);
-  const limit = Math.min(ARTIFACT_HARD_MAX_BYTES, maxBytes ?? Math.max(config.maxReadBytes, 1_000_000));
-  if (preStat.size > limit) {
-    throw new CodexProError(`Artifact is too large (${preStat.size} bytes). Limit: ${limit} bytes.`);
-  }
-  const buffer = await readBoundedBytes(resolved.absPath, preStat.size + 65_536);
-  const postStat = await fsp.stat(resolved.absPath);
-  if (postStat.size !== preStat.size || postStat.mtimeMs !== preStat.mtimeMs || postStat.ctimeMs !== preStat.ctimeMs) {
-    throw new CodexProError(`File changed during read: ${resolved.relPath}. Read the file again.`);
-  }
-  if (buffer.byteLength !== postStat.size) {
-    throw new CodexProError(`File changed during read: ${resolved.relPath}. Read the file again.`);
+  let buffer: Buffer;
+  try {
+    const preStat = await handle.stat();
+    if (!preStat.isFile()) throw new CodexProError(`Not a file: ${resolved.relPath}`);
+    const limit = Math.min(ARTIFACT_HARD_MAX_BYTES, maxBytes ?? Math.max(config.maxReadBytes, 1_000_000));
+    if (preStat.size > limit) {
+      throw new CodexProError(`Artifact is too large (${preStat.size} bytes). Limit: ${limit} bytes.`);
+    }
+    buffer = await readBoundedBytes(handle, preStat.size + 65_536);
+    const postStat = await handle.stat();
+    if (postStat.size !== preStat.size || postStat.mtimeMs !== preStat.mtimeMs || postStat.ctimeMs !== preStat.ctimeMs || buffer.byteLength !== postStat.size) {
+      throw new CodexProError(`File changed during read: ${resolved.relPath}. Read the file again.`);
+    }
+  } finally {
+    await handle.close();
   }
   return {
     path: resolved.relPath,
