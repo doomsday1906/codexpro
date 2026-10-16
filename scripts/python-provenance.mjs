@@ -29,8 +29,30 @@ const PYTHON_PUNCTUATION_TYPES = new Set([
 ]);
 const PYTHON_ERROR_NODE_PREFIX = '\u26a0';
 
-function hasPythonErrorNode(nodes) {
-  return nodes.some((node) => node.isError || node.type.startsWith(PYTHON_ERROR_NODE_PREFIX));
+function isBareYieldRecovery(node, nodes, source) {
+  // @lezer/python 1.1.19 requires a yield value. Accept only its empty
+  // recovery on a standalone bare yield inside a function; all bytes stay scanned.
+  if (node.from !== node.to || node.children.length) return false;
+  const statement = nodes[node.parent];
+  if (statement?.type !== 'YieldStatement' || statement.to !== node.to) return false;
+  const children = directChildren(nodes, statement.index);
+  const keyword = children[0];
+  if (children.at(-1) !== node || keyword?.type !== 'yield'
+    || children.slice(1, -1).some((child) => child.type !== 'Comment')) return false;
+  const lineStart = Math.max(source.lastIndexOf('\n', keyword.from - 1), source.lastIndexOf('\r', keyword.from - 1)) + 1;
+  if (!/^[ \t]*$/u.test(source.slice(lineStart, keyword.from))
+    || !/^[ \t]*(?:#[^\r\n]*)?$/u.test(source.slice(keyword.to, node.from))
+    || (node.from < source.length && !/[\r\n]/u.test(source[node.from]))) return false;
+  for (let parent = statement.parent; parent >= 0; parent = nodes[parent].parent) {
+    if (nodes[parent].type === 'ClassDefinition') return false;
+    if (nodes[parent].type === 'FunctionDefinition') return true;
+  }
+  return false;
+}
+
+function hasPythonErrorNode(nodes, source) {
+  return nodes.some((node) => (node.isError || node.type.startsWith(PYTHON_ERROR_NODE_PREFIX))
+    && !isBareYieldRecovery(node, nodes, source));
 }
 
 function hasUnexpectedTopLevelIndent(source, nodes) {
@@ -476,7 +498,7 @@ function parsePythonSegment(source, { completeSource = true } = {}) {
   // Lezer's Python grammar does not reject every CPython indentation error
   // (for example, an indented statement at module scope), so do not let such
   // a tree grant syntax ownership to a credential-looking field.
-  if (hasPythonErrorNode(nodes) || (completeSource && hasUnexpectedTopLevelIndent(text, nodes))) {
+  if (hasPythonErrorNode(nodes, text) || (completeSource && hasUnexpectedTopLevelIndent(text, nodes))) {
     return { valid: false, reason: 'parse-error', source: text };
   }
 
