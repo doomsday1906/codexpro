@@ -42,7 +42,7 @@ import { delegationToolDefs } from "./delegationTools.js";
 import { eventsCapability } from "./delegationEvents.js";
 import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
-import { hasSecretValue, hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactSensitiveTextPreservingLines, redactStructured, redactUnifiedDiff, redactUnifiedDiffPreservingLines, sourceLanguageForPath, sourceSafetyRefusalMessage, truncateUtf8 } from "./redact.js";
+import { hasSecretValue, hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactJsonText, redactSensitiveText, redactSensitiveTextPreservingLines, redactStructured, redactUnifiedDiff, redactUnifiedDiffPreservingLines, sourceLanguageForPath, sourceSafetyRefusalMessage, truncateUtf8 } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { createDiagnosticContext, type CodexProDiagnosticContext } from "./diagnosticContext.js";
 import { normalizeGitPushPolicy, sanitizeGitPushPolicy } from "./gitPushPolicy.js";
@@ -365,7 +365,7 @@ const START_VERIFICATION_LIFETIME_MS_SCHEMA = z.number()
   .int()
   .positive()
   .optional()
-  .describe("Maximum execution lifetime in milliseconds (clamped between 10,000 ms and 3,600,000 ms). Default: 1,800,000 ms (30 min).");
+  .describe("Maximum execution lifetime in milliseconds (clamped between 10,000 ms and 3,600,000 ms). Default: 1,800,000 ms (30 min); maximum: 3,600,000 ms (60 min).");
 
 const START_VERIFICATION_ARGUMENTS_SCHEMA = z.object({
   workspace_id: SESSION_WORKSPACE_DIAGNOSTICS_WORKSPACE_ID_SCHEMA,
@@ -1073,7 +1073,7 @@ function readManyText(workspace: Workspace, results: ReadManyResult[], maxTotalB
   for (const item of results) {
     if (item.ok) {
       parts.push(
-        `- [${item.index}] ${item.path}: ok; ${item.result.startLine}-${item.result.endLine} of ${item.result.totalLines} lines, ${item.result.bytes} file bytes.`,
+        `- [${item.index}] ${item.path}: ok; ${item.result.startLine}-${item.result.endLine} of ${item.result.totalLines} lines, ${item.result.bytes} file bytes; source redacted: ${item.result.redacted}.`,
         "",
         `## Item ${item.index}: ${item.path}`,
         "",
@@ -1487,7 +1487,40 @@ function diagnosticResult(result: any): any {
       return { ...part, text: redactDiagnosticText(part.text) };
     });
   }
-  if ("structuredContent" in safe) safe.structuredContent = redactDiagnosticStructured(safe.structuredContent);
+  if ("structuredContent" in safe) {
+    const rawStdout = safe.structuredContent?.stdout;
+    const priorStdoutRedaction = safe.structuredContent?.stdout_redaction;
+    if (typeof rawStdout === "string" && priorStdoutRedaction && typeof priorStdoutRedaction === "object") {
+      const { stdout: _stdout, stdout_redaction: _redaction, ...other } = safe.structuredContent;
+      safe.structuredContent = {
+        ...redactDiagnosticStructured(other),
+        stdout: rawStdout,
+        stdout_redaction: priorStdoutRedaction
+      };
+    } else {
+      safe.structuredContent = redactDiagnosticStructured(safe.structuredContent);
+    }
+    if (typeof rawStdout === "string" && safe.structuredContent && typeof safe.structuredContent === "object") {
+      const json = redactJsonText(rawStdout, "diagnostic");
+      if (json) {
+        safe.structuredContent.stdout = json.text;
+        safe.structuredContent.stdout_redaction = priorStdoutRedaction ?? {
+          format: "json",
+          parseable: true,
+          changed: json.changed,
+          coverage: "all JSON values; credential-named fields and secret patterns",
+          nested_values_omitted: json.omittedNestedValues
+        };
+      } else {
+        safe.structuredContent.stdout_redaction = priorStdoutRedaction ?? {
+          format: "text",
+          parseable: false,
+          changed: redactDiagnosticText(rawStdout) !== rawStdout,
+          coverage: "secret-pattern text redaction"
+        };
+      }
+    }
+  }
   if ("_meta" in safe) safe._meta = redactDiagnosticStructured(safe._meta);
   return safe;
 }
@@ -4370,7 +4403,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
         const text = [
           {
             kind: "normal" as const,
-            text: `# Read File\n\nPath: ${result.path}\nLines: ${result.startLine}-${result.endLine} of ${result.totalLines}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}${continuation}\n\n\`\`\`text\n`
+            text: `# Read File\n\nPath: ${result.path}\nLines: ${result.startLine}-${result.endLine} of ${result.totalLines}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}\nSource redacted: ${result.redacted}${continuation}\n\n\`\`\`text\n`
           },
           body,
           { kind: "normal" as const, text: "\n\`\`\`" }
@@ -4836,7 +4869,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     {
       title: "Start Managed Verification",
       description:
-        "Start a bounded long-running verification job in the workspace (survives MCP session churn in the same CodexPro process). Requires explicit workspace_id and a structured runner (package_script, pytest, go_test, cargo, tsc, eslint, biome_check). Non-verification scripts (start, dev, serve, watch, publish, deploy) are rejected. Returns immediately with job_id.",
+        "Start a bounded long-running verification job in the workspace (survives MCP session churn in the same CodexPro process). Default lifetime is 30 minutes, maximum 60 minutes. On Linux each job runs in its own systemd scope capped at MemoryMax=8G. Requires explicit workspace_id and a structured runner (package_script, pytest, go_test, cargo, tsc, eslint, biome_check). Non-verification scripts (start, dev, serve, watch, publish, deploy) are rejected. Returns immediately with job_id.",
       inputSchema: START_VERIFICATION_PUBLIC_SCHEMA,
       runtimeInputSchema: START_VERIFICATION_ARGUMENTS_SCHEMA,
       annotations: BASH_ANNOTATIONS,

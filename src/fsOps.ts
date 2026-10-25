@@ -39,6 +39,8 @@ export interface ReadFileResult {
   totalLines: number;
   bytes: number;
   sha256: string;
+  /** True when source-aware redaction changed any returned source text. */
+  redacted: boolean;
   truncated: boolean;
   /** UTF-8 bytes of the returned public source body. */
   returnedBytes: number;
@@ -275,6 +277,7 @@ function readFileWindow(
     totalLines,
     bytes: snapshot.bytes,
     sha256: snapshot.sha256,
+    redacted: selected.some((line, index) => line !== budgetLines[startLine - 1 + index]),
     truncated: startLine > 1 || endLine < totalLines,
     returnedBytes: Buffer.byteLength(numbered, "utf8"),
     budgetTruncated: false
@@ -929,7 +932,7 @@ async function readPublicSnapshotFile(
     sha256: digest,
     maxBytes
   });
-  return { path: resolved.relPath, ...framed };
+  return { path: resolved.relPath, ...framed, redacted: display.some((line, index) => line.text !== budget[index]?.text) };
 }
 
 /**
@@ -983,7 +986,7 @@ async function readPublicLargeFile(
     capped: scan.selectionCapped,
     capturedThroughLine: scan.capturedThroughLine
   });
-  return { path: resolved.relPath, ...framed };
+  return { path: resolved.relPath, ...framed, redacted: display.some((line, index) => line.text !== captured[index]?.text) };
 }
 
 /** Read at most `cap` bytes; exceeding the cap fails closed (source grew mid-read). */

@@ -10,6 +10,7 @@ import { loadConfig } from "../dist/config.js";
 import { PathGuard } from "../dist/guard.js";
 import { createCodexProServer } from "../dist/server.js";
 import { VerificationManager } from "../dist/verificationOps.js";
+import { redactJsonText } from "../dist/redact.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
@@ -20,6 +21,16 @@ console.log("# RepoConnect M009 TASK-006 Security Envelope & Redaction Smoke");
 const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codexpro-m009-sec-"));
 const realFixtureRoot = await fs.realpath(fixtureRoot);
 const realWsId = `ws_${createHash("sha256").update(realFixtureRoot).digest("hex").slice(0, 24)}`;
+
+const previousBashTimeout = process.env.CODEXPRO_MAX_BASH_TIMEOUT_MS;
+process.env.CODEXPRO_MAX_BASH_TIMEOUT_MS = "900000";
+assert.equal(
+  loadConfig(["--root", realFixtureRoot, "--allow-root", realFixtureRoot]).maxBashTimeoutMs,
+  600_000,
+  "native bash timeout must never exceed 600000 ms"
+);
+if (previousBashTimeout === undefined) delete process.env.CODEXPRO_MAX_BASH_TIMEOUT_MS;
+else process.env.CODEXPRO_MAX_BASH_TIMEOUT_MS = previousBashTimeout;
 
 // Link node_modules into fixtureRoot
 try {
@@ -162,6 +173,10 @@ async function runTests() {
   });
   assert.ok(!matchRes.isError, "Matching session_id must succeed on start_verification");
   const startedJob = matchRes.structuredContent;
+  if (process.platform === "linux") {
+    assert.ok(startedJob.containmentWrapper?.includes("--scope"), "Linux verification must use an isolated transient systemd scope");
+    assert.ok(startedJob.containmentWrapper?.includes("--property=MemoryMax=8G"), "Linux verification scope must enforce the 8 GiB cap");
+  }
 
   // wait_verification missing session_id must fail
   let waitMissingRes = await clientSession.callTool({
@@ -280,6 +295,51 @@ async function runTests() {
   assert.ok(!leakResult.stderr.includes("ghp_1234567890abcdef1234567890abcdef1234"), "GitHub token must not appear in stderr");
   assert.match(leakResult.stderr, /\[REDACTED_SECRET\]/, "GitHub token must be redacted in stderr");
   console.log("  PASS: High-entropy tokens and API keys are redacted in verification job records");
+
+  // Test 5: Multiline JSON stdout remains parseable after redaction.
+  console.log("\n[Test 5] Public bash JSON stdout remains parseable and reports redaction coverage...");
+  const multilineJson = JSON.stringify({
+    project: "agentworkspace-self",
+    access_token: "never-expose-this-token",
+    nested: { private_key: "-----BEGIN PRIVATE KEY-----\\nnever-expose-this-key\\n-----END PRIVATE KEY-----" },
+    ordinary: "kept"
+  }, null, 2);
+  const directJson = redactJsonText(multilineJson, "diagnostic");
+  assert.ok(directJson, "multiline JSON must be recognized");
+  const safeJson = JSON.parse(directJson.text);
+  assert.equal(safeJson.access_token, "[REDACTED_SECRET]");
+  assert.equal(safeJson.nested.private_key, "[REDACTED_SECRET]");
+  assert.equal(safeJson.project, "agentworkspace-self");
+  assert.equal(directJson.changed, true);
+
+  await fs.writeFile(path.join(realFixtureRoot, "board.json"), multilineJson, "utf8");
+  const { client: clientBash } = await createClientServer({ bashMode: "full", toolMode: "full" });
+  const jsonOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat board.json" } });
+  assert.ok(!jsonOutput.isError, `full bash must return fixture JSON through its normal route: ${JSON.stringify(jsonOutput.structuredContent)}`);
+  const safeStdout = jsonOutput.structuredContent.stdout;
+  assert.doesNotThrow(() => JSON.parse(safeStdout), "safe structured stdout must remain valid JSON");
+  assert.equal(JSON.parse(safeStdout).access_token, "[REDACTED_SECRET]");
+  assert.equal(JSON.parse(safeStdout).nested.private_key, "[REDACTED_SECRET]");
+  assert.deepEqual(jsonOutput.structuredContent.stdout_redaction, {
+    format: "json",
+    parseable: true,
+    changed: true,
+    coverage: "all JSON values; credential-named fields and secret patterns",
+    nested_values_omitted: false,
+    truncated: false
+  });
+  assert.equal(jsonOutput.content[0].text.includes("never-expose-this-token"), false);
+
+  await fs.writeFile(path.join(realFixtureRoot, "secret-source.ts"), "export const api_token = 'source-secret-that-must-not-leak';\n", "utf8");
+  const sourceSnippet = await clientBash.callTool({
+    name: "read_many",
+    arguments: { workspace_id: realWsId, items: [{ path: "secret-source.ts" }] }
+  });
+  assert.ok(!sourceSnippet.isError, "read_many must return the fixture source through its normal paged route");
+  assert.equal(sourceSnippet.structuredContent.results[0].result.redacted, true, "read_many must mark masked source snippets");
+  assert.equal(sourceSnippet.structuredContent.results[0].result.text.includes("source-secret-that-must-not-leak"), false);
+  assert.match(sourceSnippet.content[0].text, /source redacted: true/u, "read_many text must report that the snippet was masked");
+  console.log("  PASS: JSON stdout stays parseable and source snippets truthfully mark whole-file redaction");
 
   // Cleanup
   try {

@@ -83,6 +83,54 @@ export function redactSensitiveText(text: string, options: RedactionOptions | Re
   return policyRedactSensitiveText(text, options);
 }
 
+export interface JsonTextRedactionResult {
+  readonly text: string;
+  readonly changed: boolean;
+  readonly omittedNestedValues: boolean;
+}
+
+/** Redact a complete JSON value without turning its replacement into invalid JSON. */
+export function redactJsonText(text: string, options: RedactionOptions | RedactionContext = {}): JsonTextRedactionResult | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+
+  let changed = false;
+  let omittedNestedValues = false;
+  const redactValue = (value: unknown, depth: number): unknown => {
+    if (depth > 8) {
+      changed = true;
+      omittedNestedValues = true;
+      return "[REDACTED_SECRET]";
+    }
+    if (typeof value === "string") {
+      const safe = redactSensitiveText(value, options);
+      if (safe !== value) changed = true;
+      return safe;
+    }
+    if (Array.isArray(value)) return value.map((item) => redactValue(item, depth + 1));
+    if (value && typeof value === "object") {
+      const output: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(value)) {
+        if (/[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}/iu.test(key)) {
+          const safe = typeof item === "string" ? redactSensitiveText(item, options) : undefined;
+          if (typeof item !== "string" || safe !== item) changed = true;
+          output[key] = "[REDACTED_SECRET]";
+        } else {
+          output[key] = redactValue(item, depth + 1);
+        }
+      }
+      return output;
+    }
+    return value;
+  };
+
+  return { text: JSON.stringify(redactValue(parsed, 0)), changed, omittedNestedValues };
+}
+
 // Line-preserving source redaction is a pure function of (text, options) and
 // the dominant cost of search/analysis: every query re-redacted the same
 // unchanged files during scanning and hydration. Results for non-trivial

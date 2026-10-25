@@ -112,6 +112,11 @@ export const DEFAULT_VERIFICATION_LIMITS: VerificationManagerLimits = {
   retainedTailBytes: 120_000
 };
 
+const LINUX_VERIFICATION_CONTAINMENT = [
+  "systemd-run", "--user", "--scope", "--collect", "--property=MemoryMax=8G", "--",
+  "/usr/bin/env", "-u", "XDG_RUNTIME_DIR", "-u", "DBUS_SESSION_BUS_ADDRESS"
+];
+
 const VALID_RUNNERS = new Set<string>([
   "package_script",
   "pytest",
@@ -903,10 +908,17 @@ export class ManagedVerificationJob {
       path.join(this.workspaceRoot, "node_modules", ".bin")
     ];
     const pathParts = [...nodeBinDirs, baseEnv.PATH || ""].filter(Boolean);
-    const env = {
+    const env: NodeJS.ProcessEnv = {
       ...baseEnv,
       PATH: pathParts.join(path.delimiter)
     };
+    // systemd-run needs the user-bus address, but the verification command
+    // must not inherit it; its wrapper explicitly unsets both session vars.
+    if (process.platform === "linux" && this.executionArgv[0] === "systemd-run") {
+      for (const key of ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] as const) {
+        if (process.env[key]) env[key] = process.env[key];
+      }
+    }
 
     this.child = spawn(binary, argv, {
       cwd: this.absCwd,
@@ -1884,8 +1896,10 @@ export class VerificationManager {
       ...options
     };
     const envPath = makeRestrictedBashEnv(config).PATH;
-    const wrapper = options.containmentWrapper ?? config.containmentWrapper;
-    this.containmentWrapper = validateContainmentWrapper(wrapper, envPath);
+    const configuredWrapper = options.containmentWrapper ?? config.containmentWrapper;
+    this.containmentWrapper = configuredWrapper !== undefined
+      ? validateContainmentWrapper(configuredWrapper, envPath)
+      : process.platform === "linux" ? [...LINUX_VERIFICATION_CONTAINMENT] : undefined;
   }
 
   public getJob(jobId: string): ManagedVerificationJob | undefined {
@@ -1967,7 +1981,8 @@ export class VerificationManager {
     const relativeCwd = path.relative(workspace.root, cwdResolved.absPath) || ".";
 
     const runnerArgv = compileRunnerArgv(input);
-    const executionArgv = composeExecutionArgv(runnerArgv, this.containmentWrapper);
+    const containmentWrapper = validateContainmentWrapper(this.containmentWrapper, makeRestrictedBashEnv(this.config).PATH);
+    const executionArgv = composeExecutionArgv(runnerArgv, containmentWrapper);
     const commandSummary = executionArgv.join(" ");
     const lifetimeMs = clampLifetime(
       input.lifetime_ms,
@@ -1990,7 +2005,7 @@ export class VerificationManager {
       executionArgv,
       commandSummary,
       lifetimeMs,
-      containmentWrapper: this.containmentWrapper,
+      containmentWrapper,
       config: this.config,
       hardOutputCeilingBytes: this.limits.hardOutputCeilingBytes,
       retainedTailBytes: this.limits.retainedTailBytes

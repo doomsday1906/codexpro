@@ -5,7 +5,7 @@ import path from "node:path";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, PathGuard } from "./guard.js";
-import { redactDiagnosticText } from "./redact.js";
+import { redactDiagnosticText, redactJsonText } from "./redact.js";
 
 export interface BashResult {
   command: string;
@@ -14,6 +14,14 @@ export interface BashResult {
   signal: NodeJS.Signals | null;
   durationMs: number;
   stdout: string;
+  stdout_redaction: {
+    format: "json" | "text";
+    parseable: boolean;
+    changed: boolean;
+    coverage: string;
+    nested_values_omitted?: boolean;
+    truncated?: boolean;
+  };
   stderr: string;
   truncated: boolean;
   bashSessionId?: string;
@@ -338,7 +346,8 @@ export async function runBash(
       if (killedByTimeout) {
         stderr += `\n[codexpro] Command timed out after ${timeoutMs} ms.`;
       }
-      const out = trimOutput(redactDiagnosticText(stdout), config.maxOutputBytes);
+      const json = redactJsonText(stdout, "diagnostic");
+      const out = trimOutput(json?.text ?? redactDiagnosticText(stdout), config.maxOutputBytes);
       const err = trimOutput(redactDiagnosticText(stderr), config.maxOutputBytes);
       resolve({
         command: redactDiagnosticText(command),
@@ -347,6 +356,20 @@ export async function runBash(
         signal,
         durationMs: Date.now() - start,
         stdout: out.value,
+        stdout_redaction: json ? {
+          format: "json",
+          parseable: !out.truncated,
+          changed: json.changed,
+          coverage: "all JSON values; credential-named fields and secret patterns",
+          nested_values_omitted: json.omittedNestedValues,
+          truncated: out.truncated
+        } : {
+          format: "text",
+          parseable: false,
+          changed: redactDiagnosticText(stdout) !== stdout,
+          coverage: "secret-pattern text redaction",
+          truncated: out.truncated
+        },
         stderr: err.value,
         truncated: out.truncated || err.truncated,
         ...(bashSessionId ? { bashSessionId } : {})
