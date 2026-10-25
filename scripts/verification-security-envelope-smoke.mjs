@@ -323,7 +323,10 @@ async function runTests() {
     mySecret: "opaque-b",
     passwordHash: "opaque-c",
     tokenValue: "opaque-d",
-    apiToken: "opaque-f",
+    apiToken: 987654321,
+    authToken: 987654322,
+    accessToken: 987654323,
+    refreshToken: 987654324,
     secrets: { value: "opaque-e" },
     Authorization: "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
     nested: { private_key: "-----BEGIN PRIVATE KEY-----\\nnever-expose-this-key\\n-----END PRIVATE KEY-----" },
@@ -341,7 +344,7 @@ async function runTests() {
   assert.ok(directJson, "multiline JSON must be recognized");
   const safeJson = JSON.parse(directJson.text);
   assert.equal(safeJson.access_token, "[REDACTED_SECRET]");
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "Authorization", "secrets"]) {
     assert.equal(safeJson[key], "[REDACTED_SECRET]", `multiline JSON ${key} field must be redacted`);
   }
   assert.equal(safeJson.nested.private_key, "[REDACTED_SECRET]");
@@ -359,16 +362,17 @@ async function runTests() {
   assert.equal(opaqueKeyedValue.changed, true, "masking an opaque credential-named value must be reported");
   const secretFieldNames = redactJsonText(JSON.stringify({
     secretKey: "opaque-a", mySecret: "opaque-b", passwordHash: "opaque-c",
-    tokenValue: "opaque-d", apiToken: "opaque-f", secrets: { value: "opaque-e" },
+    tokenValue: "opaque-d", apiToken: 987654321, authToken: 987654322,
+    accessToken: 987654323, refreshToken: 987654324, secrets: { value: "opaque-e" },
     Authorization: "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
     token: 17, tokens: 21, token_count: 34
   }), "diagnostic");
   assert.ok(secretFieldNames);
   const secretFields = JSON.parse(secretFieldNames.text);
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "Authorization", "secrets"]) {
     assert.equal(secretFields[key], "[REDACTED_SECRET]", `${key} must be redacted by its field name`);
   }
-  assert.equal(secretFields.token, 17, "numeric singular token metrics remain numeric");
+  assert.equal(secretFields.token, "[REDACTED_SECRET]", "a numeric singular token field is a credential, not a usage metric");
   assert.equal(secretFields.tokens, 21, "numeric token metrics remain numeric");
   assert.equal(secretFields.token_count, 34, "numeric token_count remains numeric");
   const reformattedJson = redactJsonText('{\n  "answer": 1\n}', "diagnostic");
@@ -382,7 +386,7 @@ async function runTests() {
   assert.doesNotThrow(() => JSON.parse(safeStdout), "safe structured stdout must remain valid JSON");
   const publicSafeJson = JSON.parse(safeStdout);
   assert.equal(publicSafeJson.access_token, "[REDACTED_SECRET]");
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "Authorization", "secrets"]) {
     assert.equal(publicSafeJson[key], "[REDACTED_SECRET]", `public JSON ${key} field must be redacted`);
   }
   assert.equal(publicSafeJson.nested.private_key, "[REDACTED_SECRET]");

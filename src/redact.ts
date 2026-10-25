@@ -128,9 +128,7 @@ export function redactJsonText(text: string, options: RedactionOptions | Redacti
       for (const [key, item] of Object.entries(value)) {
         const safeKey = redactSensitiveText(key, options);
         const secretKey = safeKey !== key;
-        const tokenMetric = /^(?:token|tokencount)$/iu.test(key.replace(/[^a-z\d]/giu, "")) && typeof item === "number" ||
-          key.replace(/[^a-z\d]/giu, "").toLowerCase().endsWith("token") && typeof item === "number" ||
-          key.replace(/[^a-z\d]/giu, "").toLowerCase().endsWith("tokens") && typeof item === "number";
+        const tokenMetric = /^(?:tokens|tokencount)$/iu.test(key.replace(/[^a-z\d]/giu, "")) && typeof item === "number";
         const secretField = secretFieldName(key, item) && !tokenMetric;
         const outputKey = secretKey ? "[REDACTED_SECRET]" : key;
         let uniqueKey = outputKey;
