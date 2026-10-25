@@ -31,8 +31,8 @@ async function runTests() {
   const mgr1 = new VerificationManager(config, {
     maxActiveJobs: 3,
     minLifetimeMs: 500,
-    defaultLifetimeMs: 5000,
-    maxLifetimeMs: 10000
+    defaultLifetimeMs: 30000,
+    maxLifetimeMs: 60000
   });
 
   const startRecord1 = await mgr1.startVerification(fakeWorkspace, guard, {
@@ -51,10 +51,10 @@ async function runTests() {
   assert.equal(startRecord1.runner, "package_script");
   assert.equal(mgr1.getActiveCount(), 1);
 
-  const waitRecord1 = await mgr1.waitVerification(startRecord1.jobId, 10);
+  const waitRecord1 = await mgr1.waitVerification(startRecord1.jobId, 60);
   assert.equal(waitRecord1.jobId, startRecord1.jobId);
   assert.equal(waitRecord1.generationId, mgr1.generationId, "waitRecord generationId must match manager generationId");
-  assert.equal(waitRecord1.state, "succeeded");
+  assert.equal(waitRecord1.state, "succeeded", `quick verification command failed: ${JSON.stringify({ exitCode: waitRecord1.exitCode, signal: waitRecord1.signal, stdout: waitRecord1.stdout, stderr: waitRecord1.stderr, terminalReason: waitRecord1.terminalReason, commandSummary: waitRecord1.commandSummary })}`);
   assert.equal(waitRecord1.exitCode, 0);
   assert.ok(waitRecord1.durationMs >= 0, "durationMs must be recorded");
   assert.equal(mgr1.getActiveCount(), 0, "active count must decrement on completion");
@@ -183,7 +183,7 @@ async function runTests() {
   console.log("\n[Test 6] Terminal record retention cap and eviction...");
   const mgr6 = new VerificationManager(config, {
     terminalRecordMax: 3,
-    terminalRecordTtlMs: 5000
+    terminalRecordTtlMs: 60 * 60 * 1000
   });
 
   // Create 5 jobs sequentially and finish them
@@ -205,6 +205,10 @@ async function runTests() {
   assert.ok(mgr6.getJobRecord(completedIds[3]), "Job 3 must be retained");
   assert.ok(mgr6.getJobRecord(completedIds[4]), "Job 4 must be retained");
   console.log("  PASS: Oldest terminal records evicted down to max cap");
+
+  mgr6.prune(Date.now() + 60 * 60 * 1000 + 1);
+  assert.equal(mgr6.getJobRecord(completedIds[2]), undefined, "Expired terminal records must be pruned");
+  console.log("  PASS: Expired terminal records pruned independently of wall-clock test duration");
 
   // Test 7: Controlled manager shutdown
   console.log("\n[Test 7] Controlled manager close/shutdown...");

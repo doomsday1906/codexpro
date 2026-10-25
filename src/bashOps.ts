@@ -360,7 +360,7 @@ export async function runBash(
           format: "json",
           parseable: !out.truncated,
           changed: json.changed,
-          coverage: "all JSON values; credential-named fields and secret patterns",
+          coverage: "all JSON keys and values; credential-named fields and secret patterns",
           nested_values_omitted: json.omittedNestedValues,
           truncated: out.truncated
         } : {

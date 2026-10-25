@@ -100,6 +100,7 @@ export function redactJsonText(text: string, options: RedactionOptions | Redacti
 
   let changed = false;
   let omittedNestedValues = false;
+  const secretFieldName = /(?:^|[_-])(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|secret|password|passwd|private[_-]?key|credentials?)(?:$|[_-])|(?:^|[_-])token$|_token$/iu;
   const redactValue = (value: unknown, depth: number): unknown => {
     if (depth > 8) {
       changed = true;
@@ -113,14 +114,22 @@ export function redactJsonText(text: string, options: RedactionOptions | Redacti
     }
     if (Array.isArray(value)) return value.map((item) => redactValue(item, depth + 1));
     if (value && typeof value === "object") {
-      const output: Record<string, unknown> = {};
+      const output: Record<string, unknown> = Object.create(null);
       for (const [key, item] of Object.entries(value)) {
-        if (/[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}/iu.test(key)) {
-          const safe = typeof item === "string" ? redactSensitiveText(item, options) : undefined;
-          if (typeof item !== "string" || safe !== item) changed = true;
-          output[key] = "[REDACTED_SECRET]";
+        const safeKey = redactSensitiveText(key, options);
+        const secretKey = safeKey !== key;
+        const secretField = secretFieldName.test(key) || (/(?:^|[_-])tokens$/iu.test(key) && typeof item !== "number");
+        const outputKey = secretKey ? "[REDACTED_SECRET]" : key;
+        let uniqueKey = outputKey;
+        for (let suffix = 2; Object.hasOwn(output, uniqueKey); suffix += 1) {
+          uniqueKey = `${outputKey}_${suffix}`;
+        }
+        if (secretKey) changed = true;
+        if (secretField) {
+          changed = true;
+          output[uniqueKey] = "[REDACTED_SECRET]";
         } else {
-          output[key] = redactValue(item, depth + 1);
+          output[uniqueKey] = redactValue(item, depth + 1);
         }
       }
       return output;
@@ -128,7 +137,8 @@ export function redactJsonText(text: string, options: RedactionOptions | Redacti
     return value;
   };
 
-  return { text: JSON.stringify(redactValue(parsed, 0)), changed, omittedNestedValues };
+  const safeText = JSON.stringify(redactValue(parsed, 0));
+  return { text: safeText, changed: changed || safeText !== text, omittedNestedValues };
 }
 
 // Line-preserving source redaction is a pure function of (text, options) and

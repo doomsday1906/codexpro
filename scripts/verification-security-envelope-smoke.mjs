@@ -174,8 +174,10 @@ async function runTests() {
   assert.ok(!matchRes.isError, "Matching session_id must succeed on start_verification");
   const startedJob = matchRes.structuredContent;
   if (process.platform === "linux") {
-    assert.ok(startedJob.containmentWrapper?.includes("--scope"), "Linux verification must use an isolated transient systemd scope");
-    assert.ok(startedJob.containmentWrapper?.includes("--property=MemoryMax=8G"), "Linux verification scope must enforce the 8 GiB cap");
+    assert.ok(startedJob.containmentWrapper?.some((part) => part.endsWith("/scripts/verification-governed-runner.py")), "Linux verification must acquire through the shared safe_test capacity governor");
+    assert.ok(startedJob.commandSummary.includes("--lifetime-ms=1800000"), "default verification lifetime must reach the governor adapter");
+    assert.doesNotMatch(startedJob.commandSummary, /MemoryMax=8G(?:\s|$)/u, "Linux verification must not impose an unmeasured 8 GiB demand");
+    assert.ok(startedJob.commandSummary.includes("-u DBUS_SESSION_BUS_ADDRESS"), "verification commands must not inherit the user bus");
   }
 
   // wait_verification missing session_id must fail
@@ -302,6 +304,14 @@ async function runTests() {
     project: "agentworkspace-self",
     access_token: "never-expose-this-token",
     nested: { private_key: "-----BEGIN PRIVATE KEY-----\\nnever-expose-this-key\\n-----END PRIVATE KEY-----" },
+    before: { tokens: 8 },
+    after: { tokens: 13 },
+    token_count: 21,
+    issued_tokens: ["opaque-token-value"],
+    key_samples: {
+      ["ghp_1234567890abcdef1234567890abcdef1234"]: { note: "safe payload" },
+      nested: { ["sk-abc1234567890123456789012345678901234567890"]: "safe payload" }
+    },
     ordinary: "kept"
   }, null, 2);
   const directJson = redactJsonText(multilineJson, "diagnostic");
@@ -309,8 +319,20 @@ async function runTests() {
   const safeJson = JSON.parse(directJson.text);
   assert.equal(safeJson.access_token, "[REDACTED_SECRET]");
   assert.equal(safeJson.nested.private_key, "[REDACTED_SECRET]");
+  assert.equal(safeJson.before.tokens, 8, "numeric token counts must remain numbers");
+  assert.equal(safeJson.after.tokens, 13, "numeric token counts must remain numbers");
+  assert.equal(safeJson.token_count, 21, "numeric token_count metrics must remain numbers");
+  assert.equal(safeJson.issued_tokens, "[REDACTED_SECRET]", "opaque token collections must be masked by their credential field name");
+  assert.ok(!JSON.stringify(safeJson).includes("ghp_1234567890abcdef1234567890abcdef1234"), "secret-shaped object keys must be redacted");
+  assert.ok(!JSON.stringify(safeJson).includes("sk-abc1234567890123456789012345678901234567890"), "nested secret-shaped object keys must be redacted");
+  assert.equal(safeJson.key_samples["[REDACTED_SECRET]"].note, "safe payload");
+  assert.equal(safeJson.key_samples.nested["[REDACTED_SECRET]"], "safe payload");
   assert.equal(safeJson.project, "agentworkspace-self");
   assert.equal(directJson.changed, true);
+  const opaqueKeyedValue = redactJsonText('{"token":"opaque-value"}', "diagnostic");
+  assert.equal(opaqueKeyedValue.changed, true, "masking an opaque credential-named value must be reported");
+  const reformattedJson = redactJsonText('{\n  "answer": 1\n}', "diagnostic");
+  assert.equal(reformattedJson.changed, true, "JSON normalization that changes bytes must be reported");
 
   await fs.writeFile(path.join(realFixtureRoot, "board.json"), multilineJson, "utf8");
   const { client: clientBash } = await createClientServer({ bashMode: "full", toolMode: "full" });
@@ -318,13 +340,19 @@ async function runTests() {
   assert.ok(!jsonOutput.isError, `full bash must return fixture JSON through its normal route: ${JSON.stringify(jsonOutput.structuredContent)}`);
   const safeStdout = jsonOutput.structuredContent.stdout;
   assert.doesNotThrow(() => JSON.parse(safeStdout), "safe structured stdout must remain valid JSON");
-  assert.equal(JSON.parse(safeStdout).access_token, "[REDACTED_SECRET]");
-  assert.equal(JSON.parse(safeStdout).nested.private_key, "[REDACTED_SECRET]");
+  const publicSafeJson = JSON.parse(safeStdout);
+  assert.equal(publicSafeJson.access_token, "[REDACTED_SECRET]");
+  assert.equal(publicSafeJson.nested.private_key, "[REDACTED_SECRET]");
+  assert.equal(publicSafeJson.before.tokens, 8);
+  assert.equal(publicSafeJson.token_count, 21);
+  assert.equal(publicSafeJson.issued_tokens, "[REDACTED_SECRET]");
+  assert.ok(!safeStdout.includes("ghp_1234567890abcdef1234567890abcdef1234"));
+  assert.ok(!safeStdout.includes("sk-abc1234567890123456789012345678901234567890"));
   assert.deepEqual(jsonOutput.structuredContent.stdout_redaction, {
     format: "json",
     parseable: true,
     changed: true,
-    coverage: "all JSON values; credential-named fields and secret patterns",
+    coverage: "all JSON keys and values; credential-named fields and secret patterns",
     nested_values_omitted: false,
     truncated: false
   });

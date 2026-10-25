@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import fs from "node:fs";
 import path from "node:path";
+import { CODEXPRO_PACKAGE_ROOT } from "./buildIdentity.js";
 import type { CodexProConfig } from "./config.js";
 import { CodexProError, PathGuard, type Workspace } from "./guard.js";
 import { terminateProcessTree, makeRestrictedBashEnv, assertBashSession, SAFE_BLOCKED_PATTERNS } from "./bashOps.js";
@@ -112,10 +113,21 @@ export const DEFAULT_VERIFICATION_LIMITS: VerificationManagerLimits = {
   retainedTailBytes: 120_000
 };
 
-const LINUX_VERIFICATION_CONTAINMENT = [
-  "systemd-run", "--user", "--scope", "--collect", "--property=MemoryMax=8G", "--",
-  "/usr/bin/env", "-u", "XDG_RUNTIME_DIR", "-u", "DBUS_SESSION_BUS_ADDRESS"
+const LINUX_GOVERNED_RUNNER = [
+  "/usr/bin/python3", path.join(CODEXPRO_PACKAGE_ROOT, "scripts", "verification-governed-runner.py")
 ];
+
+function linuxVerificationExecution(runnerArgv: string[], lifetimeMs: number, containmentWrapper?: string[]): string[] {
+  return [
+    ...LINUX_GOVERNED_RUNNER,
+    `--lifetime-ms=${lifetimeMs}`,
+    "--",
+    ...composeExecutionArgv([
+      "/usr/bin/env", "-u", "XDG_RUNTIME_DIR", "-u", "DBUS_SESSION_BUS_ADDRESS",
+      ...runnerArgv
+    ], containmentWrapper)
+  ];
+}
 
 const VALID_RUNNERS = new Set<string>([
   "package_script",
@@ -912,9 +924,10 @@ export class ManagedVerificationJob {
       ...baseEnv,
       PATH: pathParts.join(path.delimiter)
     };
-    // systemd-run needs the user-bus address, but the verification command
-    // must not inherit it; its wrapper explicitly unsets both session vars.
-    if (process.platform === "linux" && this.executionArgv[0] === "systemd-run") {
+    // The shared capacity governor and the job scope need the user bus; the
+    // verification command itself starts through env -u below.
+    if (process.platform === "linux" && ((this.executionArgv[0] === LINUX_GOVERNED_RUNNER[0]
+      && this.executionArgv[1] === LINUX_GOVERNED_RUNNER[1]) || this.executionArgv[0] === "systemd-run")) {
       for (const key of ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] as const) {
         if (process.env[key]) env[key] = process.env[key];
       }
@@ -1899,7 +1912,7 @@ export class VerificationManager {
     const configuredWrapper = options.containmentWrapper ?? config.containmentWrapper;
     this.containmentWrapper = configuredWrapper !== undefined
       ? validateContainmentWrapper(configuredWrapper, envPath)
-      : process.platform === "linux" ? [...LINUX_VERIFICATION_CONTAINMENT] : undefined;
+      : undefined;
   }
 
   public getJob(jobId: string): ManagedVerificationJob | undefined {
@@ -1980,16 +1993,18 @@ export class VerificationManager {
     const cwdResolved = guard.resolve(workspace, input.cwd ?? ".");
     const relativeCwd = path.relative(workspace.root, cwdResolved.absPath) || ".";
 
-    const runnerArgv = compileRunnerArgv(input);
-    const containmentWrapper = validateContainmentWrapper(this.containmentWrapper, makeRestrictedBashEnv(this.config).PATH);
-    const executionArgv = composeExecutionArgv(runnerArgv, containmentWrapper);
-    const commandSummary = executionArgv.join(" ");
     const lifetimeMs = clampLifetime(
       input.lifetime_ms,
       this.limits.minLifetimeMs,
       this.limits.maxLifetimeMs,
       this.limits.defaultLifetimeMs
     );
+    const runnerArgv = compileRunnerArgv(input);
+    const containmentWrapper = validateContainmentWrapper(this.containmentWrapper, makeRestrictedBashEnv(this.config).PATH);
+    const executionArgv = process.platform === "linux"
+      ? linuxVerificationExecution(runnerArgv, lifetimeMs, containmentWrapper)
+      : composeExecutionArgv(runnerArgv, containmentWrapper);
+    const commandSummary = executionArgv.join(" ");
 
     const jobId = `vjob_${randomBytes(12).toString("hex")}`;
     const job = new ManagedVerificationJob({
@@ -2005,7 +2020,9 @@ export class VerificationManager {
       executionArgv,
       commandSummary,
       lifetimeMs,
-      containmentWrapper,
+      containmentWrapper: process.platform === "linux"
+        ? [...LINUX_GOVERNED_RUNNER, ...(containmentWrapper ?? [])]
+        : containmentWrapper,
       config: this.config,
       hardOutputCeilingBytes: this.limits.hardOutputCeilingBytes,
       retainedTailBytes: this.limits.retainedTailBytes

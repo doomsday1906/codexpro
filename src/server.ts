@@ -1508,7 +1508,7 @@ function diagnosticResult(result: any): any {
           format: "json",
           parseable: true,
           changed: json.changed,
-          coverage: "all JSON values; credential-named fields and secret patterns",
+          coverage: "all JSON keys and values; credential-named fields and secret patterns",
           nested_values_omitted: json.omittedNestedValues
         };
       } else {
@@ -4869,7 +4869,7 @@ export function createCodexProServer(config: CodexProConfig, options: CodexProSe
     {
       title: "Start Managed Verification",
       description:
-        "Start a bounded long-running verification job in the workspace (survives MCP session churn in the same CodexPro process). Default lifetime is 30 minutes, maximum 60 minutes. On Linux each job runs in its own systemd scope capped at MemoryMax=8G. Requires explicit workspace_id and a structured runner (package_script, pytest, go_test, cargo, tsc, eslint, biome_check). Non-verification scripts (start, dev, serve, watch, publish, deploy) are rejected. Returns immediately with job_id.",
+        "Start a bounded long-running verification job in the workspace (survives MCP session churn in the same CodexPro process). Default lifetime is 30 minutes, maximum 60 minutes. On Linux each job runs in its own systemd scope with a task-appropriate hard cap and shared safe_test memory admission. Requires explicit workspace_id and a structured runner (package_script, pytest, go_test, cargo, tsc, eslint, biome_check). Non-verification scripts (start, dev, serve, watch, publish, deploy) are rejected. Returns immediately with job_id.",
       inputSchema: START_VERIFICATION_PUBLIC_SCHEMA,
       runtimeInputSchema: START_VERIFICATION_ARGUMENTS_SCHEMA,
       annotations: BASH_ANNOTATIONS,

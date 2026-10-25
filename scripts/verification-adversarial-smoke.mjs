@@ -477,6 +477,16 @@ async function runTests() {
     return 0;
   }
 
+  async function waitForPidFile(absPath, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const pid = await readPidFile(absPath);
+      if (pid > 0) return pid;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return 0;
+  }
+
   async function freePort() {
     return await new Promise((resolve, reject) => {
       const probe = net.createServer();
@@ -874,16 +884,14 @@ async function runTests() {
       runner: "package_script",
       package_manager: "npm",
       script: "verification:lifecycle",
-      args: ["--detached-child-ms", "8000", "--detached-ignore-term", "--detached-pid-file", pidName, "--run-ms", "400"]
+      args: ["--detached-child-ms", "20000", "--detached-ignore-term", "--detached-pid-file", pidName, "--run-ms", "4000"]
     });
-    // Root runs 400ms then exits; exit-handler TERMs (ignored) so the
-    // inherited-pipe holder survives into the KILL window. Intervene at ~800ms:
-    // job still running (close held by pipes), holder still alive pre-KILL.
-    await new Promise((r) => setTimeout(r, 800));
+    // Shared governor admission may delay fixture startup; keep the root alive
+    // while waiting so the pipe holder is observed before cleanup begins.
+    const childPid = await waitForPidFile(path.join(realFixtureRoot, pidName), 8000);
+    assert.ok(childPid > 0, "Fixture must record detached child PID before the bounded pre-cleanup deadline");
     const jobObj = mgr.getActiveJobs().find((j) => j.jobId === started.jobId);
     assert.ok(jobObj, "16b job must still be running at intervention (close pending proves pipes held)");
-    const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
-    assert.ok(childPid > 0, "Fixture must record detached child PID");
     assert.ok(isPidAlive(childPid), `Holder PID ${childPid} must be alive at intervention (pre-KILL window)`);
     // Force discovery-miss: drop all tree-walk state.
     if (typeof jobObj.testOnlyClearOwned === "function") jobObj.testOnlyClearOwned();
