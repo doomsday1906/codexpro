@@ -100,7 +100,17 @@ export function redactJsonText(text: string, options: RedactionOptions | Redacti
 
   let changed = false;
   let omittedNestedValues = false;
-  const secretFieldName = /(?:^|[_-])(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|secret|password|passwd|private[_-]?key|credentials?)(?:$|[_-])|(?:^|[_-])token$|_token$/iu;
+  const secretFieldName = (key: string, value: unknown): boolean => {
+    const normalized = key.replace(/[^a-z\d]/giu, "").toLowerCase();
+    return normalized === "authorization" || normalized.includes("secret") ||
+      normalized.includes("password") || normalized.includes("passwd") ||
+      normalized.includes("privatekey") || normalized.includes("apikey") ||
+      normalized.includes("accesstoken") || normalized.includes("refreshtoken") ||
+      normalized.includes("idtoken") || normalized.includes("authtoken") ||
+      normalized.includes("credential") || normalized.includes("bearer") ||
+      normalized.endsWith("token") || (normalized.endsWith("tokens") && typeof value !== "number") ||
+      normalized.endsWith("tokenvalue");
+  };
   const redactValue = (value: unknown, depth: number): unknown => {
     if (depth > 8) {
       changed = true;
@@ -118,7 +128,10 @@ export function redactJsonText(text: string, options: RedactionOptions | Redacti
       for (const [key, item] of Object.entries(value)) {
         const safeKey = redactSensitiveText(key, options);
         const secretKey = safeKey !== key;
-        const secretField = secretFieldName.test(key) || (/(?:^|[_-])tokens$/iu.test(key) && typeof item !== "number");
+        const tokenMetric = /^(?:token|tokencount)$/iu.test(key.replace(/[^a-z\d]/giu, "")) && typeof item === "number" ||
+          key.replace(/[^a-z\d]/giu, "").toLowerCase().endsWith("token") && typeof item === "number" ||
+          key.replace(/[^a-z\d]/giu, "").toLowerCase().endsWith("tokens") && typeof item === "number";
+        const secretField = secretFieldName(key, item) && !tokenMetric;
         const outputKey = secretKey ? "[REDACTED_SECRET]" : key;
         let uniqueKey = outputKey;
         for (let suffix = 2; Object.hasOwn(output, uniqueKey); suffix += 1) {

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run one verification command under the shared AgentWorkspace memory governor."""
 import argparse
+import json
 import os
 from pathlib import Path
 import signal
@@ -29,9 +30,10 @@ def main():
     control_env = resolve_control_environment()
     memory = TestMemory(profile, control_env)
     scope = f"codexpro-verify-{uuid.uuid4().hex}.scope"
-    deadline = time.monotonic() + args.lifetime_ms / 1000
+    deadline = time.monotonic() + max(args.lifetime_ms, 1_800_000) / 1000
     process = None
     received_signal = None
+    child_signal = None
 
     def interrupted(signum, _frame):
         nonlocal received_signal
@@ -48,11 +50,21 @@ def main():
         argv = [
             "systemd-run", "--user", "--scope", "--collect",
             f"--slice={memory.unit}", f"--unit={scope}",
-            "--property=TimeoutStopSec=1s", "--property=KillMode=control-group", "--",
+            "--property=TimeoutStopSec=5s", "--property=KillMode=control-group",
+            "--property=OOMPolicy=kill", "--",
             *command,
         ]
         process = subprocess.Popen(argv, env=control_env)
         code = process.wait()
+        child_signal = -code if code < 0 else None
+        usage = memory.usage()
+        if usage and usage.get("limit_ooms", 0):
+            print("Verification governor OOM: " + json.dumps({
+                "slice": memory.unit,
+                "limit_ooms": usage["limit_ooms"],
+                "memory_peak": usage.get("peak_bytes"),
+                "memory_max": memory.profile.memory_max,
+            }, separators=(",", ":")), file=sys.stderr, flush=True)
         return code if code >= 0 else 128 + -code
     except InterruptedError:
         for unit in ([scope] if memory.inherited else [scope, memory.unit]):
@@ -85,6 +97,9 @@ def main():
         if received_signal is not None:
             signal.signal(received_signal, signal.SIG_DFL)
             os.kill(os.getpid(), received_signal)
+        elif child_signal is not None and child_signal not in (signal.SIGKILL, signal.SIGSTOP):
+            signal.signal(child_signal, signal.SIG_DFL)
+            os.kill(os.getpid(), child_signal)
 
 
 if __name__ == "__main__":

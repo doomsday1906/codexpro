@@ -38,7 +38,7 @@ await fs.copyFile(
 const pkgJson = {
   name: "adv-fixture",
   scripts: {
-    "tree-spin": "node -e 'const { spawn } = require(\"node:child_process\"); const child = spawn(process.execPath, [\"-e\", \"setInterval(() => {}, 500)\"], { stdio: \"ignore\" }); setInterval(() => {}, 500);'",
+    "tree-spin": "node -e 'require(\"fs\").writeFileSync(\"tree-started\",\"yes\"); const { spawn } = require(\"node:child_process\"); const child = spawn(process.execPath, [\"-e\", \"setInterval(() => {}, 500)\"], { stdio: \"ignore\" }); setInterval(() => {}, 500);'",
     "noisy-loop": "node -e 'setInterval(() => { process.stdout.write(\"X\".repeat(1024)); }, 5);'",
     "quick": "node -e 'process.exit(0);'",
     "verification:lifecycle": "node verification-lifecycle-fixture.mjs",
@@ -85,6 +85,15 @@ function arePidsDead(pids) {
   return true;
 }
 
+async function waitForFixtureFile(name, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { await fs.access(path.join(realFixtureRoot, name)); return true; } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
+
 async function runTests() {
   // Test 1: Timeout kills descendant process tree
   console.log("\n[Test 1] Timeout kills descendant process tree...");
@@ -92,16 +101,17 @@ async function runTests() {
     minLifetimeMs: 500,
     defaultLifetimeMs: 1000
   });
+  await fs.rm(path.join(realFixtureRoot, "tree-started"), { force: true });
 
   const job1 = await mgr1.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
     runner: "package_script",
     package_manager: "npm",
     script: "tree-spin",
-    lifetime_ms: 600
+    lifetime_ms: 5000
   });
 
-  // Allow process tree to spawn
+  assert.ok(await waitForFixtureFile("tree-started"), "timeout fixture must prove the command actually entered the governed scope");
   await new Promise((r) => setTimeout(r, 250));
   const jobObj1 = mgr1.getActiveJobs().find((j) => j.jobId === job1.jobId);
   const parentPid1 = jobObj1?.childProcess?.pid;
@@ -110,7 +120,7 @@ async function runTests() {
   console.log(`  Spawned parent PID ${parentPid1} with descendants: [${descendants1.join(", ")}]`);
 
   // Wait for lifetime timeout
-  const timedOutRecord = await mgr1.waitVerification(job1.jobId, 5);
+  const timedOutRecord = await mgr1.waitVerification(job1.jobId, 8);
   assert.equal(timedOutRecord.state, "timed_out");
   assert.equal(mgr1.getActiveCount(), 0);
 
@@ -133,18 +143,20 @@ async function runTests() {
       minLifetimeMs: 500,
       defaultLifetimeMs: 500
     });
+    await fs.rm(path.join(realFixtureRoot, "timeout-started"), { force: true });
     const escapedJob = await escapedManager.startVerification(fakeWorkspace, guard, {
       workspace_id: fakeWorkspace.id,
       runner: "package_script",
       package_manager: "npm",
       script: "verification:lifecycle",
-      args: ["--detached-child-ms", "2200", "--detached-ignore-term", "--run-ms", "1200"],
-      lifetime_ms: 500
+      args: ["--detached-child-ms", "12000", "--detached-ignore-term", "--started-file", "timeout-started", "--run-ms", "10000"],
+      lifetime_ms: 5000
     });
     try {
-      const escapedResult = await escapedManager.waitVerification(escapedJob.jobId, 5);
+      assert.ok(await waitForFixtureFile("timeout-started", 30_000), "timeout marker must come from the governed command");
+      const escapedResult = await escapedManager.waitVerification(escapedJob.jobId, 8);
       assert.equal(escapedResult.state, "timed_out", "Timeout should become terminal after owned descendants are killed");
-      assert.match(escapedResult.terminalReason, /lifetime of 500 ms exceeded/);
+      assert.match(escapedResult.terminalReason, /lifetime of 5000 ms exceeded/);
       assert.equal(escapedManager.getActiveCount(), 0);
     } finally {
       await escapedManager.close();
@@ -158,6 +170,7 @@ async function runTests() {
     minLifetimeMs: 500,
     defaultLifetimeMs: 30000
   });
+  await fs.rm(path.join(realFixtureRoot, "tree-started"), { force: true });
 
   const job2 = await mgr2.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
@@ -166,6 +179,7 @@ async function runTests() {
     script: "tree-spin"
   });
 
+  assert.ok(await waitForFixtureFile("tree-started"), "cancel fixture must prove the command actually entered the governed scope");
   await new Promise((r) => setTimeout(r, 250));
   const jobObj2 = mgr2.getActiveJobs().find((j) => j.jobId === job2.jobId);
   const parentPid2 = jobObj2?.childProcess?.pid;

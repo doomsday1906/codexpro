@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "../dist/config.js";
@@ -22,6 +23,15 @@ const fakeWorkspace = {
 
 const config = loadConfig(["--root", repoRoot]);
 const guard = new PathGuard(config);
+
+async function waitForFile(file, timeoutMs = 10 * 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { await fs.access(file); return true; } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
 
 async function runTests() {
   // Test 1: Start and Wait on a quick succeeded verification job.
@@ -67,6 +77,8 @@ async function runTests() {
     minLifetimeMs: 500,
     defaultLifetimeMs: 30000
   });
+  const cancelStarted = ".verification-cancel-started";
+  await fs.rm(cancelStarted, { force: true });
   assert.notEqual(mgr2.generationId, mgr1.generationId, "different manager must have different generationId");
 
   // Use verification:fixture as a lawful finite process to test cancellation, concurrency, and timeouts
@@ -75,10 +87,12 @@ async function runTests() {
     runner: "package_script",
     package_manager: "npm",
     script: "verification:fixture",
-    args: ["--sleep", "30000"]
+    args: ["--sleep", "30000", "--started-file", cancelStarted]
   });
 
   assert.equal(startRecord2.state, "running");
+  assert.ok(await waitForFile(path.join(repoRoot, cancelStarted)), "cancel fixture must prove the governed command started");
+  await fs.rm(path.join(repoRoot, cancelStarted), { force: true });
   const cancelRecord2 = await mgr2.cancelVerification(startRecord2.jobId);
   assert.equal(cancelRecord2.jobId, startRecord2.jobId);
   assert.equal(cancelRecord2.state, "cancelled");
@@ -138,22 +152,26 @@ async function runTests() {
   // Test 4: Lifetime timeout expiration
   console.log("\n[Test 4] Lifetime timeout expiration...");
   const mgr4 = new VerificationManager(config, {
-    minLifetimeMs: 300,
-    defaultLifetimeMs: 400
+    minLifetimeMs: 10_000,
+    defaultLifetimeMs: 10_000
   });
 
+  const timeoutStarted = ".verification-timeout-started";
+  await fs.rm(timeoutStarted, { force: true });
   const jTimeout = await mgr4.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
     runner: "package_script",
     package_manager: "npm",
     script: "verification:fixture",
-    args: ["--sleep", "10000"],
-    lifetime_ms: 300
+    args: ["--sleep", "30000", "--started-file", timeoutStarted],
+    lifetime_ms: 10_000
   });
 
-  const timeoutResult = await mgr4.waitVerification(jTimeout.jobId, 5);
+  assert.ok(await waitForFile(path.join(repoRoot, timeoutStarted)), "timeout fixture must prove the governed command started before expiration");
+  await fs.rm(path.join(repoRoot, timeoutStarted), { force: true });
+  const timeoutResult = await mgr4.waitVerification(jTimeout.jobId, 15);
   assert.equal(timeoutResult.state, "timed_out");
-  assert.match(timeoutResult.terminalReason, /lifetime of \d+ ms exceeded/);
+  assert.match(timeoutResult.terminalReason, /lifetime of 10000 ms exceeded/);
   assert.equal(mgr4.getActiveCount(), 0);
   console.log("  PASS: Job timed out and process tree terminated");
 

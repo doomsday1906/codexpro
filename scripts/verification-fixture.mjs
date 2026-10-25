@@ -3,6 +3,11 @@
 // Provides a lawful finite verification execution target without --watch.
 
 const args = process.argv.slice(2);
+const startedFileIdx = args.indexOf('--started-file');
+if (startedFileIdx !== -1 && args[startedFileIdx + 1]) {
+  const fs = await import('node:fs/promises');
+  await fs.writeFile(args[startedFileIdx + 1], 'started');
+}
 
 let sleepMs = 30000;
 const sleepIdx = args.indexOf('--sleep');

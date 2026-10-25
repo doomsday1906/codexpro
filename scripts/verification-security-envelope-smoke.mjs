@@ -45,7 +45,8 @@ await fs.writeFile(
     name: "sec-fixture",
     scripts: {
       "leak-secret": `node -e "${secretScript}"`,
-      "quick": "node -e 'process.exit(0);'"
+      "quick": "node -e 'process.exit(0);'",
+      "long": "node -e 'require(\"fs\").writeFileSync(\"cancel-started\",\"yes\"); setTimeout(() => {}, 60000);'"
     }
   }, null, 2)
 );
@@ -207,6 +208,7 @@ async function runTests() {
       session_id: validSessionId
     }
   });
+  assert.equal(waitMatchRes.structuredContent.state, "succeeded", "public wait must observe the quick command's real successful exit");
   assert.ok(!waitMatchRes.isError, "wait_verification matching session_id must succeed");
 
   // cancel_verification missing session_id must fail
@@ -228,15 +230,29 @@ async function runTests() {
   });
   assert.ok(cancelMismatchRes.isError, "cancel_verification mismatched session_id must fail");
 
-  // cancel_verification matching session_id must succeed
+  // cancel_verification matching session_id must stop a command proven to have started.
+  const longJobRes = await clientSession.callTool({
+    name: "start_verification",
+    arguments: { workspace_id: realWsId, runner: "package_script", package_manager: "npm", script: "long", session_id: validSessionId }
+  });
+  assert.ok(!longJobRes.isError, "Long command must start through the public route");
+  const startDeadline = Date.now() + 10 * 60_000;
+  let commandStarted = false;
+  while (Date.now() < startDeadline) {
+    try { await fs.access(path.join(realFixtureRoot, "cancel-started")); commandStarted = true; break; } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(commandStarted, "Cancellation fixture must prove the governed command actually started");
+  await fs.rm(path.join(realFixtureRoot, "cancel-started"), { force: true });
   let cancelMatchRes = await clientSession.callTool({
     name: "cancel_verification",
     arguments: {
-      job_id: startedJob.jobId,
+      job_id: longJobRes.structuredContent.jobId,
       session_id: validSessionId
     }
   });
   assert.ok(!cancelMatchRes.isError, "cancel_verification matching session_id must succeed");
+  assert.equal(cancelMatchRes.structuredContent.state, "cancelled", "Public cancel must truthfully report cancellation of the running command");
   console.log("  PASS: session_id required/mismatch/match behavior verified across start/wait/cancel");
 
   // Test 3: bashMode=off disables verification tools
@@ -303,6 +319,13 @@ async function runTests() {
   const multilineJson = JSON.stringify({
     project: "agentworkspace-self",
     access_token: "never-expose-this-token",
+    secretKey: "opaque-a",
+    mySecret: "opaque-b",
+    passwordHash: "opaque-c",
+    tokenValue: "opaque-d",
+    apiToken: "opaque-f",
+    secrets: { value: "opaque-e" },
+    Authorization: "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
     nested: { private_key: "-----BEGIN PRIVATE KEY-----\\nnever-expose-this-key\\n-----END PRIVATE KEY-----" },
     before: { tokens: 8 },
     after: { tokens: 13 },
@@ -318,6 +341,9 @@ async function runTests() {
   assert.ok(directJson, "multiline JSON must be recognized");
   const safeJson = JSON.parse(directJson.text);
   assert.equal(safeJson.access_token, "[REDACTED_SECRET]");
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "Authorization", "secrets"]) {
+    assert.equal(safeJson[key], "[REDACTED_SECRET]", `multiline JSON ${key} field must be redacted`);
+  }
   assert.equal(safeJson.nested.private_key, "[REDACTED_SECRET]");
   assert.equal(safeJson.before.tokens, 8, "numeric token counts must remain numbers");
   assert.equal(safeJson.after.tokens, 13, "numeric token counts must remain numbers");
@@ -331,6 +357,20 @@ async function runTests() {
   assert.equal(directJson.changed, true);
   const opaqueKeyedValue = redactJsonText('{"token":"opaque-value"}', "diagnostic");
   assert.equal(opaqueKeyedValue.changed, true, "masking an opaque credential-named value must be reported");
+  const secretFieldNames = redactJsonText(JSON.stringify({
+    secretKey: "opaque-a", mySecret: "opaque-b", passwordHash: "opaque-c",
+    tokenValue: "opaque-d", apiToken: "opaque-f", secrets: { value: "opaque-e" },
+    Authorization: "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
+    token: 17, tokens: 21, token_count: 34
+  }), "diagnostic");
+  assert.ok(secretFieldNames);
+  const secretFields = JSON.parse(secretFieldNames.text);
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "Authorization", "secrets"]) {
+    assert.equal(secretFields[key], "[REDACTED_SECRET]", `${key} must be redacted by its field name`);
+  }
+  assert.equal(secretFields.token, 17, "numeric singular token metrics remain numeric");
+  assert.equal(secretFields.tokens, 21, "numeric token metrics remain numeric");
+  assert.equal(secretFields.token_count, 34, "numeric token_count remains numeric");
   const reformattedJson = redactJsonText('{\n  "answer": 1\n}', "diagnostic");
   assert.equal(reformattedJson.changed, true, "JSON normalization that changes bytes must be reported");
 
@@ -342,8 +382,12 @@ async function runTests() {
   assert.doesNotThrow(() => JSON.parse(safeStdout), "safe structured stdout must remain valid JSON");
   const publicSafeJson = JSON.parse(safeStdout);
   assert.equal(publicSafeJson.access_token, "[REDACTED_SECRET]");
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "Authorization", "secrets"]) {
+    assert.equal(publicSafeJson[key], "[REDACTED_SECRET]", `public JSON ${key} field must be redacted`);
+  }
   assert.equal(publicSafeJson.nested.private_key, "[REDACTED_SECRET]");
   assert.equal(publicSafeJson.before.tokens, 8);
+  assert.equal(publicSafeJson.after.tokens, 13);
   assert.equal(publicSafeJson.token_count, 21);
   assert.equal(publicSafeJson.issued_tokens, "[REDACTED_SECRET]");
   assert.ok(!safeStdout.includes("ghp_1234567890abcdef1234567890abcdef1234"));
@@ -352,11 +396,17 @@ async function runTests() {
     format: "json",
     parseable: true,
     changed: true,
-    coverage: "all JSON keys and values; credential-named fields and secret patterns",
+    coverage: "credential-named fields (including camelCase), secret-shaped keys, authorization fields, and diagnostic secret patterns",
     nested_values_omitted: false,
     truncated: false
   });
   assert.equal(jsonOutput.content[0].text.includes("never-expose-this-token"), false);
+
+  await fs.writeFile(path.join(realFixtureRoot, "opaque-token.json"), '{"token":"opaque-value"}', "utf8");
+  const opaqueJsonOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat opaque-token.json" } });
+  assert.equal(JSON.parse(opaqueJsonOutput.structuredContent.stdout).token, "[REDACTED_SECRET]");
+  assert.equal(opaqueJsonOutput.structuredContent.stdout_redaction.changed, true,
+    "public redaction metadata must report opaque credential-field masking");
 
   await fs.writeFile(path.join(realFixtureRoot, "secret-source.ts"), "export const api_token = 'source-secret-that-must-not-leak';\n", "utf8");
   const sourceSnippet = await clientBash.callTool({

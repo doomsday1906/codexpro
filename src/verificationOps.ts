@@ -117,16 +117,18 @@ const LINUX_GOVERNED_RUNNER = [
   "/usr/bin/python3", path.join(CODEXPRO_PACKAGE_ROOT, "scripts", "verification-governed-runner.py")
 ];
 
-function linuxVerificationExecution(runnerArgv: string[], lifetimeMs: number, containmentWrapper?: string[]): string[] {
-  return [
+function linuxVerificationExecution(runnerArgv: string[], lifetimeMs: number, containmentWrapper?: string[]): { argv: string[]; startMarker: string } {
+  const startMarker = `codexpro-verification-start:${randomBytes(16).toString("hex")}\n`;
+  const startCode = "import os,sys;os.write(2,sys.argv[1].encode());os.execvp(sys.argv[2],sys.argv[2:])";
+  return { argv: [
     ...LINUX_GOVERNED_RUNNER,
     `--lifetime-ms=${lifetimeMs}`,
     "--",
     ...composeExecutionArgv([
       "/usr/bin/env", "-u", "XDG_RUNTIME_DIR", "-u", "DBUS_SESSION_BUS_ADDRESS",
-      ...runnerArgv
+      "/usr/bin/python3", "-c", startCode, startMarker, ...runnerArgv
     ], containmentWrapper)
-  ];
+  ], startMarker };
 }
 
 const VALID_RUNNERS = new Set<string>([
@@ -780,6 +782,9 @@ export class ManagedVerificationJob {
   private readonly config: CodexProConfig;
   private readonly hardOutputCeilingBytes: number;
   private readonly retainedTailBytes: number;
+  private readonly executionStartMarker?: Buffer;
+  private pendingStderrControl = Buffer.alloc(0);
+  private executionStarted = false;
 
   private child?: ChildProcess;
   private lifetimeTimer?: NodeJS.Timeout;
@@ -878,6 +883,7 @@ export class ManagedVerificationJob {
     commandSummary: string;
     lifetimeMs: number;
     containmentWrapper?: string[];
+    executionStartMarker?: string;
     config: CodexProConfig;
     hardOutputCeilingBytes?: number;
     retainedTailBytes?: number;
@@ -896,6 +902,7 @@ export class ManagedVerificationJob {
     this.commandSummary = options.commandSummary;
     this.lifetimeMs = options.lifetimeMs;
     this.containmentWrapper = options.containmentWrapper;
+    this.executionStartMarker = options.executionStartMarker ? Buffer.from(options.executionStartMarker) : undefined;
     this.config = options.config;
     this.hardOutputCeilingBytes = options.hardOutputCeilingBytes ?? DEFAULT_VERIFICATION_LIMITS.hardOutputCeilingBytes;
     this.retainedTailBytes = options.retainedTailBytes ?? (options.config.maxOutputBytes || DEFAULT_VERIFICATION_LIMITS.retainedTailBytes);
@@ -954,7 +961,7 @@ export class ManagedVerificationJob {
 
     this.lifetimeTimer = setTimeout(() => {
       this.handleLifetimeTimeout();
-    }, this.lifetimeMs);
+    }, this.executionStartMarker ? Math.max(this.lifetimeMs, DEFAULT_VERIFICATION_LIMITS.defaultLifetimeMs) : this.lifetimeMs);
     this.lifetimeTimer.unref();
 
     this.child.stdout?.on("data", (chunk: Buffer) => {
@@ -968,7 +975,9 @@ export class ManagedVerificationJob {
     });
 
     this.child.stderr?.on("data", (chunk: Buffer) => {
-      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const buf = this.filterExecutionStartMarker(incoming);
+      if (!buf.byteLength) return;
       this.observedStderrBytes += buf.byteLength;
       const rChunks = this.stderrRedactor.push(buf);
       for (const rc of rChunks) {
@@ -984,6 +993,7 @@ export class ManagedVerificationJob {
       for (const rc of rChunks) {
         this.combinedBuffer.append("stderr", rc);
       }
+      this.flushExecutionMarker();
       this.flushRedactors();
       this.transitionToTerminal("failed", {
         exitCode: 1,
@@ -1050,6 +1060,7 @@ export class ManagedVerificationJob {
         clearTimeout(this.killEscalationTimer);
         this.killEscalationTimer = undefined;
       }
+      this.flushExecutionMarker();
       this.flushRedactors();
 
       void this.settleRootClose(code, sig).catch(() => {
@@ -1075,6 +1086,13 @@ export class ManagedVerificationJob {
     }
   }
 
+  private flushExecutionMarker(): void {
+    const pending = this.filterExecutionStartMarker(Buffer.alloc(0), true);
+    if (!pending.byteLength) return;
+    this.observedStderrBytes += pending.byteLength;
+    for (const chunk of this.stderrRedactor.push(pending)) this.combinedBuffer.append("stderr", chunk);
+  }
+
   private checkOutputCeiling(): void {
     const total = this.observedStdoutBytes + this.observedStderrBytes;
     if (this.closed) return;
@@ -1083,6 +1101,26 @@ export class ManagedVerificationJob {
       this.pendingTerminalReason = `Output ceiling of ${this.hardOutputCeilingBytes} bytes exceeded (observed ${total} bytes).`;
       this.terminateWithEscalation();
     }
+  }
+
+  private filterExecutionStartMarker(chunk: Buffer, final = false): Buffer {
+    const marker = this.executionStartMarker;
+    if (!marker || this.executionStarted) return Buffer.concat([this.pendingStderrControl, chunk]);
+    const combined = Buffer.concat([this.pendingStderrControl, chunk]);
+    const index = combined.indexOf(marker);
+    if (index >= 0) {
+      this.executionStarted = true;
+      if (this.lifetimeTimer) clearTimeout(this.lifetimeTimer);
+      this.startedAt = new Date().toISOString();
+      this.startTimeMs = Date.now();
+      this.lifetimeTimer = setTimeout(() => this.handleLifetimeTimeout(), this.lifetimeMs);
+      this.lifetimeTimer.unref();
+      this.pendingStderrControl = Buffer.alloc(0);
+      return Buffer.concat([combined.subarray(0, index), combined.subarray(index + marker.length)]);
+    }
+    const emitLength = final ? combined.length : Math.max(0, combined.length - marker.length + 1);
+    this.pendingStderrControl = combined.subarray(emitLength);
+    return combined.subarray(0, emitLength);
   }
 
   private handleLifetimeTimeout(): void {
@@ -2001,10 +2039,11 @@ export class VerificationManager {
     );
     const runnerArgv = compileRunnerArgv(input);
     const containmentWrapper = validateContainmentWrapper(this.containmentWrapper, makeRestrictedBashEnv(this.config).PATH);
-    const executionArgv = process.platform === "linux"
+    const linuxExecution = process.platform === "linux"
       ? linuxVerificationExecution(runnerArgv, lifetimeMs, containmentWrapper)
-      : composeExecutionArgv(runnerArgv, containmentWrapper);
-    const commandSummary = executionArgv.join(" ");
+      : undefined;
+    const executionArgv = linuxExecution?.argv ?? composeExecutionArgv(runnerArgv, containmentWrapper);
+    const commandSummary = executionArgv.join(" ").replace(linuxExecution?.startMarker ?? "\0", "[execution-start-marker]");
 
     const jobId = `vjob_${randomBytes(12).toString("hex")}`;
     const job = new ManagedVerificationJob({
@@ -2020,6 +2059,7 @@ export class VerificationManager {
       executionArgv,
       commandSummary,
       lifetimeMs,
+      executionStartMarker: linuxExecution?.startMarker,
       containmentWrapper: process.platform === "linux"
         ? [...LINUX_GOVERNED_RUNNER, ...(containmentWrapper ?? [])]
         : containmentWrapper,

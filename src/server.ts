@@ -1508,7 +1508,7 @@ function diagnosticResult(result: any): any {
           format: "json",
           parseable: true,
           changed: json.changed,
-          coverage: "all JSON keys and values; credential-named fields and secret patterns",
+          coverage: "credential-named fields (including camelCase), secret-shaped keys, authorization fields, and diagnostic secret patterns",
           nested_values_omitted: json.omittedNestedValues
         };
       } else {
