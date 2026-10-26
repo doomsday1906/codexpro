@@ -5,9 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 
 const repoRoot = path.resolve('.');
-const secrets = ['CALL_LITERAL_7X9', 'ACTUAL_LITERAL'];
-const safeStdout = 'TOKEN= [REDACTED_SECRET]';
-const safeStderr = 'PASSWORD= [REDACTED_SECRET]';
+const fakeSk = 'sk-' + 'aB3xK9mQ2pL7vN4zR8tY6wS1';
+const fakeGhp = 'ghp_' + 'C4mPaIgN9sToRaGe7pIpElInE2xY8';
+const metrics = 'tokens=21 token_count=34 max_tokens=4096 call=getToken(7)';
+const secrets = [fakeSk, fakeGhp];
+const safeStdout = `TOKEN=[REDACTED_SECRET] ${metrics}`;
+const safeStderr = `PASSWORD=[REDACTED_SECRET] ${metrics}`;
 
 class McpStdioClient {
   constructor(root, transcript) {
@@ -119,8 +122,10 @@ async function callBash(root, helperName, transcript) {
     assert.equal(renderedText.includes(command), true, `${transcript} rendered command presentation missing`);
     assert.equal(typeof result.structuredContent?.stdout, 'string', `${transcript} stdout field missing`);
     assert.equal(typeof result.structuredContent?.stderr, 'string', `${transcript} stderr field missing`);
-    assert.equal(result.structuredContent.stdout.includes(safeStdout), true, `${transcript} structured stdout lost the safe redacted line`);
-    assert.equal(result.structuredContent.stderr.includes(safeStderr), true, `${transcript} structured stderr lost the safe redacted line`);
+    assert.equal(result.structuredContent.stdout.includes(safeStdout), true, `${transcript} structured stdout lost the safely redacted line or ordinary metrics`);
+    assert.equal(result.structuredContent.stderr.includes(safeStderr), true, `${transcript} structured stderr lost the safely redacted line or ordinary metrics`);
+    assert.equal(result.structuredContent.stdout.includes(metrics), true, `${transcript} structured stdout redacted ordinary metrics/calls`);
+    assert.equal(result.structuredContent.stderr.includes(metrics), true, `${transcript} structured stderr redacted ordinary metrics/calls`);
     if (transcript === 'full') {
       assert.equal(renderedText.includes('## stdout'), true, 'full transcript omitted stdout section');
       assert.equal(renderedText.includes('## stderr'), true, 'full transcript omitted stderr section');
@@ -142,7 +147,7 @@ const helperName = 'diagnostic-output-helper.mjs';
 const fixtureName = 'diagnostic-output-input.txt';
 await fs.writeFile(
   path.join(root, fixtureName),
-  'TOKEN=getToken(CALL_LITERAL_7X9)\nPASSWORD=readPassword(ACTUAL_LITERAL)\n',
+  `TOKEN=${fakeSk} ${metrics}\nPASSWORD=${fakeGhp} ${metrics}\n`,
   'utf8'
 );
 await fs.writeFile(

@@ -1,12 +1,15 @@
 // Keep one shape-based detector for source, diagnostics and mutation checks.
-import { extractDiffFileBlocks } from './python-provenance.mjs';
+import { extractDiffFileBlocks } from './diff-file-blocks.mjs';
 export { extractDiffFileBlocks };
 
 const REDACTED_SECRET = '[REDACTED_SECRET]';
 export const PRIVATE_KEY_REDACTION_MARKER = '[REDACTED_PRIVATE_KEY]';
 
 export function sourceLanguageForPath(filePath) {
-  return /\.(?:py|pyi|pyw)$/iu.test(String(filePath ?? '')) ? 'python' : undefined;
+  const path = String(filePath ?? '');
+  if (/\.(?:py|pyi|pyw)$/iu.test(path)) return 'python';
+  if (/\.(?:[cm]?[jt]sx?|go|rs|java|c|cpp|h|cs|rb|php|sh)$/iu.test(path)) return 'code';
+  return undefined;
 }
 
 const PRIVATE_KEY_LABELS = [
@@ -29,7 +32,7 @@ const CREDENTIAL_NAME = String.raw`[\w$-]*(?:api[_-]?key|token|secret|password|p
 const ASSIGNED_LITERAL = new RegExp(String.raw`\b${CREDENTIAL_NAME}["']?\s*(?:\])?\s*(?::[^=;\r\n"'\x60]+)?[=:]\s*\(?\s*(?:[rubf]{0,2})?(?<quote>"""|'''|["'\x60])(?<value>(?:\\[\s\S]|(?!\k<quote>)[^\\])*)\k<quote>`, 'gidu');
 const BARE_CREDENTIAL = new RegExp(String.raw`(?:\b${CREDENTIAL_NAME}["']?\s*[=:]\s*|--(?:token|access-token|auth-token|api[_-]?key|authtoken)[= ]+|\b(?:ngrok\s+config\s+add-authtoken|cloudflared\s+service\s+install)\s+|[?&](?:codexpro_token|token|access_token|auth_token|api[_-]?key)=)(?<value>[^\s"'\x60<>&,;)}\]]+)`, 'gidu');
 const BEARER = /\bAuthorization["']?\s*[:=]\s*["']?Bearer\s+(?<value>\$\{[^}]*\}|\{\{[^}]*\}\}|<[^>]*>|[^\s"'\x60,;}]+)/gidu;
-const URL_PASSWORD = /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:(?<value>[^@\s/]+)@/gidu;
+const URL_PASSWORD = /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]*:(?<value>[^@\s/]+)@/gidu;
 
 const PLACEHOLDERS = new Set([
   'replace-me', 'replace-with-long-random-token', 'keep-this-codexpro-token-stable',
@@ -43,7 +46,7 @@ function isPlaceholder(value) {
 
 function isHighEntropyLiteral(value) {
   if (value.length < 24 || isPlaceholder(value) || /\s|\$\{|\\/.test(value) || /^\d+$/.test(value)) return false;
-  if (!/^[A-Za-z0-9_+/=.-]+$/.test(value)) return false;
+  if (/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(value)) return true;
   const counts = new Map();
   for (const char of value) counts.set(char, (counts.get(char) ?? 0) + 1);
   let entropy = 0;
@@ -51,7 +54,8 @@ function isHighEntropyLiteral(value) {
     const probability = count / value.length;
     entropy -= probability * Math.log2(probability);
   }
-  return entropy >= 4 || (entropy >= 3.5 && /[a-z]/.test(value) && /[A-Z]/.test(value) && /\d/.test(value));
+  if (/^[A-Za-z]+$/.test(value) && (entropy < 4.5 || !/[a-z]/.test(value) || !/[A-Z]/.test(value))) return false;
+  return entropy >= 4 || (entropy >= 3.5 && /[a-z]/i.test(value) && /\d/.test(value));
 }
 
 function markerPrefixes(direction) {
@@ -176,6 +180,9 @@ export function createPrivateKeyScanner() {
     spans() {
       return spans.map((span) => ({ ...span }));
     },
+    drainSpans() {
+      return spans.splice(0);
+    },
     reset() {
       pending = '';
       inPrivateBlock = false;
@@ -200,7 +207,7 @@ function mergeSensitiveSpans(spans) {
   return result;
 }
 
-export function scanSecretValues(text, _options = {}) {
+export function scanSecretValues(text, options = {}) {
   const source = String(text ?? '');
   const scanner = createPrivateKeyScanner();
   scanner.push(source, true);
@@ -213,8 +220,14 @@ export function scanSecretValues(text, _options = {}) {
       const value = rawValue.trim();
       if (isPlaceholder(value)) continue;
       if ((pattern === ASSIGNED_LITERAL || pattern === BARE_CREDENTIAL) && !isHighEntropyLiteral(value)) continue;
-      // Bare source identifiers are references, even when their spelling has high entropy.
-      if (pattern === BARE_CREDENTIAL && /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(value)) continue;
+      if (pattern === BARE_CREDENTIAL) {
+        const language = options.language ?? sourceLanguageForPath(options.sourcePath);
+        const identifier = /^[A-Za-z_$][\w$]*$/.test(value);
+        if (identifier && (language === 'code' || language === 'python' || /^[A-Z_]+(?:\d+)?$/.test(value))) continue;
+        if (/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\(/.test(value)
+          || /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(value)
+          || /^(?:process\.env|import\.meta\.env|os\.environ)\[/.test(value)) continue;
+      }
       const [start] = match.indices?.groups?.value ?? [match.index];
       const valueStart = start + rawValue.indexOf(value);
       spans.push({ start: valueStart, end: valueStart + value.length });
@@ -227,9 +240,9 @@ export function hasSecretValue(text, options = {}) {
   return scanSecretValues(text, options).spans.length > 0;
 }
 
-function redactSpans(text, preservingLines) {
+function redactSpans(text, preservingLines, options) {
   const source = String(text ?? '');
-  const { spans } = scanSecretValues(source);
+  const { spans } = scanSecretValues(source, options);
   let output = '';
   let cursor = 0;
   for (const span of spans) {
@@ -243,11 +256,11 @@ function redactSpans(text, preservingLines) {
   return output + source.slice(cursor);
 }
 
-export function redactSensitiveText(text, _options = {}) {
-  return redactSpans(text, false);
+export function redactSensitiveText(text, options = {}) {
+  return redactSpans(text, false, options);
 }
-export function redactSensitiveTextPreservingLines(text, _options = {}) {
-  return redactSpans(text, true);
+export function redactSensitiveTextPreservingLines(text, options = {}) {
+  return redactSpans(text, true, options);
 }
 export function redactDiagnosticText(text) {
   return redactSensitiveText(text);
@@ -260,11 +273,14 @@ export function redactSearchQuery(query, safeMatchTexts = []) {
     .replaceAll(REDACTED_SECRET, '').replaceAll(PRIVATE_KEY_REDACTION_MARKER, '').includes(value))) return REDACTED_SECRET;
   return value;
 }
-export function redactUnifiedDiff(text, _options = {}) {
-  return redactSensitiveText(text);
+export function redactUnifiedDiff(text, options = {}) {
+  return extractDiffFileBlocks(text).map((block) => redactSensitiveText(block.source, {
+    language: options.languageForPath?.(block.newPath ?? block.oldPath)
+      ?? sourceLanguageForPath(block.newPath ?? block.oldPath)
+  })).join('');
 }
-export function hasSecretValueInUnifiedDiff(text, _options = {}) {
-  return hasSecretValue(text);
+export function hasSecretValueInUnifiedDiff(text, options = {}) {
+  return redactUnifiedDiff(text, options) !== String(text ?? '');
 }
 
 function utf8PrefixLength(buffer, limit) {

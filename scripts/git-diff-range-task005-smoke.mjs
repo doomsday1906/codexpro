@@ -42,7 +42,7 @@ for (const [baseRef, headRef, expectedCount] of witnesses) {
   assert.ok(result.patch_files.every((file) => file.omission_reason === null && typeof file.patch === "string"));
   assert.equal(result.patch, result.patch_files.map((file) => file.patch).join(""));
   assert.equal(result.patch_bytes, Buffer.byteLength(result.patch, "utf8"));
-  assert.equal(JSON.stringify(result).includes("ACTUAL_LITERAL_SECRET_7X9"), false);
+  assert.equal(JSON.stringify(result).includes("sk-aB3xK9mQ2pL7vN4zR8tY6wS1"), false);
   console.log(`PASS witness ${baseRef.slice(0, 8)}..${headRef.slice(0, 8)}: ${expectedCount} complete per-file fragments, immutable identity, and redacted output.`);
 }
 

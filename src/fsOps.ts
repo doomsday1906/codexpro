@@ -964,7 +964,7 @@ async function readPublicLargeFile(
       scan,
       window: captured
     },
-    (slice) => redactSensitiveTextPreservingLines(slice, { context: "source" })
+    (slice) => redactSensitiveTextPreservingLines(slice, { context: "source", language: sourceLanguageForPath(resolved.relPath) })
   );
   const display: ScannedLine[] = captured.map((line, index) => ({
     lineNo: line.lineNo,
@@ -1023,8 +1023,7 @@ export async function writeTextFile(
   }
   const sourceOptions = { context: "source" as const, language: sourceLanguageForPath(resolved.relPath), sourcePath: resolved.absPath };
   if (hasSecretValue(content, sourceOptions)) {
-    const redacted = redactSensitiveTextPreservingLines(content, sourceOptions);
-    throw new CodexProError(sourceSafetyRefusalMessage("write", resolved.relPath, content, redacted));
+    throw new CodexProError(sourceSafetyRefusalMessage("write", resolved.relPath, content));
   }
 
   const releaseWriteLock = await acquireFileWriteLock(resolved.absPath);
@@ -1135,8 +1134,7 @@ export async function editTextFile(
     }
     const sourceOptions = { context: "source" as const, language: sourceLanguageForPath(resolved.relPath), sourcePath: resolved.absPath };
     if (hasSecretValueInChangedEdit(before, after, { ...sourceOptions, oldText, newText })) {
-      const redacted = redactSensitiveTextPreservingLines(after, sourceOptions);
-      throw new CodexProError(sourceSafetyRefusalMessage("edit", resolved.relPath, after, redacted));
+      throw new CodexProError(sourceSafetyRefusalMessage("edit", resolved.relPath, after));
     }
 
     const diff = makeUnifiedDiff(before, after, resolved.relPath, 60_000, resolved.absPath);

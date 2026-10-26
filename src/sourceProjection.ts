@@ -52,8 +52,6 @@ export const SELECT_CAPTURE_CAP_RECORDS = 50_000;
  * overhead plus numbered framing prefixes/terminators (F2-B).
  */
 export const SELECT_RECORD_OVERHEAD_BYTES = 256;
-/** Cap on retained private-key spans; overflow fails closed (F2-C). */
-export const PRIVATE_KEY_SPAN_CAP = 4096;
 /** Estimated retained bytes per private-key span, for honest retention accounting. */
 const PRIVATE_KEY_SPAN_ESTIMATE_BYTES = 128;
 /**
@@ -155,11 +153,7 @@ export interface SourceScan {
   readonly giants: GiantLineRecord[];
   /** Full-stream private-key spans (decoded-string offsets; streaming-exact). */
   readonly privateKeySpans: PrivateKeySpan[];
-  /**
-   * True when private-key span discovery exceeded PRIVATE_KEY_SPAN_CAP and the
-   * scanner feed was stopped: the captured window is conservatively
-   * fully redacted and no span history grew with source size (F2-C).
-   */
+  /** Retained for scan-result compatibility; span storage is bounded by the captured window. */
   readonly spansOverflowed: boolean;
   /**
    * Whole-source credential-paren-nuke trigger offset: -1 when absent,
@@ -474,28 +468,26 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
   // other byte is fed in whole-chunk batches. The stream stays exact either way.
   let snapshotDone = !wantSelect;
   let observeAcc = "";
-  // Private-key span overflow (F2-C): the accepted scanner retains one record
-  // per block, so a span-dense source would grow span history with source
-  // size. Past the cap the feed stops and the window is conservatively fully
-  // redacted — fail closed, never expose.
-  let spansOverflowed = false;
-  let pkFeedingStopped = false;
+  let keySpans: PrivateKeySpan[] = [];
   let pkSpansSeen = 0;
+  const collectKeySpans = (): void => {
+    const closed = privateKeyScanner.drainSpans();
+    const start = windowSnapshots.start?.offset;
+    if (start === undefined) return;
+    const last = selected.at(-1);
+    const end = (captureClosed || completed >= selectEnd) && last
+      ? last.startOffset + last.text.length : Infinity;
+    keySpans = [...keySpans, ...closed].filter((span) => span.end > start && span.start < end);
+    pkSpansSeen = Math.max(pkSpansSeen, keySpans.length);
+  };
   const flushObserveAcc = (): void => {
     if (observeAcc) {
-      if (!pkFeedingStopped) privateKeyScanner.push(observeAcc, false);
+      privateKeyScanner.push(observeAcc, false);
       mask.feed(observeAcc);
       maskOffset += observeAcc.length;
       observeAcc = "";
     }
-    if (!pkFeedingStopped) {
-      const spanCount = privateKeyScanner.spans().length;
-      if (spanCount > pkSpansSeen) pkSpansSeen = spanCount;
-      if (spanCount > PRIVATE_KEY_SPAN_CAP) {
-        pkFeedingStopped = true;
-        spansOverflowed = true;
-      }
-    }
+    collectKeySpans();
   };
   /** Feed one exact source piece (content plus terminator where present). */
   const observe = (piece: string, lineNo: number): void => {
@@ -519,7 +511,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         snapshotDone = true;
         observeAcc += piece;
       } else {
-        if (!pkFeedingStopped) privateKeyScanner.push(piece, false);
+        privateKeyScanner.push(piece, false);
         mask.feed(piece);
         maskOffset += piece.length;
       }
@@ -761,7 +753,8 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       emit(carry, carryBytes, false, carry, carry.length, false);
     }
     flushObserveAcc();
-    if (!pkFeedingStopped) privateKeyScanner.push("", true);
+    privateKeyScanner.push("", true);
+    collectKeySpans();
     if (utf8Valid) {
       try {
         strictDecoder.decode();
@@ -769,13 +762,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         utf8Valid = false;
       }
     }
-    // F2-C: retain only span state necessary to protect the captured window.
-    // Blocks entirely outside it must not accumulate unbounded records. On
-    // overflow the feed already stopped and the window is fully redacted.
-    const rawSpans = spansOverflowed
-      ? []
-      : privateKeyScanner.spans().map((span) => ({ start: span.start, end: span.end }));
-    const privateKeySpans = filterSpansToCapture(rawSpans, selected);
+    const privateKeySpans = filterSpansToCapture(keySpans, selected);
     const windowStartSnapshot: MaskSnapshot | null = windowSnapshots.start;
     const digest = hash.digest("hex");
     return {
@@ -789,7 +776,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       utf8Valid,
       giants,
       privateKeySpans,
-      spansOverflowed,
+      spansOverflowed: false,
       nukeOffset: -1,
       maskAtWindowStart: windowStartSnapshot,
       windowStartsInCode: windowStartSnapshot === null ? true : windowStartSnapshot.state === "code",
@@ -1043,10 +1030,6 @@ export interface LargeWindowProjection {
   readonly forcedLines: number[];
 }
 
-function forceRedactLine(): string {
-  return REDACTED_SECRET_MARKER;
-}
-
 /**
  * Project one bounded window with whole-source-aware security.
  *
@@ -1073,21 +1056,6 @@ export function projectLargeWindow(
     throw new CodexProError("Projection window offsets disagree with the scan snapshot.");
   }
   const rawLines = window.map((entry) => entry.text);
-  // F2-C fail-closed: span discovery overflowed, so whole-stream key-block
-  // protection is no longer provable. Redact the entire window rather than
-  // risk exposing an untracked block. The scan-level `spansOverflowed` flag is
-  // the bounded machine-readable state for this condition.
-  if (scan.spansOverflowed) {
-    const forcedAll = window.map((_, index) => index);
-    const lines = window.map(() => forceRedactLine());
-    applySourceFinalEmptyLine(lines, window, scan.totalLines);
-    return {
-      lines,
-      redacted: lines.map((line, index) => line !== window[index].text),
-      nukeApplied: false,
-      forcedLines: forcedAll
-    };
-  }
   const flankBefore = scan.flankBefore;
   const flankAfter = scan.flankAfter;
   // Exact per-line string offsets from the scan (terminator-aware: CRLF counts

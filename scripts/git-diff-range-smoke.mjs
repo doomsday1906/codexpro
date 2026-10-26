@@ -12,13 +12,13 @@ import { TextDecoder } from "node:util";
 const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "codexpro-git-diff-range-"));
 const systemPath = process.env.PATH ?? "";
 const FORBIDDEN_PATCH_LITERALS = [
-  "ACTUAL_LITERAL_SECRET_7X9",
-  "DELETED_LITERAL_SECRET_8Y4",
-  "CONTEXT_LITERAL_SECRET_9Z5",
-  "RENAMED_LITERAL_SECRET_6Q2",
-  "COPIED_LITERAL_SECRET_5P1",
-  "BLOCKED_LITERAL_SECRET_4N8",
-  "BINARY_LITERAL_SECRET_3M7"
+  "sk-aB3xK9mQ2pL7vN4zR8tY6wS1",
+  "sk-bC4yL0nR3qM8wP5aT9zV2uX6",
+  "sk-cD5zM1pS4rN9xQ6bU0aW3vY7",
+  "sk-dE6aN2qT5sP0yR7cV1bX4wZ8",
+  "sk-eF7bO3rU6tQ1zS8dW2cY5xX9",
+  "sk-fG8cP4sV7uR2aT9eX3dZ6yW0",
+  "sk-hH9dQ5tW8vS3bU0fY4eA7zX1"
 ];
 const OBSERVATION_UTF8_FATAL = new TextDecoder("utf-8", { fatal: true });
 const realGit = (() => {
@@ -505,26 +505,26 @@ async function makePatchFixture() {
     "context line 11",
     "context line 12",
     "context line 13",
-    "password = \"CONTEXT_LITERAL_SECRET_9Z5\"",
+    "password = \"sk-cD5zM1pS4rN9xQ6bU0aW3vY7\"",
     "context line 14",
     "old context target",
     ...Array.from({ length: 14 }, (_, index) => `tail context ${index}`),
     "context line final"
   ].join("\n") + "\n");
-  await writeFixture(repoRoot, "delete.py", "token = \"DELETED_LITERAL_SECRET_8Y4\"\nkeep = True\n");
+  await writeFixture(repoRoot, "delete.py", "token = \"sk-bC4yL0nR3qM8wP5aT9zV2uX6\"\nkeep = True\n");
   await writeFixture(repoRoot, "rename-source.py", [
     ...Array.from({ length: 10 }, (_, index) => `rename line ${index}`),
-    "rename_token = \"RENAMED_LITERAL_SECRET_6Q2\"",
+    "rename_token = \"sk-dE6aN2qT5sP0yR7cV1bX4wZ8\"",
     ...Array.from({ length: 10 }, (_, index) => `rename tail ${index}`)
   ].join("\n") + "\n");
   await writeFixture(repoRoot, "copy-source.py", [
     ...Array.from({ length: 10 }, (_, index) => `copy line ${index}`),
-    "copy_token = \"COPIED_LITERAL_SECRET_5P1\"",
+    "copy_token = \"sk-eF7bO3rU6tQ1zS8dW2cY5xX9\"",
     ...Array.from({ length: 10 }, (_, index) => `copy tail ${index}`)
   ].join("\n") + "\n");
   await writeFixture(repoRoot, "binary-secret.bin", Buffer.concat([
     Buffer.from([0, 1, 2, 3]),
-    Buffer.from("BINARY_LITERAL_SECRET_3M7", "utf8"),
+    Buffer.from("sk-hH9dQ5tW8vS3bU0fY4eA7zX1", "utf8"),
     Buffer.from([0, 255, 8])
   ]));
   await writeFixture(repoRoot, "type-target", "type target bytes\n");
@@ -533,7 +533,7 @@ async function makePatchFixture() {
 
   await writeFixture(repoRoot, "added.py", [
     "def added():",
-    "    token = \"ACTUAL_LITERAL_SECRET_7X9\"",
+    "    token = \"sk-aB3xK9mQ2pL7vN4zR8tY6wS1\"",
     "    return token",
     ""
   ].join("\n"));
@@ -552,7 +552,7 @@ async function makePatchFixture() {
     "context line 11",
     "context line 12",
     "context line 13",
-    "password = \"CONTEXT_LITERAL_SECRET_9Z5\"",
+    "password = \"sk-cD5zM1pS4rN9xQ6bU0aW3vY7\"",
     "context line 14",
     "new context target",
     ...Array.from({ length: 14 }, (_, index) => `tail context ${index}`),
@@ -561,31 +561,31 @@ async function makePatchFixture() {
   await mustGit(repoRoot, ["mv", "rename-source.py", "rename-dest.py"]);
   const renameLines = [
     ...Array.from({ length: 10 }, (_, index) => `rename line ${index}`),
-    "rename_token = \"RENAMED_LITERAL_SECRET_6Q2\"",
+    "rename_token = \"sk-dE6aN2qT5sP0yR7cV1bX4wZ8\"",
     "rename changed line",
     ...Array.from({ length: 9 }, (_, index) => `rename tail ${index}`)
   ];
   await writeFixture(repoRoot, "rename-dest.py", renameLines.join("\n") + "\n");
   await writeFixture(repoRoot, "copy-source.py", [
     ...Array.from({ length: 10 }, (_, index) => `copy line ${index}`),
-    "copy_token = \"COPIED_LITERAL_SECRET_5P1\"",
+    "copy_token = \"sk-eF7bO3rU6tQ1zS8dW2cY5xX9\"",
     "copy changed line",
     ...Array.from({ length: 9 }, (_, index) => `copy tail ${index}`)
   ].join("\n") + "\n");
   await writeFixture(repoRoot, "copy-dest.py", [
     ...Array.from({ length: 10 }, (_, index) => `copy line ${index}`),
-    "copy_token = \"COPIED_LITERAL_SECRET_5P1\"",
+    "copy_token = \"sk-eF7bO3rU6tQ1zS8dW2cY5xX9\"",
     "copy changed line",
     ...Array.from({ length: 9 }, (_, index) => `copy tail ${index}`)
   ].join("\n") + "\n");
   await writeFixture(repoRoot, "binary-secret.bin", Buffer.concat([
     Buffer.from([0, 1, 2, 4]),
-    Buffer.from("BINARY_LITERAL_SECRET_3M7", "utf8"),
+    Buffer.from("sk-hH9dQ5tW8vS3bU0fY4eA7zX1", "utf8"),
     Buffer.from([0, 254, 9])
   ]));
   await unlink(path.join(repoRoot, "type-entry"));
   await writeFixture(repoRoot, "type-entry", "type entry is regular now\n");
-  await writeFixture(repoRoot, ".env.patch", "blocked = \"BLOCKED_LITERAL_SECRET_4N8\"\n");
+  await writeFixture(repoRoot, ".env.patch", "blocked = \"sk-fG8cP4sV7uR2aT9eX3dZ6yW0\"\n");
   await writeFixture(repoRoot, "odd path/line\nname.py", "odd = harmless\n");
   await writeFixture(repoRoot, "odd path/space name.py", "odd = harmless space\n");
   const headSha = await commitAll(repoRoot, "patch changes");
@@ -811,14 +811,14 @@ rawPatchFacts.set(rawRecordKey(typeRecord), {
 });
 const blockedRawPatchRecord = patchRaw.records.find((record) => record.newPath === patchFixture.blockedPath);
 assert.ok(blockedRawPatchRecord, "direct patch fixture did not produce a blocked record");
-assert.ok(directBlob(patchFixture.repoRoot, patchFixture.headSha, patchFixture.blockedPath).toString("utf8").includes("BLOCKED_LITERAL_SECRET_4N8"));
-assert.ok(directBlob(patchFixture.repoRoot, patchFixture.baseSha, patchFixture.binaryPath).includes(Buffer.from("BINARY_LITERAL_SECRET_3M7")));
+assert.ok(directBlob(patchFixture.repoRoot, patchFixture.headSha, patchFixture.blockedPath).toString("utf8").includes("sk-fG8cP4sV7uR2aT9eX3dZ6yW0"));
+assert.ok(directBlob(patchFixture.repoRoot, patchFixture.baseSha, patchFixture.binaryPath).includes(Buffer.from("sk-hH9dQ5tW8vS3bU0fY4eA7zX1")));
 const patchRawSecretChecks = [
-  ["addition", "added.py", "ACTUAL_LITERAL_SECRET_7X9"],
-  ["deletion", "delete.py", "DELETED_LITERAL_SECRET_8Y4"],
-  ["context", "context.py", "CONTEXT_LITERAL_SECRET_9Z5"],
-  ["rename", "rename-dest.py", "RENAMED_LITERAL_SECRET_6Q2"],
-  ["copy", "copy-dest.py", "COPIED_LITERAL_SECRET_5P1"]
+  ["addition", "added.py", "sk-aB3xK9mQ2pL7vN4zR8tY6wS1"],
+  ["deletion", "delete.py", "sk-bC4yL0nR3qM8wP5aT9zV2uX6"],
+  ["context", "context.py", "sk-cD5zM1pS4rN9xQ6bU0aW3vY7"],
+  ["rename", "rename-dest.py", "sk-dE6aN2qT5sP0yR7cV1bX4wZ8"],
+  ["copy", "copy-dest.py", "sk-eF7bO3rU6tQ1zS8dW2cY5xX9"]
 ];
 for (const [kind, pathValue, literal] of patchRawSecretChecks) {
   const record = patchRaw.records.find((entry) => entry.oldPath === pathValue || entry.newPath === pathValue);
@@ -1839,9 +1839,9 @@ const context20 = await collectGitDiffRangePatch(patchContext.config, patchConte
 assert.equal(context0.patch, expectedContext0.redacted);
 assert.equal(contextDefault.patch, expectedContext3.redacted);
 assert.equal(context20.patch, expectedContext20.redacted);
-assert.equal(context0.patch.includes("CONTEXT_LITERAL_SECRET_9Z5"), false);
-assert.equal(contextDefault.patch.includes("CONTEXT_LITERAL_SECRET_9Z5"), false);
-assert.equal(context20.patch.includes("CONTEXT_LITERAL_SECRET_9Z5"), false);
+assert.equal(context0.patch.includes("sk-cD5zM1pS4rN9xQ6bU0aW3vY7"), false);
+assert.equal(contextDefault.patch.includes("sk-cD5zM1pS4rN9xQ6bU0aW3vY7"), false);
+assert.equal(context20.patch.includes("sk-cD5zM1pS4rN9xQ6bU0aW3vY7"), false);
 console.log("PASS context_lines 0/default 3/max 20 use explicit direct-Git context and preserve redaction");
 
 const addedRecord = patchMetadata.changedFiles.find((record) => record.newPath === "added.py");

@@ -27,6 +27,7 @@ export interface SecretScanResult {
 export interface PrivateKeyScanner {
   push(input?: string, final?: boolean): string;
   spans(): readonly { readonly start: number; readonly end: number }[];
+  drainSpans(): { start: number; end: number }[];
   reset(): void;
 }
 
@@ -35,7 +36,7 @@ export function createPrivateKeyScanner(): PrivateKeyScanner {
 }
 
 export type RedactionContext = "source" | "diagnostic";
-export type SourceLanguage = "python";
+export type SourceLanguage = "python" | "code";
 export type RedactionOptions = { context?: RedactionContext; language?: SourceLanguage; sourcePath?: string };
 
 export type DiffFileBlock = {
@@ -88,8 +89,7 @@ export function redactSensitiveText(text: string, options: RedactionOptions | Re
 // unchanged files during scanning and hydration. Results for non-trivial
 // texts are memoized by content digest, bounded by retained bytes.
 // Only option shapes whose output is a pure function of (text, context,
-// language) are memoized: a sourcePath pulls live approval-registry state,
-// and the remaining policy options are caller-supplied overrides.
+// language) are memoized; sourcePath can select whether bare values are literals.
 const REDACTION_MEMO_MIN_CHARS = 1024;
 const REDACTION_MEMO_MAX_CHARS = 64 * 1024 * 1024;
 const redactionMemo = new Map<string, string>();
@@ -132,14 +132,13 @@ export function sourceSafetyRefusalMessage(
   operation: "write" | "edit" | "apply_patch",
   filePath: string,
   source: string,
-  _redacted: string,
   coordinate: "source line" | "patch line" = "source line"
 ): string {
   const position = (offset: number) => {
     const lines = source.slice(0, offset).split(/\r\n|\n|\r/u);
     return `${coordinate} ${lines.length}, column ${lines.at(-1)!.length + 1}`;
   };
-  const locations = scanSecretValues(source).spans.map((span) =>
+  const locations = scanSecretValues(source, { language: sourceLanguageForPath(filePath) }).spans.map((span) =>
     `${position(span.start)} to ${position(span.end)} (end exclusive)`
   ).join("; ");
   const safePath = redactDiagnosticText(String(filePath ?? ""))

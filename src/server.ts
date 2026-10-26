@@ -2791,8 +2791,7 @@ function validateSimulatedSource(simulated: SimulatedPatch, records: ValidatedPa
     for (const file of simulated.postApplyFiles) {
       const sourceOptions = { context: "source" as const, language: sourceLanguageForPath(file.relPath), sourcePath: file.absPath };
       if (hasSecretValue(file.content, sourceOptions)) {
-        const redacted = redactSensitiveTextPreservingLines(file.content, sourceOptions);
-        throw new CodexProError(sourceSafetyRefusalMessage("apply_patch", file.relPath, file.content, redacted, "source line"));
+        throw new CodexProError(sourceSafetyRefusalMessage("apply_patch", file.relPath, file.content));
       }
     }
     return { ...simulated, diff: redactUnifiedDiff(simulated.rawDiff, languageForPath, sourcePathForPath) };

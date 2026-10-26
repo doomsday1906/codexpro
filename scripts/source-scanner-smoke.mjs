@@ -11,7 +11,6 @@ const {
   resolveWindow,
   identitiesEqual,
   TriviaMaskStream,
-  NukeDetectorStream,
   SourceScanError,
   SelectedLineTooLargeError,
   SOURCE_SCAN_LIMIT_BYTES,
@@ -225,7 +224,7 @@ async function main() {
       console.log('ok scan-limit reason independent of budgets');
     }
 
-    // security observers: private-key spans match one-shot; nuke trigger agrees; mask snapshots exact
+    // security observers: private-key spans match one-shot; label/call code stays visible; mask snapshots exact
     {
       const SCAN_PK_BEGIN = '-----' + 'BEG' + 'IN RSA PRI' + 'VATE KEY' + '-----';
       const SCAN_PK_END = '-----' + 'EN' + 'D RSA PRI' + 'VATE KEY' + '-----';
@@ -239,9 +238,39 @@ async function main() {
       assert.deepEqual(scan.privateKeySpans, oneShot.spans().map((s) => ({ start: s.start, end: s.end })));
       assert.equal(scan.nukeOffset, -1);
       assert.ok(scan.maskAtWindowStart !== null && scan.windowStartsInCode);
-      const nuked = await writeTmp('nuked', 'const API_TOKEN = getToken(abc,\nconst NORMAL = 1;\n');
-      const scanNuked = await scanWorkingTreeFile(fsp, { absPath: nuked, startLine: 2, endLine: 2, chunkBytes: 11 });
-      assert.ok(scanNuked.nukeOffset >= 0, `expected nuke trigger, got ${scanNuked.nukeOffset}`);
+
+      // Removed label heuristics: ordinary credential-looking calls and member
+      // references are visible and never treated as secrets.
+      const legacyLabel = 'const API_TOKEN = getToken(abc,\nconst NORMAL = 1;\n';
+      const legacyPath = await writeTmp('legacy-label.ts', legacyLabel);
+      const scanLegacy = await scanWorkingTreeFile(fsp, { absPath: legacyPath, startLine: 1, endLine: 2, chunkBytes: 11 });
+      assert.equal(scanLegacy.nukeOffset, -1);
+      const legacyRaw = await fsp.readFile(legacyPath);
+      const legacyProjection = projectPublicSourceText({
+        logicalPath: 'legacy-label.ts',
+        text: legacyLabel,
+        bytes: legacyRaw.byteLength,
+        sha256: sha256(legacyRaw),
+        startLine: 1,
+        endLine: 2,
+        maxBytes: 180000
+      });
+      assert.equal(legacyProjection.text, '1 | const API_TOKEN = getToken(abc,\n2 | const NORMAL = 1;', 'ordinary label/call source was hidden');
+
+      const secretText = 'const API_KEY = "sk-' + 'aB3xK9mQ2pL7vN4zR8tY6wS1";\n';
+      const secretPath = await writeTmp('secret-value.ts', secretText);
+      const secretRaw = await fsp.readFile(secretPath);
+      const secretProjection = projectPublicSourceText({
+        logicalPath: 'secret-value.ts',
+        text: secretText,
+        bytes: secretRaw.byteLength,
+        sha256: sha256(secretRaw),
+        startLine: 1,
+        endLine: 1,
+        maxBytes: 180000
+      });
+      assert.equal(secretProjection.text, '1 | const API_KEY = "[REDACTED_SECRET]";', 'known secret span was not masked exactly');
+
       const inComment = await writeTmp('incomment', '/* open comment\ncontent line two\ncontent line three\n');
       const scanComment = await scanWorkingTreeFile(fsp, { absPath: inComment, startLine: 3, endLine: 3, chunkBytes: 5 });
       assert.equal(scanComment.windowStartsInCode, false);
@@ -256,7 +285,7 @@ async function main() {
       reseeded.restore(scan.maskAtWindowStart);
       const reseededOut = reseeded.feed(hostile.slice(scan.maskAtWindowStart.offset, scan.maskAtWindowStart.offset + 40)) + reseeded.flush();
       assert.equal(reseededOut.slice(0, 38), sliceCheck.slice(0, 38));
-      console.log('ok security observers (spans/nuke/mask snapshots)');
+      console.log('ok security observers (spans/mask snapshots/benign visibility)');
     }
 
     // AP-005: 1/20/64 MiB deterministic fixtures, constant retention, exact metadata.

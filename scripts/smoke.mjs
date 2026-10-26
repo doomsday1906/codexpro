@@ -789,15 +789,16 @@ if (openedByPath.structuredContent.workspace_id !== ws) {
 await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'demo.txt' } });
 await fs.writeFile(path.join(tmp, 'tokens.txt'), [
   'Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz123456',
-  'https://example.test/mcp?codexpro_token=verysecretcodexprotoken123&x=1',
-  'codexpro_token=secretsecret12345',
-  '"codexpro_token": "shortcodextoken"',
+  'https://example.test/mcp?codexpro_token=sk-aB3xK9mQ2pL7vN4zR8tY6wS1&x=1',
+  'codexpro_token=sk-aB3xK9mQ2pL7vN4zR8tY6wS1',
+  '"codexpro_token": "sk-aB3xK9mQ2pL7vN4zR8tY6wS1"',
   'ANTHROPIC_API_KEY=sk-ant-abcdefghijklmnopqrstuvwxyz123456',
-  '"api_key": "jsonsecretvalueabcdefghijklmnop"',
-  'service_token: yamlsecretvalueabcdefghijklmnop',
+  '"api_key": "sk-aB3xK9mQ2pL7vN4zR8tY6wS1"',
+  'service_token: sk-aB3xK9mQ2pL7vN4zR8tY6wS1',
   'ngrok config add-authtoken 2abcDEFghiJKLmnopQRSTuvWXyz_1234567890',
   'cloudflared tunnel run --token eyJhbGciOiJIUzI1NiJ9.eyJ0dW5uZWwiOiJjb2RleHBybyJ9.signature1234567890',
-  'cloudflared tunnel run --token-file /Users/rebel/.codexpro/cloudflare-tunnel-token'
+  'cloudflared tunnel run --token-file /Users/rebel/.codexpro/cloudflare-tunnel-token',
+  'ordinary metrics: tokens: 21 token_count: 34 max_tokens = 4096 token: Token<string> = getToken()'
 ].join('\n'), 'utf8');
 const secretRead = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'config.txt' } });
 const secretPayload = JSON.stringify(secretRead);
@@ -806,10 +807,10 @@ if (secretPayload.includes('sk-realSecretValue123') || !secretPayload.includes('
 }
 const tokenRead = await client.request('tools/call', { name: 'read', arguments: { workspace_id: ws, path: 'tokens.txt' } });
 const tokenPayload = JSON.stringify(tokenRead);
-for (const leaked of ['ghp_abcdefghijklmnopqrstuvwxyz123456', 'verysecretcodexprotoken123', 'secretsecret12345', 'shortcodextoken', 'sk-ant-abcdefghijklmnopqrstuvwxyz123456', 'jsonsecretvalueabcdefghijklmnop', 'yamlsecretvalueabcdefghijklmnop', '2abcDEFghiJKLmnopQRSTuvWXyz_1234567890', 'eyJhbGciOiJIUzI1NiJ9.eyJ0dW5uZWwiOiJjb2RleHBybyJ9.signature1234567890']) {
+for (const leaked of ['ghp_abcdefghijklmnopqrstuvwxyz123456', 'sk-aB3xK9mQ2pL7vN4zR8tY6wS1', 'sk-ant-abcdefghijklmnopqrstuvwxyz123456', '2abcDEFghiJKLmnopQRSTuvWXyz_1234567890', 'eyJhbGciOiJIUzI1NiJ9.eyJ0dW5uZWwiOiJjb2RleHBybyJ9.signature1234567890']) {
   if (tokenPayload.includes(leaked)) throw new Error(`read leaked token-like content: ${leaked}`);
 }
-if (!tokenPayload.includes('/Users/rebel/.codexpro/cloudflare-tunnel-token')) {
+if (!tokenPayload.includes('/Users/rebel/.codexpro/cloudflare-tunnel-token') || !tokenPayload.includes('tokens: 21 token_count: 34 max_tokens = 4096')) {
   throw new Error('redaction hid a non-secret Cloudflare token-file path');
 }
 const secretBatch = await client.request('tools/call', {
@@ -817,15 +818,15 @@ const secretBatch = await client.request('tools/call', {
   arguments: { workspace_id: ws, items: [{ path: 'config.txt' }, { path: 'tokens.txt' }] }
 });
 const secretBatchPayload = JSON.stringify(secretBatch);
-for (const leaked of ['sk-realSecretValue123', 'ghp_abcdefghijklmnopqrstuvwxyz123456', 'verysecretcodexprotoken123', 'secretsecret12345', 'shortcodextoken', 'sk-ant-abcdefghijklmnopqrstuvwxyz123456', 'jsonsecretvalueabcdefghijklmnop', 'yamlsecretvalueabcdefghijklmnop', '2abcDEFghiJKLmnopQRSTuvWXyz_1234567890', 'eyJhbGciOiJIUzI1NiJ9.eyJ0dW5uZWwiOiJjb2RleHBybyJ9.signature1234567890']) {
+for (const leaked of ['sk-realSecretValue123', 'ghp_abcdefghijklmnopqrstuvwxyz123456', 'sk-aB3xK9mQ2pL7vN4zR8tY6wS1', 'sk-ant-abcdefghijklmnopqrstuvwxyz123456', '2abcDEFghiJKLmnopQRSTuvWXyz_1234567890', 'eyJhbGciOiJIUzI1NiJ9.eyJ0dW5uZWwiOiJjb2RleHBybyJ9.signature1234567890']) {
   if (secretBatchPayload.includes(leaked)) throw new Error(`read_many leaked token-like content: ${leaked}`);
 }
-if (!secretBatchPayload.includes('[REDACTED_SECRET]') || !secretBatchPayload.includes('/Users/rebel/.codexpro/cloudflare-tunnel-token')) {
+if (!secretBatchPayload.includes('[REDACTED_SECRET]') || !secretBatchPayload.includes('/Users/rebel/.codexpro/cloudflare-tunnel-token') || !secretBatchPayload.includes('token: Token<string> = getToken()')) {
   throw new Error('read_many redaction did not preserve the secret/file-path distinction');
 }
-await expectToolError('write', { workspace_id: ws, path: 'notes.md', content: 'OPENAI_API_KEY=sk-realSecretValue123\n' }, /Secret-looking content is blocked/);
-await expectToolError('write', { workspace_id: ws, path: 'token.txt', content: 'codexpro_token=shorttok\n' }, /Secret-looking content is blocked/);
-await expectToolError('write', { workspace_id: ws, path: 'notes.yaml', content: 'api_key: yamlsecretvalueabcdefghijklmnop\n' }, /Secret-looking content is blocked/);
+await expectToolError('write', { workspace_id: ws, path: 'notes.md', content: 'OPENAI_API_KEY=sk-realSecretValue123\n' }, /Secret literal found/);
+await expectToolError('write', { workspace_id: ws, path: 'token.txt', content: 'codexpro_token=sk-aB3xK9mQ2pL7vN4zR8tY6wS1\n' }, /Secret literal found/);
+await expectToolError('write', { workspace_id: ws, path: 'notes.yaml', content: 'api_key: "aB3xK9mQ2pL7vN4zR8tY6wS1"\n' }, /Secret literal found/);
 const sourceCompatPath = path.join(tmp, 'source_compat.py');
 const sourceCompatInitial = [
   'import os',
@@ -886,8 +887,8 @@ if (await fs.readFile(sourceCompatPath, 'utf8') !== sourceCompatPatched) {
 await expectToolError('write', {
   workspace_id: ws,
   path: 'literal-secret-source.txt',
-  content: 'TOKEN="QZ7"\n'
-}, /Secret-looking content is blocked/);
+  content: 'TOKEN="sk-aB3xK9mQ2pL7vN4zR8tY6wS1"\n'
+}, /Secret literal found/);
 if (await fs.access(path.join(tmp, 'literal-secret-source.txt')).then(() => true).catch((error) => {
   if (error?.code === 'ENOENT') return false;
   throw error;
@@ -898,7 +899,7 @@ await expectToolError('write', {
   workspace_id: ws,
   path: 'private-key-source.txt',
   content: '-----BEGIN PRIVATE KEY-----\nTASK003_MCP_PRIVATE_BODY\n-----END PRIVATE KEY-----\n'
-}, /Secret-looking content is blocked/);
+}, /Secret literal found/);
 if (await fs.access(path.join(tmp, 'private-key-source.txt')).then(() => true).catch((error) => {
   if (error?.code === 'ENOENT') return false;
   throw error;
@@ -909,9 +910,9 @@ await expectToolError('edit', {
   workspace_id: ws,
   path: 'source_compat.py',
   old_text: 'SECRET = secrets.token_urlsafe(32)',
-  new_text: 'SECRET = "QZ7"',
+  new_text: 'SECRET = "sk-aB3xK9mQ2pL7vN4zR8tY6wS1"',
   expected_replacements: 1
-}, /Secret-looking content is blocked/);
+}, /Secret literal found/);
 if (await fs.readFile(sourceCompatPath, 'utf8') !== sourceCompatPatched) {
   throw new Error('literal-secret MCP edit changed the source despite the guard');
 }
@@ -924,11 +925,11 @@ await expectToolError('apply_patch', {
     '@@ -5,4 +5,4 @@',
     ' TOKEN = os.environ.get("TOKEN")',
     '-PASSWORD = getpass.getpass()',
-    '+PASSWORD = "QZ7"',
+    '+PASSWORD = "sk-aB3xK9mQ2pL7vN4zR8tY6wS1"',
     ' API_KEY = settings.apiKey',
     ' SECRET = secrets.token_urlsafe(32)'
   ].join('\n') + '\n'
-}, /Secret-looking content is blocked/);
+}, /Secret literal found/);
 if (await fs.readFile(sourceCompatPath, 'utf8') !== sourceCompatPatched) {
   throw new Error('literal-secret MCP apply_patch changed the source despite the guard');
 }

@@ -8,7 +8,6 @@ const {
   scanWorkingTreeFile,
   projectLargeWindow,
   applyPrivateKeySpansToLines,
-  applyNukeOffsetToLines,
   trimFlankBefore,
   WINDOW_FLANK_BYTES,
 } = await import('../dist/sourceProjection.js');
@@ -18,7 +17,6 @@ const {
   redactSensitiveTextPreservingLines,
   hasSecretValue,
 } = await import('../dist/redact.js');
-const { createPythonProvenance } = await import('../scripts/python-provenance.mjs');
 
 const sha256 = (b) => createHash('sha256').update(b).digest('hex');
 const redactSlice = (slice) => redactSensitiveTextPreservingLines(slice, { context: 'source' });
@@ -85,19 +83,19 @@ async function main() {
       console.log('ok AP-007a private-key stage parity');
     }
 
-    // AP-007b: nuke mapper == oracle nuke on the same window.
+    // AP-007b: ordinary credential-shaped calls are visible; a known value
+    // span is masked exactly and nothing around it is hidden.
     {
-      const text = 'const API_TOKEN = getToken(abc,\nconst NORMAL = 1;\nconst OTHER = 2;\n';
-      const p = path.join(tmpRoot, 'nuke.txt');
+      const text = 'const API_TOKEN = getToken(abc,\nconst NORMAL = 1;\nconst API_KEY = "sk-' + 'aB3xK9mQ2pL7vN4zR8tY6wS1";\n';
+      const p = path.join(tmpRoot, 'ordinary-call.txt');
       await fsp.writeFile(p, text);
-      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 2, endLine: 3, chunkBytes: 7 });
-      assert.ok(scan.nukeOffset >= 0, 'expected scan nuke trigger');
-      const { lines, offsets } = lineOffsets(text);
-      const { lines: mapped, applied } = applyNukeOffsetToLines(lines.slice(1, 3), offsets.slice(1, 3), scan.nukeOffset);
-      const oracle = redactSensitiveTextPreservingLines(text, { context: 'source' }).split('\n').slice(1, 3);
-      assert.equal(applied, true);
-      assert.deepEqual(mapped, oracle, 'nuke mapping differs from oracle');
-      console.log('ok AP-007b nuke mapping parity');
+      const { projected } = await projectWindow(p, text, 1, 3, 7);
+      assert.equal(projected.nukeApplied, false);
+      assert.deepEqual(projected.forcedLines, []);
+      assert.equal(projected.lines[0], 'const API_TOKEN = getToken(abc,');
+      assert.equal(projected.lines[1], 'const NORMAL = 1;');
+      assert.equal(projected.lines[2], 'const API_KEY = "[REDACTED_SECRET]";');
+      console.log('ok AP-007b ordinary call visible + exact value span masked');
     }
 
     // AP-007c: full large-path projection on small inputs is a superset of the oracle
@@ -117,18 +115,6 @@ async function main() {
         assertSuperset(`small-${name}`, text, lang, 1, n - 1, projected);
       }
       console.log('ok AP-007c small-input superset + correspondence');
-    }
-
-    // AP-007d: python provenance boundary — available at/below cap, over-limit above (no unbounded parse).
-    {
-      const small = `API_KEY = "x"\n`.repeat(100);
-      const prov = createPythonProvenance(small, { language: 'python' });
-      assert.equal(prov.available, true);
-      const big = `x = ${'1'.repeat(2100000)}\n`;
-      const provBig = createPythonProvenance(big, { language: 'python' });
-      assert.equal(provBig.available, false);
-      assert.equal(provBig.reason, 'over-limit');
-      console.log('ok AP-007d provenance cap (no unbounded parse above 2MiB)');
     }
 
     // AP-008: hostile large file — private key far before window, secrets at every chunk split.
@@ -235,51 +221,34 @@ async function main() {
       }
       console.log(`ok uncertain-mask window (oracle=${JSON.stringify(oracleLine.slice(0, 40))} projected=${JSON.stringify(projected.lines[0].slice(0, 40))})`);
     }
-    // AP-008c: bridge-suspect flank (trimmed partial line with label) forces first window line.
-    // trimFlankBefore unit behavior first, then the R4 projector rule with a
-    // scan carrying a trimmed flank (64KiB-scale trimming is covered at scale in AP-008).
+    // AP-008c: removed bridge/label force rules. A trimmed partial pre-window
+    // line no longer fabricates suspicion, and ordinary call/label code is
+    // visible while a real-shaped secret is still masked.
     {
       const t1 = trimFlankBefore('x = 1; API_TOKEN = "gh' + 'p_BRID');
       assert.equal(t1.flank, '');
-      assert.equal(t1.bridgeSuspect, true);
+      assert.equal(t1.bridgeSuspect, false);
       const t2 = trimFlankBefore('plain partial line without labels');
       assert.equal(t2.bridgeSuspect, false);
       const t3 = trimFlankBefore('first partial\ndropped\nsecond line kept\n');
       assert.equal(t3.flank, 'dropped\nsecond line kept\n');
       assert.equal(t3.bridgeSuspect, false);
 
-      const SECRET = 'gh' + 'p_' + 'BRIDGETESTBRIDGETESTBRIDGETEST0123456789ab';
-      const text = `x = 1; API_TOKEN = "${SECRET}"\nTAILLINE = "${SECRET.slice(8)}";\nconst CLEAN = 2;\n`;
+      const SECRET = 'sk-' + 'aB3xK9mQ2pL7vN4zR8tY6wS1';
+      const text = `const API_TOKEN = getToken(abc,\nconst TAILLINE = "${SECRET}";\nconst CLEAN = 2;\n`;
       const p = path.join(tmpRoot, 'bridge.txt');
       await fsp.writeFile(p, text);
-      const { lines, offsets } = lineOffsets(text);
       const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 2, endLine: 3, chunkBytes: 9 });
-      // Simulate a trimmed flank: the 30-byte pre-window chunk was one partial
-      // line (trimmed to empty) carrying the label, so the match may bridge in.
-      const bridgedScan = { ...scan, flankBefore: '', bridgeSuspect: true };
       const window = scan.selected.filter((entry) => entry.lineNo >= 2 && entry.lineNo <= 3);
       assert.equal(window.length, 2);
-      const projected = projectLargeWindow({ scan: bridgedScan, window }, redactSlice);
-      assert.ok(projected.forcedLines.includes(0), 'R4 did not force the bridged first line');
+      assert.equal(scan.bridgeSuspect, false);
+      const projected = projectLargeWindow({ scan, window }, redactSlice);
+      assert.deepEqual(projected.forcedLines, []);
+      assert.equal(projected.lines[0], 'const TAILLINE = "[REDACTED_SECRET]";');
+      assert.equal(projected.lines[1], 'const CLEAN = 2;');
       const joined = projected.lines.join('\n');
-      assert.ok(!joined.includes(SECRET), 'bridged secret leaked');
-      console.log('ok AP-008c bridge force-redact');
-    }
-
-    // Reviewer F1 regression: nested credential-paren candidates. The oracle counts
-    // every paren from each opening (the inner candidate's paren keeps the outer
-    // unmatched); the streaming detector must agree exactly, at any segmentation.
-    {
-      const poison = 'api_key: foo(1\nsecret: bar(2)\n';
-      const p = path.join(tmpRoot, 'nested-paren.txt');
-      await fsp.writeFile(p, poison);
-      const scan = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 1, endLine: 3, chunkBytes: 5 });
-      assert.ok(scan.nukeOffset >= 0, 'nested candidate trigger missed');
-      // The trigger is the FIRST candidate opening, not the inner one.
-      assert.equal(scan.nukeOffset, poison.indexOf('('));
-      const scan64 = await scanWorkingTreeFile(fsp, { absPath: p, startLine: 1, endLine: 3, chunkBytes: 64 });
-      assert.equal(scan64.nukeOffset, scan.nukeOffset, 'nuke trigger depends on segmentation');
-      console.log('ok reviewer-F1 nested paren trigger (segmentation-independent)');
+      assert.ok(!joined.includes(SECRET), 'known secret leaked');
+      console.log('ok AP-008c no fabricated bridge force; secret span masked');
     }
 
     // Reviewer residual: mask chunk-split closers (//, /*, */, escapes, fences).
@@ -296,40 +265,6 @@ async function main() {
         assert.equal(out, whole, `mask segmentation diverged at seg=${seg}`);
       }
       console.log('ok reviewer residual mask segmentation equivalence (closers/escapes/fences)');
-    }
-
-    // Reviewer R4 regression: nuke candidates straddling detector feed cuts are
-    // found exactly once via discovery overlap (no reliance on cut alignment).
-    {
-      const { NukeDetectorStream, TriviaMaskStream } = await import('../dist/sourceProjection.js');
-      const evil = 'const API_KEY = wrap(getToken(q7z\n';
-      const filler = Array.from({ length: 120 }, (_, i) => `const pad${i} = ${i}; // filler ${'y'.repeat(40)}\n`).join('');
-      const text = `${evil}${filler}const after = 1;\n`;
-      const oracleHere = redactSensitiveTextPreservingLines(text, { context: 'source' });
-      assert.ok(oracleHere.includes('[REDACTED_SECRET]'), 'oracle fixture must nuke');
-      for (const seg of [7, 64, 1024, 65536]) {
-        const m = new TriviaMaskStream();
-        const det = new NukeDetectorStream();
-        let fed = 0;
-        let pending = '';
-        const feedM = (chunk) => {
-          const combined = pending + chunk;
-          if (combined.length > 1024) {
-            const cut = combined.length - 1024;
-            det.feed(combined.slice(0, cut), fed);
-            fed += cut;
-            pending = combined.slice(cut);
-          } else {
-            pending = combined;
-          }
-        };
-        for (let i = 0; i < text.length; i += seg) feedM(m.feed(text.slice(i, i + seg)));
-        feedM(m.flush());
-        if (pending) det.feed(pending, fed);
-        assert.ok(det.result() >= 0, `straddled candidate missed at seg=${seg}`);
-        assert.equal(det.result(), text.indexOf('('), `wrong trigger at seg=${seg}`);
-      }
-      console.log('ok reviewer-R4 straddled candidate triggers at every segmentation');
     }
 
     // Reviewer R5 regression: CRLF span mapping is terminator-exact (no +1/line drift).
@@ -402,15 +337,19 @@ async function main() {
       lines.push('class CampaignRepo {}');
       lines.push('const CampaignStorageTopology = build();');
       lines.push('compose_campaign_storage();');
+      lines.push('const metrics = { tokens: 21, token_count: 34, max_tokens: 4096, secretName: "build" };');
+      lines.push('const API_TOKEN = getToken(abc,');
       const text = `${lines.join('\n')}\n`;
       const p = path.join(tmpRoot, 'benign20m.txt');
       await fsp.writeFile(p, text);
       const total = lines.length;
       const { scan, projected } = await projectWindow(p, text, total - 40, total, 8192);
       assert.ok(projected.redacted.every((flag) => flag === false), 'benign lines flagged redacted');
-      assert.ok(projected.lines[projected.lines.length - 1].includes('compose_campaign_storage'));
-      assert.ok(projected.lines[projected.lines.length - 2].includes('CampaignStorageTopology'));
-      assert.ok(projected.lines[projected.lines.length - 3].includes('class CampaignRepo'));
+      assert.ok(projected.lines[projected.lines.length - 3].includes('compose_campaign_storage'));
+      assert.ok(projected.lines[projected.lines.length - 4].includes('CampaignStorageTopology'));
+      assert.ok(projected.lines[projected.lines.length - 2].includes('tokens: 21, token_count: 34, max_tokens: 4096, secretName: "build"'), 'ordinary large-window metrics were hidden');
+      assert.ok(projected.lines[projected.lines.length - 1].includes('const API_TOKEN = getToken(abc,'), 'ordinary large-window call was hidden');
+      assert.ok(projected.lines[projected.lines.length - 5].includes('class CampaignRepo'));
       assert.ok(scan.maxRetainedBytes <= 2 * 1024 * 1024, `retention ${scan.maxRetainedBytes}`);
       console.log(`ok AP-009 benign 20MiB fully available retained=${scan.maxRetainedBytes}`);
     }

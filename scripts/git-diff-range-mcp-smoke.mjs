@@ -16,9 +16,9 @@ import { createCodexProServer } from "../dist/server.js";
 // supporting oracle for expected public patch bytes, not target evidence.
 const DEFAULT_SENTINEL = "DEFAULT_MCP_RANGE_SENTINEL_7X9";
 const TARGET_SENTINEL = "TARGET_MCP_RANGE_SENTINEL_7X9";
-const ADD_SECRET = "ACTUAL_LITERAL_SECRET_7X9";
-const DELETE_SECRET = "DELETED_LITERAL_SECRET_8Y4";
-const CONTEXT_SECRET = "CONTEXT_LITERAL_SECRET_9Z5";
+const ADD_SECRET = "sk-aB3xK9mQ2pL7vN4zR8tY6wS1";
+const DELETE_SECRET = "sk-bC4yL0nR3qM8wP5aT9zV2uX6";
+const CONTEXT_SECRET = "sk-cD5zM1pS4rN9xQ6bU0aW3vY7";
 const HOSTILE_KEY = "OPENAI_API_KEY_UNKNOWN_PROPERTY_7X9";
 const HOSTILE_VALUE = "sk-hostile-mcp-envelope-secret-7X9";
 const HOSTILE_REF_LITERAL = "HOSTILE_REF_SOURCE_LITERAL_8K2";
@@ -28,11 +28,11 @@ const TEXTCONV_SENTINEL = "TEXTCONV_SHOULD_NOT_RUN_6R3";
 const BLOCKED_SECRET = "BLOCKED_PUBLIC_SECRET_4N8";
 const BINARY_SECRET = "BINARY_PUBLIC_SECRET_3M7";
 const matrixSecrets = [
-  "ACTUAL_LITERAL_SECRET_7X9",
-  "DELETED_LITERAL_SECRET_8Y4",
-  "CONTEXT_LITERAL_SECRET_9Z5",
-  "RENAMED_LITERAL_SECRET_6Q2",
-  "COPIED_LITERAL_SECRET_5P1",
+  "sk-aB3xK9mQ2pL7vN4zR8tY6wS1",
+  "sk-bC4yL0nR3qM8wP5aT9zV2uX6",
+  "sk-cD5zM1pS4rN9xQ6bU0aW3vY7",
+  "sk-dE6aN2qT5sP0yR7cV1bX4wZ8",
+  "sk-eF7bO3rU6tQ1zS8dW2cY5xX9",
   BLOCKED_SECRET,
   BINARY_SECRET
 ];
@@ -436,7 +436,7 @@ async function makePublicBudgetFixture(root) {
   await writeFixture(root, "a.txt", "a before\n");
   await writeFixture(root, "b.txt", "b before\n");
   const baseSha = await commitAll(root, "public budget base");
-  await writeFixture(root, "a.txt", "a before\ntoken = \"ACTUAL_LITERAL_SECRET_7X9\"\n");
+  await writeFixture(root, "a.txt", "a before\ntoken = \"sk-aB3xK9mQ2pL7vN4zR8tY6wS1\"\n");
   await writeFixture(root, "b.txt", "b before\nafter second fragment\n");
   const headSha = await commitAll(root, "public budget head");
   return { root, baseSha, headSha, relevantPaths: ["a.txt", "b.txt"] };

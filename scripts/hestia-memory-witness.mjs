@@ -53,7 +53,7 @@ console.log(failures === 0 ? "MEMORY_WITNESS: PASS" : "MEMORY_WITNESS: FAIL");
 process.exit(failures === 0 ? 0 : 1);
 
 async function runChild(name) {
-  const { scanWorkingTreeFile, SELECT_CAPTURE_CAP_RECORDS, PRIVATE_KEY_SPAN_CAP } =
+  const { scanWorkingTreeFile, SELECT_CAPTURE_CAP_RECORDS } =
     await import(join(DIST, "sourceProjection.js"));
   const fsp = (await import("node:fs/promises")).default;
   const dir = mkdtempSync(join(tmpdir(), "hestia-mem-"));
@@ -144,7 +144,7 @@ async function runChild(name) {
       }
     );
     // streamGitBlobToScan returns the scan already run over the streamed blob.
-    return report(scan, Number(stat), { SELECT_CAPTURE_CAP_RECORDS, PRIVATE_KEY_SPAN_CAP });
+    return report(scan, Number(stat), { SELECT_CAPTURE_CAP_RECORDS });
   } else if (name === "far-range") {
     await streamLines(absPath, 8 << 20, () => "\n");
     startLine = 1; endLine = 8000000; // far more lines than capture capacity
@@ -153,7 +153,7 @@ async function runChild(name) {
   const scan = await scanWorkingTreeFile(fsp, { absPath, startLine, endLine });
   const stat = (await import("node:fs")).statSync(absPath);
   rmSync(dir, { recursive: true, force: true });
-  return report(scan, stat.size, { SELECT_CAPTURE_CAP_RECORDS, PRIVATE_KEY_SPAN_CAP });
+  return report(scan, stat.size, { SELECT_CAPTURE_CAP_RECORDS });
 
   function report(scan, sourceBytes, bounds) {
     const ru = process.resourceUsage();
@@ -161,9 +161,6 @@ async function runChild(name) {
     const notes = [];
     if (scan.selected.length > bounds.SELECT_CAPTURE_CAP_RECORDS) {
       structuralOk = false; notes.push(`selected ${scan.selected.length} exceeds record cap`);
-    }
-    if (!scan.spansOverflowed && scan.privateKeySpans.length > bounds.PRIVATE_KEY_SPAN_CAP) {
-      structuralOk = false; notes.push(`spans ${scan.privateKeySpans.length} exceed span cap`);
     }
     // Contiguity: captured lines must be an exact prefix from the window start.
     for (let i = 1; i < scan.selected.length; i += 1) {
@@ -176,8 +173,8 @@ async function runChild(name) {
       structuralOk = false; notes.push("giant content retained");
     }
     if (name === "dense-spans") {
-      if (!scan.spansOverflowed) { structuralOk = false; notes.push("dense corpus must overflow"); }
-      if (scan.privateKeySpans.length !== 0) { structuralOk = false; notes.push("overflow must retain no spans"); }
+      if (scan.spansOverflowed) { structuralOk = false; notes.push("dense corpus must not hide benign tail"); }
+      if (scan.privateKeySpans.length !== 0) { structuralOk = false; notes.push("out-of-window blocks must retain no spans"); }
     }
     if (name === "far-range" || name === "newlines-8m" || name === "tiny-8m") {
       if (!scan.selectionCapped) { structuralOk = false; notes.push("expected capture cap with continuation"); }

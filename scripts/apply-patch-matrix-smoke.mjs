@@ -536,8 +536,11 @@ try {
   const twinBothTarget = path.join(twinBothRoot, 'target');
   await initRepo(twinBothProducer, twinFiles);
   await initRepo(twinBothTarget, twinFiles);
-  await writeFile(twinBothProducer, twinLiteral, twinBaitLiteral);
-  await writeFile(twinBothProducer, twinSlash, twinBaitSlash);
+  const twinSecret = 'sk-' + 'aB3xK9mQ2pL7vN4zR8tY6wS1';
+  const twinSecretLiteral = `class Literal:\n    api_key = "${twinSecret}"\n`;
+  const twinSecretSlash = `class Slash:\n    api_key = "${twinSecret}"\n`;
+  await writeFile(twinBothProducer, twinLiteral, twinSecretLiteral);
+  await writeFile(twinBothProducer, twinSlash, twinSecretSlash);
   runGit(twinBothProducer, ['add', '-A']);
   const twinBothPatch = canonicalDiff(twinBothProducer, true);
   const twinBothPreflight = preflightEvidence(twinBothTarget, twinBothPatch);
@@ -549,8 +552,8 @@ try {
     arguments: { workspace_id: await openWorkspace(client, twinBothTarget), patch: twinBothPatch }
   });
   assert.equal(twinBothResult.isError, true, `twin C granted parser authority or applied ambiguous paths: ${resultText(twinBothResult)}`);
-  assert.match(resultText(twinBothResult), /Secret-looking content is blocked|source|policy|blocked/i, 'twin C did not fail closed at source policy');
-  assert.equal(JSON.stringify(twinBothResult).includes('ACTUAL_LITERAL_SECRET_7X9'), false, 'twin C echoed source-policy bait');
+  assert.match(resultText(twinBothResult), /Secret literal found/i, 'twin C did not fail closed at source policy');
+  assert.equal(JSON.stringify(twinBothResult).includes(twinSecret), false, 'twin C echoed source-policy bait');
   assert.equal(snapshotJson(await snapshotWorkspace(twinBothTarget)), snapshotJson(twinBothBefore), 'twin C source-policy rejection mutated either path');
   assert.deepEqual(gitIndexState(twinBothTarget), twinBothIndexBefore, 'twin C source-policy rejection changed the target index');
   for (const [name, value] of [
@@ -722,10 +725,10 @@ try {
   await rejectedCase(client, suiteRoot, 'python-gating-hostile-pyi', { 'hostile.pyi': 'class Hostile:\n    token: Token[str]\n' }, async (root) => {
     const patchRoot = path.join(path.dirname(root), 'producer');
     await initRepo(patchRoot, { 'hostile.pyi': 'class Hostile:\n    token: Token[str]\n' });
-    await writeFile(patchRoot, 'hostile.pyi', 'class Hostile:\n    token = ACTUAL_LITERAL_SECRET_7X9\n');
+    await writeFile(patchRoot, 'hostile.pyi', 'class Hostile:\n    api_key = "sk-aB3xK9mQ2pL7vN4zR8tY6wS1"\n');
     runGit(patchRoot, ['add', '-A']);
     return canonicalDiff(patchRoot, true);
-  }, /Secret-looking content is blocked|source|patch/i);
+  }, /Secret literal found/i);
   matrix.push('PYTHON-HOSTILE');
 
   const blockedRenamePatch = async (root) => {

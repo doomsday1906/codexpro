@@ -37,15 +37,10 @@ cd /path/to/your/repo
 codexpro setup
 ```
 
-## Approve nonsecret Python test values
-
-Python call keywords accept complete variable or dotted-attribute references. For a known nonsecret string or `None` in a credential-named test keyword, the local owner can enroll the existing file. Formatted strings require variable or dotted-attribute interpolations with optional static format specifications:
-
-```bash
-codexpro approve-source /absolute/path/test.py --expected-sha CURRENT_SHA256 --keywords token,work_token
-```
-
-Use the current file SHA returned by `read`. Enrollment records only the canonical path, enrollment SHA and exact keyword/callee/value hashes in `~/.codexpro/source-approvals.json`; it never changes source. Unrelated edits keep the approval. Changed values, callees, credential keyword names, unapproved paths and malformed source require a new decision. Definite credential patterns still scan every byte and cannot be approved. MCP exposes no approval-writing tool. `CODEXPRO_SOURCE_APPROVALS_FILE` selects an explicit registry for isolated testing.
+RepoConnect masks known token formats, private keys, URL passwords, Bearer values,
+and long high-entropy credential literals. Ordinary code and numeric metrics pass.
+A write containing a secret literal reports its exact line and column; replace
+that literal with an environment lookup and retry.
 
 ## Connect in ChatGPT
 
