@@ -7,7 +7,7 @@ import { CODEXPRO_PACKAGE_ROOT } from "./buildIdentity.js";
 import type { CodexProConfig } from "./config.js";
 import { CodexProError, PathGuard, type Workspace } from "./guard.js";
 import { terminateProcessTree, makeRestrictedBashEnv, assertBashSession, SAFE_BLOCKED_PATTERNS } from "./bashOps.js";
-import { redactDiagnosticText, createPrivateKeyScanner } from "./redact.js";
+import { redactDiagnosticText, redactJsonText, createPrivateKeyScanner } from "./redact.js";
 
 export type VerificationRunnerFamily =
   | "package_script"
@@ -59,6 +59,14 @@ export interface VerificationJobRecord {
   signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
+  stdout_redaction?: {
+    format: "json" | "text";
+    parseable: boolean;
+    changed: boolean;
+    coverage: string;
+    nested_values_omitted?: boolean;
+    truncated: boolean;
+  };
   truncated: boolean;
   observedStdoutBytes: number;
   observedStderrBytes: number;
@@ -571,6 +579,7 @@ export class StreamingRedactor {
   private linePending = "";
   private suppressingOverlongLine = false;
   public hasSuppressedContent = false;
+  public hasRedactedContent = false;
 
   /** Default safety bound for callers without a tighter output-budget owner. */
   public static readonly MAX_PENDING_LINE_CHARS = 4096;
@@ -597,7 +606,13 @@ export class StreamingRedactor {
 
   public peekPending(): string {
     if (this.suppressingOverlongLine || !this.linePending) return "";
-    return redactDiagnosticText(this.linePending);
+    return this.redact(this.linePending);
+  }
+
+  private redact(text: string): string {
+    const redacted = redactDiagnosticText(text);
+    this.hasRedactedContent ||= redacted !== text;
+    return redacted;
   }
 
   private processText(text: string, final: boolean): Buffer[] {
@@ -646,7 +661,7 @@ export class StreamingRedactor {
         outputChunks.push(Buffer.from(StreamingRedactor.OUTPUT_SUPPRESSION_MARKER + nlMatch.separator, "utf8"));
       } else {
         const fullLineWithSep = fullLineBody + nlMatch.separator;
-        const redacted = redactDiagnosticText(fullLineWithSep);
+        const redacted = this.redact(fullLineWithSep);
         if (redacted) {
           outputChunks.push(Buffer.from(redacted, "utf8"));
         }
@@ -663,7 +678,7 @@ export class StreamingRedactor {
           this.linePending = "";
           outputChunks.push(Buffer.from(StreamingRedactor.OUTPUT_SUPPRESSION_MARKER, "utf8"));
         } else {
-          const redacted = redactDiagnosticText(this.linePending);
+          const redacted = this.redact(this.linePending);
           this.linePending = "";
           if (redacted) {
             outputChunks.push(Buffer.from(redacted, "utf8"));
@@ -1887,6 +1902,7 @@ export class ManagedVerificationJob {
       postRedactionTruncated ||
       this.stdoutRedactor.hasSuppressedContent ||
       this.stderrRedactor.hasSuppressedContent;
+    const stdoutJson = redactJsonText(finalStdout, "diagnostic");
 
     return {
       jobId: this.jobId,
@@ -1908,6 +1924,14 @@ export class ManagedVerificationJob {
       signal: this.signal,
       stdout: finalStdout,
       stderr: finalStderr,
+      stdout_redaction: {
+        format: stdoutJson ? "json" : "text",
+        parseable: stdoutJson !== undefined,
+        changed: this.stdoutRedactor.hasRedactedContent || redactedStdout !== rawStdout,
+        coverage: "credential-named JSON fields and secret-pattern text redaction",
+        ...(stdoutJson ? { nested_values_omitted: stdoutJson.omittedNestedValues } : {}),
+        truncated
+      },
       truncated,
       observedStdoutBytes: this.observedStdoutBytes,
       observedStderrBytes: this.observedStderrBytes,

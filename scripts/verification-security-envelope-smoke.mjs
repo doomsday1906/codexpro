@@ -21,6 +21,7 @@ console.log("# RepoConnect M009 TASK-006 Security Envelope & Redaction Smoke");
 const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codexpro-m009-sec-"));
 const realFixtureRoot = await fs.realpath(fixtureRoot);
 const realWsId = `ws_${createHash("sha256").update(realFixtureRoot).digest("hex").slice(0, 24)}`;
+const mixedEscapedLog = String.raw`log: {"data":"{\"payload\":\"{\\\"apiToken":"LEAK-mixed-api\\\",\\\"authToken\\\":"LEAK-mixed-auth\\\",\\\"user.cookie\\\":"LEAK-mixed-cookie\\\",\\\"tokens\\\":21,\\\"token_count\\\":34}\"}"}`;
 
 const previousBashTimeout = process.env.CODEXPRO_MAX_BASH_TIMEOUT_MS;
 process.env.CODEXPRO_MAX_BASH_TIMEOUT_MS = "900000";
@@ -47,6 +48,7 @@ await fs.writeFile(
       "leak-secret": `node -e "${secretScript}"`,
       "leak-json": `node -e "console.log(JSON.stringify({apiToken:'LEAK-api',cookie:'LEAK-cookie',Authorization:'Bearer LEAK-auth',sessionId:123456,passphrase:'LEAK-pass',signature:'LEAK-signature',otp:654321,pwd:'LEAK-pwd',pass:'LEAK-pass-field',jwt:'LEAK-jwt',mfa:'LEAK-mfa',accessKey:'LEAK-access-key',note:'Bearer LEAK-note',tokens:21,token_count:34}))"`,
       "leak-escaped-json": "node -e 'console.log(\"log:\", JSON.stringify({data: JSON.stringify({apiToken:\"LEAK-verif-escaped\", \"user.cookie\":\"LEAK-verif-dotted\", \"session.id\":\"LEAK-verif-session\", payload: JSON.stringify({apiToken:\"LEAK-verif-deep-api\", authToken:\"LEAK-verif-deep-auth\", \"user.cookie\":\"LEAK-verif-deep-cookie\", tokens:21, token_count:34})})}))'",
+      "leak-mixed-escaped-json": `node -e "process.stdout.write(Buffer.from('${Buffer.from(mixedEscapedLog).toString("base64")}', 'base64').toString())"`,
       "quick": "node -e 'process.exit(0);'",
       "long": "node -e 'require(\"fs\").writeFileSync(\"cancel-started\",\"yes\"); setTimeout(() => {}, 60000);'"
     }
@@ -328,6 +330,10 @@ async function runTests() {
   }
   assert.match(verificationJson, /"tokens":21/u, "verification JSON must preserve numeric tokens usage");
   assert.match(verificationJson, /"token_count":34/u, "verification JSON must preserve numeric token_count usage");
+  assert.equal(jsonJobWait.structuredContent.stdout_redaction.changed, true,
+    "verification redaction metadata must report masked stdout credentials");
+  assert.equal(jsonJobWait.structuredContent.stdout_redaction.truncated, false,
+    "complete verification stdout must report no truncation");
   const escapedJobStart = await clientRedact.callTool({ name: "start_verification", arguments: {
     workspace_id: realWsId, runner: "package_script", package_manager: "npm", script: "leak-escaped-json"
   } });
@@ -346,6 +352,22 @@ async function runTests() {
     "deeply escaped verification JSON must preserve numeric tokens usage");
   assert.match(escapedJobWait.structuredContent.stdout, /\\\\\\"token_count\\\\\\":34/u,
     "deeply escaped verification JSON must preserve numeric token_count usage");
+  const mixedVerificationStart = await clientRedact.callTool({ name: "start_verification", arguments: {
+    workspace_id: realWsId, runner: "package_script", package_manager: "npm", script: "leak-mixed-escaped-json"
+  } });
+  const mixedVerificationWait = await clientRedact.callTool({ name: "wait_verification", arguments: {
+    job_id: mixedVerificationStart.structuredContent.jobId, max_wait_seconds: 10
+  } });
+  assert.equal(mixedVerificationWait.structuredContent.state, "succeeded");
+  for (const secret of ["LEAK-mixed-api", "LEAK-mixed-auth", "LEAK-mixed-cookie"]) {
+    assert.ok(!mixedVerificationWait.structuredContent.stdout.includes(secret), `malformed mixed-depth verification stdout must mask ${secret}`);
+  }
+  assert.match(mixedVerificationWait.structuredContent.stdout, /tokens.{0,10}:21/u,
+    "malformed mixed-depth verification stdout must preserve numeric tokens usage");
+  assert.match(mixedVerificationWait.structuredContent.stdout, /token_count.{0,10}:34/u,
+    "malformed mixed-depth verification stdout must preserve numeric token_count usage");
+  assert.equal(mixedVerificationWait.structuredContent.stdout_redaction.changed, true,
+    "malformed verification output metadata must report actual masking");
   console.log("  PASS: Verification stdout JSON fields are masked and numeric usage metrics stay numeric");
 
   // Test 5: Multiline JSON stdout remains parseable after redaction.
@@ -437,6 +459,11 @@ async function runTests() {
   assert.ok(!mixedDiagnostic.includes("opaque-value"), "text fallback must still redact Bearer values");
   assert.equal(JSON.parse(redactJsonText('{"note":"Bearer \\\"quoted-secret\\\""}', "diagnostic").text).note,
     "Bearer [REDACTED_SECRET]", "quoted Bearer values must be masked");
+  const malformedNested = redactJsonText(JSON.stringify({ data: '{"cookie":"LEAK-malformed-inner","tokens":21,"token_count":34' }), "diagnostic");
+  const malformedNestedValue = JSON.parse(malformedNested.text).data;
+  assert.ok(!malformedNestedValue.includes("LEAK-malformed-inner"), "malformed nested JSON strings must still redact credential fields");
+  assert.match(malformedNestedValue, /"tokens":21/u, "malformed nested JSON strings must preserve numeric tokens usage");
+  assert.match(malformedNestedValue, /"token_count":34/u, "malformed nested JSON strings must preserve numeric token_count usage");
   const opaqueKeyedValue = redactJsonText('{"token":"opaque-value"}', "diagnostic");
   assert.equal(opaqueKeyedValue.changed, true, "masking an opaque credential-named value must be reported");
   const secretFieldNames = redactJsonText(JSON.stringify({
@@ -506,6 +533,14 @@ async function runTests() {
   assert.equal(wrappedInner.tokens, 21, "JSON-string payload must preserve numeric tokens usage");
   assert.equal(wrappedInner.token_count, 34, "JSON-string payload must preserve numeric token_count usage");
 
+  const malformedWrappedText = JSON.stringify({ data: '{"cookie":"LEAK-malformed-public","tokens":21,"token_count":34' });
+  await fs.writeFile(path.join(realFixtureRoot, "malformed-wrapped-board.json"), malformedWrappedText, "utf8");
+  const malformedWrappedOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat malformed-wrapped-board.json" } });
+  const malformedWrappedOuter = JSON.parse(malformedWrappedOutput.structuredContent.stdout);
+  assert.ok(!malformedWrappedOuter.data.includes("LEAK-malformed-public"), "public JSON string fallback must mask malformed nested credentials");
+  assert.match(malformedWrappedOuter.data, /"tokens":21/u, "public malformed nested JSON must preserve numeric tokens usage");
+  assert.match(malformedWrappedOuter.data, /"token_count":34/u, "public malformed nested JSON must preserve numeric token_count usage");
+
   const deeplyWrappedJson = `log: ${JSON.stringify({ data: JSON.stringify({ payload: JSON.stringify({
     apiToken: "LEAK-deep-api", authToken: "LEAK-deep-auth", "user.cookie": "LEAK-deep-cookie", tokens: 21, token_count: 34
   }) }) })}`;
@@ -519,12 +554,35 @@ async function runTests() {
   const deeplyWrappedInner = JSON.parse(JSON.parse(deeplyWrappedOuter.data).payload);
   assert.equal(deeplyWrappedInner.tokens, 21, "deeply escaped JSON must preserve numeric tokens usage");
   assert.equal(deeplyWrappedInner.token_count, 34, "deeply escaped JSON must preserve numeric token_count usage");
+  await fs.writeFile(path.join(realFixtureRoot, "mixed-escaped-board.log"), mixedEscapedLog, "utf8");
+  const mixedEscapedOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat mixed-escaped-board.log" } });
+  for (const secret of ["LEAK-mixed-api", "LEAK-mixed-auth", "LEAK-mixed-cookie"]) {
+    assert.ok(!mixedEscapedOutput.structuredContent.stdout.includes(secret), `malformed mixed-depth public stdout must mask ${secret}`);
+  }
+  assert.match(mixedEscapedOutput.structuredContent.stdout, /tokens.{0,10}:21/u,
+    "malformed mixed-depth public stdout must preserve numeric tokens usage");
+  assert.match(mixedEscapedOutput.structuredContent.stdout, /token_count.{0,10}:34/u,
+    "malformed mixed-depth public stdout must preserve numeric token_count usage");
+  assert.equal(mixedEscapedOutput.structuredContent.stdout_redaction.changed, true,
+    "malformed mixed-depth public stdout metadata must report credential masking");
+  await fs.writeFile(path.join(realFixtureRoot, "mixed-escaped-large.log"), `${mixedEscapedLog}\n${"x".repeat(300_000)}`, "utf8");
+  const truncatedMixedEscaped = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat mixed-escaped-large.log" } });
+  assert.equal(truncatedMixedEscaped.structuredContent.stdout_redaction.truncated, true,
+    "malformed mixed-depth truncated output must report source truncation");
+  for (const secret of ["LEAK-mixed-api", "LEAK-mixed-auth", "LEAK-mixed-cookie"]) {
+    assert.ok(!truncatedMixedEscaped.structuredContent.stdout.includes(secret), `malformed mixed-depth truncated output must not leak ${secret}`);
+  }
+  assert.match(truncatedMixedEscaped.structuredContent.stdout, /tokens.{0,10}:21/u,
+    "malformed mixed-depth truncated output must preserve numeric tokens usage");
+  assert.match(truncatedMixedEscaped.structuredContent.stdout, /token_count.{0,10}:34/u,
+    "malformed mixed-depth truncated output must preserve numeric token_count usage");
   const singleEscapedDiagnostic = redactDiagnosticText(`log: ${JSON.stringify({ data: JSON.stringify({ apiToken: "LEAK-single", tokens: 21, token_count: 34 }) })}`);
   const singleEscapedOuter = JSON.parse(singleEscapedDiagnostic.slice("log: ".length));
   const singleEscapedInner = JSON.parse(singleEscapedOuter.data);
   assert.equal(singleEscapedInner.apiToken, "[REDACTED_SECRET]");
   assert.equal(singleEscapedInner.tokens, 21, "single-escaped redaction must not consume the next field");
   assert.equal(singleEscapedInner.token_count, 34, "single-escaped redaction must preserve adjacent numeric metrics");
+
   assert.deepEqual(jsonOutput.structuredContent.stdout_redaction, {
     format: "json",
     parseable: true,

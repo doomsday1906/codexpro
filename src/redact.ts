@@ -134,7 +134,11 @@ function jsonValueEnd(text: string, start: number, escapeDepth: number): number 
   const first = text[quotePosition];
   if (first === '"' || first === "'") {
     for (let index = quotePosition + 1; index < text.length; index += 1) {
-      if (text[index] === first && backslashesBefore(text, index) === openingEscapeDepth) return index + 1;
+      if (text[index] !== first) continue;
+      let afterQuote = index + 1;
+      while (/\s/u.test(text[afterQuote] ?? "")) afterQuote += 1;
+      const delimiter = afterQuote === text.length || /[,}\]\r\n]/u.test(text[afterQuote] ?? "");
+      if (delimiter) return index + 1;
     }
     return text.length;
   }
@@ -166,7 +170,7 @@ interface DiagnosticField {
   keyStart: number;
   valueStart: number;
   valueEnd: number;
-  escapeDepth: number;
+  valueEscapeDepth: number;
 }
 
 function decodedFieldName(value: string): string {
@@ -195,7 +199,6 @@ function diagnosticFields(text: string): DiagnosticField[] {
     }
     let cursor = index;
     while (text[cursor] === "\\") cursor += 1;
-    const escapeDepth = cursor - index;
     const quote = text[cursor] === '"' || text[cursor] === "'" ? text[cursor++] : undefined;
     if (!quote && !isNameStart(text[cursor])) {
       index += 1;
@@ -203,7 +206,12 @@ function diagnosticFields(text: string): DiagnosticField[] {
     }
     const nameStart = cursor;
     if (quote) {
-      while (cursor < text.length && !(text[cursor] === quote && backslashesBefore(text, cursor) === escapeDepth)) {
+      while (cursor < text.length) {
+        if (text[cursor] === quote) {
+          let afterQuote = cursor + 1;
+          while (/\s/u.test(text[afterQuote] ?? "")) afterQuote += 1;
+          if (text[afterQuote] === ":") break;
+        }
         cursor += 1;
       }
     } else {
@@ -225,8 +233,11 @@ function diagnosticFields(text: string): DiagnosticField[] {
       continue;
     }
     const valueStart = cursor + 1;
-    const valueEnd = jsonValueEnd(text, valueStart, escapeDepth);
-    fields.push({ key, keyStart: index, valueStart, valueEnd, escapeDepth });
+    let valueQuoteStart = valueStart;
+    while (/\s/u.test(text[valueQuoteStart] ?? "")) valueQuoteStart += 1;
+    const valueEscapeDepth = backslashesAfter(text, valueQuoteStart);
+    const valueEnd = jsonValueEnd(text, valueStart, valueEscapeDepth);
+    fields.push({ key, keyStart: index, valueStart, valueEnd, valueEscapeDepth });
     index = Math.max(index + 1, cursor + 1);
   }
   return fields;
@@ -256,10 +267,12 @@ function redactDiagnosticPreservingMetrics(text: string): string {
     } else if (isCredentialFieldName(field.key)) {
       let placeholder = `__AW_CREDENTIAL_VALUE_${replacements.length}__`;
       while (text.includes(placeholder)) placeholder += "_";
-      const quotePosition = field.valueStart + backslashesBefore(text, field.valueStart);
+      let quotePosition = field.valueStart;
+      while (/\s/u.test(text[quotePosition] ?? "")) quotePosition += 1;
+      quotePosition += backslashesAfter(text, quotePosition);
       const first = text[quotePosition];
       const quote = first === "'" ? "'" : '"';
-      const escapedQuote = "\\".repeat(field.escapeDepth);
+      const escapedQuote = "\\".repeat(field.valueEscapeDepth);
       replacements.push({
         start: field.keyStart,
         end: field.valueEnd,
@@ -303,7 +316,7 @@ function redactJsonTextAtDepth(
         omittedNestedValues ||= nested.omittedNestedValues;
         return nested.text;
       }
-      const safe = redactSensitiveText(value, options).replace(/\bBearer\s+(?:"[^"]*"|'[^']*'|[A-Za-z0-9._~+/-]+=*)/giu, "Bearer [REDACTED_SECRET]");
+      const safe = redactDiagnosticPreservingMetrics(value);
       if (safe !== value) changed = true;
       return safe;
     }
