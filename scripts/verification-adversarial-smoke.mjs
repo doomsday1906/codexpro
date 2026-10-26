@@ -659,7 +659,6 @@ async function runTests() {
     const mgr = new VerificationManager(baseConfig, { minLifetimeMs: 500, defaultLifetimeMs: 30000 });
     const pidName = "detached-16.pid";
     try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
-    const startT = Date.now();
     const started = await mgr.startVerification(fakeWorkspace, guard, {
       workspace_id: fakeWorkspace.id,
       runner: "package_script",
@@ -667,16 +666,16 @@ async function runTests() {
       script: "verification:lifecycle",
       args: ["--detached-child-ms", "8000", "--detached-pid-file", pidName, "--run-ms", "0"]
     });
+    const childPid = await waitForPidFile(path.join(realFixtureRoot, pidName), 5000);
+    assert.ok(childPid > 0, "Zero-cushion fixture must record its detached child PID");
+    const startT = Date.now();
     const result = await mgr.waitVerification(started.jobId, 10);
     const elapsed = Date.now() - startT;
-    const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
-    assert.ok(elapsed < 6000, `Zero-cushion pipe-holder must bound before self-exit (elapsed ${elapsed}ms)`);
+    assert.ok(elapsed < 7000, `Zero-cushion pipe-holder must bound before the child's 8s self-exit (elapsed ${elapsed}ms)`);
     assert.equal(result.state, "failed", `Zero-cushion intervention must be cleanup-aware failure, got ${result.state}`);
     assert.match(result.terminalReason ?? "", /cleanup|owned descendant/i, "Terminal reason must be cleanup-aware");
     assert.equal(mgr.getActiveCount(), 0);
-    if (childPid > 0) {
-      assert.ok(!isPidAlive(childPid), `Pipe-holding child PID ${childPid} must be dead (no orphan)`);
-    }
+    assert.ok(!isPidAlive(childPid), `Pipe-holding child PID ${childPid} must be dead (no orphan)`);
     try { await mgr.close(); } catch {}
     try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
     console.log(`  PASS: Zero-cushion holder bounded in ${elapsed}ms with cleanup-aware failure, no orphan`);

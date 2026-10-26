@@ -10,7 +10,7 @@ import { loadConfig } from "../dist/config.js";
 import { PathGuard } from "../dist/guard.js";
 import { createCodexProServer } from "../dist/server.js";
 import { VerificationManager } from "../dist/verificationOps.js";
-import { redactJsonText } from "../dist/redact.js";
+import { redactDiagnosticText, redactJsonText } from "../dist/redact.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
@@ -45,6 +45,7 @@ await fs.writeFile(
     name: "sec-fixture",
     scripts: {
       "leak-secret": `node -e "${secretScript}"`,
+      "leak-json": `node -e "console.log(JSON.stringify({apiToken:'LEAK-api',cookie:'LEAK-cookie',Authorization:'Bearer LEAK-auth',sessionId:123456,passphrase:'LEAK-pass',signature:'LEAK-signature',otp:654321,pwd:'LEAK-pwd',pass:'LEAK-pass-field',jwt:'LEAK-jwt',mfa:'LEAK-mfa',accessKey:'LEAK-access-key',note:'Bearer LEAK-note',tokens:21,token_count:34}))"`,
       "quick": "node -e 'process.exit(0);'",
       "long": "node -e 'require(\"fs\").writeFileSync(\"cancel-started\",\"yes\"); setTimeout(() => {}, 60000);'"
     }
@@ -288,7 +289,7 @@ async function runTests() {
 
   // Test 4: Secret and token redaction in verification stdout/stderr
   console.log("\n[Test 4] Redaction filters secrets/tokens from verification stdout and stderr...");
-  const { verificationManager: mgrRedact, config: configSafeRedact } = await createClientServer({ bashMode: "safe" });
+  const { client: clientRedact, verificationManager: mgrRedact, config: configSafeRedact } = await createClientServer({ bashMode: "safe" });
   const fakeWorkspace = {
     id: "ws_sec_test_000000000000",
     root: realFixtureRoot,
@@ -312,7 +313,21 @@ async function runTests() {
 
   assert.ok(!leakResult.stderr.includes("ghp_1234567890abcdef1234567890abcdef1234"), "GitHub token must not appear in stderr");
   assert.match(leakResult.stderr, /\[REDACTED_SECRET\]/, "GitHub token must be redacted in stderr");
-  console.log("  PASS: High-entropy tokens and API keys are redacted in verification job records");
+  const jsonJobStart = await clientRedact.callTool({ name: "start_verification", arguments: {
+    workspace_id: realWsId, runner: "package_script", package_manager: "npm", script: "leak-json"
+  } });
+  assert.ok(!jsonJobStart.isError, "JSON fixture must start through public start_verification");
+  const jsonJobWait = await clientRedact.callTool({ name: "wait_verification", arguments: {
+    job_id: jsonJobStart.structuredContent.jobId, max_wait_seconds: 10
+  } });
+  assert.equal(jsonJobWait.structuredContent.state, "succeeded");
+  const verificationJson = jsonJobWait.structuredContent.stdout;
+  for (const secret of ["LEAK-api", "LEAK-cookie", "LEAK-auth", "LEAK-pass", "LEAK-signature", "LEAK-note", "LEAK-pwd", "LEAK-pass-field", "LEAK-jwt", "LEAK-mfa", "LEAK-access-key"]) {
+    assert.ok(!verificationJson.includes(secret), `verification stdout must mask ${secret}`);
+  }
+  assert.match(verificationJson, /"tokens":21/u, "verification JSON must preserve numeric tokens usage");
+  assert.match(verificationJson, /"token_count":34/u, "verification JSON must preserve numeric token_count usage");
+  console.log("  PASS: Verification stdout JSON fields are masked and numeric usage metrics stay numeric");
 
   // Test 5: Multiline JSON stdout remains parseable after redaction.
   console.log("\n[Test 5] Public bash JSON stdout remains parseable and reports redaction coverage...");
@@ -335,6 +350,7 @@ async function runTests() {
     tokenCounts: { value: "opaque-camel-plural" },
     tokens_count: "opaque-suffix-credential",
     token_counts_value: 777666,
+    accessKey: "opaque-access-key", pwd: "opaque-pwd", pass: "opaque-pass", jwt: "opaque-jwt", mfa: "opaque-mfa",
     cookie: "session=abcdef1234567890",
     setCookie: ["session=another-secret-value"],
     sessionId: 987654321,
@@ -367,7 +383,7 @@ async function runTests() {
   assert.ok(directJson, "multiline JSON must be recognized");
   const safeJson = JSON.parse(directJson.text);
   assert.equal(safeJson.access_token, "[REDACTED_SECRET]");
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "token_counts_value", "cookie", "setCookie", "sessionId", "auth", "passphrase", "signature", "otp", "proxyAuthorization", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "token_counts_value", "cookie", "setCookie", "sessionId", "auth", "passphrase", "signature", "otp", "accessKey", "pwd", "pass", "jwt", "mfa", "proxyAuthorization", "Authorization", "secrets"]) {
     assert.equal(safeJson[key], "[REDACTED_SECRET]", `multiline JSON ${key} field must be redacted`);
   }
   assert.equal(safeJson.note, "Bearer [REDACTED_SECRET]");
@@ -393,6 +409,8 @@ async function runTests() {
     "masking nonnumeric token_count credentials must be reported");
   assert.equal(JSON.parse(redactJsonText('{"note":"Bearer standalone-token-1234567890"}', "diagnostic").text).note,
     "Bearer [REDACTED_SECRET]", "standalone Bearer values must be masked");
+  assert.match(redactDiagnosticText('{"Authorization": Bearer leaked-credential-value'), /\[REDACTED_SECRET\]/u,
+    "malformed or truncated unquoted credential values must be masked through their full value");
   assert.equal(JSON.parse(redactJsonText('{"note":"Bearer \\\"quoted-secret\\\""}', "diagnostic").text).note,
     "Bearer [REDACTED_SECRET]", "quoted Bearer values must be masked");
   const opaqueKeyedValue = redactJsonText('{"token":"opaque-value"}', "diagnostic");
@@ -406,13 +424,14 @@ async function runTests() {
     tokens_count: "opaque", token_counts_value: 123,
     cookie: "session=opaque", setCookie: ["opaque"], sessionId: 123,
     auth: "Basic opaque", passphrase: { value: "opaque" }, signature: null, otp: true,
+    accessKey: "opaque", pwd: "opaque", pass: "opaque", jwt: "opaque", mfa: "opaque",
     proxyAuthorization: "Basic dXNlcjpwYXNz", secrets: { value: "opaque-e" },
     Authorization: "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
     token: 17, tokens: 21, token_count: 34
   }), "diagnostic");
   assert.ok(secretFieldNames);
   const secretFields = JSON.parse(secretFieldNames.text);
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "token_counts_value", "cookie", "setCookie", "sessionId", "auth", "passphrase", "signature", "otp", "proxyAuthorization", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "token_counts_value", "cookie", "setCookie", "sessionId", "auth", "passphrase", "signature", "otp", "accessKey", "pwd", "pass", "jwt", "mfa", "proxyAuthorization", "Authorization", "secrets"]) {
     assert.equal(secretFields[key], "[REDACTED_SECRET]", `${key} must be redacted by its field name`);
   }
   assert.equal(secretFields.token, "[REDACTED_SECRET]", "a numeric singular token field is a credential, not a usage metric");
@@ -456,6 +475,24 @@ async function runTests() {
     truncated: false
   });
   assert.equal(jsonOutput.content[0].text.includes("never-expose-this-token"), false);
+
+  const largeJson = JSON.stringify({
+    Authorization: "Bearer LEAK-large-auth", proxyAuthorization: "Basic LEAK-large-proxy",
+    cookie: "LEAK-large-cookie", sessionId: 998877, auth: "Basic LEAK-large-auth-field",
+    passphrase: "LEAK-large-passphrase", signature: "LEAK-large-signature", otp: 776655,
+    note: "Bearer LEAK-large-note", tokens: 21, token_count: 34, data: "x".repeat(300_000)
+  });
+  await fs.writeFile(path.join(realFixtureRoot, "large-board.json"), largeJson, "utf8");
+  const largeOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat large-board.json" } });
+  const largeStdout = largeOutput.structuredContent.stdout;
+  for (const secret of ["LEAK-large-auth", "LEAK-large-proxy", "LEAK-large-cookie", "LEAK-large-auth-field", "LEAK-large-passphrase", "LEAK-large-signature", "LEAK-large-note"]) {
+    assert.ok(!largeStdout.includes(secret), `truncated JSON stdout must mask ${secret}`);
+  }
+  assert.match(largeStdout, /"tokens":21/u, "truncated JSON text must preserve numeric tokens usage");
+  assert.match(largeStdout, /"token_count":34/u, "truncated JSON text must preserve numeric token_count usage");
+  assert.equal(largeOutput.structuredContent.stdout_redaction.truncated, true, "raw capture truncation must remain visible in metadata");
+  assert.equal(largeOutput.structuredContent.stdout_redaction.parseable, false, "truncated JSON must not claim parseability");
+  assert.equal(largeOutput.structuredContent.truncated, true, "public result must report output truncation");
 
   await fs.writeFile(path.join(realFixtureRoot, "opaque-token.json"), '{"token":"opaque-value"}', "utf8");
   const opaqueJsonOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat opaque-token.json" } });

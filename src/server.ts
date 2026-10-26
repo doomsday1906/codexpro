@@ -1512,11 +1512,13 @@ function diagnosticResult(result: any): any {
           nested_values_omitted: json.omittedNestedValues
         };
       } else {
+        const redactedText = redactDiagnosticText(rawStdout);
+        safe.structuredContent.stdout = redactedText;
         safe.structuredContent.stdout_redaction = priorStdoutRedaction ?? {
           format: "text",
           parseable: false,
-          changed: redactDiagnosticText(rawStdout) !== rawStdout,
-          coverage: "secret-pattern text redaction"
+          changed: redactedText !== rawStdout,
+          coverage: "credential-named JSON fields and secret-pattern text redaction"
         };
       }
     }

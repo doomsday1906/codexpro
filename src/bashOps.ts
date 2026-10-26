@@ -301,6 +301,8 @@ export async function runBash(
     let killedByTimeout = false;
     let closed = false;
     let terminationStarted = false;
+    let stdoutCaptureTruncated = false;
+    let stderrCaptureTruncated = false;
     let killTimer: NodeJS.Timeout | undefined;
     let observedOutputBytes = 0;
     const retainedOutputBytes = config.maxOutputBytes + 1;
@@ -316,11 +318,15 @@ export async function runBash(
       killTimer = setTimeout(() => terminate("SIGKILL"), 1_500);
       killTimer.unref();
     };
-    const appendBounded = (current: string, chunk: unknown) => {
+    const appendBounded = (current: string, chunk: unknown, onTruncated: () => void) => {
       const bytes = Buffer.from(String(chunk), "utf8");
       observedOutputBytes += bytes.byteLength;
       const remaining = retainedOutputBytes - Buffer.byteLength(stdout, "utf8") - Buffer.byteLength(stderr, "utf8");
-      if (remaining <= 0) return current;
+      if (remaining <= 0) {
+        onTruncated();
+        return current;
+      }
+      if (bytes.byteLength > remaining) onTruncated();
       return current + bytes.subarray(0, remaining).toString("utf8");
     };
 
@@ -331,11 +337,11 @@ export async function runBash(
     timer.unref();
 
     child.stdout.on("data", (chunk) => {
-      stdout = appendBounded(stdout, chunk);
+      stdout = appendBounded(stdout, chunk, () => { stdoutCaptureTruncated = true; });
       if (observedOutputBytes > config.maxOutputBytes) terminateWithEscalation();
     });
     child.stderr.on("data", (chunk) => {
-      stderr = appendBounded(stderr, chunk);
+      stderr = appendBounded(stderr, chunk, () => { stderrCaptureTruncated = true; });
       if (observedOutputBytes > config.maxOutputBytes) terminateWithEscalation();
     });
     child.on("error", reject);
@@ -347,7 +353,8 @@ export async function runBash(
         stderr += `\n[codexpro] Command timed out after ${timeoutMs} ms.`;
       }
       const json = redactJsonText(stdout, "diagnostic");
-      const out = trimOutput(json?.text ?? redactDiagnosticText(stdout), config.maxOutputBytes);
+      const safeStdout = json?.text ?? redactDiagnosticText(stdout);
+      const out = trimOutput(safeStdout, config.maxOutputBytes);
       const err = trimOutput(redactDiagnosticText(stderr), config.maxOutputBytes);
       resolve({
         command: redactDiagnosticText(command),
@@ -358,20 +365,20 @@ export async function runBash(
         stdout: out.value,
         stdout_redaction: json ? {
           format: "json",
-          parseable: !out.truncated,
+          parseable: !out.truncated && !stdoutCaptureTruncated,
           changed: json.changed,
           coverage: "credential-named fields (including camelCase), secret-shaped keys, authorization fields, Bearer token values, and diagnostic secret patterns",
           nested_values_omitted: json.omittedNestedValues,
-          truncated: out.truncated
+          truncated: out.truncated || stdoutCaptureTruncated
         } : {
           format: "text",
           parseable: false,
-          changed: redactDiagnosticText(stdout) !== stdout,
-          coverage: "secret-pattern text redaction",
-          truncated: out.truncated
+          changed: safeStdout !== stdout,
+          coverage: "credential-named JSON fields and secret-pattern text redaction",
+          truncated: out.truncated || stdoutCaptureTruncated
         },
         stderr: err.value,
-        truncated: out.truncated || err.truncated,
+        truncated: out.truncated || err.truncated || stdoutCaptureTruncated || stderrCaptureTruncated,
         ...(bashSessionId ? { bashSessionId } : {})
       });
     });

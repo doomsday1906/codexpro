@@ -89,6 +89,105 @@ export interface JsonTextRedactionResult {
   readonly omittedNestedValues: boolean;
 }
 
+function normalizedFieldName(key: string): string {
+  return key.replace(/[^a-z\d]/giu, "").toLowerCase();
+}
+
+function isCredentialFieldName(key: string): boolean {
+  const normalized = normalizedFieldName(key);
+  return normalized.includes("authorization") || normalized.includes("secret") ||
+    normalized.includes("password") || normalized.includes("passwd") ||
+    normalized.includes("privatekey") || normalized.includes("apikey") ||
+    normalized.includes("accesskey") || normalized.includes("passphrase") ||
+    normalized.includes("passcode") || normalized.includes("pwd") || normalized === "pass" ||
+    normalized.includes("jwt") || normalized.includes("mfa") ||
+    normalized.includes("credential") || normalized.includes("bearer") ||
+    normalized.includes("token") || normalized.includes("cookie") ||
+    normalized.includes("session") ||
+    normalized.includes("signature") || normalized.includes("otp") ||
+    (normalized.startsWith("auth") && !normalized.startsWith("author")) || normalized.endsWith("auth");
+}
+
+function isNumericUsageMetric(key: string, value: unknown): boolean {
+  return typeof value === "number" && /^(?:tokens|tokencount)$/u.test(normalizedFieldName(key));
+}
+
+function jsonValueEnd(text: string, start: number): number {
+  while (/\s/u.test(text[start] ?? "")) start += 1;
+  const first = text[start];
+  if (first === '"' || first === "'") {
+    for (let index = start + 1; index < text.length; index += 1) {
+      if (text[index] === "\\") index += 1;
+      else if (text[index] === first) return index + 1;
+    }
+    return text.length;
+  }
+  if (first === "{" || first === "[") {
+    const stack = [first === "{" ? "}" : "]"];
+    let inString = false;
+    for (let index = start + 1; index < text.length; index += 1) {
+      const char = text[index];
+      if (inString) {
+        if (char === "\\") index += 1;
+        else if (char === '"') inString = false;
+      } else if (char === '"') inString = true;
+      else if (char === "{") stack.push("}");
+      else if (char === "[") stack.push("]");
+      else if (char === stack.at(-1)) {
+        stack.pop();
+        if (stack.length === 0) return index + 1;
+      }
+    }
+    return text.length;
+  }
+  let end = start;
+  while (end < text.length && !/[,}\]\r\n]/u.test(text[end])) end += 1;
+  return end;
+}
+
+function redactCredentialFieldsInText(text: string): string {
+  const field = /(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([A-Za-z_$][A-Za-z\d_$-]*))\s*:/gu;
+  const replacements: { start: number; end: number }[] = [];
+  let coveredUntil = 0;
+  for (let match = field.exec(text); match; match = field.exec(text)) {
+    if (match.index < coveredUntil) continue;
+    let key = match[1] ?? match[2] ?? match[3] ?? "";
+    if (match[1] !== undefined) try { key = JSON.parse(`"${key}"`); } catch {}
+    if (!isCredentialFieldName(key)) continue;
+    const valueStart = field.lastIndex;
+    const valueEnd = jsonValueEnd(text, valueStart);
+    const rawValue = text.slice(valueStart, valueEnd).trim();
+    const metric = /^(?:tokens|tokencount)$/u.test(normalizedFieldName(key)) &&
+      /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/u.test(rawValue);
+    if (metric) continue;
+    replacements.push({ start: valueStart, end: valueEnd });
+    coveredUntil = Math.max(valueEnd, valueStart);
+  }
+  if (replacements.length === 0) return text;
+  let result = text;
+  for (const span of replacements.reverse()) {
+    result = `${result.slice(0, span.start)}"[REDACTED_SECRET]"${result.slice(span.end)}`;
+  }
+  return result;
+}
+
+function redactDiagnosticPreservingMetrics(text: string): string {
+  const metrics: { field: string; placeholder: string }[] = [];
+  const metricField = /(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([A-Za-z_$][A-Za-z\d_$-]*))\s*:\s*(-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/gu;
+  const protectedText = text.replace(metricField, (field, doubleKey: string | undefined, singleKey: string | undefined, bareKey: string | undefined) => {
+    let key = doubleKey ?? singleKey ?? bareKey ?? "";
+    if (doubleKey !== undefined) try { key = JSON.parse(`"${key}"`); } catch {}
+    if (!/^(?:tokens|tokencount)$/u.test(normalizedFieldName(key))) return field;
+    let placeholder = `__AW_NUMERIC_USAGE_${metrics.length}__`;
+    while (text.includes(placeholder)) placeholder += "_";
+    metrics.push({ field, placeholder });
+    return placeholder;
+  });
+  const safe = policyRedactDiagnosticText(redactCredentialFieldsInText(protectedText));
+  const restored = metrics.reduce((value, metric) => value.replace(metric.placeholder, metric.field), safe);
+  return restored.replace(/\bBearer\s+(?:"[^"]*"|'[^']*'|[A-Za-z0-9._~+/-]+=*)/giu, "Bearer [REDACTED_SECRET]");
+}
+
 /** Redact a complete JSON value without turning its replacement into invalid JSON. */
 export function redactJsonText(text: string, options: RedactionOptions | RedactionContext = {}): JsonTextRedactionResult | undefined {
   let parsed: unknown;
@@ -100,17 +199,6 @@ export function redactJsonText(text: string, options: RedactionOptions | Redacti
 
   let changed = false;
   let omittedNestedValues = false;
-  const secretFieldName = (key: string): boolean => {
-    const normalized = key.replace(/[^a-z\d]/giu, "").toLowerCase();
-    return normalized.includes("authorization") || normalized.includes("secret") ||
-      normalized.includes("password") || normalized.includes("passwd") ||
-      normalized.includes("privatekey") || normalized.includes("apikey") ||
-      normalized.includes("credential") || normalized.includes("bearer") ||
-      normalized.includes("token") || normalized.includes("cookie") ||
-      normalized.includes("session") || normalized.includes("passphrase") ||
-      normalized.includes("signature") || normalized.includes("otp") ||
-      (normalized.startsWith("auth") && !normalized.startsWith("author")) || normalized.endsWith("auth");
-  };
   const redactValue = (value: unknown, depth: number): unknown => {
     if (depth > 8) {
       changed = true;
@@ -128,8 +216,8 @@ export function redactJsonText(text: string, options: RedactionOptions | Redacti
       for (const [key, item] of Object.entries(value)) {
         const safeKey = redactSensitiveText(key, options);
         const secretKey = safeKey !== key;
-        const tokenMetric = /^(?:tokens|tokencount)$/iu.test(key.replace(/[^a-z\d]/giu, "")) && typeof item === "number";
-        const secretField = secretFieldName(key) && !tokenMetric;
+        const tokenMetric = isNumericUsageMetric(key, item);
+        const secretField = isCredentialFieldName(key) && !tokenMetric;
         const outputKey = secretKey ? "[REDACTED_SECRET]" : key;
         let uniqueKey = outputKey;
         for (let suffix = 2; Object.hasOwn(output, uniqueKey); suffix += 1) {
@@ -257,7 +345,9 @@ export function redactUnifiedDiffPreservingLines(
 }
 
 export function redactDiagnosticText(text: string): string {
-  return policyRedactDiagnosticText(text);
+  const json = redactJsonText(text, "diagnostic");
+  if (json) return json.text;
+  return redactDiagnosticPreservingMetrics(text);
 }
 
 export function redactSearchQuery(query: string, safeMatchTexts: string[] = []): string {
