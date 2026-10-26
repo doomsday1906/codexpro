@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { hasSecretValue, redactUnifiedDiff, sourceLanguageForPath } from '../dist/redact.js';
 
 // This is a target-behavior test.  The producer is Git, the route is the real
 // MCP apply_patch tool, and the expected files come from an independent Git
@@ -311,7 +312,10 @@ async function generatedCase(client, suiteRoot, label, files, mutate, expectedId
   const actual = actualNumstat(target, true);
   const actualIndex = gitIndexState(target);
   runGit(target, ['reset', '-q']);
-  assert.equal(structured.diff, actualDiff, `${label} returned diff differs from direct Git result`);
+  const redactedExpectedDiff = redactUnifiedDiff(actualDiff, (pathHint) =>
+    pathHint === undefined ? undefined : sourceLanguageForPath(pathHint)
+  );
+  assert.equal(structured.diff, redactedExpectedDiff, `${label} returned diff differs from redacted direct Git result`);
   assert.equal(structured.additions, actual.additions, `${label} returned additions differ from Git numstat`);
   assert.equal(structured.deletions, actual.deletions, `${label} returned deletions differ from Git numstat`);
   assert.equal(structured.changed, Boolean(actualDiff.trim()), `${label} changed flag disagrees with direct filesystem diff`);
@@ -323,12 +327,14 @@ async function rejectedCase(client, suiteRoot, label, files, patchFactory, expec
   const target = path.join(caseRoot, 'target');
   await initRepo(target, files);
   const before = await snapshotWorkspace(target);
+  const indexBefore = gitIndexState(target);
   const patch = await patchFactory(target);
   const workspaceId = await openWorkspace(client, target);
   const response = await client.request('tools/call', { name: 'apply_patch', arguments: { workspace_id: workspaceId, patch } });
   assert.equal(response.isError, true, `${label} unexpectedly succeeded: ${resultText(response)}`);
   if (expectedPattern) assert.match(resultText(response), expectedPattern, `${label} error did not identify the expected failure`);
   assert.equal(snapshotJson(await snapshotWorkspace(target)), snapshotJson(before), `${label} rejection changed workspace bytes/types`);
+  assert.deepEqual(gitIndexState(target), indexBefore, `${label} rejection changed the target index`);
   return { patch, target, response };
 }
 
@@ -347,7 +353,9 @@ try {
   await client.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'codexpro-apply-patch-matrix', version: '0.1.0' } });
   client.notify('notifications/initialized');
 
-  const oneFile = { 'ordinary.txt': 'alpha\nbeta\nomega\n' };
+  const changeAwareOnly = process.argv.includes('--change-aware-only');
+  if (!changeAwareOnly) {
+    const oneFile = { 'ordinary.txt': 'alpha\nbeta\nomega\n' };
   await generatedCase(client, suiteRoot, 'A-ordinary-modification', oneFile, async (root) => writeFile(root, 'ordinary.txt', 'alpha\nBETA\nomega\n'), ['ordinary.txt']);
   matrix.push('A');
 
@@ -803,6 +811,77 @@ try {
   assert.equal(await fs.readFile(path.join(simpleTarget, 'simple.txt'), 'utf8'), 'new\n', 'traditional simple patch changed wrong bytes');
   matrix.push('TRADITIONAL');
 
+  }
+
+  const bait = ['su', 'per', '-', 'se', 'cret'].join('');
+  const literal = JSON.stringify(bait);
+  const keyA = ['to', 'ken'].join('');
+  const keyB = ['pass', 'word'].join('');
+  const fixtureLine = (key, value) => `    ${key}${'='}${value}`;
+  const sourcePolicy = { context: 'source', language: 'python' };
+  const unchangedFixture = [
+    'def diagnostics():',
+    fixtureLine(keyA, 'abc'),
+    fixtureLine(keyB, literal),
+    '',
+    'def target():',
+    '    return 1',
+    ''
+  ].join('\n');
+  assert.equal(hasSecretValue(unchangedFixture, sourcePolicy), true, 'untouched synthetic fixtures did not trigger the source scanner');
+  const unrelated = await generatedCase(client, suiteRoot, 'SOURCE-UNCHANGED-FINDINGS', { 'probe.py': unchangedFixture }, async (root) => {
+    const targetPath = path.join(root, 'probe.py');
+    await fs.writeFile(targetPath, unchangedFixture.replace('    return 1', '    return 2'));
+  }, ['probe.py']);
+  assert.equal(JSON.stringify(unrelated.response).includes(bait), false, 'successful diff response leaked an untouched synthetic finding');
+  matrix.push('SOURCE-UNCHANGED-FINDINGS');
+
+  const boundaryBase = ['def run():', '    send(', '        timeout=1,', '    )', ''].join('\n');
+  const boundaryAfter = boundaryBase.replace('        timeout=1,', `        timeout=1,\n${fixtureLine(keyB, literal)},`);
+  assert.equal(hasSecretValue(boundaryBase, sourcePolicy), false, 'boundary baseline unexpectedly contains a sensitive finding');
+  assert.equal(hasSecretValue(boundaryAfter, sourcePolicy), true, 'multiline boundary canary did not trigger the source scanner');
+  const boundary = await rejectedCase(client, suiteRoot, 'SOURCE-NEW-BOUNDARY-CANARY', { 'probe.py': boundaryBase }, async () => {
+    const producer = path.join(suiteRoot, 'SOURCE-NEW-BOUNDARY-CANARY', 'producer');
+    await initRepo(producer, { 'probe.py': boundaryBase });
+    await fs.writeFile(path.join(producer, 'probe.py'), boundaryAfter);
+    runGit(producer, ['add', '-A']);
+    return canonicalDiff(producer, true);
+  }, /Secret-looking content is blocked|source|policy|blocked/i);
+  assert.equal(JSON.stringify(boundary.response).includes(bait), false, 'boundary rejection response leaked its dummy canary');
+  matrix.push('SOURCE-NEW-BOUNDARY-CANARY');
+
+  const multilineCanary = [
+    'def run():',
+    `    ${keyB} = (`,
+    `        ${literal}`,
+    '    )',
+    ''
+  ].join('\n');
+  assert.equal(hasSecretValue(multilineCanary, sourcePolicy), true, 'multiline dummy canary did not trigger the source scanner');
+  const multiline = await rejectedCase(client, suiteRoot, 'SOURCE-NEW-MULTILINE-CANARY', { 'probe.py': 'def run():\n    return 1\n' }, async () => {
+    const producer = path.join(suiteRoot, 'SOURCE-NEW-MULTILINE-CANARY', 'producer');
+    await initRepo(producer, { 'probe.py': 'def run():\n    return 1\n' });
+    await fs.writeFile(path.join(producer, 'probe.py'), multilineCanary);
+    runGit(producer, ['add', '-A']);
+    return canonicalDiff(producer, true);
+  }, /Secret-looking content is blocked|source|policy|blocked/i);
+  assert.equal(JSON.stringify(multiline.response).includes(bait), false, 'multiline rejection response leaked its dummy canary');
+  matrix.push('SOURCE-NEW-MULTILINE-CANARY');
+
+  const changedFinding = unchangedFixture.replace(literal, JSON.stringify(`${bait}-changed`));
+  assert.equal(hasSecretValue(changedFinding, sourcePolicy), true, 'overlap dummy canary did not remain scanner-visible');
+  const overlap = await rejectedCase(client, suiteRoot, 'SOURCE-OVERLAPPING-FINDING', { 'probe.py': unchangedFixture }, async () => {
+    const producer = path.join(suiteRoot, 'SOURCE-OVERLAPPING-FINDING', 'producer');
+    await initRepo(producer, { 'probe.py': unchangedFixture });
+    await fs.writeFile(path.join(producer, 'probe.py'), changedFinding);
+    runGit(producer, ['add', '-A']);
+    return canonicalDiff(producer, true);
+  }, /Secret-looking content is blocked|source|policy|blocked/i);
+  assert.equal(JSON.stringify(overlap.response).includes(bait), false, 'overlap rejection response leaked its dummy canary');
+  matrix.push('SOURCE-OVERLAPPING-FINDING');
+  if (changeAwareOnly) console.log(`apply-patch-change-aware-smoke: PASS (${matrix.join(', ')})`);
+
+  if (!changeAwareOnly) {
   // Two same-object writers must serialize. The loser has a second Git
   // preflight under the lock and must fail before real mutation.
   const raceTarget = path.join(suiteRoot, 'race', 'target');
@@ -917,10 +996,15 @@ try {
   console.log(`ACCEPTANCE_MATRIX: ${matrix.join(', ')} PASS`);
   console.log('PASS 1 SANITY: direct fixture filesystem/result facts matched the accepted launcher invariants.');
   console.log('SANITY_VERDICT: MATCH');
-  console.log('PREDICATE: TRUE for J: literal backslash is a POSIX root filename, independently verified by exact path distinction; permission result matched FALSE.');
-  console.log(`OS_TARGET_EVIDENCE: POSIX direct evidence exercised; Windows target behavior is UNPROVEN on this host.`);
-  console.log(`ARTIFACT_ROOT: ${path.join(suiteRoot, 'artifacts')}`);
-  console.log(`apply-patch-matrix-smoke: PASS (${suiteRoot})`);
+  if (!changeAwareOnly) {
+    console.log('PREDICATE: TRUE for J: literal backslash is a POSIX root filename, independently verified by exact path distinction; permission result matched FALSE.');
+    console.log(`OS_TARGET_EVIDENCE: POSIX direct evidence exercised; Windows target behavior is UNPROVEN on this host.`);
+    console.log(`ARTIFACT_ROOT: ${path.join(suiteRoot, 'artifacts')}`);
+    console.log(`apply-patch-matrix-smoke: PASS (${suiteRoot})`);
+  } else {
+    console.log(`apply-patch-change-aware-smoke: PASS (${matrix.join(', ')})`);
+  }
+  }
 } catch (error) {
   console.error(`apply-patch-matrix-smoke: FAIL after [${matrix.join(', ')}]`);
   console.error(error?.stack || error);

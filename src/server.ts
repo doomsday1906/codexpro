@@ -42,7 +42,7 @@ import { delegationToolDefs } from "./delegationTools.js";
 import { eventsCapability } from "./delegationEvents.js";
 import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
-import { hasSecretValue, hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactSensitiveTextPreservingLines, redactStructured, redactUnifiedDiff, redactUnifiedDiffPreservingLines, sourceLanguageForPath, sourceSafetyRefusalMessage, truncateUtf8 } from "./redact.js";
+import { extractDiffFileBlocks, hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactSensitiveTextPreservingLines, redactStructured, redactUnifiedDiff, redactUnifiedDiffPreservingLines, scanSecretValues, sourceLanguageForPath, sourceSafetyRefusalMessage, truncateUtf8 } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { createDiagnosticContext, type CodexProDiagnosticContext } from "./diagnosticContext.js";
 import { normalizeGitPushPolicy, sanitizeGitPushPolicy } from "./gitPushPolicy.js";
@@ -2325,7 +2325,8 @@ type SimulatedPatch = {
   additions: number;
   deletions: number;
   changed: boolean;
-  postApplyFiles: { gitPath: string; relPath: string; absPath: string; content: string }[];
+  changeDiff: string;
+  postApplyFiles: { gitPath: string; relPath: string; absPath: string; beforeContent: string; content: string; sourceText: boolean }[];
 };
 type ValidatedSimulation = SimulatedPatch & { diff: string };
 
@@ -2697,39 +2698,57 @@ async function simulateWorkspacePatch(config: CodexProConfig, records: Validated
     const numstat = parseGitNumstat(numstatResult.stdout ?? "");
     const summary = summarizeNumstat(numstat);
     const rawDiff = gitOutputText(diffResult.stdout);
-    // Whole-file protection: the canonical diff only proves added lines, so
-    // capture the simulated post-apply bytes now (before the sandbox is
-    // removed) for a full-content source-policy scan in validateSimulatedSource.
-    // FINDING 4 bounded admission (no new limit names): per-file content is
-    // capped by the existing maxWriteBytes write envelope (the same envelope
-    // write/edit enforce for after-image bytes), the aggregate retained
-    // post-apply total is capped by that same maxWriteBytes budget, and the
-    // canonical rawDiff stays capped by the existing maxOutputBytes git-output
-    // envelope (runApplyGit maxBuffer). Combined retained validation bytes are
-    // therefore bounded by maxWriteBytes + maxOutputBytes. Admission is
-    // enforced by stat-before-read plus a running total before each
-    // allocation; over-limit refuses all files with targets unchanged (the
-    // real workspace apply below never runs). Whole-file secret scanning for
-    // admitted files is unchanged in validateSimulatedSource.
+    const changeDiffResult = runApplyGit(
+      root,
+      ["-c", "core.autocrlf=false", "-c", "core.filemode=true", "-c", "core.quotepath=true", "diff", "--cached", "--no-color", "--no-ext-diff", "--no-textconv", "--full-index", "--binary", "--src-prefix=a/", "--dst-prefix=b/", "--find-renames", "--find-copies", "--find-copies-harder", "--unified=0"],
+      undefined,
+      config.maxOutputBytes,
+      true
+    );
+    assertApplyGitSuccess(changeDiffResult, "git simulation change-range diff failed");
+    const changeDiff = gitOutputText(changeDiffResult.stdout);
+    // Retain bounded pre- and post-apply source images so sensitive findings
+    // can be compared across exact unchanged regions before any real apply.
     const perFileLimit = config.maxWriteBytes;
     const totalFileLimit = config.maxWriteBytes;
     const rawDiffBytes = Buffer.byteLength(rawDiff, "utf8");
-    if (rawDiffBytes > config.maxOutputBytes) {
+    const changeDiffBytes = Buffer.byteLength(changeDiff, "utf8");
+    if (rawDiffBytes > config.maxOutputBytes || changeDiffBytes > config.maxOutputBytes) {
       throw new CodexProError(
-        `Patch validation output is too large (${rawDiffBytes} bytes). Limit: ${config.maxOutputBytes} bytes. Patch refused without applying any file.`
+        `Patch validation output is too large. Limit: ${config.maxOutputBytes} bytes. Patch refused without applying any file.`
       );
     }
     const sanitizeValidationPath = (value: string): string =>
       redactDiagnosticText(String(value ?? "")).replace(/[\r\n]/gu, " ").slice(0, 512) || "<unknown>";
     const postApplyFiles: SimulatedPatch["postApplyFiles"] = [];
+    let retainedBeforeBytes = 0;
     let retainedFileBytes = 0;
     for (const record of records) {
+      let beforeContent = "";
+      let beforeIsText = true;
+      try {
+        const beforeStat = await fsp.stat(record.absPath);
+        if (!beforeStat.isFile()) throw new CodexProError("Patch source is not a regular file.");
+        if (beforeStat.size > perFileLimit || retainedBeforeBytes + beforeStat.size > totalFileLimit) {
+          throw new CodexProError("Patch validation needs whole-file review; pre-apply files exceed the configured source budget. Patch refused without applying any file.");
+        }
+        const beforeBytes = await fsp.readFile(record.absPath);
+        beforeContent = beforeBytes.toString("utf8");
+        beforeIsText = Buffer.from(beforeContent, "utf8").equals(beforeBytes);
+        retainedBeforeBytes += beforeBytes.byteLength;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+      }
+
       const simulatedPath = simulationPath(root, record.gitPath);
       let statedSize: number;
       try {
         statedSize = (await fsp.stat(simulatedPath)).size;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+          postApplyFiles.push({ gitPath: record.gitPath, relPath: record.relPath, absPath: record.absPath, beforeContent, content: "", sourceText: beforeIsText });
+          continue;
+        }
         throw new CodexProError("Canonical Git diff source validation failed.");
       }
       if (statedSize > perFileLimit) {
@@ -2742,29 +2761,25 @@ async function simulateWorkspacePatch(config: CodexProConfig, records: Validated
           `Patch validation needs whole-file review but the touched files are too large in aggregate (${records.length} files, ${retainedFileBytes + statedSize} bytes). Limit: ${totalFileLimit} bytes total (${perFileLimit} bytes per file). Patch refused without applying any file.`
         );
       }
-      let content: string;
-      try {
-        content = await fsp.readFile(simulatedPath, "utf8");
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") continue;
-        throw new CodexProError("Canonical Git diff source validation failed.");
-      }
-      const contentBytes = Buffer.byteLength(content, "utf8");
-      if (contentBytes > perFileLimit) {
+      const contentBytes = await fsp.readFile(simulatedPath);
+      const content = contentBytes.toString("utf8");
+      const afterIsText = Buffer.from(content, "utf8").equals(contentBytes);
+      if (contentBytes.byteLength > perFileLimit) {
         throw new CodexProError(
-          `Patch validation needs whole-file review but ${sanitizeValidationPath(record.relPath)} is too large (${contentBytes} bytes). Limit: ${perFileLimit} bytes per file, ${totalFileLimit} bytes total across ${records.length} files. Patch refused without applying any file.`
+          `Patch validation needs whole-file review but ${sanitizeValidationPath(record.relPath)} is too large (${contentBytes.byteLength} bytes). Limit: ${perFileLimit} bytes per file, ${totalFileLimit} bytes total across ${records.length} files. Patch refused without applying any file.`
         );
       }
-      retainedFileBytes += contentBytes;
+      retainedFileBytes += contentBytes.byteLength;
       if (retainedFileBytes > totalFileLimit) {
         throw new CodexProError(
           `Patch validation needs whole-file review but the touched files are too large in aggregate (${records.length} files, ${retainedFileBytes} bytes). Limit: ${totalFileLimit} bytes total (${perFileLimit} bytes per file). Patch refused without applying any file.`
         );
       }
-      postApplyFiles.push({ gitPath: record.gitPath, relPath: record.relPath, absPath: record.absPath, content });
+      postApplyFiles.push({ gitPath: record.gitPath, relPath: record.relPath, absPath: record.absPath, beforeContent, content, sourceText: beforeIsText && afterIsText });
     }
     return {
       rawDiff,
+      changeDiff,
       numstat,
       additions: summary.additions,
       deletions: summary.deletions,
@@ -2779,6 +2794,106 @@ async function simulateWorkspacePatch(config: CodexProConfig, records: Validated
   }
 }
 
+type SourceChangeHunk = { oldStart: number; oldCount: number; newStart: number; newCount: number };
+
+function sourceLineCount(text: string): number {
+  if (!text) return 0;
+  return text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
+}
+
+function sourceLineBoundary(text: string, linesBefore: number): number {
+  let boundary = 0;
+  for (let line = 0; line < linesBefore; line += 1) {
+    const next = text.indexOf("\n", boundary);
+    if (next < 0) return text.length;
+    boundary = next + 1;
+  }
+  return boundary;
+}
+
+function sourceDiffFileBlock(changeDiff: string, file: SimulatedPatch["postApplyFiles"][number]): ReturnType<typeof extractDiffFileBlocks>[number] | undefined {
+  const blocks = extractDiffFileBlocks(changeDiff);
+  const exact = blocks.filter((block) =>
+    [block.oldPath, block.newPath].some((diffPath) => diffPath === file.gitPath || diffPath === file.relPath)
+  );
+  const candidates = exact.length > 0 ? exact : blocks.filter((block) =>
+    [block.oldPath, block.newPath].some((diffPath) => typeof diffPath === "string"
+      && (policyPathMatches(file.gitPath, diffPath) || policyPathMatches(file.relPath, diffPath)))
+  );
+  if (candidates.length !== 1 || !candidates[0].pathDiscoveryValid) return undefined;
+  return candidates[0];
+}
+
+function sourceChangeHunks(changeDiff: string, file: SimulatedPatch["postApplyFiles"][number]): SourceChangeHunk[] | undefined {
+  const block = sourceDiffFileBlock(changeDiff, file);
+  if (!block) return undefined;
+  const hunks: SourceChangeHunk[] = [];
+  for (const match of block.source.matchAll(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gmu)) {
+    hunks.push({
+      oldStart: Number(match[1]),
+      oldCount: match[2] === undefined ? 1 : Number(match[2]),
+      newStart: Number(match[3]),
+      newCount: match[4] === undefined ? 1 : Number(match[4])
+    });
+  }
+  return hunks;
+}
+
+function sourceChangedRange(text: string, start: number, count: number): { start: number; end: number } | undefined {
+  const firstLine = count === 0 ? start : start - 1;
+  const afterLine = firstLine + count;
+  const totalLines = sourceLineCount(text);
+  if (firstLine < 0 || afterLine < firstLine || afterLine > totalLines) return undefined;
+  return { start: sourceLineBoundary(text, firstLine), end: sourceLineBoundary(text, afterLine) };
+}
+
+function sourceSpansInRegion(spans: readonly { start: number; end: number }[], start: number, end: number): number[][] {
+  return spans.filter((span) => span.start >= start && span.end <= end)
+    .map((span) => [span.start - start, span.end - start]);
+}
+
+function changedSensitiveSource(
+  changeDiff: string,
+  file: SimulatedPatch["postApplyFiles"][number],
+  sourceOptions: { context: "source"; language: ReturnType<typeof sourceLanguageForPath>; sourcePath: string }
+): string | undefined {
+  const before = scanSecretValues(file.beforeContent, sourceOptions);
+  const after = scanSecretValues(file.content, sourceOptions);
+  if (!before.complete || !after.complete) return file.content || file.beforeContent;
+  if (file.beforeContent === file.content) return undefined;
+  if (!before.spans.length && !after.spans.length) return undefined;
+
+  const hunks = sourceChangeHunks(changeDiff, file);
+  if (!hunks) return file.content || file.beforeContent;
+  const touches = (span: { start: number; end: number }, start: number, end: number) =>
+    start === end ? span.start < start && start < span.end : span.start < end && span.end > start;
+  const regionMatches = (beforeStart: number, beforeEnd: number, afterStart: number, afterEnd: number) =>
+    file.beforeContent.slice(beforeStart, beforeEnd) === file.content.slice(afterStart, afterEnd)
+    && JSON.stringify(sourceSpansInRegion(before.spans, beforeStart, beforeEnd))
+      === JSON.stringify(sourceSpansInRegion(after.spans, afterStart, afterEnd));
+
+  let beforeCursor = 0;
+  let afterCursor = 0;
+  for (const hunk of hunks) {
+    const oldRange = sourceChangedRange(file.beforeContent, hunk.oldStart, hunk.oldCount);
+    const newRange = sourceChangedRange(file.content, hunk.newStart, hunk.newCount);
+    if (!oldRange || !newRange || oldRange.start < beforeCursor || newRange.start < afterCursor) {
+      return file.content || file.beforeContent;
+    }
+    if (before.spans.some((span) => touches(span, oldRange.start, oldRange.end))) return file.beforeContent;
+    if (after.spans.some((span) => touches(span, newRange.start, newRange.end))) return file.content;
+    if (!regionMatches(beforeCursor, oldRange.start, afterCursor, newRange.start)) {
+      return file.content || file.beforeContent;
+    }
+    beforeCursor = oldRange.end;
+    afterCursor = newRange.end;
+  }
+  if (!regionMatches(beforeCursor, file.beforeContent.length, afterCursor, file.content.length)) {
+    return file.content || file.beforeContent;
+  }
+  return undefined;
+}
+
 function validateSimulatedSource(simulated: SimulatedPatch, records: ValidatedPatchPath[]): ValidatedSimulation {
   const languageForPath = languageForValidatedPaths(records);
   const sourcePathForPath = (pathHint: string | undefined): string | undefined => {
@@ -2787,25 +2902,20 @@ function validateSimulatedSource(simulated: SimulatedPatch, records: ValidatedPa
     return matches.length === 1 ? matches[0].absPath : undefined;
   };
   try {
-    if (hasSecretValueInUnifiedDiff(simulated.rawDiff, languageForPath, sourcePathForPath)) {
-      // Bounded patch-line coordinates from a line-preserving redaction of
-      // the canonical diff, consistent with ordinary edit/write refusals.
-      // Only sanitized touched paths and physical diff line numbers are
-      // disclosed; matched content is never echoed and no detector rule
-      // identity is claimed.
-      const redactedDiff = redactUnifiedDiffPreservingLines(simulated.rawDiff, languageForPath);
-      const touchedPaths = records.slice(0, 4).map((record) => record.relPath).join("; ") +
-        (records.length > 4 ? ` (+${records.length - 4} more)` : "");
-      throw new CodexProError(sourceSafetyRefusalMessage("apply_patch", touchedPaths || "<unknown>", simulated.rawDiff, redactedDiff, "patch line"));
-    }
-    // Whole-file protection: a benign hunk must not leave secret-looking
-    // content in unpatched regions. Scan the simulated post-apply bytes with
-    // the same source policy ordinary edits use, reporting source lines.
     for (const file of simulated.postApplyFiles) {
       const sourceOptions = { context: "source" as const, language: sourceLanguageForPath(file.relPath), sourcePath: file.absPath };
-      if (hasSecretValue(file.content, sourceOptions)) {
-        const redacted = redactSensitiveTextPreservingLines(file.content, sourceOptions);
-        throw new CodexProError(sourceSafetyRefusalMessage("apply_patch", file.relPath, file.content, redacted, "source line"));
+      if (!file.sourceText) {
+        if (file.beforeContent === file.content) continue;
+        if (hasSecretValueInUnifiedDiff(simulated.rawDiff, languageForPath, sourcePathForPath)) {
+          const redacted = redactUnifiedDiffPreservingLines(simulated.rawDiff, languageForPath);
+          throw new CodexProError(sourceSafetyRefusalMessage("apply_patch", file.relPath, simulated.rawDiff, redacted, "patch line"));
+        }
+        continue;
+      }
+      const issue = changedSensitiveSource(simulated.changeDiff, file, sourceOptions);
+      if (issue !== undefined) {
+        const redacted = redactSensitiveTextPreservingLines(issue, sourceOptions);
+        throw new CodexProError(sourceSafetyRefusalMessage("apply_patch", file.relPath, issue, redacted, "source line"));
       }
     }
     return { ...simulated, diff: redactUnifiedDiff(simulated.rawDiff, languageForPath, sourcePathForPath) };
