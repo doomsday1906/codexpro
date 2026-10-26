@@ -114,9 +114,11 @@ function isNumericUsageMetric(key: string, value: unknown): boolean {
 
 function jsonValueEnd(text: string, start: number): number {
   while (/\s/u.test(text[start] ?? "")) start += 1;
-  const first = text[start];
+  const escapedQuote = text[start] === "\\" && (text[start + 1] === '"' || text[start + 1] === "'");
+  const valueStart = start + (escapedQuote ? 1 : 0);
+  const first = text[valueStart];
   if (first === '"' || first === "'") {
-    for (let index = start + 1; index < text.length; index += 1) {
+    for (let index = valueStart + 1; index < text.length; index += 1) {
       if (text[index] === "\\") index += 1;
       else if (text[index] === first) return index + 1;
     }
@@ -145,46 +147,86 @@ function jsonValueEnd(text: string, start: number): number {
   return end;
 }
 
-function redactCredentialFieldsInText(text: string): string {
-  const field = /(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([A-Za-z_$][A-Za-z\d_$-]*))\s*:/gu;
-  const replacements: { start: number; end: number }[] = [];
-  let coveredUntil = 0;
-  for (let match = field.exec(text); match; match = field.exec(text)) {
-    if (match.index < coveredUntil) continue;
-    let key = match[1] ?? match[2] ?? match[3] ?? "";
-    if (match[1] !== undefined) try { key = JSON.parse(`"${key}"`); } catch {}
-    if (!isCredentialFieldName(key)) continue;
-    const valueStart = field.lastIndex;
+interface DiagnosticField {
+  key: string;
+  keyStart: number;
+  valueStart: number;
+  valueEnd: number;
+}
+
+function diagnosticFields(text: string): DiagnosticField[] {
+  const fields: DiagnosticField[] = [];
+  const isBoundary = (char: string | undefined) => char === undefined || /[,{;\s]/u.test(char);
+  const isNameStart = (char: string | undefined) => !!char && /[A-Za-z_$]/u.test(char);
+  const isNamePart = (char: string | undefined) => !!char && /[A-Za-z\d_$-]/u.test(char);
+  for (let index = 0; index < text.length;) {
+    if (!isBoundary(text[index - 1])) {
+      index += 1;
+      continue;
+    }
+    let cursor = index;
+    if (text[cursor] === "\\" && (text[cursor + 1] === '"' || text[cursor + 1] === "'")) cursor += 1;
+    const quote = text[cursor] === '"' || text[cursor] === "'" ? text[cursor++] : undefined;
+    if (!isNameStart(text[cursor])) {
+      index += 1;
+      continue;
+    }
+    const nameStart = cursor;
+    while (isNamePart(text[cursor])) cursor += 1;
+    const key = text.slice(nameStart, cursor);
+    if (quote && text[cursor] === "\\" && text[cursor + 1] === quote) cursor += 1;
+    if (quote && text[cursor] === quote) cursor += 1;
+    while (/\s/u.test(text[cursor] ?? "")) cursor += 1;
+    if (text[cursor] !== ":") {
+      index = Math.max(index + 1, cursor);
+      continue;
+    }
+    const valueStart = cursor + 1;
     const valueEnd = jsonValueEnd(text, valueStart);
-    const rawValue = text.slice(valueStart, valueEnd).trim();
-    const metric = /^(?:tokens|tokencount)$/u.test(normalizedFieldName(key)) &&
-      /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/u.test(rawValue);
-    if (metric) continue;
-    replacements.push({ start: valueStart, end: valueEnd });
-    coveredUntil = Math.max(valueEnd, valueStart);
+    fields.push({ key, keyStart: index, valueStart, valueEnd });
+    index = Math.max(index + 1, cursor + 1);
   }
-  if (replacements.length === 0) return text;
+  return fields;
+}
+
+function replaceSpans(text: string, spans: Array<{ start: number; end: number; replacement?: string }>, replacement: string): string {
   let result = text;
-  for (const span of replacements.reverse()) {
-    result = `${result.slice(0, span.start)}"[REDACTED_SECRET]"${result.slice(span.end)}`;
+  for (const span of spans.sort((left, right) => right.start - left.start)) {
+    result = `${result.slice(0, span.start)}${span.replacement ?? replacement}${result.slice(span.end)}`;
   }
   return result;
 }
 
+function redactCredentialFieldsInText(text: string): string {
+  const fields = diagnosticFields(text);
+  const replacements: { start: number; end: number }[] = [];
+  let coveredUntil = 0;
+  for (const field of fields) {
+    if (field.valueStart < coveredUntil || !isCredentialFieldName(field.key)) continue;
+    const rawValue = text.slice(field.valueStart, field.valueEnd).trim();
+    if (/^__AW_NUMERIC_USAGE_\d+_*$/u.test(rawValue)) continue;
+    const metric = isNumericUsageMetric(field.key, Number(rawValue)) &&
+      /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/u.test(rawValue);
+    if (metric) continue;
+    replacements.push({ start: field.valueStart, end: field.valueEnd });
+    coveredUntil = Math.max(field.valueEnd, field.valueStart);
+  }
+  return replacements.length === 0 ? text : replaceSpans(text, replacements, '"[REDACTED_SECRET]"');
+}
+
 function redactDiagnosticPreservingMetrics(text: string): string {
-  const metrics: { field: string; placeholder: string }[] = [];
-  const metricField = /(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([A-Za-z_$][A-Za-z\d_$-]*))\s*:\s*(-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/gu;
-  const protectedText = text.replace(metricField, (field, doubleKey: string | undefined, singleKey: string | undefined, bareKey: string | undefined) => {
-    let key = doubleKey ?? singleKey ?? bareKey ?? "";
-    if (doubleKey !== undefined) try { key = JSON.parse(`"${key}"`); } catch {}
-    if (!/^(?:tokens|tokencount)$/u.test(normalizedFieldName(key))) return field;
-    let placeholder = `__AW_NUMERIC_USAGE_${metrics.length}__`;
+  const replacements: Array<{ start: number; end: number; placeholder: string; replacement: string }> = [];
+  for (const field of diagnosticFields(text)) {
+    if (!isNumericUsageMetric(field.key, Number(text.slice(field.valueStart, field.valueEnd).trim())) ||
+      !/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/u.test(text.slice(field.valueStart, field.valueEnd).trim())) continue;
+    let placeholder = `__AW_NUMERIC_USAGE_${replacements.length}__`;
     while (text.includes(placeholder)) placeholder += "_";
-    metrics.push({ field, placeholder });
-    return placeholder;
-  });
+    replacements.push({ start: field.keyStart, end: field.valueEnd, placeholder, replacement: placeholder });
+  }
+  const protectedText = replaceSpans(text, replacements, "");
   const safe = policyRedactDiagnosticText(redactCredentialFieldsInText(protectedText));
-  const restored = metrics.reduce((value, metric) => value.replace(metric.placeholder, metric.field), safe);
+  let restored = safe;
+  for (const item of replacements) restored = restored.replace(item.placeholder, text.slice(item.start, item.end));
   return restored.replace(/\bBearer\s+(?:"[^"]*"|'[^']*'|[A-Za-z0-9._~+/-]+=*)/giu, "Bearer [REDACTED_SECRET]");
 }
 

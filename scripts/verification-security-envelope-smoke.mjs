@@ -46,6 +46,7 @@ await fs.writeFile(
     scripts: {
       "leak-secret": `node -e "${secretScript}"`,
       "leak-json": `node -e "console.log(JSON.stringify({apiToken:'LEAK-api',cookie:'LEAK-cookie',Authorization:'Bearer LEAK-auth',sessionId:123456,passphrase:'LEAK-pass',signature:'LEAK-signature',otp:654321,pwd:'LEAK-pwd',pass:'LEAK-pass-field',jwt:'LEAK-jwt',mfa:'LEAK-mfa',accessKey:'LEAK-access-key',note:'Bearer LEAK-note',tokens:21,token_count:34}))"`,
+      "leak-escaped-json": "node -e 'console.log(\"log:\", JSON.stringify({data: JSON.stringify({apiToken:\"LEAK-verif-escaped\"})}))'",
       "quick": "node -e 'process.exit(0);'",
       "long": "node -e 'require(\"fs\").writeFileSync(\"cancel-started\",\"yes\"); setTimeout(() => {}, 60000);'"
     }
@@ -327,6 +328,14 @@ async function runTests() {
   }
   assert.match(verificationJson, /"tokens":21/u, "verification JSON must preserve numeric tokens usage");
   assert.match(verificationJson, /"token_count":34/u, "verification JSON must preserve numeric token_count usage");
+  const escapedJobStart = await clientRedact.callTool({ name: "start_verification", arguments: {
+    workspace_id: realWsId, runner: "package_script", package_manager: "npm", script: "leak-escaped-json"
+  } });
+  const escapedJobWait = await clientRedact.callTool({ name: "wait_verification", arguments: {
+    job_id: escapedJobStart.structuredContent.jobId, max_wait_seconds: 10
+  } });
+  assert.ok(!escapedJobWait.structuredContent.stdout.includes("LEAK-verif-escaped"),
+    "verification text fallback must redact credentials in escaped JSON log fields");
   console.log("  PASS: Verification stdout JSON fields are masked and numeric usage metrics stay numeric");
 
   // Test 5: Multiline JSON stdout remains parseable after redaction.
@@ -411,6 +420,10 @@ async function runTests() {
     "Bearer [REDACTED_SECRET]", "standalone Bearer values must be masked");
   assert.match(redactDiagnosticText('{"Authorization": Bearer leaked-credential-value'), /\[REDACTED_SECRET\]/u,
     "malformed or truncated unquoted credential values must be masked through their full value");
+  const mixedDiagnostic = redactDiagnosticText('npm test output: {"note":"Bearer opaque-value","tokens":21,"token_count":34}');
+  assert.match(mixedDiagnostic, /"tokens":21/u, "text fallback must preserve numeric tokens usage");
+  assert.match(mixedDiagnostic, /"token_count":34/u, "text fallback must preserve numeric token_count usage");
+  assert.ok(!mixedDiagnostic.includes("opaque-value"), "text fallback must still redact Bearer values");
   assert.equal(JSON.parse(redactJsonText('{"note":"Bearer \\\"quoted-secret\\\""}', "diagnostic").text).note,
     "Bearer [REDACTED_SECRET]", "quoted Bearer values must be masked");
   const opaqueKeyedValue = redactJsonText('{"token":"opaque-value"}', "diagnostic");
@@ -476,16 +489,25 @@ async function runTests() {
   });
   assert.equal(jsonOutput.content[0].text.includes("never-expose-this-token"), false);
 
+  await fs.writeFile(path.join(realFixtureRoot, "escaped-board.log"),
+    `log: ${JSON.stringify({ data: JSON.stringify({ apiToken: "LEAK-bash-escaped" }) })}`, "utf8");
+  const escapedBashOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat escaped-board.log" } });
+  assert.ok(!escapedBashOutput.structuredContent.stdout.includes("LEAK-bash-escaped"),
+    "bash text fallback must redact credentials in escaped JSON log fields");
+
   const largeJson = JSON.stringify({
     Authorization: "Bearer LEAK-large-auth", proxyAuthorization: "Basic LEAK-large-proxy",
     cookie: "LEAK-large-cookie", sessionId: 998877, auth: "Basic LEAK-large-auth-field",
     passphrase: "LEAK-large-passphrase", signature: "LEAK-large-signature", otp: 776655,
-    note: "Bearer LEAK-large-note", tokens: 21, token_count: 34, data: "x".repeat(300_000)
+    note: "Bearer LEAK-large-note", tokens: 21, token_count: 34,
+    escapedLog: JSON.stringify({ apiToken: "LEAK-large-escaped" }), data: "x".repeat(300_000)
   });
   await fs.writeFile(path.join(realFixtureRoot, "large-board.json"), largeJson, "utf8");
+  const largeCallStartedAt = Date.now();
   const largeOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat large-board.json" } });
+  assert.ok(Date.now() - largeCallStartedAt < 10_000, "large truncated JSON redaction must stay comfortably below the SDK request timeout");
   const largeStdout = largeOutput.structuredContent.stdout;
-  for (const secret of ["LEAK-large-auth", "LEAK-large-proxy", "LEAK-large-cookie", "LEAK-large-auth-field", "LEAK-large-passphrase", "LEAK-large-signature", "LEAK-large-note"]) {
+  for (const secret of ["LEAK-large-auth", "LEAK-large-proxy", "LEAK-large-cookie", "LEAK-large-auth-field", "LEAK-large-passphrase", "LEAK-large-signature", "LEAK-large-note", "LEAK-large-escaped"]) {
     assert.ok(!largeStdout.includes(secret), `truncated JSON stdout must mask ${secret}`);
   }
   assert.match(largeStdout, /"tokens":21/u, "truncated JSON text must preserve numeric tokens usage");
