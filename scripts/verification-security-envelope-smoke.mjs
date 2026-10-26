@@ -332,9 +332,15 @@ async function runTests() {
     clientTokens: 222333,
     tokenValues: 888999,
     proxyAuthorization: "Basic dXNlcjpwYXNz",
+    note: "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
+    nested: { message: "prefix Bearer nested-token-1234567890 suffix", private_key: "-----BEGIN PRIVATE KEY-----\\nnever-expose-this-key\\n-----END PRIVATE KEY-----" },
+    messages: ["Bearer array-token-1234567890", { message: "Bearer nested-array-token-1234567890" }],
+    non_numeric_token_counts: [
+      { token_count: "opaque-credential" }, { token_count: false }, { token_count: null },
+      { token_count: ["opaque-credential"] }, { token_count: { value: "opaque-credential" } }
+    ],
     secrets: { value: "opaque-e" },
     Authorization: "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
-    nested: { private_key: "-----BEGIN PRIVATE KEY-----\\nnever-expose-this-key\\n-----END PRIVATE KEY-----" },
     before: { tokens: 8 },
     after: { tokens: 13 },
     token_count: 21,
@@ -352,6 +358,13 @@ async function runTests() {
   for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "proxyAuthorization", "Authorization", "secrets"]) {
     assert.equal(safeJson[key], "[REDACTED_SECRET]", `multiline JSON ${key} field must be redacted`);
   }
+  assert.equal(safeJson.note, "Bearer [REDACTED_SECRET]");
+  assert.equal(safeJson.nested.message, "prefix Bearer [REDACTED_SECRET] suffix");
+  assert.equal(safeJson.messages[0], "Bearer [REDACTED_SECRET]");
+  assert.equal(safeJson.messages[1].message, "Bearer [REDACTED_SECRET]");
+  for (const item of safeJson.non_numeric_token_counts) {
+    assert.equal(item.token_count, "[REDACTED_SECRET]", "only numeric token_count usage metrics may be preserved");
+  }
   assert.equal(safeJson.nested.private_key, "[REDACTED_SECRET]");
   assert.equal(safeJson.before.tokens, 8, "numeric token counts must remain numbers");
   assert.equal(safeJson.after.tokens, 13, "numeric token counts must remain numbers");
@@ -363,6 +376,10 @@ async function runTests() {
   assert.equal(safeJson.key_samples.nested["[REDACTED_SECRET]"], "safe payload");
   assert.equal(safeJson.project, "agentworkspace-self");
   assert.equal(directJson.changed, true);
+  assert.equal(redactJsonText('{"token_count":"opaque-credential"}', "diagnostic").changed, true,
+    "masking nonnumeric token_count credentials must be reported");
+  assert.equal(JSON.parse(redactJsonText('{"note":"Bearer standalone-token-1234567890"}', "diagnostic").text).note,
+    "Bearer [REDACTED_SECRET]", "standalone Bearer values must be masked");
   const opaqueKeyedValue = redactJsonText('{"token":"opaque-value"}', "diagnostic");
   assert.equal(opaqueKeyedValue.changed, true, "masking an opaque credential-named value must be reported");
   const secretFieldNames = redactJsonText(JSON.stringify({
@@ -393,8 +410,15 @@ async function runTests() {
   assert.doesNotThrow(() => JSON.parse(safeStdout), "safe structured stdout must remain valid JSON");
   const publicSafeJson = JSON.parse(safeStdout);
   assert.equal(publicSafeJson.access_token, "[REDACTED_SECRET]");
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "proxyAuthorization", "Authorization", "secrets"]) {
     assert.equal(publicSafeJson[key], "[REDACTED_SECRET]", `public JSON ${key} field must be redacted`);
+  }
+  assert.equal(publicSafeJson.note, "Bearer [REDACTED_SECRET]");
+  assert.equal(publicSafeJson.nested.message, "prefix Bearer [REDACTED_SECRET] suffix");
+  assert.equal(publicSafeJson.messages[0], "Bearer [REDACTED_SECRET]");
+  assert.equal(publicSafeJson.messages[1].message, "Bearer [REDACTED_SECRET]");
+  for (const item of publicSafeJson.non_numeric_token_counts) {
+    assert.equal(item.token_count, "[REDACTED_SECRET]", "public route must preserve only numeric token_count metrics");
   }
   assert.equal(publicSafeJson.nested.private_key, "[REDACTED_SECRET]");
   assert.equal(publicSafeJson.before.tokens, 8);
@@ -407,7 +431,7 @@ async function runTests() {
     format: "json",
     parseable: true,
     changed: true,
-    coverage: "credential-named fields (including camelCase), secret-shaped keys, authorization fields, and diagnostic secret patterns",
+    coverage: "credential-named fields (including camelCase), secret-shaped keys, authorization fields, Bearer token values, and diagnostic secret patterns",
     nested_values_omitted: false,
     truncated: false
   });

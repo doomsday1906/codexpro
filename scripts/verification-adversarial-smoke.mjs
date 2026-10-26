@@ -529,10 +529,10 @@ async function runTests() {
       script: "verification:lifecycle",
       args: ["--detached-child-ms", "15000", "--detached-separate", "--detached-ignore-term", "--detached-pid-file", pidName, "--run-ms", "400"]
     });
-    // Allow root exit + initial SIGTERM to be delivered while the ignorer survives.
-    await new Promise((r) => setTimeout(r, 1100));
-    const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
+    // Synchronize to child creation, then observe it after root exit and TERM but before the 1s KILL escalation.
+    const childPid = await waitForPidFile(path.join(realFixtureRoot, pidName), 10_000);
     assert.ok(childPid > 0, "Fixture must record detached child PID");
+    await new Promise((r) => setTimeout(r, 800));
     assert.ok(isPidAlive(childPid), `Detached ignorer PID ${childPid} must still be alive after SIGTERM (proves SIGKILL is required)`);
     const result = await mgr.waitVerification(started.jobId, 8);
     assert.notEqual(result.state, "succeeded", "Must not report clean success while an owned child was alive");
@@ -557,7 +557,6 @@ async function runTests() {
     const mgr = new VerificationManager(baseConfig, { minLifetimeMs: 500, defaultLifetimeMs: 30000 });
     const pidName = "detached-12.pid";
     try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
-    const startT = Date.now();
     const started = await mgr.startVerification(fakeWorkspace, guard, {
       workspace_id: fakeWorkspace.id,
       runner: "package_script",
@@ -565,18 +564,18 @@ async function runTests() {
       script: "verification:lifecycle",
       args: ["--detached-child-ms", "8000", "--detached-pid-file", pidName, "--run-ms", "400"]
     });
+    const childPid = await waitForPidFile(path.join(realFixtureRoot, pidName), 10_000);
+    assert.ok(childPid > 0, "Fixture must record inherited-pipe holder PID");
+    const startT = Date.now();
     const result = await mgr.waitVerification(started.jobId, 10);
     const elapsed = Date.now() - startT;
-    const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
-    assert.ok(elapsed < 6000, `Pipe-holder must be reaped boundedly, not held to self-exit (elapsed ${elapsed}ms)`);
+    assert.ok(elapsed < 6000, `Pipe-holder must be reaped boundedly after child start, not held to self-exit (elapsed ${elapsed}ms)`);
     assert.equal(result.state, "failed", `Intervention must be cleanup-aware failure, got ${result.state}`);
     assert.match(result.terminalReason ?? "", /cleanup|owned descendant/i, "Terminal reason must be cleanup-aware");
     assert.ok((result.cleanupPerformed ?? 0) >= 1, `cleanupPerformed must record intervention, got ${result.cleanupPerformed}`);
     assert.equal(result.descendantsObserved, true, "Descendants must have been observed");
     assert.equal(mgr.getActiveCount(), 0);
-    if (childPid > 0) {
-      assert.ok(!isPidAlive(childPid), `Pipe-holding child PID ${childPid} must be dead (no orphan)`);
-    }
+    assert.ok(!isPidAlive(childPid), `Pipe-holding child PID ${childPid} must be dead (no orphan)`);
     try { await mgr.close(); } catch {}
     try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
     console.log(`  PASS: Pipe holder reaped in ${elapsed}ms with cleanup-aware failure`);
@@ -892,7 +891,6 @@ async function runTests() {
     const mgr = new VerificationManager(baseConfig, { minLifetimeMs: 500, defaultLifetimeMs: 30000 });
     const pidName = "detached-16b.pid";
     try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
-    const startT = Date.now();
     const started = await mgr.startVerification(fakeWorkspace, guard, {
       workspace_id: fakeWorkspace.id,
       runner: "package_script",
@@ -904,6 +902,7 @@ async function runTests() {
     // while waiting so the pipe holder is observed before cleanup begins.
     const childPid = await waitForPidFile(path.join(realFixtureRoot, pidName), 8000);
     assert.ok(childPid > 0, "Fixture must record detached child PID before the bounded pre-cleanup deadline");
+    const startT = Date.now();
     const jobObj = mgr.getActiveJobs().find((j) => j.jobId === started.jobId);
     assert.ok(jobObj, "16b job must still be running at intervention (close pending proves pipes held)");
     assert.ok(isPidAlive(childPid), `Holder PID ${childPid} must be alive at intervention (pre-KILL window)`);
@@ -953,13 +952,14 @@ async function runTests() {
     // `close` stays pending; gating + capture still run and are recorded.
     jobObj.testHookSuppressSignals = true;
     jobObj.testHookKillAttempts = [];
+    // Measure from actual child creation, rather than command admission latency.
+    const childPid = await waitForPidFile(path.join(realFixtureRoot, pidName), 10_000);
+    assert.ok(childPid > 0, "Fixture must record close-pending holder PID");
     const startT = Date.now();
-    // At ~2s (pre-watchdog) the job must still be running: proves `close` is
-    // pending (pipes held), not early-settled via the close path.
+    // At ~2s after child creation (pre-watchdog) the job must still be running:
+    // proves `close` is pending (pipes held), not early-settled via the close path.
     await new Promise((r) => setTimeout(r, 2000));
     assert.equal(mgr.getActiveCount(), 1, "Job must still be running pre-watchdog (close pending, pipes held)");
-    const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
-    assert.ok(childPid > 0, "Fixture must record close-pending holder PID");
     assert.ok(isPidAlive(childPid), `Holder PID ${childPid} must be alive pre-watchdog (suppressed kills)`);
     const result = await mgr.waitVerification(started.jobId, 10);
     const elapsed = Date.now() - startT;
@@ -967,7 +967,7 @@ async function runTests() {
     assert.match(result.terminalReason ?? "", /cleanup_incomplete/, "Terminal reason must carry cleanup_incomplete evidence");
     assert.ok((result.recoveryHint ?? "").length <= 600, "Recovery hint must stay bounded");
     assert.ok((result.recoveryHint ?? "").includes("live"), "Recovery hint must carry live-set evidence");
-    assert.ok(elapsed < 9000, `Watchdog must bound (elapsed ${elapsed}ms)`);
+    assert.ok(elapsed < 12_000, `Watchdog must settle before the holder's 15s self-exit (elapsed ${elapsed}ms)`);
     assert.equal(mgr.getActiveCount(), 0);
     // Single terminal assignment: re-wait observes the identical terminal.
     const second = await mgr.waitVerification(started.jobId, 2);
