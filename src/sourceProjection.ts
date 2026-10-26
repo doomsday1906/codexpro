@@ -1065,7 +1065,9 @@ export function projectLargeWindow(
   const keyMapped = applyPrivateKeySpansToLines(rawLines, lineStarts, scan.privateKeySpans);
   // Stage 2: credential/direct patterns over the flanked slice. The window is
   // explicitly terminated so its last line can never fuse with flankAfter.
-  const slice = `${flankBefore}${keyMapped.join("\n")}\n${flankAfter}`;
+  // Full-stream spans already own PEM mapping; a raw flank BEGIN must not
+  // reopen a block whose END was replaced in the window.
+  const slice = `${flankBefore.replace(/-----BEGIN/giu, ".....BEGIN")}${keyMapped.join("\n")}\n${flankAfter}`;
   const redactedSlice = redactSlice(slice);
   const sliceLines = redactedSlice.split("\n");
   const baseLine = flankBefore.length === 0 ? 0 : flankBefore.split("\n").length - 1;
