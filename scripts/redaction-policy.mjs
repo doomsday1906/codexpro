@@ -1,47 +1,12 @@
-import {
-  createPythonProvenance,
-  extractDiffFileBlocks,
-  isPythonFunctionReturnTypeName,
-  isPythonSuiteConditionName,
-  ownsPythonCallKeywordReference,
-  approvedPythonAssignEnd,
-  approvedPythonCallKeywordEnd,
-  ownsPythonCredential,
-  pythonAuthorizationAnnotationEnd
-} from './python-provenance.mjs';
-import { loadCallKeywordApprovals } from './source-approvals.mjs';
-
+// Keep one shape-based detector for source, diagnostics and mutation checks.
+import { extractDiffFileBlocks } from './python-provenance.mjs';
 export { extractDiffFileBlocks };
 
 const REDACTED_SECRET = '[REDACTED_SECRET]';
 export const PRIVATE_KEY_REDACTION_MARKER = '[REDACTED_PRIVATE_KEY]';
 
-// A path hint is trusted only after the caller has resolved/validated the
-// target path. Text itself never selects a parser or language.
 export function sourceLanguageForPath(filePath) {
-  const value = String(filePath ?? '').replaceAll('\\', '/');
-  return /\.(?:py|pyi|pyw)$/iu.test(value) ? 'python' : undefined;
-}
-
-function normalizeOptions(options, defaultContext = 'source') {
-  if (typeof options === 'string') return {
-    context: options,
-    language: undefined,
-    oldLanguage: undefined,
-    newLanguage: undefined,
-    languageForPath: undefined
-  };
-  const context = options?.context ?? defaultContext;
-  const language = context === 'source' && options?.language === 'python' ? 'python' : undefined;
-  const oldLanguage = context === 'source' && options?.oldLanguage === 'python' ? 'python' : undefined;
-  const newLanguage = context === 'source' && options?.newLanguage === 'python' ? 'python' : undefined;
-  const languageForPath = context === 'source' && typeof options?.languageForPath === 'function'
-    ? options.languageForPath
-    : undefined;
-  const approvedCallKeywordValues = context === 'source'
-    ? (Array.isArray(options?.approvedCallKeywordValues) ? options.approvedCallKeywordValues : loadCallKeywordApprovals(options?.sourcePath))
-    : [];
-  return { context, language, oldLanguage, newLanguage, languageForPath, approvedCallKeywordValues };
+  return /\.(?:py|pyi|pyw)$/iu.test(String(filePath ?? '')) ? 'python' : undefined;
 }
 
 const PRIVATE_KEY_LABELS = [
@@ -57,646 +22,36 @@ const PRIVATE_KEY_LABEL_PATTERN = PRIVATE_KEY_LABELS.map((label) => label.replac
 const PRIVATE_BEGIN_PATTERN = new RegExp(`-----BEGIN\\s+(?:${PRIVATE_KEY_LABEL_PATTERN})-----`, 'gi');
 const PRIVATE_PARTIAL_PATTERN = new RegExp(`-----BEGIN\\s+(?:${PRIVATE_KEY_LABEL_PATTERN})-*(?:\\r?\\n|$)`, 'i');
 
-const REFERENCE_CALL = '[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*\\s*\\([^;()=\\r\\n]*\\)';
-const CREDENTIAL_LABEL = '[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}';
-const CREDENTIAL_LABEL_PATTERN = new RegExp(`^${CREDENTIAL_LABEL}$`, 'i');
-// A credential literal owns its escaped/triple/template body through the
-// closing delimiter (or EOF), including every concatenated literal.
-const CREDENTIAL_STRING_VALUE = String.raw`(?:[rubf]{0,2})(?:"""(?:\\[\s\S]|(?!""")[^\\])*(?:"""|$)|'''(?:\\[\s\S]|(?!''')[^\\])*(?:'''|$)|(?!""")"(?:\\[\s\S]|[^"\\])*(?:"|$)|(?!''')'(?:\\[\s\S]|[^'\\])*(?:'|$)|\x60(?:\\[\s\S]|[^\x60\\])*(?:\x60|$))`;
-const CREDENTIAL_PARENTHESIZED_VALUE = `\\((?:${REFERENCE_CALL}|(?:${CREDENTIAL_STRING_VALUE}|[^()="'\\x60]){1,1024})\\)`;
-const CREDENTIAL_VALUE_ATOM = `(?:${CREDENTIAL_STRING_VALUE}|${CREDENTIAL_PARENTHESIZED_VALUE}|(?:${REFERENCE_CALL})(?=[\\s,;})\\]]|$)|[^\\s"'\\x60<>\\[\\]{},;()+]+(?![A-Za-z0-9_$])(?!(?:[ \\t]*\\()))`;
-const CREDENTIAL_VALUE = `(?:${CREDENTIAL_STRING_VALUE}(?:(?:\\s*\\+\\s*${CREDENTIAL_VALUE_ATOM})|(?:[ \\t]+${CREDENTIAL_STRING_VALUE})|(?:[ \\t]*\\\\\\r?\\n[ \\t]*${CREDENTIAL_STRING_VALUE}))*|${CREDENTIAL_VALUE_ATOM})`;
-const CREDENTIAL_ASSIGNMENT_PATTERN = new RegExp(`\\b(${CREDENTIAL_LABEL}\\s*=\\s*)(${CREDENTIAL_VALUE})`, 'gi');
-// Generic bracketed targets/PEP695 aliases are anchored to a statement start.
-// Without that boundary, `Token[str] = ...` inside an annotated declaration
-// is mistaken for a second assignment and can override the real AST owner.
-const CREDENTIAL_ALIAS_ASSIGNMENT_PATTERN = new RegExp(`((?:^|[;\\n])\\s*(?:type\\s+)?${CREDENTIAL_LABEL}\\s*\\[[^\\]\\r\\n]{1,256}\\]\\s*=\\s*)(${CREDENTIAL_VALUE})`, 'gim');
-const CREDENTIAL_SUBSCRIPT_ASSIGNMENT_PATTERN = new RegExp(`([\\[(,]\\s*${CREDENTIAL_LABEL}\\s*]\\s*=\\s*)(${CREDENTIAL_VALUE})`, 'gi');
-const CREDENTIAL_DESTRUCTURED_ASSIGNMENT_PATTERN = new RegExp(`((?:^|[\\[(,])\\s*\\*?${CREDENTIAL_LABEL}\\s*(?:[,\\]])[^=\\r\\n]{0,256}=\\s*(?:[([{]\\s*)?)(${CREDENTIAL_VALUE})`, 'gim');
-const CREDENTIAL_FIELD_PATTERN = new RegExp(`(["']?${CREDENTIAL_LABEL}["']?\\s*:\\s*)(${CREDENTIAL_VALUE})`, 'gi');
-// A typed declaration keeps the credential label and its annotation in one
-// prefix, so the initializer can be redacted without treating the annotation
-// (including an inline object type or generic tail) as a credential value.
-const TYPED_DECLARATION_ASSIGNMENT_PATTERN = new RegExp(`((?:^|[;\\n])\\s*(?:(?:\\d+\\s*\\|\\s*)|(?:[^:\\r\\n]+:\\d+\\s*:\\s*))?(?:(?:export\\s+)?(?:const|let|var)\\s+)?${CREDENTIAL_LABEL}\\s*:\\s*[^=\\r\\n]{1,512}?\\s*=\\s*)(${CREDENTIAL_VALUE})`, 'gim');
 
-const AUTHORIZATION_PATTERN = /\b(Authorization\s*:\s*)([^\r\n]*)/gi;
-const CLI_TOKEN_PATTERN = /((?:\bngrok\s+config\s+add-authtoken|\bcloudflared\s+service\s+install|--(?:token|access-token|auth-token|api[_-]?key|authtoken))(?:=|[ \t]+))(?:("[^"\r\n]*"|'[^'\r\n]*'|`[^`\r\n]*`|[^\s"'`<>]+))/gi;
-const QUERY_TOKEN_PATTERN = /([?&](?:codexpro_token|token|access_token|auth_token|api[_-]?key)=)([^&\s"'`<>]+)/gi;
-const CREDENTIAL_URL_PATTERN = /\b((?:https?|wss?):\/\/)[^/\s:@]+:([^@\s/]+)@/gi;
-const OPENAI_SECRET_PATTERN = /\bsk-[A-Za-z0-9_-]{10,}\b/g;
-const COMMON_TOKEN_PATTERN = /\b(?:sk-ant-[A-Za-z0-9_-]{10,}|gh[opsru]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9_-]{20,})\b/g;
-const JWT_TOKEN_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
+const KNOWN_TOKEN = /\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{10,}|gh[opsru]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b/g;
+const CREDENTIAL_NAME = String.raw`[\w$-]*(?:api[_-]?key|token|secret|password|private[_-]?key)[\w$-]*`;
+// Only literal bodies are candidates; references, calls and annotations have no value shape.
+const ASSIGNED_LITERAL = new RegExp(String.raw`\b${CREDENTIAL_NAME}["']?\s*(?:\])?\s*(?::[^=;\r\n"'\x60]+)?[=:]\s*\(?\s*(?:[rubf]{0,2})?(?<quote>"""|'''|["'\x60])(?<value>(?:\\[\s\S]|(?!\k<quote>)[^\\])*)\k<quote>`, 'gidu');
+const BARE_CREDENTIAL = new RegExp(String.raw`(?:\b${CREDENTIAL_NAME}["']?\s*[=:]\s*|--(?:token|access-token|auth-token|api[_-]?key|authtoken)[= ]+|\b(?:ngrok\s+config\s+add-authtoken|cloudflared\s+service\s+install)\s+|[?&](?:codexpro_token|token|access_token|auth_token|api[_-]?key)=)(?<value>[^\s"'\x60<>&,;)}\]]+)`, 'gidu');
+const BEARER = /\bAuthorization["']?\s*[:=]\s*["']?Bearer\s+(?<value>\$\{[^}]*\}|\{\{[^}]*\}\}|<[^>]*>|[^\s"'\x60,;}]+)/gidu;
+const URL_PASSWORD = /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:(?<value>[^@\s/]+)@/gidu;
 
-const EXACT_PLACEHOLDERS = new Set([
-  REDACTED_SECRET.toLowerCase(),
-  PRIVATE_KEY_REDACTION_MARKER.toLowerCase(),
-  'replace-me',
-  'replace-with-long-random-token',
-  'keep-this-codexpro-token-stable',
-  'keep-this-stable-token',
-  'your-ngrok-token',
-  'your-token',
-  'your-api-key-here',
-  '<openai_api_key>',
-  'sk-...'
+const PLACEHOLDERS = new Set([
+  'replace-me', 'replace-with-long-random-token', 'keep-this-codexpro-token-stable',
+  'keep-this-stable-token', 'your-ngrok-token', 'your-token', 'your-api-key-here', 'sk-...'
 ]);
-const REFERENCE_ROOTS = /^(?:config|credentials|process|env|settings|secrets|options|runtime|context|this|import|os)$/i;
-const HORIZONTAL_WHITESPACE = /[^\S\r\n]/u;
-const MAX_GENERIC_TAIL_LENGTH = 512;
-const MAX_GENERIC_TAIL_DEPTH = 16;
+function isPlaceholder(value) {
+  return PLACEHOLDERS.has(value.toLowerCase())
+    || /^(?:\[REDACTED_(?:SECRET|PRIVATE_KEY)\]|<[^>]*>|\$\{[^}]*\}|\$[\w]+|%[\w]+%|\{\{[\s\S]*\}\})$/iu.test(value)
+    || /^(?:(?:sk-|gh[opsru]_|github_pat_|npm_))?(?:your[-_]|replace[-_]|example[-_]|placeholder|dummy|redacted)/iu.test(value);
+}
 
-function normalizeCredentialValue(value) {
-  let normalized = String(value ?? '').trim().replace(/[;,]+$/, '').trim();
-  if (normalized.length >= 2) {
-    const first = normalized[0];
-    const last = normalized[normalized.length - 1];
-    if ((first === '"' && last === '"') || (first === "'" && last === "'") || (first === '`' && last === '`')) {
-      normalized = normalized.slice(1, -1).trim();
-    }
+function isHighEntropyLiteral(value) {
+  if (value.length < 24 || isPlaceholder(value) || /\s|\$\{|\\/.test(value) || /^\d+$/.test(value)) return false;
+  if (!/^[A-Za-z0-9_+/=.-]+$/.test(value)) return false;
+  const counts = new Map();
+  for (const char of value) counts.set(char, (counts.get(char) ?? 0) + 1);
+  let entropy = 0;
+  for (const count of counts.values()) {
+    const probability = count / value.length;
+    entropy -= probability * Math.log2(probability);
   }
-  return normalized.toLowerCase();
-}
-
-function isExactPlaceholder(value) {
-  const normalized = normalizeCredentialValue(value);
-  if (EXACT_PLACEHOLDERS.has(normalized)) return true;
-  return /^(?:process\.env|import\.meta\.env|os\.environ)(?:\.[A-Za-z_$][A-Za-z0-9_$]*|\[[^\]\r\n]+\])*$/u.test(normalized);
-}
-
-function isReferenceExpression(value, options = {}) {
-  const normalized = String(value ?? '').trim().replace(/[;,]+$/, '').trim();
-  if (!normalized) return false;
-  if (new RegExp(`^${REFERENCE_CALL}$`).test(normalized)) return true;
-  if (/['"`]/.test(normalized)) return false;
-  const member = normalized.match(/^([A-Za-z_$][A-Za-z0-9_$]*)(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/);
-  return Boolean(member && (options.allowAnyRoot === true || REFERENCE_ROOTS.test(member[1])));
-}
-
-const BARE_REFERENCE_PATTERN = /^([A-Za-z_$][A-Za-z0-9_$]*)(?:[,;)}\]:]+)?$/u;
-
-function maskSourceTrivia(text) {
-  const source = String(text ?? '');
-  const masked = source.split('');
-  let state = 'code';
-  let quote = '';
-
-  const blank = (index) => {
-    if (masked[index] !== '\n' && masked[index] !== '\r') masked[index] = ' ';
-  };
-
-  for (let index = 0; index < source.length; index += 1) {
-    const current = source[index];
-    const next = source[index + 1] ?? '';
-
-    if (state === 'line-comment') {
-      if (current === '\n' || current === '\r') state = 'code';
-      else blank(index);
-      continue;
-    }
-    if (state === 'block-comment') {
-      if (current === '*' && next === '/') {
-        blank(index);
-        blank(index + 1);
-        index += 1;
-        state = 'code';
-      } else {
-        blank(index);
-      }
-      continue;
-    }
-    if (state === 'string') {
-      if (current === '\\') {
-        blank(index);
-        if (index + 1 < source.length) {
-          blank(index + 1);
-          index += 1;
-        }
-      } else if (current === quote) {
-        blank(index);
-        state = 'code';
-        quote = '';
-      } else {
-        blank(index);
-      }
-      continue;
-    }
-
-    if (current === '/' && next === '/') {
-      blank(index);
-      blank(index + 1);
-      index += 1;
-      state = 'line-comment';
-      continue;
-    }
-    if (current === '/' && next === '*') {
-      blank(index);
-      blank(index + 1);
-      index += 1;
-      state = 'block-comment';
-      continue;
-    }
-    if (current === '`' && source.slice(index, index + 3) === '```') {
-      index += 2;
-      continue;
-    }
-    if (current === '#') {
-      blank(index);
-      state = 'line-comment';
-      continue;
-    }
-    if (current === '"' || current === "'" || current === '`') {
-      blank(index);
-      state = 'string';
-      quote = current;
-    }
-  }
-
-  return masked.join('');
-}
-
-function buildDelimiterPairs(code) {
-  const stacks = { '(': [], '[': [], '{': [] };
-  const closeToOpen = { ')': '(', ']': '[', '}': '{' };
-  const openToClose = new Map();
-  const openers = [];
-  const enclosing = { '(': new Int32Array(code.length), '{': new Int32Array(code.length) };
-  enclosing['('].fill(-1);
-  enclosing['{'].fill(-1);
-
-  for (let index = 0; index < code.length; index += 1) {
-    const parens = stacks['('];
-    const braces = stacks['{'];
-    enclosing['('][index] = parens.length > 0 ? parens[parens.length - 1] : -1;
-    enclosing['{'][index] = braces.length > 0 ? braces[braces.length - 1] : -1;
-    const current = code[index];
-    if (stacks[current]) {
-      stacks[current].push(index);
-      openers.push(index);
-      continue;
-    }
-    const opener = closeToOpen[current];
-    if (!opener || stacks[opener].length === 0) continue;
-    const open = stacks[opener].pop();
-    openToClose.set(open, index);
-  }
-  return { openToClose, openers, enclosing };
-}
-
-function findEnclosingPair(syntax, open, close, offset) {
-  const openIndex = syntax.pairs.enclosing[open]?.[offset];
-  if (openIndex === undefined || openIndex < 0) return null;
-  const closeIndex = syntax.pairs.openToClose.get(openIndex);
-  return closeIndex !== undefined && closeIndex > offset ? { open: openIndex, close: closeIndex } : null;
-}
-
-function sourceAnchorPrefix(code, offset) {
-  let start = 0;
-  for (const boundary of [';', '{', '}']) start = Math.max(start, code.lastIndexOf(boundary, offset - 1) + 1);
-  return code.slice(start, offset)
-    .replace(/^\s*\d+\s*\|\s?/gmu, '')
-    .replace(/^\s*[^:\n]+:\d+\s*:\s?/gmu, '')
-    .replace(/[ \t\r\n]+$/u, '');
-}
-
-function sourceLineBounds(code, offset) {
-  const start = code.lastIndexOf('\n', offset - 1) + 1;
-  const endAt = code.indexOf('\n', offset);
-  return { start, end: endAt < 0 ? code.length : endAt };
-}
-
-function hasVariableInitializerAnchor(code, offset) {
-  const prefix = sourceAnchorPrefix(code, offset);
-  // `import x = ...` (TypeScript import-equals, including `export import`)
-  // and `using x = ...` (C# using-alias / using declaration) bind a name to
-  // a module/namespace reference exactly like a const/let/var initializer, so
-  // they share this declaration anchor. This cannot allowlist a quoted
-  // literal: string/comment bytes never survive trivia masking, and callers
-  // reject the match before this anchor is consulted. Known token shapes
-  // (provider/JWT/OpenAI/Authorization/URL) are caught by the direct patterns
-  // independently of any anchor, so parity with const introduces no new hole.
-  // The optional leading `+` is unified-diff added-line framing, so an added
-  // declaration is judged as the statement the edit path scans post-apply and
-  // both mutation paths agree. Removal (`-`) lines stay framed and fail closed.
-  return /(?:^|[\n;{}])[+]?\s*(?:export\s+)?(?:const|let|var|import|using)\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*:\s*[^=;{}]+)?\s*=\s*$/u.test(prefix);
-}
-
-function hasAssignmentAnchor(code, offset, value = '') {
-  const prefix = sourceAnchorPrefix(code, offset);
-  // Optional leading `+` is unified-diff added-line framing (see the
-  // declaration anchor above); removals stay framed and fail closed.
-  if (!/(?:^|[\n;{}])[+]?\s*(?:[+-]\s*)?[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*$/u.test(prefix)) return false;
-  // Compact assignment syntax is ambiguous with env/config records. Retain
-  // only the existing root-call compatibility (`TOKEN=getToken(...)`); a
-  // compact member or member-call value stays conservative.
-  if (!/(?:[A-Za-z_$][A-Za-z0-9_$]*)=\s*$/u.test(prefix)) return true;
-  return /^[A-Za-z_$][A-Za-z0-9_$]*\s*\([^;\r\n]*\)$/u.test(String(value ?? '').trim());
-}
-
-function genericTailEnd(code, end) {
-  let index = end;
-  while (index < code.length && HORIZONTAL_WHITESPACE.test(code[index])) index += 1;
-  if (code[index] !== '<' && code[index] !== '[') return index;
-  const start = index;
-  const expectedClosers = { '<': '>', '[': ']' };
-  const openers = new Set(Object.keys(expectedClosers));
-  const closers = new Set(Object.values(expectedClosers));
-  const stack = [];
-  for (; index < code.length; index += 1) {
-    if (index - start >= MAX_GENERIC_TAIL_LENGTH) return -1;
-    const current = code[index];
-    if (current === '\n' || current === '\r' || (stack.length > 0 && /[=;{}]/u.test(current))) return -1;
-    if (openers.has(current)) {
-      stack.push(current);
-      if (stack.length > MAX_GENERIC_TAIL_DEPTH) return -1;
-    } else if (closers.has(current)) {
-      if (expectedClosers[stack[stack.length - 1]] !== current) return -1;
-      stack.pop();
-      if (stack.length === 0) return index + 1;
-    }
-  }
-  return -1;
-}
-
-function genericTailStart(code, end) {
-  let index = end;
-  while (index < code.length && HORIZONTAL_WHITESPACE.test(code[index])) index += 1;
-  return code[index] === '<' || code[index] === '[' ? index : -1;
-}
-
-function genericTailRecordEnd(code, start) {
-  const line = sourceLineBounds(code, start);
-  // Once the bounded parser rejects a tail, consume only the rest of the
-  // current physical line. This cannot leak a rejected payload after an
-  // internal delimiter, and it cannot consume a later source line.
-  return line.end > line.start && code[line.end - 1] === '\r' ? line.end - 1 : line.end;
-}
-
-function genericTailBoundaryIsValid(code, start, end) {
-  // `]` remains a lawful suffix after an angle generic (`Token<T>[]`), but a
-  // second close bracket after a square tail is an unmatched/malformed tail.
-  if (code[start] === '[') return /^(?:[^\S\r\n]*(?:[,;=)}:]|#|\/\/|\/\*|\r?\n|$))/u.test(code.slice(end));
-  return /^(?:[^\S\r\n]*(?:[,;=)}\]:]|#|\/\/|\/\*|\r?\n|$))/u.test(code.slice(end));
-}
-
-function genericTailInfo(code, end) {
-  const start = genericTailStart(code, end);
-  if (start < 0) return null;
-  const parsedEnd = genericTailEnd(code, end);
-  const balanced = parsedEnd >= 0 && genericTailBoundaryIsValid(code, start, parsedEnd);
-  return {
-    start,
-    end: balanced ? parsedEnd : genericTailRecordEnd(code, start),
-    balanced
-  };
-}
-
-function hasMalformedGenericTail(code) {
-  const text = String(code ?? '');
-  const masked = maskSourceTrivia(text);
-  for (const match of masked.matchAll(/[<[]/gu)) {
-    const tail = genericTailInfo(masked, match.index);
-    if (tail && !tail.balanced) return true;
-  }
-  return false;
-}
-
-function unmatchedCredentialParenthesisStart(text) {
-  const source = String(text ?? '');
-  const masked = maskSourceTrivia(source);
-  const candidatePattern = new RegExp(`\\b${CREDENTIAL_LABEL}\\s*(?::|=)[^\\r\\n]{0,512}\\(`, 'gi');
-  let match;
-  while ((match = candidatePattern.exec(masked)) !== null) {
-    const opening = masked.indexOf('(', match.index);
-    if (opening < 0) continue;
-    let depth = 0;
-    for (let index = opening; index < masked.length; index += 1) {
-      if (masked[index] === '(') depth += 1;
-      else if (masked[index] === ')') {
-        depth -= 1;
-        if (depth === 0) break;
-      }
-    }
-    if (depth !== 0) return opening;
-  }
-  return -1;
-}
-
-function redactMalformedCredentialParentheses(text) {
-  const source = String(text ?? '');
-  const start = unmatchedCredentialParenthesisStart(source);
-  if (start < 0) return source;
-  return `${source.slice(0, start)}${REDACTED_SECRET}${source.slice(start).replace(/[^\r\n]/gu, '')}`;
-}
-
-function quotedLiteralEnd(text, start, depth = 0) {
-  if (depth > MAX_GENERIC_TAIL_DEPTH) return text.length;
-  const quote = text[start];
-  const delimiter = quote !== '`' && text.startsWith(quote.repeat(3), start) ? quote.repeat(3) : quote;
-  for (let index = start + delimiter.length; index < text.length; index += 1) {
-    if (text[index] === '\\') { index += 1; continue; }
-    if (text.startsWith(delimiter, index)) return index + delimiter.length;
-    if (quote !== '`' || !text.startsWith('${', index)) continue;
-    let braces = 1;
-    index += 2;
-    for (; index < text.length && braces; index += 1) {
-      if (text.startsWith('//', index)) {
-        const end = text.indexOf('\n', index + 2);
-        if (end < 0) return text.length;
-        index = end;
-      } else if (text.startsWith('/*', index)) {
-        const end = text.indexOf('*/', index + 2);
-        if (end < 0) return text.length;
-        index = end + 1;
-      } else if ('"\'`'.includes(text[index])) {
-        index = quotedLiteralEnd(text, index, depth + 1) - 1;
-      } else if (text[index] === '{') braces += 1;
-      else if (text[index] === '}') braces -= 1;
-    }
-    if (braces) return text.length;
-    index -= 1;
-  }
-  return text.length;
-}
-
-function credentialLiteralSpanEnd(text, valueEnd, valueStart) {
-  const source = String(text ?? '');
-  const prefix = source.slice(valueStart).match(/^[rubf]{0,2}(?=["'`])/iu);
-  return prefix ? Math.max(valueEnd, quotedLiteralEnd(source, valueStart + prefix[0].length)) : valueEnd;
-}
-
-function credentialValueSpanEnd(text, valueEnd) {
-  const genericTail = genericTailInfo(String(text ?? ''), valueEnd);
-  return genericTail ? genericTail.end : valueEnd;
-}
-
-function pythonReturnTypeFieldColonEnd(match, syntax) {
-  if (!syntax?.pythonProvenance) return undefined;
-  const prefix = match[1] ?? '';
-  const colon = prefix.indexOf(':');
-  if (colon < 0) return undefined;
-  const name = {
-    provenance: syntax.pythonProvenance,
-    offset: match.index,
-    end: match.index + colon
-  };
-  if (!isPythonFunctionReturnTypeName(name) && !isPythonSuiteConditionName(name)) return undefined;
-  return match.index + colon + 1;
-}
-
-function hasTypedVariableAnnotationAnchor(code, syntax, offset, assignment = '', value = '') {
-  const raw = String(value ?? '').trim();
-  const valueStart = offset + assignment.length;
-  const valueEnd = valueStart + raw.length;
-  const forwardClose = code[valueStart] === '{' ? syntax.pairs.openToClose.get(valueStart) : undefined;
-  if (forwardClose !== undefined) {
-    const prefix = sourceAnchorPrefix(code, valueStart);
-    const suffix = code.slice(forwardClose + 1, forwardClose + 257);
-    if (/(?:^|[\n;{}])\s*(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*:\s*$/u.test(prefix)
-      && /^\s*=/u.test(suffix)) return true;
-  }
-  const braces = findEnclosingPair(syntax, '{', '}', offset);
-  if (braces) {
-    const prefix = sourceAnchorPrefix(code, braces.open);
-    const suffix = code.slice(braces.close + 1, braces.close + 257);
-    if (/(?:^|[\n;{}])\s*(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*:\s*$/u.test(prefix)
-      && /^\s*=/u.test(suffix)) return true;
-  }
-  // A credential-looking assignment nested in a call/parenthesized expression
-  // is a keyword/value, not the enclosing declaration's initializer. Keep the
-  // declaration anchor line-local and let the nested assignment be redacted.
-  if (findEnclosingPair(syntax, '(', ')', offset)) return false;
-
-  const line = sourceLineBounds(code, valueStart);
-  const linePrefix = code.slice(line.start, valueStart).trim()
-    .replace(/^(?:\d+\s*\|\s*|[^:\r\n]+:\d+\s*:\s*)/u, '');
-  // Keep the simple declaration check line-local. A whole-file prefix can
-  // contain unrelated diagnostic records such as `Authorization: ...` and
-  // must not be mistaken for a typed declaration ending at this assignment.
-  const localPrefixes = [linePrefix];
-  if (localPrefixes.some((candidate) => /^(?:(?:export\s+)?(?:const|let|var)\s+)?[A-Za-z_$][A-Za-z0-9_$]*\s*:\s*[\s\S]{1,512}?=\s*$/u.test(candidate))) return true;
-  if (braces) return false;
-  const declaration = localPrefixes.some((candidate) => /^(?:(?:export\s+)?(?:const|let|var)\s+)?[A-Za-z_$][A-Za-z0-9_$]*\s*:\s*$/u.test(candidate));
-  if (!declaration) return false;
-  const tailEnd = genericTailEnd(code, valueEnd);
-  if (tailEnd >= 0 && /^\s*=/u.test(code.slice(tailEnd, tailEnd + 8))) return true;
-  const lineEnd = code.indexOf('\n', valueEnd);
-  const lineTail = code.slice(valueEnd, lineEnd < 0 ? code.length : lineEnd);
-  return /^[^;{}]*=/u.test(lineTail);
-}
-
-function hasDestructuringAnchor(code, syntax, offset) {
-  const braces = findEnclosingPair(syntax, '{', '}', offset);
-  if (!braces) return false;
-  const prefix = sourceAnchorPrefix(code, braces.open);
-  if (!/(?:^|[\n;{}])\s*(?:export\s+)?(?:const|let|var)\s*$/u.test(prefix)) return false;
-  return /^\s*=/.test(code.slice(braces.close + 1));
-}
-
-function hasTypeLikeBodyAnchor(code, syntax, offset) {
-  const braces = findEnclosingPair(syntax, '{', '}', offset);
-  if (!braces) return false;
-  const prefix = sourceAnchorPrefix(code, braces.open);
-  const genericParameters = '(?:\\s*<[^{}\\n]{1,256}>)?';
-  const interfaceAnchor = new RegExp(`(?:^|[\\n;{}])\\s*(?:export\\s+)?interface\\s+[A-Za-z_$][A-Za-z0-9_$]*${genericParameters}(?:\\s+extends[\\s\\S]*)?$`, 'u');
-  const classAnchor = new RegExp(`(?:^|[\\n;{}])\\s*(?:export\\s+)?class\\s+[A-Za-z_$][A-Za-z0-9_$]*${genericParameters}(?:\\s+extends[\\s\\S]*)?$`, 'u');
-  const typeAnchor = new RegExp(`(?:^|[\\n;{}])\\s*(?:export\\s+)?type\\s+[A-Za-z_$][A-Za-z0-9_$]*${genericParameters}\\s*=\\s*[\\s\\S]*$`, 'u');
-  return interfaceAnchor.test(prefix) || classAnchor.test(prefix) || typeAnchor.test(prefix);
-}
-
-function hasObjectExpressionAnchor(code, syntax, offset) {
-  const braces = findEnclosingPair(syntax, '{', '}', offset);
-  if (!braces) return false;
-  const prefix = sourceAnchorPrefix(code, braces.open);
-  const trimmed = prefix.trim();
-  const plainAssignment = /(?:^|[\n;{}])\s*[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*$/u.test(prefix);
-  const boundedPrefix = code.slice(Math.max(0, braces.open - 1024), braces.open)
-    .replace(/^\s*\d+\s*\|\s?/gmu, '')
-    .replace(/^\s*[^:\n]+:\d+\s*:\s?/gmu, '');
-  const typedObjectAssignment = /(?:^|[\n;])\s*(?:(?:export\s+)?(?:const|let|var)\s+)?[A-Za-z_$][A-Za-z0-9_$]*\s*:\s*(?:\{[\s\S]{0,768}\}|[A-Za-z_$][A-Za-z0-9_$]*(?:\s*<[^>\n]{0,256}>)?(?:\s*\[\])?)\s*=\s*$/u.test(boundedPrefix);
-  return hasVariableInitializerAnchor(code, braces.open)
-    || plainAssignment
-    || typedObjectAssignment
-    || /\breturn\s*$/u.test(trimmed)
-    || /\bexport\s+default\s*$/u.test(trimmed)
-    || /=>\s*\(?\s*$/u.test(trimmed)
-    || /\b[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\s*\([^{}]*$/u.test(prefix);
-}
-
-function hasParameterAnchor(code, syntax, offset) {
-  const parens = findEnclosingPair(syntax, '(', ')', offset);
-  if (!parens) return false;
-  const tail = code.slice(parens.close + 1, parens.close + 256);
-  const arrow = /^\s*(?::\s*[^=\n{};]+)?\s*=>/u.test(tail);
-  const declaration = /^\s*(?::\s*[^\n{};]+)?\s*\{|^\s*(?:->\s*[^\n{};]+)?\s*:/u.test(tail);
-  if (!arrow && !declaration) return false;
-  if (arrow) return true;
-  const prefix = sourceAnchorPrefix(code, parens.open);
-  return /(?:^|[\n;{}])\s*(?:(?:export\s+)?(?:async\s+)?function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\s*<[^>\n]*>)?)?|(?:async\s+)?[A-Za-z_$][A-Za-z0-9_$]*(?:\s*<[^>\n]*>)?)\s*$/u.test(prefix);
-}
-
-
-
-function hasBalancedGenericTail(code, end) {
-  const tail = genericTailInfo(code, end);
-  return !tail || tail.balanced;
-}
-
-function createSourceSyntax(text, options = {}) {
-  const source = String(text ?? '');
-  const { language, oldLanguage, newLanguage, languageForPath } = normalizeOptions(options);
-  const code = maskSourceTrivia(source);
-  const provenanceOptions = { language };
-  if (oldLanguage !== undefined) provenanceOptions.oldLanguage = oldLanguage;
-  if (newLanguage !== undefined) provenanceOptions.newLanguage = newLanguage;
-  if (languageForPath !== undefined) provenanceOptions.languageForPath = languageForPath;
-  return {
-    code,
-    pairs: buildDelimiterPairs(code),
-    language,
-    approvedCallKeywordValues: normalizeOptions(options).approvedCallKeywordValues,
-    // Parser authority is opt-in from a trusted path-derived language hint.
-    // Diagnostics, URLs, config, and generic text deliberately carry no
-    // provenance object, even when their bytes resemble Python.
-    pythonProvenance: language === 'python' || oldLanguage === 'python' || newLanguage === 'python'
-      ? createPythonProvenance(source, provenanceOptions)
-      : undefined
-  };
-}
-
-function isCredibleSourceReference(value, text, offset, assignment = '', syntax = undefined) {
-  const raw = String(value ?? '').trim();
-  const reference = raw.match(BARE_REFERENCE_PATTERN)?.[1];
-  if (!syntax) return false;
-  const valueStart = offset + assignment.length;
-  const valueEnd = valueStart + raw.length;
-  const original = String(text ?? '');
-  if (hasMalformedGenericTail(assignment)) return false;
-  // Parser ownership is authoritative only for an explicitly trusted Python
-  // source hint. A Python-looking string passed without that hint remains
-  // generic/fail-closed rather than silently selecting a parser.
-  if (syntax.language === 'python' || syntax.pythonProvenance?.available) {
-    // AST ownership grants the Python source-fidelity exception for supported
-    // declaration roles. Parser-unowned reference assignments still use the
-    // language-neutral envelope below (for example `TOKEN = os.getenv(...)`);
-    // literal/value-shaped occurrences continue through the generic checks and
-    // therefore remain fail-closed.
-    if (ownsPythonCredential({ provenance: syntax.pythonProvenance, offset, valueStart })) return true;
-    const keyword = assignment.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*$/u);
-    const query = keyword && {
-      provenance: syntax.pythonProvenance,
-      nameStart: offset,
-      nameEnd: offset + keyword[1].length,
-      valueStart,
-      valueEnd
-    };
-    if (query) {
-      if (ownsPythonCallKeywordReference(query)) return true;
-      // Regexes may see only an f-string prefix. Approval still owns the exact
-      // complete parser RHS on every side, never that prefix or its wrapper.
-      // Keep regex cursors unchanged so the remaining bytes are also scanned.
-      const approvedEnd = approvedPythonCallKeywordEnd({ ...query, entries: syntax.approvedCallKeywordValues });
-      if (Number.isInteger(approvedEnd) && valueEnd <= approvedEnd) return true;
-    }
-    // Parser-owned local assignment approval (`AssignStatement Name = RHS`).
-    // Same narrow style as call keywords: only the exact approved RHS bytes
-    // are exempted while every surrounding byte is still scanned by its own
-    // match. The triple binds target name plus enclosing function scope plus
-    // exact RHS bytes; direct credential shapes (private-key/JWT/sk-/
-    // Authorization/URL-password/query-token) and non-Python (.env) routes
-    // never reach this exemption.
-    const assignTarget = assignment.match(/([A-Za-z_][A-Za-z0-9_]*)/u)?.[1];
-    const assignQuery = assignTarget && {
-      provenance: syntax.pythonProvenance,
-      nameStart: offset + assignment.indexOf(assignTarget),
-      nameEnd: offset + assignment.indexOf(assignTarget) + assignTarget.length,
-      valueStart,
-      valueEnd
-    };
-    if (assignQuery) {
-      const assignApprovedEnd = approvedPythonAssignEnd({ ...assignQuery, entries: syntax.approvedCallKeywordValues });
-      if (Number.isInteger(assignApprovedEnd) && valueEnd <= assignApprovedEnd) return true;
-    }
-  }
-  // Only the matched occurrence's code boundary must survive trivia masking.
-  // Calls such as os.getenv("TOKEN") legitimately contain masked string bytes
-  // inside the outer source expression, so comparing the complete slice would
-  // reject lawful source while still failing to reject strings/comments.
-  if (syntax.code[offset] !== original[offset] || syntax.code[valueStart] !== original[valueStart]) return false;
-  const genericTail = genericTailInfo(original, valueEnd);
-  if (genericTail && !genericTail.balanced) return false;
-  if (!hasBalancedGenericTail(syntax.code, valueEnd)) return false;
-  const typedAnnotation = hasTypedVariableAnnotationAnchor(syntax.code, syntax, offset, assignment, raw);
-  const typeLikeBody = hasTypeLikeBodyAnchor(syntax.code, syntax, offset);
-  const parameter = hasParameterAnchor(syntax.code, syntax, offset);
-  const destructuring = hasDestructuringAnchor(syntax.code, syntax, offset);
-  const initializerGeneric = Boolean(genericTail && /=\s*$/u.test(assignment));
-  // An unhinted `name: Type = value` is Python-looking source, not a lawful
-  // generic source reference. Only an explicit Python language hint may grant
-  // its AST declaration ownership; TS/JS declarations retain their keyword.
-  if (syntax.language !== 'python' && isPythonLikeTypedAssignment(assignment)) return false;
-  // A generic tail is source syntax only when a surrounding type, parameter,
-  // annotation, or destructuring anchor proves that it is not a value. In an
-  // object/config expression it remains part of the credential-looking value.
-  if (genericTail && (initializerGeneric || !(typedAnnotation || typeLikeBody || parameter || destructuring))) return false;
-  const expressionReference = isReferenceExpression(raw, { allowAnyRoot: true });
-  if (!reference && !expressionReference) return typedAnnotation && !/=\s*$/u.test(assignment);
-  const memberExpression = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/u.test(raw);
-  const callExpression = new RegExp(`^${REFERENCE_CALL}$`).test(raw);
-  const objectExpression = hasObjectExpressionAnchor(syntax.code, syntax, offset);
-  // Member/call values nested in an object/config record are ambiguous with
-  // credential material. Keep the existing declaration/parameter/type
-  // compatibility, but fail closed for this value-shaped route.
-  if (objectExpression && (memberExpression || callExpression)) return false;
-  const assignmentReference = hasAssignmentAnchor(syntax.code, offset + assignment.length, raw)
-    && (callExpression || !memberExpression || isReferenceExpression(raw));
-  return hasVariableInitializerAnchor(syntax.code, offset + assignment.length)
-    || (expressionReference && assignmentReference)
-    || typedAnnotation
-    || destructuring
-    || typeLikeBody
-    // A parser-unowned Python occurrence inside a dict/object remains a
-    // value-shaped hostile case even when its value happens to look like a
-    // generic reference. The language-neutral object envelope remains
-    // available for non-Python source, while ordinary Python reference
-    // assignments (outside the container) use the branches above.
-    || (objectExpression && syntax.language !== 'python')
-    || parameter;
-}
-
-function isSourceDeclaration(text, offset, assignment = '', context = 'source') {
-  const lineStart = text.lastIndexOf('\n', offset - 1) + 1;
-  const linePrefix = text.slice(lineStart, offset + assignment.length);
-  const statementStart = Math.max(linePrefix.lastIndexOf(';'), linePrefix.lastIndexOf('{'), linePrefix.lastIndexOf('}')) + 1;
-  const structuralPrefix = context === 'diagnostic'
-    ? '(?:\\[[^\\]\\r\\n]{1,64}\\]\\s*)?'
-    : '(?:(?:\\d+\\s*\\|\\s*)|(?:[+-]\\s*))?';
-  return new RegExp(`^\\s*${structuralPrefix}(?:export\\s+)?(?:const|let|var)\\s+[A-Za-z_$][A-Za-z0-9_$]*\\s*=\\s*$`, 'u').test(linePrefix.slice(statementStart));
-}
-
-function isPythonLikeTypedAssignment(assignment) {
-  const normalized = String(assignment ?? '').trim();
-  return /^[A-Za-z_$][A-Za-z0-9_$]*\s*:\s*[^=\r\n]{1,512}?=\s*$/u.test(normalized);
-}
-
-function safeCredentialReference(value, text, offset, context, assignment = '', syntax = undefined) {
-  if (isExactPlaceholder(value) && !(context === 'source' && syntax?.pythonProvenance
-    && !EXACT_PLACEHOLDERS.has(normalizeCredentialValue(value)))) return true;
-  // Python environment expressions require complete syntax ownership too;
-  // the generic placeholder compatibility must not donate a safe RHS prefix.
-  // Source member/call expressions are safe only through the masked-syntax
-  // envelope. Do not let a source string/comment/config record inherit the
-  // diagnostic member compatibility fallback.
-  if (context === 'source') return isCredibleSourceReference(value, text, offset, assignment, syntax);
-  if (!isReferenceExpression(value)) return false;
-  // Retain the existing diagnostic member compatibility, while requiring a
-  // visible declaration for diagnostic call expressions.
-  const normalized = String(value ?? '').trim().replace(/[;,]+$/, '').trim();
-  if (!new RegExp(`^${REFERENCE_CALL}$`).test(normalized)) return true;
-  return isSourceDeclaration(text, offset, assignment, context);
-}
-
-function authorizationValue(value) {
-  return String(value ?? '').trim().replace(/^[A-Za-z][A-Za-z0-9_-]*\s+/, '');
+  return entropy >= 4 || (entropy >= 3.5 && /[a-z]/.test(value) && /[A-Z]/.test(value) && /\d/.test(value));
 }
 
 function markerPrefixes(direction) {
@@ -833,373 +188,83 @@ export function createPrivateKeyScanner() {
 }
 
 
-function redactPrivateKeys(text) {
-  const scanner = createPrivateKeyScanner();
-  return scanner.push(String(text ?? ''), true);
-}
 
-function splitLinesWithOffsets(text) {
-  const lines = [];
-  let start = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    if (text[index] !== '\n' && text[index] !== '\r') continue;
-    const separator = text[index] === '\r' && text[index + 1] === '\n' ? '\r\n' : text[index];
-    lines.push({ start, end: index, separator });
-    index += separator.length - 1;
-    start = index + 1;
+function mergeSensitiveSpans(spans) {
+  spans.sort((a, b) => a.start - b.start || b.end - a.end);
+  const result = [];
+  for (const span of spans) {
+    const previous = result.at(-1);
+    if (previous && span.start < previous.end) previous.end = Math.max(previous.end, span.end);
+    else result.push({ ...span });
   }
-  lines.push({ start, end: text.length, separator: '' });
-  return lines;
+  return result;
 }
 
-function replacePrivateSpansWithLineMarkers(text, spans) {
-  if (spans.length === 0) return text;
-  const lines = splitLinesWithOffsets(text);
-  let spanIndex = 0;
-  const output = [];
-  for (const line of lines) {
-    while (spanIndex < spans.length && spans[spanIndex].end <= line.start) spanIndex += 1;
-    let cursor = line.start;
-    let currentSpanIndex = spanIndex;
-    let transformed = '';
-    while (currentSpanIndex < spans.length) {
-      const span = spans[currentSpanIndex];
-      if (span.start >= line.end) break;
-      if (span.end <= line.start) {
-        currentSpanIndex += 1;
-        continue;
-      }
-      const start = Math.max(line.start, span.start);
-      const end = Math.min(line.end, span.end);
-      if (start > cursor) transformed += text.slice(cursor, start);
-      transformed += PRIVATE_KEY_REDACTION_MARKER;
-      cursor = Math.max(cursor, end);
-      if (span.end <= line.end) currentSpanIndex += 1;
-      else break;
-    }
-    transformed += text.slice(cursor, line.end);
-    output.push(transformed + line.separator);
-    spanIndex = currentSpanIndex;
-  }
-  return output.join('');
-}
-
-function redactPrivateKeysPreservingLines(text) {
+export function scanSecretValues(text, _options = {}) {
   const source = String(text ?? '');
   const scanner = createPrivateKeyScanner();
   scanner.push(source, true);
-  return replacePrivateSpansWithLineMarkers(source, scanner.spans());
-}
-
-function redactCredentialAssignment(match, prefix, value, wholeText, offset, context, syntax = undefined) {
-  if (safeCredentialReference(value, wholeText, offset, context, prefix, syntax)) return match;
-  const valueEnd = offset + prefix.length + value.length;
-  const genericTail = genericTailInfo(wholeText, valueEnd);
-  const initializerGeneric = Boolean(genericTail && /=\s*$/u.test(prefix));
-  if (hasMalformedGenericTail(prefix)) {
-    const colon = prefix.lastIndexOf(':');
-    const equals = prefix.lastIndexOf('=');
-    if (colon >= 0 && colon < equals) return `${prefix.slice(0, colon + 1).trimEnd()} ${REDACTED_SECRET}`;
-  }
-  if (context === 'source' && syntax && !initializerGeneric && (!genericTail || genericTail.balanced) && hasTypedVariableAnnotationAnchor(syntax.code, syntax, offset, prefix, value)) {
-    if (!/=\s*$/u.test(prefix)) return match;
-    return `${prefix}${REDACTED_SECRET}`;
-  }
-  const equals = prefix.lastIndexOf('=');
-  const preservedValueLineBreaks = value.replace(/[^\r\n]/gu, '');
-  if (equals >= 0) {
-    const beforeEquals = prefix.slice(0, equals).trimEnd();
-    // Keep a separator for typed declarations so the follow-up field pass
-    // cannot absorb the assignment operator into the annotation value.
-    const typedSeparator = beforeEquals.includes(':') ? ' ' : '';
-    return `${beforeEquals}${typedSeparator}= ${REDACTED_SECRET}${preservedValueLineBreaks}`;
-  }
-  return `${prefix}${REDACTED_SECRET}${preservedValueLineBreaks}`;
-}
-
-function collectCredentialMatches(text, pattern, context, syntax, priority) {
-  pattern.lastIndex = 0;
-  const matches = [];
-  let match;
-  while ((match = pattern.exec(text)) !== null) {
-    const returnTypeColonEnd = pattern === CREDENTIAL_FIELD_PATTERN
-      ? pythonReturnTypeFieldColonEnd(match, syntax)
-      : undefined;
-    if (returnTypeColonEnd !== undefined) {
-      // The field regex may have consumed the next statement's label as the
-      // return annotation's value. Resume after the function-suite colon so
-      // that the same pass can inspect that next statement independently.
-      pattern.lastIndex = returnTypeColonEnd;
-      continue;
-    }
-    const prefix = match[1] ?? '';
-    const valueStart = match.index + prefix.length;
-    const valueEnd = credentialLiteralSpanEnd(text, match.index + match[0].length, valueStart);
-    const value = text.slice(valueStart, valueEnd);
-    const fullMatch = text.slice(match.index, valueEnd);
-    const replacement = redactCredentialAssignment(fullMatch, prefix, value, text, match.index, context, syntax);
-    const end = replacement === fullMatch ? valueEnd : credentialValueSpanEnd(text, valueEnd);
-    matches.push({ start: match.index, end, replacement, priority });
-  }
-  return matches;
-}
-
-function applyCredentialPatterns(text, context, languageOptions) {
-  const syntax = context === 'source' ? createSourceSyntax(text, languageOptions) : undefined;
-  const candidates = [
-    [TYPED_DECLARATION_ASSIGNMENT_PATTERN, 0],
-    [CREDENTIAL_ASSIGNMENT_PATTERN, 2],
-    [CREDENTIAL_ALIAS_ASSIGNMENT_PATTERN, 2],
-    [CREDENTIAL_SUBSCRIPT_ASSIGNMENT_PATTERN, 2],
-    [CREDENTIAL_DESTRUCTURED_ASSIGNMENT_PATTERN, 2],
-    [CREDENTIAL_FIELD_PATTERN, 3]
-  ].flatMap(([pattern, priority]) => collectCredentialMatches(text, pattern, context, syntax, priority));
-  candidates.sort((left, right) => left.start - right.start || left.priority - right.priority || right.end - left.end);
-
-  const selected = [];
-  let coveredUntil = 0;
-  for (const candidate of candidates) {
-    if (candidate.start < coveredUntil) continue;
-    selected.push(candidate);
-    coveredUntil = candidate.end;
-  }
-  let cursor = 0;
-  let output = '';
-  for (const candidate of selected) {
-    output += text.slice(cursor, candidate.start) + candidate.replacement;
-    cursor = candidate.end;
-  }
-  return output + text.slice(cursor);
-}
-
-function sourceAuthorizationEnd(match, syntax) {
-  if (!syntax?.pythonProvenance) return undefined;
-  const prefix = match[1];
-  const name = prefix.slice(0, prefix.indexOf(':')).trimEnd();
-  return pythonAuthorizationAnnotationEnd({ provenance: syntax.pythonProvenance,
-    nameStart: match.index, nameEnd: match.index + name.length,
-    valueStart: match.index + prefix.length });
-}
-
-function applyDirectPatterns(text, options) {
-  let syntax;
-  let output = '';
-  let cursor = 0;
-  AUTHORIZATION_PATTERN.lastIndex = 0;
-  let match;
-  while ((match = AUTHORIZATION_PATTERN.exec(text)) !== null) {
-    if (options.context === 'source' && syntax === undefined) syntax = createSourceSyntax(text, options);
-    const sourceEnd = sourceAuthorizationEnd(match, syntax);
-    if (sourceEnd !== undefined) {
-      // Resume at the exact owned syntax end, so a following real header on
-      // the same line is still inspected by this independent pattern pass.
-      AUTHORIZATION_PATTERN.lastIndex = sourceEnd;
-      continue;
-    }
-    if (isExactPlaceholder(authorizationValue(match[2]))) continue;
-    output += text.slice(cursor, match.index) + match[1] + REDACTED_SECRET;
-    cursor = match.index + match[0].length;
-  }
-  output += text.slice(cursor);
-  output = output.replace(CLI_TOKEN_PATTERN, (match, prefix, value) => isExactPlaceholder(value) ? match : `${prefix}${REDACTED_SECRET}`);
-  output = output.replace(QUERY_TOKEN_PATTERN, (match, prefix, value) => isExactPlaceholder(value) ? match : `${prefix}${REDACTED_SECRET}`);
-  output = output.replace(CREDENTIAL_URL_PATTERN, (match, prefix, value) => isExactPlaceholder(value) ? match : `${prefix}${REDACTED_SECRET}@`);
-  output = output.replace(OPENAI_SECRET_PATTERN, (match) => isExactPlaceholder(match) ? match : REDACTED_SECRET);
-  output = output.replace(COMMON_TOKEN_PATTERN, (match) => isExactPlaceholder(match) ? match : REDACTED_SECRET);
-  output = output.replace(JWT_TOKEN_PATTERN, (match) => isExactPlaceholder(match) ? match : REDACTED_SECRET);
-  return output;
-}
-
-export function redactSensitiveText(text, options = {}) {
-  const normalized = normalizeOptions(options);
-  const { context } = normalized;
-  const privateSafe = redactPrivateKeys(String(text ?? ''));
-  // Protect transport-shaped credentials before generic assignment handling;
-  // otherwise `?codexpro_token=value` becomes `?codexpro_token= [REDACTED_SECRET]`
-  // and the displayed URL no longer retains a valid query shape.
-  const directSafe = applyDirectPatterns(privateSafe, normalized);
-  return redactMalformedCredentialParentheses(applyCredentialPatterns(directSafe, context, normalized));
-}
-
-export function redactSensitiveTextPreservingLines(text, options = {}) {
-  const linePreserved = redactPrivateKeysPreservingLines(String(text ?? ''));
-  return redactSensitiveText(linePreserved, options);
-}
-
-const SEARCH_QUERY_MEMBER_OR_CALL = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+(?:\s*\([^;\r\n]*\))?$/u;
-const SEARCH_QUERY_LITERAL_LIKE = /^(?=.*\d)[A-Z0-9][A-Z0-9_-]*$/u;
-
-// Search analysis echoes the caller's query in a structured field.  A query
-// is lawful to echo only when a redacted match still contains that exact
-// query outside policy markers.  Marker-only matches (including fail-closed
-// binary/private-key lines) and obviously member/call-shaped fallbacks must
-// not reintroduce the hidden value through analysis metadata.
-export function redactSearchQuery(query, safeMatchTexts = []) {
-  const normalized = String(query ?? '').trim();
-  if (!normalized) return normalized;
-  const texts = Array.isArray(safeMatchTexts)
-    ? safeMatchTexts.filter((value) => typeof value === 'string').map((value) => String(value))
-    : [];
-  const unmarked = (value) => value
-    .replaceAll(REDACTED_SECRET, '')
-    .replaceAll(PRIVATE_KEY_REDACTION_MARKER, '');
-
-  if (texts.some((text) => unmarked(text).includes(normalized))) return normalized;
-  if (texts.length > 0) return REDACTED_SECRET;
-  if (SEARCH_QUERY_MEMBER_OR_CALL.test(normalized)) return REDACTED_SECRET;
-
-  // Keep ordinary source symbol searches intact while covering literal-like
-  // credential queries when no match text is available (disabled/error path).
-  const quoted = /^(['"`])[\s\S]*\1$/u.test(normalized);
-  const probe = `TOKEN=${normalized}`;
-  if ((quoted || SEARCH_QUERY_LITERAL_LIKE.test(normalized)) && hasSecretValue(probe, { context: 'source' })) {
-    return REDACTED_SECRET;
-  }
-  return normalized;
-}
-
-export function redactDiagnosticText(text) {
-  return redactSensitiveText(text, { context: 'diagnostic' });
-}
-
-function collectUnsafeCredentialSpans(text, pattern, context, syntax = undefined) {
-  pattern.lastIndex = 0;
-  const spans = [];
-  let match;
-  while ((match = pattern.exec(text)) !== null) {
-    const returnTypeColonEnd = pattern === CREDENTIAL_FIELD_PATTERN
-      ? pythonReturnTypeFieldColonEnd(match, syntax)
-      : undefined;
-    if (returnTypeColonEnd !== undefined) {
-      pattern.lastIndex = returnTypeColonEnd;
-      continue;
-    }
-    const prefix = match[1] ?? '';
-    const valueEnd = credentialLiteralSpanEnd(text, match.index + match[0].length, match.index + prefix.length);
-    const value = text.slice(match.index + prefix.length, valueEnd);
-    if (!safeCredentialReference(value, text, match.index, context, prefix, syntax)) {
-      spans.push({ start: match.index, end: credentialValueSpanEnd(text, valueEnd) });
-    }
-  }
-  return spans;
-}
-
-function mergeSensitiveSpans(spans) {
-  spans.sort((left, right) => left.start - right.start || left.end - right.end);
-  const merged = [];
-  for (const span of spans) {
-    const previous = merged.at(-1);
-    if (previous && span.start <= previous.end) previous.end = Math.max(previous.end, span.end);
-    else merged.push({ start: span.start, end: span.end });
-  }
-  return merged;
-}
-
-/** Scan a complete source snapshot and return conservative UTF-16 source spans.
- * complete is false when trusted Python parser coverage was required but unavailable.
- */
-export function scanSecretValues(text, options = {}) {
-  const source = String(text ?? '');
-  const normalized = normalizeOptions(options);
-  const { context } = normalized;
-  const syntax = context === 'source' ? createSourceSyntax(source, normalized) : undefined;
-  const spans = [];
-  const privateKeyScanner = createPrivateKeyScanner();
-  privateKeyScanner.push(source, true);
-  spans.push(...privateKeyScanner.spans());
-  const unmatchedParenthesis = unmatchedCredentialParenthesisStart(source);
-  if (unmatchedParenthesis >= 0) spans.push({ start: unmatchedParenthesis, end: source.length });
-  for (const pattern of [TYPED_DECLARATION_ASSIGNMENT_PATTERN, CREDENTIAL_ALIAS_ASSIGNMENT_PATTERN,
-    CREDENTIAL_SUBSCRIPT_ASSIGNMENT_PATTERN, CREDENTIAL_DESTRUCTURED_ASSIGNMENT_PATTERN,
-    CREDENTIAL_ASSIGNMENT_PATTERN, CREDENTIAL_FIELD_PATTERN]) {
-    spans.push(...collectUnsafeCredentialSpans(source, pattern, context, syntax));
-  }
-
-  AUTHORIZATION_PATTERN.lastIndex = 0;
-  let match;
-  while ((match = AUTHORIZATION_PATTERN.exec(source)) !== null) {
-    const sourceEnd = sourceAuthorizationEnd(match, syntax);
-    if (sourceEnd !== undefined) {
-      AUTHORIZATION_PATTERN.lastIndex = sourceEnd;
-      continue;
-    }
-    if (!isExactPlaceholder(authorizationValue(match[2]))) spans.push({ start: match.index, end: match.index + match[0].length });
-  }
-  for (const pattern of [CLI_TOKEN_PATTERN, QUERY_TOKEN_PATTERN, CREDENTIAL_URL_PATTERN]) {
+  const spans = scanner.spans();
+  for (const pattern of [KNOWN_TOKEN, ASSIGNED_LITERAL, BARE_CREDENTIAL, BEARER, URL_PASSWORD]) {
     pattern.lastIndex = 0;
+    let match;
     while ((match = pattern.exec(source)) !== null) {
-      if (!isExactPlaceholder(match[2])) spans.push({ start: match.index, end: match.index + match[0].length });
+      const rawValue = match.groups?.value ?? match[0];
+      const value = rawValue.trim();
+      if (isPlaceholder(value)) continue;
+      if ((pattern === ASSIGNED_LITERAL || pattern === BARE_CREDENTIAL) && !isHighEntropyLiteral(value)) continue;
+      // Bare source identifiers are references, even when their spelling has high entropy.
+      if (pattern === BARE_CREDENTIAL && /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(value)) continue;
+      const [start] = match.indices?.groups?.value ?? [match.index];
+      const valueStart = start + rawValue.indexOf(value);
+      spans.push({ start: valueStart, end: valueStart + value.length });
     }
   }
-  for (const pattern of [OPENAI_SECRET_PATTERN, COMMON_TOKEN_PATTERN, JWT_TOKEN_PATTERN]) {
-    pattern.lastIndex = 0;
-    while ((match = pattern.exec(source)) !== null) {
-      if (!isExactPlaceholder(match[0])) spans.push({ start: match.index, end: match.index + match[0].length });
-    }
-  }
-  const pythonSides = syntax?.pythonProvenance?.segments?.flatMap((segment) => segment.sides ?? [segment]) ?? [];
-  const complete = !(context === 'source' && syntax?.language === 'python'
-    && (!syntax.pythonProvenance?.available || pythonSides.some((side) => !side.parse?.valid)));
-  return { spans: mergeSensitiveSpans(spans), complete };
+  return { spans: mergeSensitiveSpans(spans), complete: true };
 }
 
 export function hasSecretValue(text, options = {}) {
   return scanSecretValues(text, options).spans.length > 0;
 }
 
-function trustedDiffLanguage(languageForPath, path, present, pathDiscoveryValid) {
-  // A file block has one metadata/hunk authority. Do not let a side-specific
-  // path or the absence of a parser error donate provenance after that
-  // authority has failed.
-  if (!pathDiscoveryValid) return undefined;
-  let candidate;
-  try {
-    // Consult both sides independently, including an undefined absent or
-    // unknown path. The result is ignored for an invalid/absent side.
-    candidate = languageForPath(path);
-  } catch {
-    candidate = undefined;
+function redactSpans(text, preservingLines) {
+  const source = String(text ?? '');
+  const { spans } = scanSecretValues(source);
+  let output = '';
+  let cursor = 0;
+  for (const span of spans) {
+    const value = source.slice(span.start, span.end);
+    const marker = /^-----BEGIN\s/i.test(value) ? PRIVATE_KEY_REDACTION_MARKER : REDACTED_SECRET;
+    output += source.slice(cursor, span.start) + (preservingLines
+      ? value.replace(/[^\r\n]+/gu, marker)
+      : marker);
+    cursor = span.end;
   }
-  return present && candidate === 'python' ? 'python' : undefined;
+  return output + source.slice(cursor);
 }
 
-// Unified diff output is a collection of per-file target routes. A block must
-// first pass the canonical pathDiscoveryValid authority: invalid metadata or
-// hunks disable both sides, while valid blocks retain independent old/new path
-// language routing.
-function diffCallKeywordApprovals(block, options) {
-  if (!block.pathDiscoveryValid || typeof options.sourcePathForPath !== 'function') return [];
-  const paths = [block.oldPresent && block.oldPath, block.newPresent && block.newPath].filter(Boolean);
-  try {
-    const lists = paths.map((filePath) => loadCallKeywordApprovals(options.sourcePathForPath(filePath)));
-    return lists.length ? lists[0].filter((entry) => lists.every((list) => list.some((other) =>
-      entry.keyword_sha256 === other.keyword_sha256 && entry.callee_sha256 === other.callee_sha256
-      && entry.value_sha256 === other.value_sha256))) : [];
-  } catch { return []; }
+export function redactSensitiveText(text, _options = {}) {
+  return redactSpans(text, false);
 }
-
-export function redactUnifiedDiff(text, options = {}) {
-  const languageForPath = typeof options?.languageForPath === 'function'
-    ? options.languageForPath
-    : sourceLanguageForPath;
-  return extractDiffFileBlocks(text).map((block) => {
-    const oldLanguage = trustedDiffLanguage(languageForPath, block.oldPath, block.oldPresent, block.pathDiscoveryValid);
-    const newLanguage = trustedDiffLanguage(languageForPath, block.newPath, block.newPresent, block.pathDiscoveryValid);
-    return redactSensitiveText(block.source, { context: 'source', oldLanguage, newLanguage,
-      approvedCallKeywordValues: diffCallKeywordApprovals(block, options) });
-  }).join('');
+export function redactSensitiveTextPreservingLines(text, _options = {}) {
+  return redactSpans(text, true);
 }
-
-export function hasSecretValueInUnifiedDiff(text, options = {}) {
-  const languageForPath = typeof options?.languageForPath === 'function'
-    ? options.languageForPath
-    : sourceLanguageForPath;
-  return extractDiffFileBlocks(text).some((block) => {
-    const oldLanguage = trustedDiffLanguage(languageForPath, block.oldPath, block.oldPresent, block.pathDiscoveryValid);
-    const newLanguage = trustedDiffLanguage(languageForPath, block.newPath, block.newPresent, block.pathDiscoveryValid);
-    return hasSecretValue(block.source, { context: 'source', oldLanguage, newLanguage,
-      approvedCallKeywordValues: diffCallKeywordApprovals(block, options) });
-  });
+export function redactDiagnosticText(text) {
+  return redactSensitiveText(text);
+}
+export function redactSearchQuery(query, safeMatchTexts = []) {
+  const value = String(query ?? '').trim();
+  if (hasSecretValue(value) || hasSecretValue(`TOKEN="${value}"`)) return REDACTED_SECRET;
+  // A query matching a masked part of a file must not echo the hidden body back.
+  if (safeMatchTexts.length && !safeMatchTexts.some((text) => text
+    .replaceAll(REDACTED_SECRET, '').replaceAll(PRIVATE_KEY_REDACTION_MARKER, '').includes(value))) return REDACTED_SECRET;
+  return value;
+}
+export function redactUnifiedDiff(text, _options = {}) {
+  return redactSensitiveText(text);
+}
+export function hasSecretValueInUnifiedDiff(text, _options = {}) {
+  return hasSecretValue(text);
 }
 
 function utf8PrefixLength(buffer, limit) {

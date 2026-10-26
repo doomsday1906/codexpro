@@ -1080,32 +1080,15 @@ function hasSecretValueInChangedEdit(before: string, after: string, sourceOption
   const beforeScan = scanSecretValues(before, sourceOptions);
   const afterScan = scanSecretValues(after, sourceOptions);
   if (!beforeScan.complete || !afterScan.complete) return true;
-  // A deletion at a span boundary is safe only if the untouched classification stays identical.
   const touches = (span: { start: number; end: number }, start: number, end: number) =>
     start === end ? span.start < start && start < span.end : span.start < end && span.end > start;
-  if (beforeScan.spans.some((span) => edits.some((edit) => touches(span, edit.beforeStart, edit.beforeEnd)))) return true;
-  if (afterScan.spans.some((span) => edits.some((edit) => touches(span, edit.afterStart, edit.afterEnd)))) return true;
-
-  // Exact untouched chunks and their sensitive classifications must map
-  // one-to-one across every disjoint replacement.
-  let beforeCursor = 0;
-  let afterCursor = 0;
-  for (const edit of edits) {
-    if (before.slice(beforeCursor, edit.beforeStart) !== after.slice(afterCursor, edit.afterStart)) return true;
-    const beforeSpans = beforeScan.spans.filter((span) => span.start >= beforeCursor && span.end <= edit.beforeStart)
-      .map((span) => [span.start - beforeCursor, span.end - beforeCursor]);
-    const afterSpans = afterScan.spans.filter((span) => span.start >= afterCursor && span.end <= edit.afterStart)
-      .map((span) => [span.start - afterCursor, span.end - afterCursor]);
-    if (JSON.stringify(beforeSpans) !== JSON.stringify(afterSpans)) return true;
-    beforeCursor = edit.beforeEnd;
-    afterCursor = edit.afterEnd;
-  }
-  if (before.slice(beforeCursor) !== after.slice(afterCursor)) return true;
-  const beforeSpans = beforeScan.spans.filter((span) => span.start >= beforeCursor)
-    .map((span) => [span.start - beforeCursor, span.end - beforeCursor]);
-  const afterSpans = afterScan.spans.filter((span) => span.start >= afterCursor)
-    .map((span) => [span.start - afterCursor, span.end - afterCursor]);
-  return JSON.stringify(beforeSpans) !== JSON.stringify(afterSpans);
+  return afterScan.spans.some((span) => {
+    if (edits.some((edit) => touches(span, edit.afterStart, edit.afterEnd))) return true;
+    const shift = edits.filter((edit) => edit.afterEnd <= span.start)
+      .reduce((total, edit) => total + (edit.afterEnd - edit.afterStart) - (edit.beforeEnd - edit.beforeStart), 0);
+    // Existing untouched secrets may remain; only new or changed secret spans refuse the edit.
+    return !beforeScan.spans.some((old) => old.start === span.start - shift && old.end === span.end - shift);
+  });
 }
 
 export async function editTextFile(

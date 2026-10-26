@@ -127,36 +127,25 @@ export function redactSensitiveTextPreservingLines(text: string, options: Redact
   return redacted;
 }
 
-/** Describe a blocked source candidate without echoing matched content. */
+/** Locate secret literals without echoing their content. */
 export function sourceSafetyRefusalMessage(
   operation: "write" | "edit" | "apply_patch",
   filePath: string,
   source: string,
-  redacted: string,
+  _redacted: string,
   coordinate: "source line" | "patch line" = "source line"
 ): string {
-  const sourceLines = String(source ?? "").split(/\r\n|\n|\r/u);
-  const redactedLines = String(redacted ?? "").split(/\r\n|\n|\r/u);
-  const lineNumbers: number[] = [];
-  if (sourceLines.length === redactedLines.length) {
-    for (let index = 0; index < sourceLines.length; index += 1) {
-      if (sourceLines[index] !== redactedLines[index]) lineNumbers.push(index + 1);
-    }
-  }
-
-  const shownLines = lineNumbers.slice(0, 12).join(", ");
-  const overflow = lineNumbers.length > 12 ? `, +${lineNumbers.length - 12} more` : "";
-  const location = lineNumbers.length > 0
-    ? `${coordinate}(s) ${shownLines}${overflow}`
-    : `${coordinate}(s) unavailable (line-preserving evidence unavailable)`;
-  // The diagnostic stays generic on purpose: the detector reports only a
-  // boolean, never a rule name, so no rule identity is claimed here. Only the
-  // sanitized path and bounded physical line numbers are disclosed; matched
-  // content is never echoed.
+  const position = (offset: number) => {
+    const lines = source.slice(0, offset).split(/\r\n|\n|\r/u);
+    return `${coordinate} ${lines.length}, column ${lines.at(-1)!.length + 1}`;
+  };
+  const locations = scanSecretValues(source).spans.map((span) =>
+    `${position(span.start)} to ${position(span.end)} (end exclusive)`
+  ).join("; ");
   const safePath = redactDiagnosticText(String(filePath ?? ""))
     .replace(/[\r\n]/gu, " ")
     .slice(0, 512) || "<unknown>";
-  return `Secret-looking content is blocked from ${operation}. Use placeholders such as [REDACTED_SECRET] in handoff files. Path ${safePath}; ${location}; matched content omitted.`;
+  return `Secret literal found in ${safePath}: ${locations}. ${operation} was not applied. Replace the literal with an env lookup (for example process.env.API_KEY), then retry ${operation}.`;
 }
 export function redactUnifiedDiff(
   text: string,

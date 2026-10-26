@@ -42,7 +42,7 @@ import { delegationToolDefs } from "./delegationTools.js";
 import { eventsCapability } from "./delegationEvents.js";
 import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
-import { hasSecretValue, hasSecretValueInUnifiedDiff, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactSensitiveTextPreservingLines, redactStructured, redactUnifiedDiff, redactUnifiedDiffPreservingLines, sourceLanguageForPath, sourceSafetyRefusalMessage, truncateUtf8 } from "./redact.js";
+import { hasSecretValue, redactDiagnosticStructured, redactDiagnosticText, redactSensitiveText, redactSensitiveTextPreservingLines, redactStructured, redactUnifiedDiff, sourceLanguageForPath, sourceSafetyRefusalMessage, truncateUtf8 } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { createDiagnosticContext, type CodexProDiagnosticContext } from "./diagnosticContext.js";
 import { normalizeGitPushPolicy, sanitizeGitPushPolicy } from "./gitPushPolicy.js";
@@ -2787,20 +2787,7 @@ function validateSimulatedSource(simulated: SimulatedPatch, records: ValidatedPa
     return matches.length === 1 ? matches[0].absPath : undefined;
   };
   try {
-    if (hasSecretValueInUnifiedDiff(simulated.rawDiff, languageForPath, sourcePathForPath)) {
-      // Bounded patch-line coordinates from a line-preserving redaction of
-      // the canonical diff, consistent with ordinary edit/write refusals.
-      // Only sanitized touched paths and physical diff line numbers are
-      // disclosed; matched content is never echoed and no detector rule
-      // identity is claimed.
-      const redactedDiff = redactUnifiedDiffPreservingLines(simulated.rawDiff, languageForPath);
-      const touchedPaths = records.slice(0, 4).map((record) => record.relPath).join("; ") +
-        (records.length > 4 ? ` (+${records.length - 4} more)` : "");
-      throw new CodexProError(sourceSafetyRefusalMessage("apply_patch", touchedPaths || "<unknown>", simulated.rawDiff, redactedDiff, "patch line"));
-    }
-    // Whole-file protection: a benign hunk must not leave secret-looking
-    // content in unpatched regions. Scan the simulated post-apply bytes with
-    // the same source policy ordinary edits use, reporting source lines.
+    // Validate the resulting files; removed literals may be replaced with env lookups.
     for (const file of simulated.postApplyFiles) {
       const sourceOptions = { context: "source" as const, language: sourceLanguageForPath(file.relPath), sourcePath: file.absPath };
       if (hasSecretValue(file.content, sourceOptions)) {

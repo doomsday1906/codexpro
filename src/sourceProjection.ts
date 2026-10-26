@@ -56,8 +56,6 @@ export const SELECT_RECORD_OVERHEAD_BYTES = 256;
 export const PRIVATE_KEY_SPAN_CAP = 4096;
 /** Estimated retained bytes per private-key span, for honest retention accounting. */
 const PRIVATE_KEY_SPAN_ESTIMATE_BYTES = 128;
-/** Conservative retained-bytes estimate for bounded nuke-detector state. */
-const NUKE_STATE_ESTIMATE_BYTES = 65536;
 /**
  * Post-snapshot observer staging flushes past this size, so giant-line
  * fragments can never accumulate source-sized staging before finalization
@@ -66,10 +64,6 @@ const NUKE_STATE_ESTIMATE_BYTES = 65536;
 const OBSERVE_ACC_FLUSH_CHARS = 64 * 1024;
 /** Flanking context retained around a projected window for bounded redaction decisions. */
 export const WINDOW_FLANK_BYTES = 64 * 1024;
-/** Cap on simultaneously tracked paren-nuke candidates; overflow is conservative (nuke-all). */
-export const NUKE_CANDIDATE_CAP = 1024;
-/** Overlap for single-line nuke-candidate detection across stream segments. */
-const NUKE_OVERLAP_BYTES = 1024;
 
 export type ScanFailureReason = "source_scan_limit" | "race" | "aborted" | "not-a-file";
 
@@ -209,7 +203,7 @@ export interface ScanOptions extends ScanWindow {
   readonly selectMaxBytes?: number;
 }
 
-/** Forward trivia-mask state machine mirroring `maskSourceTrivia` (scripts/redaction-policy.mjs). */
+/** Forward trivia-mask state for source-window offset snapshots. */
 export class TriviaMaskStream {
   private state: TriviaMaskState = "code";
   private quote = "";
@@ -376,113 +370,6 @@ export class TriviaMaskStream {
   }
 }
 
-const CREDENTIAL_LABEL = "[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]{0,64}";
-const NUKE_CANDIDATE_PATTERN = new RegExp(`\\b${CREDENTIAL_LABEL}\\s*(?::|=)[^\\r\\n]{0,512}\\(`, "gi");
-
-interface NukeCandidate {
-  opening: number;
-  balance: number;
-  min: number;
-  bornFeed: number;
-}
-
-/** Discovery lookbehind: retained masked tail re-scanned with each segment. Must exceed any credential-match length. */
-const NUKE_DISCOVERY_OVERLAP = 1024;
-
-/**
- * Streaming replica of `unmatchedCredentialParenthesisStart`: masked-text
- * candidate detection with per-candidate (balance, min) tracking in absolute
- * offset order. Matched candidates are pruned; at most NUKE_CANDIDATE_CAP are
- * tracked and overflow resolves conservative (trigger at 0).
- *
- * Candidate discovery runs over retained history plus the new segment, so
- * matches straddling feed cuts are still found exactly once (deduped by
- * absolute opening); paren accounting applies strictly once per position.
- */
-export class NukeDetectorStream {
-  private readonly candidates: NukeCandidate[] = [];
-  private overflow = false;
-  private readonly cap: number;
-  private history = "";
-  private historyBase = 0;
-  private feedId = 0;
-  constructor(cap = NUKE_CANDIDATE_CAP) {
-    this.cap = cap;
-  }
-  /** Feed one masked segment with its absolute base offset. Segments must be fed once, in order. */
-  feed(maskedSegment: string, baseOffset: number): void {
-    const myId = this.feedId++;
-    // 1. Discovery over history + new segment (absolute coordinates).
-    const windowText = this.history + maskedSegment;
-    const windowBase = this.historyBase;
-    const seen = new Set<number>(this.candidates.map((candidate) => candidate.opening));
-    NUKE_CANDIDATE_PATTERN.lastIndex = 0;
-    let match: RegExpExecArray | null;
-    while ((match = NUKE_CANDIDATE_PATTERN.exec(windowText)) !== null) {
-      const localOpen = windowText.indexOf("(", match.index);
-      if (localOpen < 0) continue;
-      const opening = windowBase + localOpen;
-      if (seen.has(opening)) continue;
-      seen.add(opening);
-      // Suffix balance/min from the opening through the window end, mirroring
-      // the oracle's depth-scan prefix. A suffix returning to zero is a matched
-      // paren pair, not a trigger.
-      let balance = 0;
-      let min = Number.POSITIVE_INFINITY;
-      let matched = false;
-      for (let k = localOpen; k < windowText.length; k += 1) {
-        const c = windowText[k];
-        if (c !== "(" && c !== ")") continue;
-        balance += c === "(" ? 1 : -1;
-        if (balance < min) min = balance;
-        if (balance === 0) {
-          matched = true;
-          break;
-        }
-      }
-      if (matched) continue;
-      if (this.candidates.length < this.cap) {
-        this.candidates.push({ opening, balance, min, bornFeed: myId });
-      } else {
-        this.overflow = true;
-      }
-    }
-    // 2. Accounting: new-segment parens only, for earlier-born candidates.
-    for (let i = 0; i < maskedSegment.length; i += 1) {
-      const c = maskedSegment[i];
-      if (c !== "(" && c !== ")") continue;
-      const cursor = baseOffset + i;
-      for (const candidate of this.candidates) {
-        if (candidate.bornFeed === myId) continue;
-        if (candidate.opening >= cursor) continue;
-        candidate.balance += c === "(" ? 1 : -1;
-        if (candidate.balance < candidate.min) candidate.min = candidate.balance;
-      }
-      for (let j = this.candidates.length - 1; j >= 0; j -= 1) {
-        if (this.candidates[j].balance === 0) this.candidates.splice(j, 1);
-      }
-    }
-    // 3. Retain the discovery tail.
-    const combined = this.history + maskedSegment;
-    if (combined.length > NUKE_DISCOVERY_OVERLAP) {
-      const cut = combined.length - NUKE_DISCOVERY_OVERLAP;
-      this.history = combined.slice(cut);
-      this.historyBase += cut;
-    } else {
-      this.history = combined;
-    }
-  }
-  /** -1 when no trigger; otherwise the first unmatched offset (0 on overflow). */
-  result(): number {
-    if (this.overflow) return 0;
-    let trigger = -1;
-    for (const candidate of this.candidates) {
-      if (candidate.min > 0 && (trigger < 0 || candidate.opening < trigger)) trigger = candidate.opening;
-    }
-    return trigger;
-  }
-}
-
 export interface StreamChunkSource {
   /** Read the next chunk; null signals EOF. */
   read(): Promise<Buffer | null>;
@@ -546,7 +433,6 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
   let utf8Valid = true;
   const privateKeyScanner = createPrivateKeyScanner();
   const mask = new TriviaMaskStream();
-  const nuke = new NukeDetectorStream();
   const wantSelect = options.startLine !== undefined || options.endLine !== undefined;
   const selectStart = normalizeSelectStart(options.startLine);
   const selectEnd = normalizeSelectEnd(options.endLine);
@@ -583,20 +469,6 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
     if (options.signal?.aborted) throw new SourceScanError("aborted");
   };
 
-  // Nuke-detector segment accounting (decoded-string offsets).
-  let maskedFed = 0;
-  let maskedPending = "";
-  const feedMasked = (masked: string): void => {
-    const combined = maskedPending + masked;
-    if (combined.length > NUKE_OVERLAP_BYTES) {
-      const cut = combined.length - NUKE_OVERLAP_BYTES;
-      nuke.feed(combined.slice(0, cut), maskedFed);
-      maskedFed += cut;
-      maskedPending = combined.slice(cut);
-    } else {
-      maskedPending = combined;
-    }
-  };
   // Gated observer feed. Only the chunk containing the window-start line is
   // split per line (to capture the exact mask state at its first byte); every
   // other byte is fed in whole-chunk batches. The stream stays exact either way.
@@ -612,7 +484,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
   const flushObserveAcc = (): void => {
     if (observeAcc) {
       if (!pkFeedingStopped) privateKeyScanner.push(observeAcc, false);
-      feedMasked(mask.feed(observeAcc));
+      mask.feed(observeAcc);
       maskOffset += observeAcc.length;
       observeAcc = "";
     }
@@ -648,7 +520,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         observeAcc += piece;
       } else {
         if (!pkFeedingStopped) privateKeyScanner.push(piece, false);
-        feedMasked(mask.feed(piece));
+        mask.feed(piece);
         maskOffset += piece.length;
       }
     }
@@ -753,7 +625,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         }
       }
       let text = decoder.write(chunk);
-      track(chunk.byteLength + Buffer.byteLength(text, "utf8") + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length + observeAcc.length + pkSpansSeen * PRIVATE_KEY_SPAN_ESTIMATE_BYTES + NUKE_STATE_ESTIMATE_BYTES);
+      track(chunk.byteLength + Buffer.byteLength(text, "utf8") + carryBytes + giantBytes + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length + observeAcc.length + pkSpansSeen * PRIVATE_KEY_SPAN_ESTIMATE_BYTES);
       if (pendingCR) {
         text = `\r${text}`;
         pendingCR = false;
@@ -788,7 +660,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         // Same per-chunk observer cadence as the multi-line path: bounds
         // staging, feeds detector streams promptly, and runs the span-cap check.
         flushObserveAcc();
-        track(chunk.byteLength + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length + observeAcc.length + pkSpansSeen * PRIVATE_KEY_SPAN_ESTIMATE_BYTES + NUKE_STATE_ESTIMATE_BYTES);
+        track(chunk.byteLength + carryBytes + giantBytes + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length + observeAcc.length + pkSpansSeen * PRIVATE_KEY_SPAN_ESTIMATE_BYTES);
         continue;
       }
       // Head completes the carried fragment and its line (content + terminator fed exactly).
@@ -831,7 +703,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         carryBytes = tailBytes;
       }
       flushObserveAcc();
-      track(chunk.byteLength + carryBytes + giantBytes + NUKE_OVERLAP_BYTES + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length + observeAcc.length + pkSpansSeen * PRIVATE_KEY_SPAN_ESTIMATE_BYTES + NUKE_STATE_ESTIMATE_BYTES);
+      track(chunk.byteLength + carryBytes + giantBytes + 2048 + selectedBytes + preTail.length + flankBefore.length + flankAfter.length + observeAcc.length + pkSpansSeen * PRIVATE_KEY_SPAN_ESTIMATE_BYTES);
     }
     checkAborted();
     if (pendingCR) {
@@ -897,13 +769,6 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
         utf8Valid = false;
       }
     }
-    // Flush lookahead-held mask tail so the detector sees the complete stream.
-    feedMasked(mask.flush());
-    if (maskedPending) {
-      nuke.feed(maskedPending, maskedFed);
-      maskedFed += maskedPending.length;
-      maskedPending = "";
-    }
     // F2-C: retain only span state necessary to protect the captured window.
     // Blocks entirely outside it must not accumulate unbounded records. On
     // overflow the feed already stopped and the window is fully redacted.
@@ -925,7 +790,7 @@ export async function scanStream(source: StreamChunkSource, options: CoreScanOpt
       giants,
       privateKeySpans,
       spansOverflowed,
-      nukeOffset: nuke.result(),
+      nukeOffset: -1,
       maskAtWindowStart: windowStartSnapshot,
       windowStartsInCode: windowStartSnapshot === null ? true : windowStartSnapshot.state === "code",
       flankBefore,
@@ -1114,10 +979,6 @@ export function frameRawWindow(
 export const PRIVATE_KEY_MARKER = "[REDACTED_PRIVATE_KEY]";
 export const REDACTED_SECRET_MARKER = "[REDACTED_SECRET]";
 
-/** Over-approximate credential-label test for conservative force rules (safe direction). */
-const FORCE_LABEL_PATTERN = /[A-Za-z0-9_]{0,64}(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[A-Za-z0-9_]*/i;
-const FORCE_SHAPE_PATTERN = /=|:/;
-
 /**
  * Map full-stream private-key spans onto window lines, replicating the
  * accepted `replacePrivateSpansWithLineMarkers` line mapping restricted to
@@ -1163,30 +1024,6 @@ export function applyPrivateKeySpansToLines(
   return out;
 }
 
-/**
- * Replicate the accepted malformed-credential-paren nuke for a window:
- * content at/after the trigger offset becomes the marker plus preserved
- * newlines. Returns the mapped lines and whether the trigger touched them.
- */
-export function applyNukeOffsetToLines(
-  lines: string[],
-  lineStarts: number[],
-  trigger: number,
-  marker: string = REDACTED_SECRET_MARKER
-): { lines: string[]; applied: boolean } {
-  if (trigger < 0) return { lines: [...lines], applied: false };
-  let applied = false;
-  const out = lines.map((line, li) => {
-    const lineStart = lineStarts[li];
-    const lineEnd = lineStart + line.length;
-    if (lineEnd <= trigger) return line;
-    applied = true;
-    if (lineStart >= trigger) return "";
-    return `${line.slice(0, trigger - lineStart)}${marker}`;
-  });
-  return { lines: out, applied };
-}
-
 export interface LargeWindowProjectionRequest {
   readonly scan: SourceScan;
   /**
@@ -1208,15 +1045,6 @@ export interface LargeWindowProjection {
 
 function forceRedactLine(): string {
   return REDACTED_SECRET_MARKER;
-}
-
-/** Back-scan for a statement boundary; true when the scan reaches the slice start. */
-function anchorReachesSliceStart(maskedSlice: string, fromOffset: number): boolean {
-  for (let i = fromOffset - 1; i >= 0; i -= 1) {
-    const c = maskedSlice[i];
-    if (c === ";" || c === "{" || c === "}") return false;
-  }
-  return true;
 }
 
 /**
@@ -1256,13 +1084,12 @@ export function projectLargeWindow(
     return {
       lines,
       redacted: lines.map((line, index) => line !== window[index].text),
-      nukeApplied: scan.nukeOffset >= 0,
+      nukeApplied: false,
       forcedLines: forcedAll
     };
   }
   const flankBefore = scan.flankBefore;
   const flankAfter = scan.flankAfter;
-  const bridgeSuspect = scan.bridgeSuspect;
   // Exact per-line string offsets from the scan (terminator-aware: CRLF counts
   // two). Never recomputed with +1/line arithmetic here.
   const lineStarts: number[] = window.map((entry) => entry.startOffset);
@@ -1271,63 +1098,19 @@ export function projectLargeWindow(
   // Stage 2: credential/direct patterns over the flanked slice. The window is
   // explicitly terminated so its last line can never fuse with flankAfter.
   const slice = `${flankBefore}${keyMapped.join("\n")}\n${flankAfter}`;
-  const sliceWindowBase = flankBefore.length;
   const redactedSlice = redactSlice(slice);
   const sliceLines = redactedSlice.split("\n");
   const baseLine = flankBefore.length === 0 ? 0 : flankBefore.split("\n").length - 1;
   if (flankBefore.length > 0 && !flankBefore.endsWith("\n")) {
     throw new CodexProError("flankBefore must end at a line boundary.");
   }
-  let windowLines = sliceLines.slice(baseLine, baseLine + rawLines.length);
+  const windowLines = sliceLines.slice(baseLine, baseLine + rawLines.length);
   if (windowLines.length !== rawLines.length) {
     throw new CodexProError("Projection broke physical line correspondence.");
   }
-  // Stage 3: replicated paren nuke from the scan-phase trigger.
-  const nuke = applyNukeOffsetToLines(windowLines, lineStarts, scan.nukeOffset);
-  windowLines = nuke.lines;
-  // Stage 4: conservative force rules for slice-edge uncertainty.
-  const forcedLines: number[] = [];
-  const sliceMasker = new TriviaMaskStream();
-  const maskedSlice = sliceMasker.feed(slice) + sliceMasker.flush();
-  const forceLine = (index: number): void => {
-    windowLines[index] = forceRedactLine();
-    if (!forcedLines.includes(index)) forcedLines.push(index);
-  };
-  rawLines.forEach((raw, index) => {
-    if (raw.length === 0) return;
-    if (!FORCE_LABEL_PATTERN.test(raw) || !FORCE_SHAPE_PATTERN.test(raw)) return;
-    // Uncertain mask state (window opens inside a string/block comment): the
-    // slice redactor may misread string content as code and grant allowances
-    // the whole-source oracle denies. Deny them all on labeled lines.
-    if (!scan.windowStartsInCode) {
-      forceLine(index);
-      return;
-    }
-    // Offsets track the key-mapped slice (private-key markers change lengths).
-    const lineStartInSlice = sliceWindowBase + keyMapped.slice(0, index).join("\n").length + (index > 0 ? 1 : 0);
-    if (anchorReachesSliceStart(maskedSlice, lineStartInSlice)) {
-      forceLine(index); // R3: statement context extends beyond the slice start
-      return;
-    }
-    if (bridgeSuspect && index === 0) {
-      forceLine(index); // R4: a trimmed partial line may bridge a match into the window
-    }
-  });
-  if (bridgeSuspect && rawLines.length > 0 && !forcedLines.includes(0)) {
-    const firstRaw = rawLines[0];
-    if (firstRaw.length > 0 && (FORCE_LABEL_PATTERN.test(firstRaw) || FORCE_SHAPE_PATTERN.test(firstRaw))) {
-      forceLine(0);
-    }
-  }
-  // R1-Finding-1: the source-final zero-width line is always bare in the
-  // accepted oracle (no span can cover it — the `end <= lineStart` skip — and
-  // no credential pattern or nuke trigger touches empty text), while Stage 2
-  // re-detection on the flanked slice would mark it whenever an unterminated
-  // block reaches EOF. Restore the exact oracle verdict (fail-closed residue
-  // removed: an empty line carries no content to expose either way).
   applySourceFinalEmptyLine(windowLines, window, scan.totalLines);
   const redacted = windowLines.map((line, index) => line !== rawLines[index]);
-  return { lines: windowLines, redacted, nukeApplied: nuke.applied, forcedLines };
+  return { lines: windowLines, redacted, nukeApplied: false, forcedLines: [] };
 }
 
 /**
@@ -1346,8 +1129,7 @@ function applySourceFinalEmptyLine(lines: string[], window: ScannedLine[], total
 }
 
 /**
- * Trim a flank-before chunk to the first line boundary. Returns the trimmed
- * flank plus whether a dropped partial line looked credential-suspect.
+ * Trim a flank-before chunk to the first line boundary.
  */
 export function trimFlankBefore(chunk: string): { flank: string; bridgeSuspect: boolean } {
   if (chunk.length === 0) return { flank: "", bridgeSuspect: false };
@@ -1355,13 +1137,12 @@ export function trimFlankBefore(chunk: string): { flank: string; bridgeSuspect: 
   if (newline < 0) {
     return {
       flank: "",
-      bridgeSuspect: FORCE_LABEL_PATTERN.test(chunk) && FORCE_SHAPE_PATTERN.test(chunk)
+      bridgeSuspect: false
     };
   }
-  const dropped = chunk.slice(0, newline);
   return {
     flank: chunk.slice(newline + 1),
-    bridgeSuspect: FORCE_LABEL_PATTERN.test(dropped) && FORCE_SHAPE_PATTERN.test(dropped)
+    bridgeSuspect: false
   };
 }
 
