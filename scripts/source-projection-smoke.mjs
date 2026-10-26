@@ -81,6 +81,35 @@ async function main() {
       const oracle = redactSensitiveTextPreservingLines(text, { context: 'source' }).split('\n').slice(27, 36);
       assert.deepEqual(mapped, oracle, 'private-key line mapping differs from oracle stage');
       console.log('ok AP-007a private-key stage parity');
+
+    // D6: a window opening at the BODY or END of a known private-key block
+    // redacts only the key lines; the benign tail must stay byte-exact.
+    {
+      const PK_BEGIN_RSA = '-----' + 'BEG' + 'IN RSA PRI' + 'VATE KEY' + '-----';
+      const PK_END_RSA = '-----' + 'EN' + 'D RSA PRI' + 'VATE KEY' + '-----';
+      const body = 'TAIL' + 'BODY7X9ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+      const text = [
+        'before',
+        PK_BEGIN_RSA,
+        body,
+        PK_END_RSA,
+        'benign tail marker 7X9',
+        'const ordinary = 42;',
+        'tokens: 21',
+        ''
+      ].join('\n');
+      const p = path.join(tmpRoot, 'mid-key-window.txt');
+      await fsp.writeFile(p, text);
+      const expected = {
+        3: ['[REDACTED_PRIVATE_KEY]', '[REDACTED_PRIVATE_KEY]', 'benign tail marker 7X9', 'const ordinary = 42;', 'tokens: 21'],
+        4: ['[REDACTED_PRIVATE_KEY]', 'benign tail marker 7X9', 'const ordinary = 42;', 'tokens: 21']
+      };
+      for (const startLine of [3, 4]) {
+        const { projected } = await projectWindow(p, text, startLine, 7, 7);
+        assert.deepEqual(projected.lines, expected[startLine], `D6 mid-key window from line ${startLine} changed benign tail`);
+      }
+      console.log('ok D6 BODY/END mid-key windows preserve exact benign tail');
+    }
     }
 
     // AP-007b: ordinary credential-shaped calls are visible; a known value

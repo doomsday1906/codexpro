@@ -225,9 +225,8 @@ export function scanSecretValues(text, options = {}) {
         if (language === 'code' || language === 'python') continue;
         const identifier = /^[A-Za-z_$][\w$]*$/.test(value);
         const prefix = source.slice(source.lastIndexOf('\n', match.index) + 1, match.index);
-        const suffix = source.slice(match.index + match[0].length);
         if (identifier && (/^[A-Z_]+(?:\d+)?$/.test(value)
-          || /\b(?:const|let|var)\s+$/u.test(prefix) || /^\s*;/u.test(suffix))) continue;
+          || /\b(?:const|let|var)\s+$/u.test(prefix))) continue;
         if (/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*[([<]/.test(value)
           || /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(value)
           || /^(?:process\.env|import\.meta\.env|os\.environ)\[/.test(value)) continue;

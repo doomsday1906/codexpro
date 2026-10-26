@@ -9,7 +9,8 @@ const fakeSk = 'sk-' + 'aB3xK9mQ2pL7vN4zR8tY6wS1';
 const fakeGhp = 'ghp_' + 'C4mPaIgN9sToRaGe7pIpElInE2xY8';
 const metrics = 'tokens=21 token_count=34 max_tokens=4096 call=getToken(7)';
 const secrets = [fakeSk, fakeGhp];
-const safeStdout = `TOKEN=[REDACTED_SECRET] ${metrics}`;
+const safeDeclaration = 'const API_KEY = someLongCamelCaseIdentifierName123;';
+const safeStdout = `TOKEN=[REDACTED_SECRET] ${metrics}\n${safeDeclaration}`;
 const safeStderr = `PASSWORD=[REDACTED_SECRET] ${metrics}`;
 
 class McpStdioClient {
@@ -125,6 +126,7 @@ async function callBash(root, helperName, transcript) {
     assert.equal(result.structuredContent.stdout.includes(safeStdout), true, `${transcript} structured stdout lost the safely redacted line or ordinary metrics`);
     assert.equal(result.structuredContent.stderr.includes(safeStderr), true, `${transcript} structured stderr lost the safely redacted line or ordinary metrics`);
     assert.equal(result.structuredContent.stdout.includes(metrics), true, `${transcript} structured stdout redacted ordinary metrics/calls`);
+    assert.equal(result.structuredContent.stdout.includes(safeDeclaration), true, `${transcript} structured stdout redacted a declared identifier`);
     assert.equal(result.structuredContent.stderr.includes(metrics), true, `${transcript} structured stderr redacted ordinary metrics/calls`);
     if (transcript === 'full') {
       assert.equal(renderedText.includes('## stdout'), true, 'full transcript omitted stdout section');
@@ -147,7 +149,7 @@ const helperName = 'diagnostic-output-helper.mjs';
 const fixtureName = 'diagnostic-output-input.txt';
 await fs.writeFile(
   path.join(root, fixtureName),
-  `TOKEN=${fakeSk} ${metrics}\nPASSWORD=${fakeGhp} ${metrics}\n`,
+  `TOKEN=${fakeSk} ${metrics}\nPASSWORD=${fakeGhp} ${metrics}\n${safeDeclaration}\n`,
   'utf8'
 );
 await fs.writeFile(
@@ -155,7 +157,7 @@ await fs.writeFile(
   [
     "import fs from 'node:fs/promises';",
     `const lines = (await fs.readFile(new URL(${JSON.stringify(fixtureName)}, import.meta.url), 'utf8')).split(/\\r?\\n/).filter(Boolean);`,
-    "process.stdout.write(`${lines[0]}\\n`);",
+    "process.stdout.write(`${lines[0]}\\n${lines[2]}\\n`);",
     "process.stderr.write(`${lines[1]}\\n`);"
   ].join('\n'),
   'utf8'

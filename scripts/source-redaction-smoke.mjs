@@ -205,12 +205,15 @@ const harmlessCases = [
   ['boolean', 'const token = true;'],
   ['short word', 'const apiKey = "primary";'],
   ['identifier', 'const BUILD_TOKEN = CAMPAIGN_STORAGE_TOPOLOGY_PIPELINE_V2;'],
+  ['declared identifier value', 'const API_KEY = someLongCamelCaseIdentifierName123;'],
   ['call', 'const TOKEN = getToken(CALL_LITERAL_7X9);'],
   ['member call', 'PASSWORD = credentials.getPassword();'],
   ['env lookup', 'const API_KEY = process.env.API_KEY;'],
   ['long env lookup', 'API_TOKEN = process.env.CAMPAIGN_STORAGE_TOPOLOGY_PIPELINE;'],
   ['annotation', 'const token: Token<string> = getToken();'],
   ['typed annotation', 'def run(token: Token[str]) -> Token[str]: return token'],
+  ['generic annotation index', 'token: Token[ACTUAL_LITERAL_SECRET_7X9]'],
+  ['generic annotation angle', 'const token: Token<ACTUAL_LITERAL_SECRET_7X9> = getToken();'],
   ['placeholder', 'API_KEY = "replace-with-long-random-token";'],
   ['placeholder sk', 'API_KEY = "sk-your-api-key-here";'],
   ['prose', 'the token count was 34 and the secret name was build'],
@@ -259,6 +262,8 @@ try {
     'max_tokens = 4096',
     'secretName: build',
     'const token: Token<string> = getToken();',
+    'const token: Token<ACTUAL_LITERAL_SECRET_7X9> = getToken();',
+    'const token = values[ACTUAL_LITERAL_SECRET_7X9];',
     'const BUILD_TOKEN = CAMPAIGN_STORAGE_TOPOLOGY_PIPELINE_V2;',
     ''
   ].join('\n');
@@ -271,10 +276,24 @@ try {
     ''
   ].join('\n');
   const pemSource = ['before', '-----BEGIN RSA PRIVATE KEY-----', PEM_BODY, PEM_END_BODY, '-----END RSA PRIVATE KEY-----', 'after', ''].join('\n');
+  const pythonSource = ['class Generic:', '    token: Token[ACTUAL_LITERAL_SECRET_7X9]', '    value: str', '', 'token = values[ACTUAL_LITERAL_SECRET_7X9]', ''].join('\n');
+  const identText = 'const API_KEY = someLongCamelCaseIdentifierName123;\n';
+  const envText = `API_KEY=${HIGH_ENTROPY}\n`;
+  const ymlText = `password: ${HIGH_ENTROPY}\n`;
+  const envSemicolonText = `API_KEY=${HIGH_ENTROPY};\n`;
+  const ymlSemicolonText = `password: ${HIGH_ENTROPY};\n`;
+  const bareText = `API_KEY=${HIGH_ENTROPY}\n`;
   const jsonSource = '{"secretName":"build","token_count":34,"max_tokens":4096}\n';
   await fs.writeFile(path.join(tmp, 'metrics.ts'), metricsSource);
   await fs.writeFile(path.join(tmp, 'secret.ts'), secretSource);
   await fs.writeFile(path.join(tmp, 'private-key.txt'), pemSource);
+  await fs.writeFile(path.join(tmp, 'generic.py'), pythonSource);
+  await fs.writeFile(path.join(tmp, 'ident.txt'), identText);
+  await fs.writeFile(path.join(tmp, 'config.env'), envText);
+  await fs.writeFile(path.join(tmp, 'config.yml'), ymlText);
+  await fs.writeFile(path.join(tmp, 'config-semicolon.env'), envSemicolonText);
+  await fs.writeFile(path.join(tmp, 'config-semicolon.yml'), ymlSemicolonText);
+  await fs.writeFile(path.join(tmp, 'bare.txt'), bareText);
   await fs.writeFile(path.join(tmp, 'obj.json'), jsonSource);
   await fs.writeFile(path.join(tmp, 'edit.ts'), 'const API_KEY = process.env.API_KEY;\nconst marker = 1;\n');
   await fs.writeFile(path.join(tmp, 'git-target.ts'), 'const tokens = 21;\nconst API_KEY = process.env.API_KEY;\n');
@@ -334,6 +353,36 @@ try {
   assert.equal(resultText(pemRead).includes('[REDACTED_PRIVATE_KEY]'), true, 'private-key read omitted its marker');
   assert.equal(resultText(pemRead).includes('before'), true, 'private-key read hid surrounding text');
 
+  const pyRead = assertSuccess(await call('read', { path: 'generic.py' }), 'python generic read');
+  assert.equal(JSON.stringify(pyRead).includes('[REDACTED_SECRET]'), false, 'python generic annotation was redacted');
+  assert.equal(pyRead.structuredContent.text, numbered(pythonSource), 'python generic annotation read changed source');
+  assert.equal(resultText(pyRead).includes('token: Token[ACTUAL_LITERAL_SECRET_7X9]'), true, 'python generic annotation hidden');
+
+  const identRead = assertSuccess(await call('read', { path: 'ident.txt' }), 'declared identifier text read');
+  assert.equal(identRead.structuredContent.text, numbered(identText), 'declared identifier text read changed source');
+  assert.equal(JSON.stringify(identRead).includes('someLongCamelCaseIdentifierName123'), true, 'declared identifier value was redacted');
+  assert.equal(JSON.stringify(identRead).includes('[REDACTED_SECRET]'), false, 'declared identifier text read masked an ordinary value');
+
+  const envRead = assertSuccess(await call('read', { path: 'config.env' }), 'env scalar read');
+  assert.equal(JSON.stringify(envRead).includes(HIGH_ENTROPY), false, 'env bare high-entropy scalar leaked');
+  assert.equal(resultText(envRead).includes('[REDACTED_SECRET]'), true, 'env bare high-entropy scalar was not masked');
+
+  const envSemicolonRead = assertSuccess(await call('read', { path: 'config-semicolon.env' }), 'env semicolon scalar read');
+  assert.equal(JSON.stringify(envSemicolonRead).includes(HIGH_ENTROPY), false, 'env bare high-entropy scalar with semicolon leaked');
+  assert.equal(resultText(envSemicolonRead).includes('[REDACTED_SECRET];'), true, 'env bare high-entropy scalar with semicolon was not masked');
+
+  const ymlRead = assertSuccess(await call('read', { path: 'config.yml' }), 'YAML scalar read');
+  assert.equal(JSON.stringify(ymlRead).includes(HIGH_ENTROPY), false, 'YAML bare high-entropy scalar leaked');
+  assert.equal(resultText(ymlRead).includes('[REDACTED_SECRET]'), true, 'YAML bare high-entropy scalar was not masked');
+
+  const ymlSemicolonRead = assertSuccess(await call('read', { path: 'config-semicolon.yml' }), 'YAML semicolon scalar read');
+  assert.equal(JSON.stringify(ymlSemicolonRead).includes(HIGH_ENTROPY), false, 'YAML bare high-entropy scalar with semicolon leaked');
+  assert.equal(resultText(ymlSemicolonRead).includes('[REDACTED_SECRET];'), true, 'YAML bare high-entropy scalar with semicolon was not masked');
+
+  const bareRead = assertSuccess(await call('read', { path: 'bare.txt' }), 'unknown bare scalar read');
+  assert.equal(JSON.stringify(bareRead).includes(HIGH_ENTROPY), false, 'unknown bare high-entropy scalar leaked');
+  assert.equal(resultText(bareRead).includes('[REDACTED_SECRET]'), true, 'unknown bare high-entropy scalar was not masked');
+
   const many = assertSuccess(await call('read_many', { items: [{ path: 'metrics.ts' }, { path: 'secret.ts' }] }), 'read_many');
   assert.deepEqual(many.structuredContent.results.map((item) => item.path), ['metrics.ts', 'secret.ts'], 'read_many changed item order');
   assert.equal(many.structuredContent.results[0].result.text, numbered(metricsSource), 'read_many changed metrics projection');
@@ -374,6 +423,28 @@ try {
     content: 'const TOKEN = getToken();\nconst token: Token<string> = getToken();\nconst API_KEY = process.env.API_KEY;\n'
   });
   assert.notEqual(benignWrite.isError, true, 'ordinary call/annotation/env write was refused');
+
+  const pySecretWrite = assertFailure(await call('write', {
+    path: 'py-secret.py',
+    content: `token = "${SK}"\n`
+  }), 'python quoted secret write');
+  assert.match(resultText(pySecretWrite), /Replace the literal with an env lookup/, 'python quoted secret write omitted next action');
+
+  const pyWrite = assertSuccess(await call('write', { path: 'generic-written.py', content: pythonSource }), 'python generic write');
+  assert.equal(JSON.stringify(pyWrite).includes('[REDACTED_SECRET]'), false, 'python generic write redacted annotation');
+  assert.equal(await fs.readFile(path.join(tmp, 'generic-written.py'), 'utf8'), pythonSource, 'python generic write changed bytes');
+
+  const envWrite = assertFailure(await call('write', { path: 'written.env', content: envText }), 'env bare high-entropy write');
+  assert.match(resultText(envWrite), /Replace the literal with an env lookup/, 'env bare high-entropy write omitted next action');
+
+  const ymlWrite = assertFailure(await call('write', { path: 'written.yml', content: ymlText }), 'YAML bare high-entropy write');
+  assert.match(resultText(ymlWrite), /Replace the literal with an env lookup/, 'YAML bare high-entropy write omitted next action');
+
+  const envSemicolonWrite = assertFailure(await call('write', { path: 'written-semicolon.env', content: envSemicolonText }), 'env bare high-entropy semicolon write');
+  assert.match(resultText(envSemicolonWrite), /Replace the literal with an env lookup/, 'env bare high-entropy semicolon write omitted next action');
+
+  const ymlSemicolonWrite = assertFailure(await call('write', { path: 'written-semicolon.yml', content: ymlSemicolonText }), 'YAML bare high-entropy semicolon write');
+  assert.match(resultText(ymlSemicolonWrite), /Replace the literal with an env lookup/, 'YAML bare high-entropy semicolon write omitted next action');
 
   const secretWrite = assertFailure(await call('write', {
     path: 'written-secret.ts',
@@ -440,6 +511,21 @@ try {
   ].join('\n');
   assertSuccess(await call('apply_patch', { patch: patchBenign }), 'benign env apply_patch');
   assert.equal(await fs.readFile(path.join(tmp, 'edit.ts'), 'utf8'), 'const API_KEY = process.env.THIRD_KEY;\nconst marker = 1;\n', 'benign apply_patch changed unexpected bytes');
+
+  await fs.writeFile(path.join(tmp, 'patch-generic.py'), 'class Generic:\n    value: str\n');
+  const genericPatch = [
+    'diff --git a/patch-generic.py b/patch-generic.py',
+    '--- a/patch-generic.py',
+    '+++ b/patch-generic.py',
+    '@@ -1,2 +1,3 @@',
+    ' class Generic:',
+    '     value: str',
+    '+    token: Token[ACTUAL_LITERAL_SECRET_7X9]',
+    ''
+  ].join('\n');
+  const genericPatchResult = assertSuccess(await call('apply_patch', { patch: genericPatch }), 'generic annotation apply_patch');
+  assert.equal(JSON.stringify(genericPatchResult).includes('[REDACTED_SECRET]'), false, 'generic annotation apply_patch redacted');
+  assert.equal(await fs.readFile(path.join(tmp, 'patch-generic.py'), 'utf8'), 'class Generic:\n    value: str\n    token: Token[ACTUAL_LITERAL_SECRET_7X9]\n', 'generic annotation apply_patch changed bytes');
 
   // Git diff is also a public output surface: only the matched value span is masked.
   await fs.writeFile(path.join(tmp, 'git-target.ts'), `const tokens = 34;\nconst API_KEY = "${SK}";\n`);
