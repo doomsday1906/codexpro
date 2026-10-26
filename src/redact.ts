@@ -112,27 +112,41 @@ function isNumericUsageMetric(key: string, value: unknown): boolean {
   return typeof value === "number" && /^(?:tokens|tokencount)$/u.test(normalizedFieldName(key));
 }
 
-function jsonValueEnd(text: string, start: number): number {
+function backslashesBefore(text: string, position: number): number {
+  let count = 0;
+  while (position > 0 && text[position - 1] === "\\") {
+    count += 1;
+    position -= 1;
+  }
+  return count;
+}
+
+function backslashesAfter(text: string, position: number): number {
+  let count = 0;
+  while (text[position + count] === "\\") count += 1;
+  return count;
+}
+
+function jsonValueEnd(text: string, start: number, escapeDepth: number): number {
   while (/\s/u.test(text[start] ?? "")) start += 1;
-  const escapedQuote = text[start] === "\\" && (text[start + 1] === '"' || text[start + 1] === "'");
-  const valueStart = start + (escapedQuote ? 1 : 0);
-  const first = text[valueStart];
+  const openingEscapeDepth = backslashesAfter(text, start);
+  const quotePosition = start + openingEscapeDepth;
+  const first = text[quotePosition];
   if (first === '"' || first === "'") {
-    for (let index = valueStart + 1; index < text.length; index += 1) {
-      if (text[index] === "\\") index += 1;
-      else if (text[index] === first) return index + 1;
+    for (let index = quotePosition + 1; index < text.length; index += 1) {
+      if (text[index] === first && backslashesBefore(text, index) === openingEscapeDepth) return index + 1;
     }
     return text.length;
   }
-  if (first === "{" || first === "[") {
-    const stack = [first === "{" ? "}" : "]"];
+  if (text[start] === "{" || text[start] === "[") {
+    const firstContainer = text[start];
+    const stack = [firstContainer === "{" ? "}" : "]"];
     let inString = false;
     for (let index = start + 1; index < text.length; index += 1) {
       const char = text[index];
       if (inString) {
-        if (char === "\\") index += 1;
-        else if (char === '"') inString = false;
-      } else if (char === '"') inString = true;
+        if (char === '"' && backslashesBefore(text, index) === escapeDepth) inString = false;
+      } else if (char === '"' && backslashesBefore(text, index) === escapeDepth) inString = true;
       else if (char === "{") stack.push("}");
       else if (char === "[") stack.push("]");
       else if (char === stack.at(-1)) {
@@ -152,6 +166,7 @@ interface DiagnosticField {
   keyStart: number;
   valueStart: number;
   valueEnd: number;
+  escapeDepth: number;
 }
 
 function decodedFieldName(value: string): string {
@@ -179,7 +194,8 @@ function diagnosticFields(text: string): DiagnosticField[] {
       continue;
     }
     let cursor = index;
-    if (text[cursor] === "\\" && (text[cursor + 1] === '"' || text[cursor + 1] === "'")) cursor += 1;
+    while (text[cursor] === "\\") cursor += 1;
+    const escapeDepth = cursor - index;
     const quote = text[cursor] === '"' || text[cursor] === "'" ? text[cursor++] : undefined;
     if (!quote && !isNameStart(text[cursor])) {
       index += 1;
@@ -187,8 +203,7 @@ function diagnosticFields(text: string): DiagnosticField[] {
     }
     const nameStart = cursor;
     if (quote) {
-      while (cursor < text.length && text[cursor] !== quote && !(text[cursor] === "\\" && text[cursor + 1] === quote)) {
-        if (text[cursor] === "\\") cursor += 1;
+      while (cursor < text.length && !(text[cursor] === quote && backslashesBefore(text, cursor) === escapeDepth)) {
         cursor += 1;
       }
     } else {
@@ -210,8 +225,8 @@ function diagnosticFields(text: string): DiagnosticField[] {
       continue;
     }
     const valueStart = cursor + 1;
-    const valueEnd = jsonValueEnd(text, valueStart);
-    fields.push({ key, keyStart: index, valueStart, valueEnd });
+    const valueEnd = jsonValueEnd(text, valueStart, escapeDepth);
+    fields.push({ key, keyStart: index, valueStart, valueEnd, escapeDepth });
     index = Math.max(index + 1, cursor + 1);
   }
   return fields;
@@ -241,13 +256,15 @@ function redactDiagnosticPreservingMetrics(text: string): string {
     } else if (isCredentialFieldName(field.key)) {
       let placeholder = `__AW_CREDENTIAL_VALUE_${replacements.length}__`;
       while (text.includes(placeholder)) placeholder += "_";
-      const first = rawValue[0];
+      const quotePosition = field.valueStart + backslashesBefore(text, field.valueStart);
+      const first = text[quotePosition];
       const quote = first === "'" ? "'" : '"';
+      const escapedQuote = "\\".repeat(field.escapeDepth);
       replacements.push({
         start: field.keyStart,
         end: field.valueEnd,
         placeholder,
-        replacement: `${text.slice(field.keyStart, field.valueStart)}${quote}[REDACTED_SECRET]${quote}`
+        replacement: `${text.slice(field.keyStart, field.valueStart)}${escapedQuote}${quote}[REDACTED_SECRET]${escapedQuote}${quote}`
       });
       coveredUntil = field.valueEnd;
     }

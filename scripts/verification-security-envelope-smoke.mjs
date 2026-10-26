@@ -46,7 +46,7 @@ await fs.writeFile(
     scripts: {
       "leak-secret": `node -e "${secretScript}"`,
       "leak-json": `node -e "console.log(JSON.stringify({apiToken:'LEAK-api',cookie:'LEAK-cookie',Authorization:'Bearer LEAK-auth',sessionId:123456,passphrase:'LEAK-pass',signature:'LEAK-signature',otp:654321,pwd:'LEAK-pwd',pass:'LEAK-pass-field',jwt:'LEAK-jwt',mfa:'LEAK-mfa',accessKey:'LEAK-access-key',note:'Bearer LEAK-note',tokens:21,token_count:34}))"`,
-      "leak-escaped-json": "node -e 'console.log(\"log:\", JSON.stringify({data: JSON.stringify({apiToken:\"LEAK-verif-escaped\", \"user.cookie\":\"LEAK-verif-dotted\", \"session.id\":\"LEAK-verif-session\"})}))'",
+      "leak-escaped-json": "node -e 'console.log(\"log:\", JSON.stringify({data: JSON.stringify({apiToken:\"LEAK-verif-escaped\", \"user.cookie\":\"LEAK-verif-dotted\", \"session.id\":\"LEAK-verif-session\", payload: JSON.stringify({apiToken:\"LEAK-verif-deep-api\", authToken:\"LEAK-verif-deep-auth\", \"user.cookie\":\"LEAK-verif-deep-cookie\", tokens:21, token_count:34})})}))'",
       "quick": "node -e 'process.exit(0);'",
       "long": "node -e 'require(\"fs\").writeFileSync(\"cancel-started\",\"yes\"); setTimeout(() => {}, 60000);'"
     }
@@ -339,6 +339,13 @@ async function runTests() {
   for (const secret of ["LEAK-verif-dotted", "LEAK-verif-session"]) {
     assert.ok(!escapedJobWait.structuredContent.stdout.includes(secret), `verification text fallback must redact ${secret}`);
   }
+  for (const secret of ["LEAK-verif-deep-api", "LEAK-verif-deep-auth", "LEAK-verif-deep-cookie"]) {
+    assert.ok(!escapedJobWait.structuredContent.stdout.includes(secret), `verification text fallback must redact deeply escaped ${secret}`);
+  }
+  assert.match(escapedJobWait.structuredContent.stdout, /\\\\\\"tokens\\\\\\":21/u,
+    "deeply escaped verification JSON must preserve numeric tokens usage");
+  assert.match(escapedJobWait.structuredContent.stdout, /\\\\\\"token_count\\\\\\":34/u,
+    "deeply escaped verification JSON must preserve numeric token_count usage");
   console.log("  PASS: Verification stdout JSON fields are masked and numeric usage metrics stay numeric");
 
   // Test 5: Multiline JSON stdout remains parseable after redaction.
@@ -498,6 +505,26 @@ async function runTests() {
   }
   assert.equal(wrappedInner.tokens, 21, "JSON-string payload must preserve numeric tokens usage");
   assert.equal(wrappedInner.token_count, 34, "JSON-string payload must preserve numeric token_count usage");
+
+  const deeplyWrappedJson = `log: ${JSON.stringify({ data: JSON.stringify({ payload: JSON.stringify({
+    apiToken: "LEAK-deep-api", authToken: "LEAK-deep-auth", "user.cookie": "LEAK-deep-cookie", tokens: 21, token_count: 34
+  }) }) })}`;
+  await fs.writeFile(path.join(realFixtureRoot, "deeply-wrapped-board.log"), deeplyWrappedJson, "utf8");
+  const deeplyWrappedOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat deeply-wrapped-board.log" } });
+  for (const secret of ["LEAK-deep-api", "LEAK-deep-auth", "LEAK-deep-cookie"]) {
+    assert.ok(!deeplyWrappedOutput.structuredContent.stdout.includes(secret), `deeply escaped public JSON must mask ${secret}`);
+  }
+  assert.ok(deeplyWrappedOutput.structuredContent.stdout.startsWith("log: "), "deeply escaped public JSON wrapper must remain available");
+  const deeplyWrappedOuter = JSON.parse(deeplyWrappedOutput.structuredContent.stdout.slice("log: ".length));
+  const deeplyWrappedInner = JSON.parse(JSON.parse(deeplyWrappedOuter.data).payload);
+  assert.equal(deeplyWrappedInner.tokens, 21, "deeply escaped JSON must preserve numeric tokens usage");
+  assert.equal(deeplyWrappedInner.token_count, 34, "deeply escaped JSON must preserve numeric token_count usage");
+  const singleEscapedDiagnostic = redactDiagnosticText(`log: ${JSON.stringify({ data: JSON.stringify({ apiToken: "LEAK-single", tokens: 21, token_count: 34 }) })}`);
+  const singleEscapedOuter = JSON.parse(singleEscapedDiagnostic.slice("log: ".length));
+  const singleEscapedInner = JSON.parse(singleEscapedOuter.data);
+  assert.equal(singleEscapedInner.apiToken, "[REDACTED_SECRET]");
+  assert.equal(singleEscapedInner.tokens, 21, "single-escaped redaction must not consume the next field");
+  assert.equal(singleEscapedInner.token_count, 34, "single-escaped redaction must preserve adjacent numeric metrics");
   assert.deepEqual(jsonOutput.structuredContent.stdout_redaction, {
     format: "json",
     parseable: true,
@@ -520,14 +547,16 @@ async function runTests() {
     sessionId: 998877, auth: "Basic LEAK-large-auth-field",
     passphrase: "LEAK-large-passphrase", signature: "LEAK-large-signature", otp: 776655,
     note: "Bearer LEAK-large-note", tokens: 21, token_count: 34,
-    escapedLog: JSON.stringify({ apiToken: "LEAK-large-escaped" }), data: "x".repeat(300_000)
+    escapedLog: JSON.stringify({ apiToken: "LEAK-large-escaped" }),
+    deeplyEscapedLog: JSON.stringify({ payload: JSON.stringify({ apiToken: "LEAK-large-deep-escaped", tokens: 21, token_count: 34 }) }),
+    data: "x".repeat(300_000)
   }).replace('"cookie":', String.raw`"\u0063ookie":`);
   await fs.writeFile(path.join(realFixtureRoot, "large-board.json"), largeJson, "utf8");
   const largeCallStartedAt = Date.now();
   const largeOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat large-board.json" } });
   assert.ok(Date.now() - largeCallStartedAt < 10_000, "large truncated JSON redaction must stay comfortably below the SDK request timeout");
   const largeStdout = largeOutput.structuredContent.stdout;
-  for (const secret of ["LEAK-large-auth", "LEAK-large-proxy", "LEAK-large-cookie", "LEAK-large-dotted", "LEAK-large-dotted-session", "LEAK-large-auth-field", "LEAK-large-passphrase", "LEAK-large-signature", "LEAK-large-note", "LEAK-large-escaped"]) {
+  for (const secret of ["LEAK-large-auth", "LEAK-large-proxy", "LEAK-large-cookie", "LEAK-large-dotted", "LEAK-large-dotted-session", "LEAK-large-auth-field", "LEAK-large-passphrase", "LEAK-large-signature", "LEAK-large-note", "LEAK-large-escaped", "LEAK-large-deep-escaped"]) {
     assert.ok(!largeStdout.includes(secret), `truncated JSON stdout must mask ${secret}`);
   }
   assert.match(largeStdout, /"tokens":21/u, "truncated JSON text must preserve numeric tokens usage");
