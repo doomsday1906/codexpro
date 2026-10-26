@@ -154,11 +154,25 @@ interface DiagnosticField {
   valueEnd: number;
 }
 
+function decodedFieldName(value: string): string {
+  let key = value;
+  for (let depth = 0; depth < 3; depth += 1) {
+    try {
+      const decoded = JSON.parse(`"${key}"`);
+      if (decoded === key) break;
+      key = decoded;
+    } catch {
+      break;
+    }
+  }
+  return key;
+}
+
 function diagnosticFields(text: string): DiagnosticField[] {
   const fields: DiagnosticField[] = [];
   const isBoundary = (char: string | undefined) => char === undefined || /[,{;\s]/u.test(char);
   const isNameStart = (char: string | undefined) => !!char && /[A-Za-z_$]/u.test(char);
-  const isNamePart = (char: string | undefined) => !!char && /[A-Za-z\d_$-]/u.test(char);
+  const isNamePart = (char: string | undefined) => !!char && /[A-Za-z\d_$.-]/u.test(char);
   for (let index = 0; index < text.length;) {
     if (!isBoundary(text[index - 1])) {
       index += 1;
@@ -167,18 +181,32 @@ function diagnosticFields(text: string): DiagnosticField[] {
     let cursor = index;
     if (text[cursor] === "\\" && (text[cursor + 1] === '"' || text[cursor + 1] === "'")) cursor += 1;
     const quote = text[cursor] === '"' || text[cursor] === "'" ? text[cursor++] : undefined;
-    if (!isNameStart(text[cursor])) {
+    if (!quote && !isNameStart(text[cursor])) {
       index += 1;
       continue;
     }
     const nameStart = cursor;
-    while (isNamePart(text[cursor])) cursor += 1;
-    const key = text.slice(nameStart, cursor);
+    if (quote) {
+      while (cursor < text.length && text[cursor] !== quote && !(text[cursor] === "\\" && text[cursor + 1] === quote)) {
+        if (text[cursor] === "\\") cursor += 1;
+        cursor += 1;
+      }
+    } else {
+      while (isNamePart(text[cursor])) cursor += 1;
+    }
+    const key = decodedFieldName(text.slice(nameStart, cursor));
     if (quote && text[cursor] === "\\" && text[cursor + 1] === quote) cursor += 1;
     if (quote && text[cursor] === quote) cursor += 1;
     while (/\s/u.test(text[cursor] ?? "")) cursor += 1;
     if (text[cursor] !== ":") {
-      index = Math.max(index + 1, cursor);
+      if (quote) {
+        const objectStart = text.indexOf("{", index + 1);
+        const memberStart = text.indexOf(",", index + 1);
+        const nextBoundary = [objectStart, memberStart].filter((position) => position >= 0 && position < cursor).sort((a, b) => a - b)[0];
+        index = nextBoundary === undefined ? cursor + 1 : nextBoundary + 1;
+      } else {
+        index = Math.max(index + 1, cursor);
+      }
       continue;
     }
     const valueStart = cursor + 1;
@@ -197,41 +225,45 @@ function replaceSpans(text: string, spans: Array<{ start: number; end: number; r
   return result;
 }
 
-function redactCredentialFieldsInText(text: string): string {
-  const fields = diagnosticFields(text);
-  const replacements: { start: number; end: number }[] = [];
-  let coveredUntil = 0;
-  for (const field of fields) {
-    if (field.valueStart < coveredUntil || !isCredentialFieldName(field.key)) continue;
-    const rawValue = text.slice(field.valueStart, field.valueEnd).trim();
-    if (/^__AW_NUMERIC_USAGE_\d+_*$/u.test(rawValue)) continue;
-    const metric = isNumericUsageMetric(field.key, Number(rawValue)) &&
-      /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/u.test(rawValue);
-    if (metric) continue;
-    replacements.push({ start: field.valueStart, end: field.valueEnd });
-    coveredUntil = Math.max(field.valueEnd, field.valueStart);
-  }
-  return replacements.length === 0 ? text : replaceSpans(text, replacements, '"[REDACTED_SECRET]"');
-}
-
 function redactDiagnosticPreservingMetrics(text: string): string {
   const replacements: Array<{ start: number; end: number; placeholder: string; replacement: string }> = [];
+  let coveredUntil = 0;
   for (const field of diagnosticFields(text)) {
-    if (!isNumericUsageMetric(field.key, Number(text.slice(field.valueStart, field.valueEnd).trim())) ||
-      !/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/u.test(text.slice(field.valueStart, field.valueEnd).trim())) continue;
-    let placeholder = `__AW_NUMERIC_USAGE_${replacements.length}__`;
-    while (text.includes(placeholder)) placeholder += "_";
-    replacements.push({ start: field.keyStart, end: field.valueEnd, placeholder, replacement: placeholder });
+    if (field.valueStart < coveredUntil) continue;
+    const rawValue = text.slice(field.valueStart, field.valueEnd).trim();
+    const numericMetric = isNumericUsageMetric(field.key, Number(rawValue)) &&
+      /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/u.test(rawValue);
+    if (numericMetric) {
+      let placeholder = `__AW_NUMERIC_USAGE_${replacements.length}__`;
+      while (text.includes(placeholder)) placeholder += "_";
+      replacements.push({ start: field.keyStart, end: field.valueEnd, placeholder, replacement: text.slice(field.keyStart, field.valueEnd) });
+      coveredUntil = field.valueEnd;
+    } else if (isCredentialFieldName(field.key)) {
+      let placeholder = `__AW_CREDENTIAL_VALUE_${replacements.length}__`;
+      while (text.includes(placeholder)) placeholder += "_";
+      const first = rawValue[0];
+      const quote = first === "'" ? "'" : '"';
+      replacements.push({
+        start: field.keyStart,
+        end: field.valueEnd,
+        placeholder,
+        replacement: `${text.slice(field.keyStart, field.valueStart)}${quote}[REDACTED_SECRET]${quote}`
+      });
+      coveredUntil = field.valueEnd;
+    }
   }
-  const protectedText = replaceSpans(text, replacements, "");
-  const safe = policyRedactDiagnosticText(redactCredentialFieldsInText(protectedText));
-  let restored = safe;
-  for (const item of replacements) restored = restored.replace(item.placeholder, text.slice(item.start, item.end));
+  const protectedText = replaceSpans(text, replacements.map(({ start, end, placeholder }) => ({ start, end, replacement: placeholder })), "");
+  let restored = policyRedactDiagnosticText(protectedText);
+  for (const item of replacements) restored = restored.replace(item.placeholder, item.replacement);
   return restored.replace(/\bBearer\s+(?:"[^"]*"|'[^']*'|[A-Za-z0-9._~+/-]+=*)/giu, "Bearer [REDACTED_SECRET]");
 }
 
 /** Redact a complete JSON value without turning its replacement into invalid JSON. */
-export function redactJsonText(text: string, options: RedactionOptions | RedactionContext = {}): JsonTextRedactionResult | undefined {
+function redactJsonTextAtDepth(
+  text: string,
+  options: RedactionOptions | RedactionContext,
+  startDepth: number
+): JsonTextRedactionResult | undefined {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -248,6 +280,12 @@ export function redactJsonText(text: string, options: RedactionOptions | Redacti
       return "[REDACTED_SECRET]";
     }
     if (typeof value === "string") {
+      const nested = redactJsonTextAtDepth(value, options, depth + 1);
+      if (nested) {
+        changed ||= nested.changed;
+        omittedNestedValues ||= nested.omittedNestedValues;
+        return nested.text;
+      }
       const safe = redactSensitiveText(value, options).replace(/\bBearer\s+(?:"[^"]*"|'[^']*'|[A-Za-z0-9._~+/-]+=*)/giu, "Bearer [REDACTED_SECRET]");
       if (safe !== value) changed = true;
       return safe;
@@ -278,8 +316,12 @@ export function redactJsonText(text: string, options: RedactionOptions | Redacti
     return value;
   };
 
-  const safeText = JSON.stringify(redactValue(parsed, 0));
+  const safeText = JSON.stringify(redactValue(parsed, startDepth));
   return { text: safeText, changed: changed || safeText !== text, omittedNestedValues };
+}
+
+export function redactJsonText(text: string, options: RedactionOptions | RedactionContext = {}): JsonTextRedactionResult | undefined {
+  return redactJsonTextAtDepth(text, options, 0);
 }
 
 // Line-preserving source redaction is a pure function of (text, options) and

@@ -46,7 +46,7 @@ await fs.writeFile(
     scripts: {
       "leak-secret": `node -e "${secretScript}"`,
       "leak-json": `node -e "console.log(JSON.stringify({apiToken:'LEAK-api',cookie:'LEAK-cookie',Authorization:'Bearer LEAK-auth',sessionId:123456,passphrase:'LEAK-pass',signature:'LEAK-signature',otp:654321,pwd:'LEAK-pwd',pass:'LEAK-pass-field',jwt:'LEAK-jwt',mfa:'LEAK-mfa',accessKey:'LEAK-access-key',note:'Bearer LEAK-note',tokens:21,token_count:34}))"`,
-      "leak-escaped-json": "node -e 'console.log(\"log:\", JSON.stringify({data: JSON.stringify({apiToken:\"LEAK-verif-escaped\"})}))'",
+      "leak-escaped-json": "node -e 'console.log(\"log:\", JSON.stringify({data: JSON.stringify({apiToken:\"LEAK-verif-escaped\", \"user.cookie\":\"LEAK-verif-dotted\", \"session.id\":\"LEAK-verif-session\"})}))'",
       "quick": "node -e 'process.exit(0);'",
       "long": "node -e 'require(\"fs\").writeFileSync(\"cancel-started\",\"yes\"); setTimeout(() => {}, 60000);'"
     }
@@ -336,6 +336,9 @@ async function runTests() {
   } });
   assert.ok(!escapedJobWait.structuredContent.stdout.includes("LEAK-verif-escaped"),
     "verification text fallback must redact credentials in escaped JSON log fields");
+  for (const secret of ["LEAK-verif-dotted", "LEAK-verif-session"]) {
+    assert.ok(!escapedJobWait.structuredContent.stdout.includes(secret), `verification text fallback must redact ${secret}`);
+  }
   console.log("  PASS: Verification stdout JSON fields are masked and numeric usage metrics stay numeric");
 
   // Test 5: Multiline JSON stdout remains parseable after redaction.
@@ -359,6 +362,7 @@ async function runTests() {
     tokenCounts: { value: "opaque-camel-plural" },
     tokens_count: "opaque-suffix-credential",
     token_counts_value: 777666,
+    "user.cookie": "opaque-dotted-cookie", "session.id": "opaque-dotted-session",
     accessKey: "opaque-access-key", pwd: "opaque-pwd", pass: "opaque-pass", jwt: "opaque-jwt", mfa: "opaque-mfa",
     cookie: "session=abcdef1234567890",
     setCookie: ["session=another-secret-value"],
@@ -392,7 +396,7 @@ async function runTests() {
   assert.ok(directJson, "multiline JSON must be recognized");
   const safeJson = JSON.parse(directJson.text);
   assert.equal(safeJson.access_token, "[REDACTED_SECRET]");
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "token_counts_value", "cookie", "setCookie", "sessionId", "auth", "passphrase", "signature", "otp", "accessKey", "pwd", "pass", "jwt", "mfa", "proxyAuthorization", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "token_counts_value", "cookie", "setCookie", "sessionId", "auth", "passphrase", "signature", "otp", "accessKey", "pwd", "pass", "jwt", "mfa", "user.cookie", "session.id", "proxyAuthorization", "Authorization", "secrets"]) {
     assert.equal(safeJson[key], "[REDACTED_SECRET]", `multiline JSON ${key} field must be redacted`);
   }
   assert.equal(safeJson.note, "Bearer [REDACTED_SECRET]");
@@ -479,6 +483,21 @@ async function runTests() {
   assert.equal(publicSafeJson.issued_tokens, "[REDACTED_SECRET]");
   assert.ok(!safeStdout.includes("ghp_1234567890abcdef1234567890abcdef1234"));
   assert.ok(!safeStdout.includes("sk-abc1234567890123456789012345678901234567890"));
+
+  const wrappedJsonText = JSON.stringify({ data: JSON.stringify({
+    cookie: "LEAK-nested-cookie", sessionId: "LEAK-nested-session", passphrase: "LEAK-nested-passphrase",
+    signature: "LEAK-nested-signature", otp: "LEAK-nested-otp", accessKey: "LEAK-nested-access-key",
+    Authorization: "Basic LEAK-nested-auth", tokens: 21, token_count: 34
+  }) });
+  await fs.writeFile(path.join(realFixtureRoot, "wrapped-board.json"), wrappedJsonText, "utf8");
+  const wrappedOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat wrapped-board.json" } });
+  const wrappedOuter = JSON.parse(wrappedOutput.structuredContent.stdout);
+  const wrappedInner = JSON.parse(wrappedOuter.data);
+  for (const secret of ["LEAK-nested-cookie", "LEAK-nested-session", "LEAK-nested-passphrase", "LEAK-nested-signature", "LEAK-nested-otp", "LEAK-nested-access-key", "LEAK-nested-auth"]) {
+    assert.ok(!wrappedOutput.structuredContent.stdout.includes(secret), `JSON-string credential ${secret} must be masked`);
+  }
+  assert.equal(wrappedInner.tokens, 21, "JSON-string payload must preserve numeric tokens usage");
+  assert.equal(wrappedInner.token_count, 34, "JSON-string payload must preserve numeric token_count usage");
   assert.deepEqual(jsonOutput.structuredContent.stdout_redaction, {
     format: "json",
     parseable: true,
@@ -497,17 +516,18 @@ async function runTests() {
 
   const largeJson = JSON.stringify({
     Authorization: "Bearer LEAK-large-auth", proxyAuthorization: "Basic LEAK-large-proxy",
-    cookie: "LEAK-large-cookie", sessionId: 998877, auth: "Basic LEAK-large-auth-field",
+    cookie: "LEAK-large-cookie", "user.cookie": "LEAK-large-dotted", "session.id": "LEAK-large-dotted-session",
+    sessionId: 998877, auth: "Basic LEAK-large-auth-field",
     passphrase: "LEAK-large-passphrase", signature: "LEAK-large-signature", otp: 776655,
     note: "Bearer LEAK-large-note", tokens: 21, token_count: 34,
     escapedLog: JSON.stringify({ apiToken: "LEAK-large-escaped" }), data: "x".repeat(300_000)
-  });
+  }).replace('"cookie":', String.raw`"\u0063ookie":`);
   await fs.writeFile(path.join(realFixtureRoot, "large-board.json"), largeJson, "utf8");
   const largeCallStartedAt = Date.now();
   const largeOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat large-board.json" } });
   assert.ok(Date.now() - largeCallStartedAt < 10_000, "large truncated JSON redaction must stay comfortably below the SDK request timeout");
   const largeStdout = largeOutput.structuredContent.stdout;
-  for (const secret of ["LEAK-large-auth", "LEAK-large-proxy", "LEAK-large-cookie", "LEAK-large-auth-field", "LEAK-large-passphrase", "LEAK-large-signature", "LEAK-large-note", "LEAK-large-escaped"]) {
+  for (const secret of ["LEAK-large-auth", "LEAK-large-proxy", "LEAK-large-cookie", "LEAK-large-dotted", "LEAK-large-dotted-session", "LEAK-large-auth-field", "LEAK-large-passphrase", "LEAK-large-signature", "LEAK-large-note", "LEAK-large-escaped"]) {
     assert.ok(!largeStdout.includes(secret), `truncated JSON stdout must mask ${secret}`);
   }
   assert.match(largeStdout, /"tokens":21/u, "truncated JSON text must preserve numeric tokens usage");
