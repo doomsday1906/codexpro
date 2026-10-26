@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
@@ -476,9 +477,12 @@ async function runTests() {
     if (!Number.isSafeInteger(pid) || pid <= 0) return false;
     try {
       process.kill(pid, 0);
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const commEnd = stat.lastIndexOf(")");
+      if (commEnd >= 0 && /[ZX]/u.test(stat[commEnd + 2] ?? "")) return false;
       return true;
     } catch (err) {
-      return err?.code === "ESRCH" ? false : true;
+      return err?.code === "ESRCH" || err?.code === "ENOENT" ? false : true;
     }
   }
 

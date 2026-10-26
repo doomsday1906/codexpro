@@ -335,6 +335,13 @@ async function runTests() {
     tokenCounts: { value: "opaque-camel-plural" },
     tokens_count: "opaque-suffix-credential",
     token_counts_value: 777666,
+    cookie: "session=abcdef1234567890",
+    setCookie: ["session=another-secret-value"],
+    sessionId: 987654321,
+    auth: "Basic dXNlcjpwYXNz",
+    passphrase: { value: "opaque-passphrase" },
+    signature: null,
+    otp: true,
     proxyAuthorization: "Basic dXNlcjpwYXNz",
     note: "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
     quotedMessage: 'Bearer "quoted-secret-token"',
@@ -360,7 +367,7 @@ async function runTests() {
   assert.ok(directJson, "multiline JSON must be recognized");
   const safeJson = JSON.parse(directJson.text);
   assert.equal(safeJson.access_token, "[REDACTED_SECRET]");
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "token_counts_value", "proxyAuthorization", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "token_counts_value", "cookie", "setCookie", "sessionId", "auth", "passphrase", "signature", "otp", "proxyAuthorization", "Authorization", "secrets"]) {
     assert.equal(safeJson[key], "[REDACTED_SECRET]", `multiline JSON ${key} field must be redacted`);
   }
   assert.equal(safeJson.note, "Bearer [REDACTED_SECRET]");
@@ -395,13 +402,17 @@ async function runTests() {
     tokenValue: "opaque-d", apiToken: 987654321, authToken: 987654322,
     accessToken: 987654323, refreshToken: 987654324, apiTokens: 987654325,
     sessionTokens: 123456, clientTokens: 222333, tokenValues: 888999,
+    token_counts: "opaque-plural", tokenCounts: { value: "opaque" },
+    tokens_count: "opaque", token_counts_value: 123,
+    cookie: "session=opaque", setCookie: ["opaque"], sessionId: 123,
+    auth: "Basic opaque", passphrase: { value: "opaque" }, signature: null, otp: true,
     proxyAuthorization: "Basic dXNlcjpwYXNz", secrets: { value: "opaque-e" },
     Authorization: "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
     token: 17, tokens: 21, token_count: 34
   }), "diagnostic");
   assert.ok(secretFieldNames);
   const secretFields = JSON.parse(secretFieldNames.text);
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "proxyAuthorization", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "token_counts_value", "cookie", "setCookie", "sessionId", "auth", "passphrase", "signature", "otp", "proxyAuthorization", "Authorization", "secrets"]) {
     assert.equal(secretFields[key], "[REDACTED_SECRET]", `${key} must be redacted by its field name`);
   }
   assert.equal(secretFields.token, "[REDACTED_SECRET]", "a numeric singular token field is a credential, not a usage metric");
@@ -418,7 +429,7 @@ async function runTests() {
   assert.doesNotThrow(() => JSON.parse(safeStdout), "safe structured stdout must remain valid JSON");
   const publicSafeJson = JSON.parse(safeStdout);
   assert.equal(publicSafeJson.access_token, "[REDACTED_SECRET]");
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "proxyAuthorization", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "token_counts_value", "cookie", "setCookie", "sessionId", "auth", "passphrase", "signature", "otp", "proxyAuthorization", "Authorization", "secrets"]) {
     assert.equal(publicSafeJson[key], "[REDACTED_SECRET]", `public JSON ${key} field must be redacted`);
   }
   assert.equal(publicSafeJson.note, "Bearer [REDACTED_SECRET]");

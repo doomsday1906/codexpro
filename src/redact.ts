@@ -105,10 +105,11 @@ export function redactJsonText(text: string, options: RedactionOptions | Redacti
     return normalized.includes("authorization") || normalized.includes("secret") ||
       normalized.includes("password") || normalized.includes("passwd") ||
       normalized.includes("privatekey") || normalized.includes("apikey") ||
-      normalized.includes("accesstoken") || normalized.includes("refreshtoken") ||
-      normalized.includes("idtoken") || normalized.includes("authtoken") ||
       normalized.includes("credential") || normalized.includes("bearer") ||
-      normalized.includes("token");
+      normalized.includes("token") || normalized.includes("cookie") ||
+      normalized.includes("session") || normalized.includes("passphrase") ||
+      normalized.includes("signature") || normalized.includes("otp") ||
+      (normalized.startsWith("auth") && !normalized.startsWith("author")) || normalized.endsWith("auth");
   };
   const redactValue = (value: unknown, depth: number): unknown => {
     if (depth > 8) {
