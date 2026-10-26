@@ -331,11 +331,16 @@ async function runTests() {
     sessionTokens: 123456,
     clientTokens: 222333,
     tokenValues: 888999,
+    token_counts: "opaque-plural-credential",
+    tokenCounts: { value: "opaque-camel-plural" },
+    tokens_count: "opaque-suffix-credential",
+    token_counts_value: 777666,
     proxyAuthorization: "Basic dXNlcjpwYXNz",
     note: "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
+    quotedMessage: 'Bearer "quoted-secret-token"',
     nested: { message: "prefix Bearer nested-token-1234567890 suffix", private_key: "-----BEGIN PRIVATE KEY-----\\nnever-expose-this-key\\n-----END PRIVATE KEY-----" },
     messages: ["Bearer array-token-1234567890", { message: "Bearer nested-array-token-1234567890" }],
-    non_numeric_token_counts: [
+    non_numeric_metrics: [
       { token_count: "opaque-credential" }, { token_count: false }, { token_count: null },
       { token_count: ["opaque-credential"] }, { token_count: { value: "opaque-credential" } }
     ],
@@ -355,14 +360,15 @@ async function runTests() {
   assert.ok(directJson, "multiline JSON must be recognized");
   const safeJson = JSON.parse(directJson.text);
   assert.equal(safeJson.access_token, "[REDACTED_SECRET]");
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "proxyAuthorization", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "token_counts_value", "proxyAuthorization", "Authorization", "secrets"]) {
     assert.equal(safeJson[key], "[REDACTED_SECRET]", `multiline JSON ${key} field must be redacted`);
   }
   assert.equal(safeJson.note, "Bearer [REDACTED_SECRET]");
+  assert.equal(safeJson.quotedMessage, "Bearer [REDACTED_SECRET]");
   assert.equal(safeJson.nested.message, "prefix Bearer [REDACTED_SECRET] suffix");
   assert.equal(safeJson.messages[0], "Bearer [REDACTED_SECRET]");
   assert.equal(safeJson.messages[1].message, "Bearer [REDACTED_SECRET]");
-  for (const item of safeJson.non_numeric_token_counts) {
+  for (const item of safeJson.non_numeric_metrics) {
     assert.equal(item.token_count, "[REDACTED_SECRET]", "only numeric token_count usage metrics may be preserved");
   }
   assert.equal(safeJson.nested.private_key, "[REDACTED_SECRET]");
@@ -380,6 +386,8 @@ async function runTests() {
     "masking nonnumeric token_count credentials must be reported");
   assert.equal(JSON.parse(redactJsonText('{"note":"Bearer standalone-token-1234567890"}', "diagnostic").text).note,
     "Bearer [REDACTED_SECRET]", "standalone Bearer values must be masked");
+  assert.equal(JSON.parse(redactJsonText('{"note":"Bearer \\\"quoted-secret\\\""}', "diagnostic").text).note,
+    "Bearer [REDACTED_SECRET]", "quoted Bearer values must be masked");
   const opaqueKeyedValue = redactJsonText('{"token":"opaque-value"}', "diagnostic");
   assert.equal(opaqueKeyedValue.changed, true, "masking an opaque credential-named value must be reported");
   const secretFieldNames = redactJsonText(JSON.stringify({
@@ -414,10 +422,11 @@ async function runTests() {
     assert.equal(publicSafeJson[key], "[REDACTED_SECRET]", `public JSON ${key} field must be redacted`);
   }
   assert.equal(publicSafeJson.note, "Bearer [REDACTED_SECRET]");
+  assert.equal(publicSafeJson.quotedMessage, "Bearer [REDACTED_SECRET]");
   assert.equal(publicSafeJson.nested.message, "prefix Bearer [REDACTED_SECRET] suffix");
   assert.equal(publicSafeJson.messages[0], "Bearer [REDACTED_SECRET]");
   assert.equal(publicSafeJson.messages[1].message, "Bearer [REDACTED_SECRET]");
-  for (const item of publicSafeJson.non_numeric_token_counts) {
+  for (const item of publicSafeJson.non_numeric_metrics) {
     assert.equal(item.token_count, "[REDACTED_SECRET]", "public route must preserve only numeric token_count metrics");
   }
   assert.equal(publicSafeJson.nested.private_key, "[REDACTED_SECRET]");

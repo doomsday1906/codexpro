@@ -108,8 +108,7 @@ export function redactJsonText(text: string, options: RedactionOptions | Redacti
       normalized.includes("accesstoken") || normalized.includes("refreshtoken") ||
       normalized.includes("idtoken") || normalized.includes("authtoken") ||
       normalized.includes("credential") || normalized.includes("bearer") ||
-      normalized.endsWith("token") || normalized.endsWith("tokens") ||
-      normalized.includes("tokenvalue") || normalized === "tokencount";
+      normalized.includes("token");
   };
   const redactValue = (value: unknown, depth: number): unknown => {
     if (depth > 8) {
@@ -118,7 +117,7 @@ export function redactJsonText(text: string, options: RedactionOptions | Redacti
       return "[REDACTED_SECRET]";
     }
     if (typeof value === "string") {
-      const safe = redactSensitiveText(value, options).replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/giu, "Bearer [REDACTED_SECRET]");
+      const safe = redactSensitiveText(value, options).replace(/\bBearer\s+(?:"[^"]*"|'[^']*'|[A-Za-z0-9._~+/-]+=*)/giu, "Bearer [REDACTED_SECRET]");
       if (safe !== value) changed = true;
       return safe;
     }
