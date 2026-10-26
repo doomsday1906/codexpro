@@ -2729,8 +2729,15 @@ async function simulateWorkspacePatch(config: CodexProConfig, records: Validated
       try {
         const beforeStat = await fsp.stat(record.absPath);
         if (!beforeStat.isFile()) throw new CodexProError("Patch source is not a regular file.");
-        if (beforeStat.size > perFileLimit || retainedBeforeBytes + beforeStat.size > totalFileLimit) {
-          throw new CodexProError("Patch validation needs whole-file review; pre-apply files exceed the configured source budget. Patch refused without applying any file.");
+        if (beforeStat.size > perFileLimit) {
+          throw new CodexProError(
+            `Patch validation needs whole-file review but ${sanitizeValidationPath(record.relPath)} is too large (${beforeStat.size} bytes). Limit: ${perFileLimit} bytes per file, ${totalFileLimit} bytes total across ${records.length} files. Patch refused without applying any file.`
+          );
+        }
+        if (retainedBeforeBytes + beforeStat.size > totalFileLimit) {
+          throw new CodexProError(
+            `Patch validation needs whole-file review but pre-apply files are too large in aggregate (${records.length} files, ${retainedBeforeBytes + beforeStat.size} bytes). Limit: ${totalFileLimit} bytes total (${perFileLimit} bytes per file). Patch refused without applying any file.`
+          );
         }
         const beforeBytes = await fsp.readFile(record.absPath);
         beforeContent = beforeBytes.toString("utf8");
@@ -2811,17 +2818,35 @@ function sourceLineBoundary(text: string, linesBefore: number): number {
   return boundary;
 }
 
+function canonicalDiffPathPairs(source: string): { oldPath: string; newPath: string }[] {
+  const header = /^diff --git (.*)$/mu.exec(source)?.[1];
+  if (header === undefined) return [];
+  const decodeSide = (text: string, prefix: string): string | undefined => {
+    if (text.startsWith('"')) {
+      if (!/^"(?:[^"\\]|\\.)*"$/u.test(text)) return undefined;
+      text = decodeGitQuotedPath(text);
+    } else if (/["\\]/u.test(text)) return undefined;
+    return text.startsWith(prefix) ? text.slice(prefix.length) : undefined;
+  };
+  const pairs: { oldPath: string; newPath: string }[] = [];
+  // Unquoted Git paths may contain spaces. Resolve every possible separator
+  // against exact Git identities rather than trimming or normalizing paths.
+  for (let index = 0; index < header.length; index += 1) {
+    if (header[index] !== " ") continue;
+    const oldPath = decodeSide(header.slice(0, index), "a/");
+    const newPath = decodeSide(header.slice(index + 1), "b/");
+    if (oldPath !== undefined && newPath !== undefined) pairs.push({ oldPath, newPath });
+  }
+  return pairs;
+}
+
 function sourceDiffFileBlock(changeDiff: string, file: SimulatedPatch["postApplyFiles"][number]): ReturnType<typeof extractDiffFileBlocks>[number] | undefined {
-  const blocks = extractDiffFileBlocks(changeDiff);
-  const exact = blocks.filter((block) =>
-    [block.oldPath, block.newPath].some((diffPath) => diffPath === file.gitPath || diffPath === file.relPath)
+  const candidates = extractDiffFileBlocks(changeDiff).filter((block) =>
+    canonicalDiffPathPairs(block.source).filter((pair) =>
+      [pair.oldPath, pair.newPath].some((diffPath) => diffPath === file.gitPath || diffPath === file.relPath)
+    ).length === 1
   );
-  const candidates = exact.length > 0 ? exact : blocks.filter((block) =>
-    [block.oldPath, block.newPath].some((diffPath) => typeof diffPath === "string"
-      && (policyPathMatches(file.gitPath, diffPath) || policyPathMatches(file.relPath, diffPath)))
-  );
-  if (candidates.length !== 1 || !candidates[0].pathDiscoveryValid) return undefined;
-  return candidates[0];
+  return candidates.length === 1 ? candidates[0] : undefined;
 }
 
 function sourceChangeHunks(changeDiff: string, file: SimulatedPatch["postApplyFiles"][number]): SourceChangeHunk[] | undefined {
@@ -2859,9 +2884,12 @@ function changedSensitiveSource(
 ): string | undefined {
   const before = scanSecretValues(file.beforeContent, sourceOptions);
   const after = scanSecretValues(file.content, sourceOptions);
-  if (!before.complete || !after.complete) return file.content || file.beforeContent;
+  if (!after.complete) return file.content || file.beforeContent;
   if (file.beforeContent === file.content) return undefined;
-  if (!before.spans.length && !after.spans.length) return undefined;
+  // A complete clean after-image is enough even if the old file was incomplete.
+  if (!after.spans.length) return undefined;
+  // Remaining findings cannot be preserved if the before-image was ambiguous.
+  if (!before.complete) return file.content || file.beforeContent;
 
   const hunks = sourceChangeHunks(changeDiff, file);
   if (!hunks) return file.content || file.beforeContent;
@@ -2902,6 +2930,37 @@ function validateSimulatedSource(simulated: SimulatedPatch, records: ValidatedPa
     return matches.length === 1 ? matches[0].absPath : undefined;
   };
   try {
+    // Resolve policy aliases independently of findings, including clean after-images.
+    for (const block of extractDiffFileBlocks(simulated.rawDiff)) {
+      const exactRecord = (diffPath: string) => {
+        const matches = records.filter((record) => record.gitPath === diffPath || record.relPath === diffPath);
+        return matches.length === 1 ? matches[0] : undefined;
+      };
+      const pairs = canonicalDiffPathPairs(block.source).map((pair) => ({
+        oldRecord: exactRecord(pair.oldPath), newRecord: exactRecord(pair.newPath)
+      })).filter((pair) => pair.oldRecord && pair.newRecord);
+      const aliasCollision = [block.oldPath, block.newPath].some((pathHint) =>
+        typeof pathHint === "string" && records.filter((record) =>
+          policyPathMatches(record.gitPath, pathHint) || policyPathMatches(record.relPath, pathHint)).length > 1);
+      if (pairs.length !== 1 || aliasCollision) {
+        throw new CodexProError("Canonical diff source path is ambiguous. Patch refused without applying any file.");
+      }
+      const { oldRecord, newRecord } = pairs[0];
+      // A rename must not reclassify a previously unsafe value as lawful syntax.
+      if (oldRecord && newRecord
+        && sourceLanguageForPath(oldRecord.relPath) !== sourceLanguageForPath(newRecord.relPath)
+        && hasSecretValueInUnifiedDiff(block.source, languageForPath, sourcePathForPath)) {
+        const redacted = redactUnifiedDiffPreservingLines(block.source, languageForPath);
+        throw new CodexProError(sourceSafetyRefusalMessage("apply_patch", newRecord.relPath, block.source, redacted, "patch line"));
+      }
+    }
+    // Context and hunk section headings are not additions or modifications.
+    const changedDiff = simulated.changeDiff.replace(/^(@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@).*$/gmu, "$1");
+    if (hasSecretValueInUnifiedDiff(changedDiff, languageForPath, sourcePathForPath)) {
+      const redacted = redactUnifiedDiffPreservingLines(changedDiff, languageForPath);
+      const touchedPaths = records.slice(0, 4).map((record) => record.relPath).join("; ");
+      throw new CodexProError(sourceSafetyRefusalMessage("apply_patch", touchedPaths, changedDiff, redacted, "patch line"));
+    }
     for (const file of simulated.postApplyFiles) {
       const sourceOptions = { context: "source" as const, language: sourceLanguageForPath(file.relPath), sourcePath: file.absPath };
       if (!file.sourceText) {

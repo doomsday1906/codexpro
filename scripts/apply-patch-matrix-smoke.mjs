@@ -835,6 +835,23 @@ try {
   }, ['probe.py']);
   assert.equal(JSON.stringify(unrelated.response).includes(bait), false, 'successful diff response leaked an untouched synthetic finding');
   matrix.push('SOURCE-UNCHANGED-FINDINGS');
+  // Canonical diff context contains the old finding next to this insertion.
+  const nearby = await generatedCase(client, suiteRoot, 'SOURCE-NEARBY-CONTEXT', { 'probe.py': unchangedFixture }, async (root) => {
+    await fs.writeFile(path.join(root, 'probe.py'), unchangedFixture.replace('def diagnostics():', 'def diagnostics():\n    # benign note'));
+  }, ['probe.py']);
+  assert.equal(JSON.stringify(nearby.response).includes(bait), false, 'nearby-context response leaked its dummy canary');
+  matrix.push('SOURCE-NEARBY-CONTEXT');
+  await generatedCase(client, suiteRoot, 'SOURCE-INCOMPLETE-REPAIR', { 'probe.py': 'class Repair:\n' }, async (root) => {
+    await fs.writeFile(path.join(root, 'probe.py'), 'class Repair:\n    pass\n');
+  }, ['probe.py']);
+  matrix.push('SOURCE-INCOMPLETE-REPAIR');
+  for (const exactPath of [' leading-space.py', 'trailing-space.py ', 'inside b/name.py']) {
+    const exactCase = await generatedCase(client, suiteRoot, 'SOURCE-EXACT-PATH-' + Buffer.from(exactPath).toString('hex'), { [exactPath]: unchangedFixture }, async (root) => {
+      await fs.writeFile(path.join(root, exactPath), unchangedFixture.replace('    return 1', '    return 2'));
+    }, [exactPath]);
+    assert.equal(JSON.stringify(exactCase.response).includes(bait), false, 'exact-path response leaked an unchanged finding');
+  }
+  matrix.push('SOURCE-EXACT-PATHS');
 
   const boundaryBase = ['def run():', '    send(', '        timeout=1,', '    )', ''].join('\n');
   const boundaryAfter = boundaryBase.replace('        timeout=1,', `        timeout=1,\n${fixtureLine(keyB, literal)},`);

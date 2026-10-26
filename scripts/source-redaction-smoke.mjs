@@ -5176,10 +5176,8 @@ try {
     expectNoHostileResponseFields(matrixBlockPatchRefusal, [matrixPyValue], 'consistency-matrix hostile Python apply_patch refusal');
     assert.deepEqual(await fs.readFile(path.join(tmp, matrixBlockPath)), matrixBlockBefore, 'consistency-matrix hostile Python apply_patch partially mutated the file');
 
-    // Whole-file protection: the patch hunk is benign and the canonical diff
-    // context (3 lines) cannot see the secret kept further away, but
-    // unpatched regions keep secret-looking content. Both routes must block.
-    // The hunk touches only the tail; the secret stays at source line 2.
+    // An unrelated tail append preserves the existing finding at source line 2.
+    // Both apply_patch and ordinary edit must preserve its bytes and redact output.
     const matrixWholePath = 'matrix-wholefile.py';
     await fs.writeFile(path.join(tmp, matrixWholePath), [
       '# benign header',
@@ -5204,14 +5202,25 @@ try {
       '+# appended note',
       ''
     ].join('\n');
-    const matrixWholePatchRefusal = assertToolError(await client.request('tools/call', {
+    // Approved change-aware contract: preserve proven untouched findings exactly.
+    const matrixWholePatchResult = assertToolSuccess(await client.request('tools/call', {
       name: 'apply_patch', arguments: { workspace_id: workspaceId, patch: matrixWholePatch }
-    }), 'consistency-matrix whole-file apply_patch');
-    assert.match(resultText(matrixWholePatchRefusal), /Secret-looking content is blocked from apply_patch/);
-    assert.ok(resultText(matrixWholePatchRefusal).includes(`Path ${matrixWholePath}; source line(s) 2; matched content omitted`), 'consistency-matrix whole-file apply_patch omitted source-line diagnostics');
-    assert.equal(/\brule\b/i.test(resultText(matrixWholePatchRefusal)), false, 'consistency-matrix whole-file apply_patch inferred a detector rule name');
-    expectNoHostileResponseFields(matrixWholePatchRefusal, [matrixWholeValue], 'consistency-matrix whole-file apply_patch refusal');
-    assert.deepEqual(await fs.readFile(path.join(tmp, matrixWholePath)), matrixWholeBefore, 'consistency-matrix whole-file apply_patch partially mutated the file');
+    }), 'consistency-matrix unrelated whole-file apply_patch');
+    const matrixWholeAfter = Buffer.concat([matrixWholeBefore, Buffer.from('# appended note\n')]);
+    assert.deepEqual(await fs.readFile(path.join(tmp, matrixWholePath)), matrixWholeAfter, 'unrelated patch changed existing fixture bytes');
+    expectNoHostileResponseFields(matrixWholePatchResult, [matrixWholeValue], 'consistency-matrix unrelated apply_patch');
+    const addedFindingPatch = [
+      `diff --git a/${matrixWholePath} b/${matrixWholePath}`,
+      `--- a/${matrixWholePath}`, `+++ b/${matrixWholePath}`,
+      '@@ -9,0 +10 @@', `+${matrixPyLabel} = ${matrixWholeValue}`, ''
+    ].join('\n');
+    const addedFindingRefusal = assertToolError(await client.request('tools/call', {
+      name: 'apply_patch', arguments: { workspace_id: workspaceId, patch: addedFindingPatch }
+    }), 'consistency-matrix newly added finding');
+    assert.match(resultText(addedFindingRefusal), /Secret-looking content is blocked from apply_patch/, 'new finding was refused for a reason other than source safety');
+    expectNoHostileResponseFields(addedFindingRefusal, [matrixWholeValue], 'consistency-matrix added finding refusal');
+    assert.deepEqual(await fs.readFile(path.join(tmp, matrixWholePath)), matrixWholeAfter, 'refused added finding mutated fixture bytes');
+    await fs.writeFile(path.join(tmp, matrixWholePath), matrixWholeBefore);
     const matrixWholeEdit = assertToolSuccess(await client.request('tools/call', {
       name: 'edit',
       arguments: {
@@ -5292,7 +5301,7 @@ try {
     assert.equal(/\brule\b/i.test(resultText(matrixTxtRefusal)), false, 'consistency-matrix hostile txt apply_patch inferred a detector rule name');
     expectNoHostileResponseFields(matrixTxtRefusal, [matrixTxtValue], 'consistency-matrix hostile txt apply_patch refusal');
     assert.deepEqual(await fs.readFile(path.join(tmp, matrixTxtPath)), matrixTxtBefore, 'consistency-matrix hostile txt apply_patch partially mutated the file');
-    console.log('APPLY_PATCH_CONSISTENCY_MATRIX: ordinary edit and apply_patch agree on allow and block; whole-file and undefined-language routes refused with bounded diagnostics');
+    console.log('APPLY_PATCH_CONSISTENCY_MATRIX: ordinary edit and apply_patch agree on allow and block; unchanged findings preserved; new findings and undefined-language routes refused with bounded diagnostics');
   }
   {
     // FINDING 4 bounded whole-file patch validation: small files plus
@@ -5712,7 +5721,9 @@ try {
   assert.equal(approvalDiffCommit.status, 0, `approved-side diff baseline commit failed: ${approvalDiffCommit.stderr || approvalDiffCommit.stdout}`);
   const approvalDiffFinal = approvalDiffAfter.replace('# diff marker: after', '# diff marker: final');
   await fs.writeFile(diffApprovalFile, approvalDiffFinal, 'utf8');
-  await fs.writeFile(path.join(tmp, unapprovedDiffPath), approvalDiffAfter, 'utf8');
+  // An unchanged sibling finding is allowed; a newly added unapproved call must
+  // still reject the entire mixed patch without borrowing another file's approval.
+  await fs.writeFile(path.join(tmp, unapprovedDiffPath), approvalDiffAfter + approvalDiffSource.split('\n')[2] + '\n', 'utf8');
   const mixedApprovalDiff = spawnSync('git', ['diff', '--no-ext-diff', '--unified=3', '--', approvalDiffPath, unapprovedDiffPath], { cwd: tmp, encoding: 'utf8' });
   assert.equal(mixedApprovalDiff.status, 0, `mixed approval-side Git diff failed: ${mixedApprovalDiff.stderr || mixedApprovalDiff.stdout}`);
   await fs.writeFile(diffApprovalFile, approvalDiffAfter, 'utf8');
@@ -5973,7 +5984,8 @@ try {
   const fstringDiffEnrollment = runApprovalCommand(fstringDiffAbsolute, sha256(fstringDiffSource));
   assert.equal(fstringDiffEnrollment.status, 0, `f-string diff path enrollment failed: ${fstringDiffEnrollment.stderr || fstringDiffEnrollment.stdout}`);
   await fs.writeFile(fstringDiffAbsolute, fstringDiffAfter, 'utf8');
-  await fs.writeFile(path.join(tmp, fstringUnapprovedDiffPath), fstringDiffAfter, 'utf8');
+  // Keep the approval-isolation refusal meaningful under unchanged-finding preservation.
+  await fs.writeFile(path.join(tmp, fstringUnapprovedDiffPath), fstringDiffAfter + fstringDiffSource.split('\n')[2] + '\n', 'utf8');
   const fstringMixedDiff = spawnSync('git', ['diff', '--no-ext-diff', '--unified=3', '--', fstringDiffPath, fstringUnapprovedDiffPath], { cwd: tmp, encoding: 'utf8' });
   assert.equal(fstringMixedDiff.status, 0, `f-string mixed-side Git diff failed: ${fstringMixedDiff.stderr || fstringMixedDiff.stdout}`);
   await fs.writeFile(fstringDiffAbsolute, fstringDiffSource, 'utf8');
