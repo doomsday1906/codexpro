@@ -2577,7 +2577,7 @@ function policyPathMatches(recordPath: string, policyPath: string): boolean {
   return usedCompatibilityAlias && recordIndex === recordPath.length;
 }
 
-function languageForValidatedPaths(records: ValidatedPatchPath[]): (pathHint: string | undefined) => "python" | undefined {
+function languageForValidatedPaths(records: ValidatedPatchPath[]): (pathHint: string | undefined) => ReturnType<typeof sourceLanguageForPath> {
   return (pathHint: string | undefined) => {
     if (typeof pathHint !== "string") return undefined;
     const matches = records.filter((record) => policyPathMatches(record.gitPath, pathHint) || policyPathMatches(record.relPath, pathHint));
