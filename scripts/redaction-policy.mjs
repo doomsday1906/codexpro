@@ -222,9 +222,10 @@ export function scanSecretValues(text, options = {}) {
       if ((pattern === ASSIGNED_LITERAL || pattern === BARE_CREDENTIAL) && !isHighEntropyLiteral(value)) continue;
       if (pattern === BARE_CREDENTIAL) {
         const language = options.language ?? sourceLanguageForPath(options.sourcePath);
+        if (language === 'code' || language === 'python') continue;
         const identifier = /^[A-Za-z_$][\w$]*$/.test(value);
-        if (identifier && (language === 'code' || language === 'python' || /^[A-Z_]+(?:\d+)?$/.test(value))) continue;
-        if (/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\(/.test(value)
+        if (identifier && /^[A-Z_]+(?:\d+)?$/.test(value)) continue;
+        if (/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*[([<]/.test(value)
           || /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(value)
           || /^(?:process\.env|import\.meta\.env|os\.environ)\[/.test(value)) continue;
       }
