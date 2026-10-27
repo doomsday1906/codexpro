@@ -257,6 +257,9 @@ assert.equal(redactDiagnosticText('plain log Authorization: Bearer abc.def.ghi a
 const lawfulDiagnostic = { usage: { input_tokens: 120, output_tokens: 30, total_tokens: 150, tokens: 9,
   inputTokenCount: 120, token_usage: 150 }, bashSessionId: 'bs_123', sessionId: 'abc', session_count: 3 };
 assert.deepEqual(JSON.parse(redactDiagnosticText(JSON.stringify(lawfulDiagnostic))), lawfulDiagnostic);
+assert.equal(redactDiagnosticText('  {"password":"opaque-credential"}\r\n'),
+  '  {"password":"[REDACTED_SECRET]"}\r\n', 'JSON redaction must retain log framing');
+
 for (const key of ['input_tokens', 'inputTokenCount', 'token_usage', 'api_key', 'password', 'sessionId']) {
   const value = key === 'sessionId' ? SK : 'opaque-credential';
   assert.ok(!redactDiagnosticText(JSON.stringify({ [key]: value })).includes(value), `${key} secret must stay masked`);

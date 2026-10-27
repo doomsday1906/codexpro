@@ -46,7 +46,7 @@ await fs.writeFile(
     name: "sec-fixture",
     scripts: {
       "leak-secret": `node -e "${secretScript}"`,
-      "leak-json": `node -e "console.log(JSON.stringify({apiToken:'LEAK-api',cookie:'LEAK-cookie',Authorization:'Bearer LEAK-auth',sessionId:123456,passphrase:'LEAK-pass',signature:'LEAK-signature',otp:654321,pwd:'LEAK-pwd',pass:'LEAK-pass-field',jwt:'LEAK-jwt',mfa:'LEAK-mfa',accessKey:'LEAK-access-key',note:'Bearer LEAK-note',tokens:21,token_count:34}))"`,
+      "leak-json": `node -e "console.log(JSON.stringify({apiToken:'LEAK-api',cookie:'LEAK-cookie',Authorization:'Bearer LEAK-auth',sessionId:123456,passphrase:'LEAK-pass',signature:'LEAK-signature',otp:654321,pwd:'LEAK-pwd',pass:'LEAK-pass-field',jwt:'LEAK-jwt',mfa:'LEAK-mfa',accessKey:'LEAK-access-key',note:'Bearer LEAK-note',tokens:21,token_count:34}));console.log('plain log Authorization: Bearer abc.def.ghi and done')"`,
       "leak-escaped-json": "node -e 'console.log(\"log:\", JSON.stringify({data: JSON.stringify({apiToken:\"LEAK-verif-escaped\", \"user.cookie\":\"LEAK-verif-dotted\", \"session.id\":\"sk-test-verif-session-1234567890\", payload: JSON.stringify({apiToken:\"LEAK-verif-deep-api\", authToken:\"LEAK-verif-deep-auth\", \"user.cookie\":\"LEAK-verif-deep-cookie\", tokens:21, token_count:34})})}))'",
       "leak-mixed-escaped-json": `node -e "process.stdout.write(Buffer.from('${Buffer.from(mixedEscapedLog).toString("base64")}', 'base64').toString())"`,
       "quick": "node -e 'process.exit(0);'",
@@ -330,6 +330,12 @@ async function runTests() {
   }
   assert.match(verificationJson, /"tokens":21/u, "verification JSON must preserve numeric tokens usage");
   assert.match(verificationJson, /"token_count":34/u, "verification JSON must preserve numeric token_count usage");
+  const verificationLines = verificationJson.split("\n");
+  const verificationPayload = JSON.parse(verificationLines.find((line) => line.startsWith("{")));
+  assert.equal(verificationPayload.tokens, 21);
+  assert.equal(verificationPayload.sessionId, 123456);
+  assert.ok(verificationLines.includes("plain log Authorization: [REDACTED_SECRET] and done"),
+    "streamed JSON and the following plain log must remain separate readable records");
   assert.equal(jsonJobWait.structuredContent.stdout_redaction.changed, true,
     "verification redaction metadata must report masked stdout credentials");
   assert.equal(jsonJobWait.structuredContent.stdout_redaction.truncated, false,

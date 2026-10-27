@@ -386,7 +386,9 @@ function redactJsonTextAtDepth(
   };
 
   const safeText = JSON.stringify(redactValue(parsed, startDepth));
-  return { text: changed ? safeText : text, changed, omittedNestedValues };
+  // Streaming callers redact one line at a time; keep its separators for the next log record.
+  const framedText = (text.match(/^\s*/u)?.[0] ?? "") + safeText + (text.match(/\s*$/u)?.[0] ?? "");
+  return { text: changed ? framedText : text, changed, omittedNestedValues };
 }
 
 export function redactJsonText(text: string, options: RedactionOptions | RedactionContext = {}): JsonTextRedactionResult | undefined {
