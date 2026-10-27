@@ -226,7 +226,23 @@ const harmlessCases = [
 for (const [label, source] of harmlessCases) {
   assert.equal(hasSecretValue(source), false, `${label} was incorrectly classified as a secret`);
   assert.equal(redactSensitiveText(source), source, `${label} was incorrectly redacted`);
-  assert.equal(redactDiagnosticText(source), source, `${label} diagnostic text was incorrectly redacted`);
+  if (label === 'digest auth') {
+    // W-135: source stays readable for Digest, but diagnostics must mask Authorization values.
+    const masked = redactDiagnosticText(source);
+    assert.equal(masked.includes('abcdefghijklmnopqrstuvwxyz012345'), false, `${label} diagnostic leaked its credential`);
+    assert.equal(masked.includes('[REDACTED_SECRET]'), true, `${label} diagnostic omitted its marker`);
+  } else {
+    assert.equal(redactDiagnosticText(source), source, `${label} diagnostic text was incorrectly redacted`);
+  }
+}
+// W-135: typed JSON credential must mask in diagnostics even when source preserves a short ordinary value.
+assert.equal(hasSecretValue('{"API_TOKEN":"QZ7"}'), false, 'short JSON credential was incorrectly classified as a source secret');
+assert.equal(redactSensitiveText('{"API_TOKEN":"QZ7"}'), '{"API_TOKEN":"QZ7"}', 'short JSON credential source was incorrectly redacted');
+{
+  const maskedJson = redactDiagnosticText('{"API_TOKEN":"QZ7"}');
+  assert.equal(maskedJson.includes('QZ7'), false, 'short JSON credential leaked in diagnostics');
+  assert.equal(maskedJson.includes('[REDACTED_SECRET]'), true, 'short JSON credential diagnostic omitted its marker');
+  assert.deepEqual(JSON.parse(maskedJson), { API_TOKEN: '[REDACTED_SECRET]' }, 'short JSON credential diagnostic is not parseable honest metadata');
 }
 assert.equal(redactSearchQuery('tokens: 21'), 'tokens: 21');
 assert.equal(redactSearchQuery('token_count: 34'), 'token_count: 34');

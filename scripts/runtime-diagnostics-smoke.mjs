@@ -223,9 +223,7 @@ const redactionParityCases = [
   { input: 'max_tokens = 4096', harmless: true },
   { input: '{"secretName": "build"}', harmless: true },
   { input: 'TOKEN=QZ7', harmless: true },
-  { input: '{"API_TOKEN":"QZ7"}', harmless: true },
   { input: 'password: QZ7', harmless: true },
-  { input: 'Authorization: Digest QZ7', harmless: true },
   { input: 'const API_TOKEN = getToken();', harmless: true },
   { input: 'const TOKEN = getToken(user);', harmless: true },
   { input: 'const TOKEN = getToken("user");', harmless: true },
@@ -249,6 +247,15 @@ for (const testCase of redactionParityCases) {
     assert.equal(redactDiagnosticText(testCase.input), testCase.input, `diagnostic redaction corrupted harmless source/member expression ${testCase.input}`);
   }
 }
+// W-135: typed JSON credential + Authorization must mask in diagnostics even when source preserves short QZ7.
+for (const input of ['{"API_TOKEN":"QZ7"}', 'Authorization: Digest QZ7']) {
+  assert.equal(redactSensitiveText(input), input, `source must stay readable for ${input}`);
+  assert.equal(hasSecretValue(input), false, `source misclassified short value ${input}`);
+  const masked = redactDiagnosticText(input);
+  assert.equal(masked.includes('QZ7'), false, `diagnostic leaked short credential ${input}`);
+  assert.equal(masked.includes('[REDACTED_SECRET]'), true, `diagnostic omitted marker for ${input}`);
+}
+assert.deepEqual(JSON.parse(redactDiagnosticText('{"API_TOKEN":"QZ7"}')), { API_TOKEN: '[REDACTED_SECRET]' }, 'typed JSON diagnostic is not parseable honest metadata');
 const exactPlaceholderCases = [
   'TOKEN=keep-this-codexpro-token-stable',
   'TOKEN="keep-this-codexpro-token-stable"',

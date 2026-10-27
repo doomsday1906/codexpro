@@ -40,7 +40,7 @@ const pkgJson = {
   name: "adv-fixture",
   scripts: {
     "tree-spin": "node -e 'require(\"fs\").writeFileSync(\"tree-started\",\"yes\"); const { spawn } = require(\"node:child_process\"); const child = spawn(process.execPath, [\"-e\", \"setInterval(() => {}, 500)\"], { stdio: \"ignore\" }); setInterval(() => {}, 500);'",
-    "noisy-loop": "node -e 'setInterval(() => { process.stdout.write(\"X\".repeat(1024)); }, 5);'",
+    "noisy-loop": "node -e 'require(\"fs\").writeFileSync(\"noisy-started\",\"yes\"); setInterval(() => { process.stdout.write(\"X\".repeat(1024)); }, 5);'",
     "quick": "node -e 'process.exit(0);'",
     "verification:lifecycle": "node verification-lifecycle-fixture.mjs",
     "verification:fixture": "node verification-fixture.mjs"
@@ -205,6 +205,7 @@ async function runTests() {
     retainedTailBytes: 512
   });
 
+  await fs.rm(path.join(realFixtureRoot, "noisy-started"), { force: true });
   const job3 = await mgr3.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
     runner: "package_script",
@@ -212,6 +213,8 @@ async function runTests() {
     script: "noisy-loop"
   });
 
+  assert.ok(await waitForFixtureFile("noisy-started"), "output-ceiling fixture must prove the command actually entered the governed scope");
+  await new Promise((r) => setTimeout(r, 250));
   const outputCeilingResult = await mgr3.waitVerification(job3.jobId, 5);
   assert.equal(outputCeilingResult.state, "output_limit_exceeded");
   assert.match(outputCeilingResult.terminalReason, /Output ceiling of 2048 bytes exceeded/);
