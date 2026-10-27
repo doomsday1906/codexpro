@@ -31,9 +31,9 @@ import {
 } from './launcher-process-tree.mjs';
 import {
   createPrivateKeyScanner,
-  redactDiagnosticText,
   truncateUtf8
 } from './redaction-policy.mjs';
+import { redactDiagnosticText } from '../dist/redact.js';
 import {
   parseGitPushPolicy,
   sanitizeGitPushPolicy,

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
@@ -38,7 +39,7 @@ await fs.copyFile(
 const pkgJson = {
   name: "adv-fixture",
   scripts: {
-    "tree-spin": "node -e 'const { spawn } = require(\"node:child_process\"); const child = spawn(process.execPath, [\"-e\", \"setInterval(() => {}, 500)\"], { stdio: \"ignore\" }); setInterval(() => {}, 500);'",
+    "tree-spin": "node -e 'require(\"fs\").writeFileSync(\"tree-started\",\"yes\"); const { spawn } = require(\"node:child_process\"); const child = spawn(process.execPath, [\"-e\", \"setInterval(() => {}, 500)\"], { stdio: \"ignore\" }); setInterval(() => {}, 500);'",
     "noisy-loop": "node -e 'setInterval(() => { process.stdout.write(\"X\".repeat(1024)); }, 5);'",
     "quick": "node -e 'process.exit(0);'",
     "verification:lifecycle": "node verification-lifecycle-fixture.mjs",
@@ -85,6 +86,15 @@ function arePidsDead(pids) {
   return true;
 }
 
+async function waitForFixtureFile(name, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { await fs.access(path.join(realFixtureRoot, name)); return true; } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
+
 async function runTests() {
   // Test 1: Timeout kills descendant process tree
   console.log("\n[Test 1] Timeout kills descendant process tree...");
@@ -92,16 +102,17 @@ async function runTests() {
     minLifetimeMs: 500,
     defaultLifetimeMs: 1000
   });
+  await fs.rm(path.join(realFixtureRoot, "tree-started"), { force: true });
 
   const job1 = await mgr1.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
     runner: "package_script",
     package_manager: "npm",
     script: "tree-spin",
-    lifetime_ms: 600
+    lifetime_ms: 5000
   });
 
-  // Allow process tree to spawn
+  assert.ok(await waitForFixtureFile("tree-started"), "timeout fixture must prove the command actually entered the governed scope");
   await new Promise((r) => setTimeout(r, 250));
   const jobObj1 = mgr1.getActiveJobs().find((j) => j.jobId === job1.jobId);
   const parentPid1 = jobObj1?.childProcess?.pid;
@@ -110,7 +121,7 @@ async function runTests() {
   console.log(`  Spawned parent PID ${parentPid1} with descendants: [${descendants1.join(", ")}]`);
 
   // Wait for lifetime timeout
-  const timedOutRecord = await mgr1.waitVerification(job1.jobId, 5);
+  const timedOutRecord = await mgr1.waitVerification(job1.jobId, 8);
   assert.equal(timedOutRecord.state, "timed_out");
   assert.equal(mgr1.getActiveCount(), 0);
 
@@ -133,18 +144,20 @@ async function runTests() {
       minLifetimeMs: 500,
       defaultLifetimeMs: 500
     });
+    await fs.rm(path.join(realFixtureRoot, "timeout-started"), { force: true });
     const escapedJob = await escapedManager.startVerification(fakeWorkspace, guard, {
       workspace_id: fakeWorkspace.id,
       runner: "package_script",
       package_manager: "npm",
       script: "verification:lifecycle",
-      args: ["--detached-child-ms", "2200", "--detached-ignore-term", "--run-ms", "1200"],
-      lifetime_ms: 500
+      args: ["--detached-child-ms", "12000", "--detached-ignore-term", "--started-file", "timeout-started", "--run-ms", "10000"],
+      lifetime_ms: 5000
     });
     try {
-      const escapedResult = await escapedManager.waitVerification(escapedJob.jobId, 5);
+      assert.ok(await waitForFixtureFile("timeout-started", 30_000), "timeout marker must come from the governed command");
+      const escapedResult = await escapedManager.waitVerification(escapedJob.jobId, 8);
       assert.equal(escapedResult.state, "timed_out", "Timeout should become terminal after owned descendants are killed");
-      assert.match(escapedResult.terminalReason, /lifetime of 500 ms exceeded/);
+      assert.match(escapedResult.terminalReason, /lifetime of 5000 ms exceeded/);
       assert.equal(escapedManager.getActiveCount(), 0);
     } finally {
       await escapedManager.close();
@@ -158,6 +171,7 @@ async function runTests() {
     minLifetimeMs: 500,
     defaultLifetimeMs: 30000
   });
+  await fs.rm(path.join(realFixtureRoot, "tree-started"), { force: true });
 
   const job2 = await mgr2.startVerification(fakeWorkspace, guard, {
     workspace_id: fakeWorkspace.id,
@@ -166,6 +180,7 @@ async function runTests() {
     script: "tree-spin"
   });
 
+  assert.ok(await waitForFixtureFile("tree-started"), "cancel fixture must prove the command actually entered the governed scope");
   await new Promise((r) => setTimeout(r, 250));
   const jobObj2 = mgr2.getActiveJobs().find((j) => j.jobId === job2.jobId);
   const parentPid2 = jobObj2?.childProcess?.pid;
@@ -462,9 +477,12 @@ async function runTests() {
     if (!Number.isSafeInteger(pid) || pid <= 0) return false;
     try {
       process.kill(pid, 0);
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const commEnd = stat.lastIndexOf(")");
+      if (commEnd >= 0 && /[ZX]/u.test(stat[commEnd + 2] ?? "")) return false;
       return true;
     } catch (err) {
-      return err?.code === "ESRCH" ? false : true;
+      return err?.code === "ESRCH" || err?.code === "ENOENT" ? false : true;
     }
   }
 
@@ -474,6 +492,16 @@ async function runTests() {
       const pid = Number(text.trim());
       if (Number.isSafeInteger(pid) && pid > 0) return pid;
     } catch {}
+    return 0;
+  }
+
+  async function waitForPidFile(absPath, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const pid = await readPidFile(absPath);
+      if (pid > 0) return pid;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     return 0;
   }
 
@@ -505,10 +533,10 @@ async function runTests() {
       script: "verification:lifecycle",
       args: ["--detached-child-ms", "15000", "--detached-separate", "--detached-ignore-term", "--detached-pid-file", pidName, "--run-ms", "400"]
     });
-    // Allow root exit + initial SIGTERM to be delivered while the ignorer survives.
-    await new Promise((r) => setTimeout(r, 1100));
-    const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
+    // Synchronize to child creation, then observe it after root exit and TERM but before the 1s KILL escalation.
+    const childPid = await waitForPidFile(path.join(realFixtureRoot, pidName), 10_000);
     assert.ok(childPid > 0, "Fixture must record detached child PID");
+    await new Promise((r) => setTimeout(r, 800));
     assert.ok(isPidAlive(childPid), `Detached ignorer PID ${childPid} must still be alive after SIGTERM (proves SIGKILL is required)`);
     const result = await mgr.waitVerification(started.jobId, 8);
     assert.notEqual(result.state, "succeeded", "Must not report clean success while an owned child was alive");
@@ -533,7 +561,6 @@ async function runTests() {
     const mgr = new VerificationManager(baseConfig, { minLifetimeMs: 500, defaultLifetimeMs: 30000 });
     const pidName = "detached-12.pid";
     try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
-    const startT = Date.now();
     const started = await mgr.startVerification(fakeWorkspace, guard, {
       workspace_id: fakeWorkspace.id,
       runner: "package_script",
@@ -541,18 +568,18 @@ async function runTests() {
       script: "verification:lifecycle",
       args: ["--detached-child-ms", "8000", "--detached-pid-file", pidName, "--run-ms", "400"]
     });
+    const childPid = await waitForPidFile(path.join(realFixtureRoot, pidName), 10_000);
+    assert.ok(childPid > 0, "Fixture must record inherited-pipe holder PID");
+    const startT = Date.now();
     const result = await mgr.waitVerification(started.jobId, 10);
     const elapsed = Date.now() - startT;
-    const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
-    assert.ok(elapsed < 6000, `Pipe-holder must be reaped boundedly, not held to self-exit (elapsed ${elapsed}ms)`);
+    assert.ok(elapsed < 6000, `Pipe-holder must be reaped boundedly after child start, not held to self-exit (elapsed ${elapsed}ms)`);
     assert.equal(result.state, "failed", `Intervention must be cleanup-aware failure, got ${result.state}`);
     assert.match(result.terminalReason ?? "", /cleanup|owned descendant/i, "Terminal reason must be cleanup-aware");
     assert.ok((result.cleanupPerformed ?? 0) >= 1, `cleanupPerformed must record intervention, got ${result.cleanupPerformed}`);
     assert.equal(result.descendantsObserved, true, "Descendants must have been observed");
     assert.equal(mgr.getActiveCount(), 0);
-    if (childPid > 0) {
-      assert.ok(!isPidAlive(childPid), `Pipe-holding child PID ${childPid} must be dead (no orphan)`);
-    }
+    assert.ok(!isPidAlive(childPid), `Pipe-holding child PID ${childPid} must be dead (no orphan)`);
     try { await mgr.close(); } catch {}
     try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
     console.log(`  PASS: Pipe holder reaped in ${elapsed}ms with cleanup-aware failure`);
@@ -632,7 +659,6 @@ async function runTests() {
     const mgr = new VerificationManager(baseConfig, { minLifetimeMs: 500, defaultLifetimeMs: 30000 });
     const pidName = "detached-16.pid";
     try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
-    const startT = Date.now();
     const started = await mgr.startVerification(fakeWorkspace, guard, {
       workspace_id: fakeWorkspace.id,
       runner: "package_script",
@@ -640,16 +666,16 @@ async function runTests() {
       script: "verification:lifecycle",
       args: ["--detached-child-ms", "8000", "--detached-pid-file", pidName, "--run-ms", "0"]
     });
+    const childPid = await waitForPidFile(path.join(realFixtureRoot, pidName), 5000);
+    assert.ok(childPid > 0, "Zero-cushion fixture must record its detached child PID");
+    const startT = Date.now();
     const result = await mgr.waitVerification(started.jobId, 10);
     const elapsed = Date.now() - startT;
-    const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
-    assert.ok(elapsed < 6000, `Zero-cushion pipe-holder must bound before self-exit (elapsed ${elapsed}ms)`);
+    assert.ok(elapsed < 7000, `Zero-cushion pipe-holder must bound before the child's 8s self-exit (elapsed ${elapsed}ms)`);
     assert.equal(result.state, "failed", `Zero-cushion intervention must be cleanup-aware failure, got ${result.state}`);
     assert.match(result.terminalReason ?? "", /cleanup|owned descendant/i, "Terminal reason must be cleanup-aware");
     assert.equal(mgr.getActiveCount(), 0);
-    if (childPid > 0) {
-      assert.ok(!isPidAlive(childPid), `Pipe-holding child PID ${childPid} must be dead (no orphan)`);
-    }
+    assert.ok(!isPidAlive(childPid), `Pipe-holding child PID ${childPid} must be dead (no orphan)`);
     try { await mgr.close(); } catch {}
     try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
     console.log(`  PASS: Zero-cushion holder bounded in ${elapsed}ms with cleanup-aware failure, no orphan`);
@@ -868,22 +894,20 @@ async function runTests() {
     const mgr = new VerificationManager(baseConfig, { minLifetimeMs: 500, defaultLifetimeMs: 30000 });
     const pidName = "detached-16b.pid";
     try { await fs.rm(path.join(realFixtureRoot, pidName), { force: true }); } catch {}
-    const startT = Date.now();
     const started = await mgr.startVerification(fakeWorkspace, guard, {
       workspace_id: fakeWorkspace.id,
       runner: "package_script",
       package_manager: "npm",
       script: "verification:lifecycle",
-      args: ["--detached-child-ms", "8000", "--detached-ignore-term", "--detached-pid-file", pidName, "--run-ms", "400"]
+      args: ["--detached-child-ms", "20000", "--detached-ignore-term", "--detached-pid-file", pidName, "--run-ms", "4000"]
     });
-    // Root runs 400ms then exits; exit-handler TERMs (ignored) so the
-    // inherited-pipe holder survives into the KILL window. Intervene at ~800ms:
-    // job still running (close held by pipes), holder still alive pre-KILL.
-    await new Promise((r) => setTimeout(r, 800));
+    // Shared governor admission may delay fixture startup; keep the root alive
+    // while waiting so the pipe holder is observed before cleanup begins.
+    const childPid = await waitForPidFile(path.join(realFixtureRoot, pidName), 8000);
+    assert.ok(childPid > 0, "Fixture must record detached child PID before the bounded pre-cleanup deadline");
+    const startT = Date.now();
     const jobObj = mgr.getActiveJobs().find((j) => j.jobId === started.jobId);
     assert.ok(jobObj, "16b job must still be running at intervention (close pending proves pipes held)");
-    const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
-    assert.ok(childPid > 0, "Fixture must record detached child PID");
     assert.ok(isPidAlive(childPid), `Holder PID ${childPid} must be alive at intervention (pre-KILL window)`);
     // Force discovery-miss: drop all tree-walk state.
     if (typeof jobObj.testOnlyClearOwned === "function") jobObj.testOnlyClearOwned();
@@ -931,13 +955,14 @@ async function runTests() {
     // `close` stays pending; gating + capture still run and are recorded.
     jobObj.testHookSuppressSignals = true;
     jobObj.testHookKillAttempts = [];
+    // Measure from actual child creation, rather than command admission latency.
+    const childPid = await waitForPidFile(path.join(realFixtureRoot, pidName), 10_000);
+    assert.ok(childPid > 0, "Fixture must record close-pending holder PID");
     const startT = Date.now();
-    // At ~2s (pre-watchdog) the job must still be running: proves `close` is
-    // pending (pipes held), not early-settled via the close path.
+    // At ~2s after child creation (pre-watchdog) the job must still be running:
+    // proves `close` is pending (pipes held), not early-settled via the close path.
     await new Promise((r) => setTimeout(r, 2000));
     assert.equal(mgr.getActiveCount(), 1, "Job must still be running pre-watchdog (close pending, pipes held)");
-    const childPid = await readPidFile(path.join(realFixtureRoot, pidName));
-    assert.ok(childPid > 0, "Fixture must record close-pending holder PID");
     assert.ok(isPidAlive(childPid), `Holder PID ${childPid} must be alive pre-watchdog (suppressed kills)`);
     const result = await mgr.waitVerification(started.jobId, 10);
     const elapsed = Date.now() - startT;
@@ -945,7 +970,7 @@ async function runTests() {
     assert.match(result.terminalReason ?? "", /cleanup_incomplete/, "Terminal reason must carry cleanup_incomplete evidence");
     assert.ok((result.recoveryHint ?? "").length <= 600, "Recovery hint must stay bounded");
     assert.ok((result.recoveryHint ?? "").includes("live"), "Recovery hint must carry live-set evidence");
-    assert.ok(elapsed < 9000, `Watchdog must bound (elapsed ${elapsed}ms)`);
+    assert.ok(elapsed < 12_000, `Watchdog must settle before the holder's 15s self-exit (elapsed ${elapsed}ms)`);
     assert.equal(mgr.getActiveCount(), 0);
     // Single terminal assignment: re-wait observes the identical terminal.
     const second = await mgr.waitVerification(started.jobId, 2);

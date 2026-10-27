@@ -428,10 +428,14 @@ async function runTests() {
 
   // Wait for stdio child to exit
   await new Promise((resolve) => {
-    stdioClient.child.once("exit", resolve);
-    setTimeout(resolve, 3000);
+    const timer = setTimeout(resolve, 6000);
+    stdioClient.child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
   });
   assert.ok(stdioClient.child.exitCode !== null || stdioClient.child.signalCode !== null, "Stdio process must exit");
+  assert.equal(stdioClient.child.exitCode, 0, "Stdio process must finish graceful SIGTERM cleanup without emergency exit");
 
   // Wait 1.5s for escalation/exit of any descendants
   await new Promise((r) => setTimeout(r, 1500));

@@ -648,7 +648,12 @@ function projectHistoricalSnapshot(
       maxBytes
     }
   );
-  return { path: canonicalPath, ...framed };
+  return {
+    path: canonicalPath,
+    ...framed,
+    redacted: redactedLines.slice(window.startLine - 1, window.endLine)
+      .some((line, index) => line !== rawLines[window.startLine - 1 + index])
+  };
 }
 
 /** Large-blob route: shared secure projector over the streamed window. */
@@ -686,7 +691,7 @@ function projectHistoricalLarge(
     capped: scan.selectionCapped,
     capturedThroughLine: scan.capturedThroughLine
   });
-  return { path: canonicalPath, ...framed };
+  return { path: canonicalPath, ...framed, redacted: display.some((line, index) => line.text !== captured[index]?.text) };
 }
 
 // Operation-oriented aliases keep the internal primitive easy to consume

@@ -4,6 +4,10 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 
 const args = process.argv.slice(2);
+const startedFileIndex = args.indexOf("--started-file");
+if (startedFileIndex >= 0 && args[startedFileIndex + 1]) {
+  fs.writeFileSync(String(args[startedFileIndex + 1]).slice(0, 512), "started", "utf8");
+}
 function numberArg(name, fallback = 0, max = 60_000) {
   const index = args.indexOf(name);
   if (index < 0) return fallback;

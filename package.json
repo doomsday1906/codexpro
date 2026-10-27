@@ -88,7 +88,7 @@
     "pty-http-public:smoke": "npm run build && node scripts/pty-http-public-smoke.mjs",
     "deploy-local:smoke": "node scripts/deploy-local-smoke.mjs",
     "pty-stdio-public:smoke": "npm run build && node scripts/pty-stdio-public-smoke.mjs",
-    "verification:smoke": "npm run build && node scripts/verification-manager-smoke.mjs && node scripts/http-session-continuity-smoke.mjs && node scripts/verification-adversarial-smoke.mjs && node scripts/verification-security-envelope-smoke.mjs && node scripts/list-verification-jobs-boundary-smoke.mjs",
+    "verification:smoke": "npm run build && node scripts/verification-manager-smoke.mjs && node scripts/http-session-continuity-smoke.mjs && node scripts/verification-adversarial-smoke.mjs && node scripts/verification-security-envelope-smoke.mjs && node scripts/verification-memory-limit-smoke.mjs && node scripts/list-verification-jobs-boundary-smoke.mjs",
     "verification:fixture": "node scripts/verification-fixture.mjs",
     "verification:r2-falsifier": "node scripts/verification-r2-falsifier.mjs",
     "verification:r3-falsifier": "node scripts/verification-r3-falsifier.mjs",
