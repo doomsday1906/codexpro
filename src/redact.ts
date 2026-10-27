@@ -139,7 +139,12 @@ function jsonValueEnd(text: string, start: number, escapeDepth: number): number 
       let afterQuote = index + 1;
       while (/\s/u.test(text[afterQuote] ?? "")) afterQuote += 1;
       const delimiter = afterQuote === text.length || /[,}\]\r\n]/u.test(text[afterQuote] ?? "");
-      if (delimiter) return index + 1;
+      if (!delimiter) continue;
+      const closingEscapeDepth = backslashesBefore(text, index);
+      const nextField = /^,\s*\\*["'][\w.$-]+\\*["']\s*:/u.test(text.slice(afterQuote));
+      // Mixed-depth malformed logs may close at a different depth; an escaped
+      // quote inside a value must not expose the rest of that credential.
+      if (closingEscapeDepth === escapeDepth || nextField) return index + 1;
     }
     return text.length;
   }
@@ -449,6 +454,11 @@ export function redactUnifiedDiffPreservingLines(
 export function redactDiagnosticText(text: string): string {
   const json = redactJsonText(text, "diagnostic");
   if (json) return json.text;
+  const objectStart = text.indexOf("{");
+  if (objectStart > 0) {
+    const embedded = redactJsonText(text.slice(objectStart), "diagnostic");
+    if (embedded) return redactDiagnosticPreservingMetrics(text.slice(0, objectStart)) + embedded.text;
+  }
   return redactDiagnosticPreservingMetrics(text);
 }
 

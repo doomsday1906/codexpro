@@ -629,14 +629,14 @@ async function runTests() {
   assert.equal(opaqueJsonOutput.structuredContent.stdout_redaction.changed, true,
     "public redaction metadata must report opaque credential-field masking");
 
-  await fs.writeFile(path.join(realFixtureRoot, "secret-source.ts"), "export const api_token = 'source-secret-that-must-not-leak';\n", "utf8");
+  await fs.writeFile(path.join(realFixtureRoot, "secret-source.ts"), "export const api_token = 'sk-aB3xK9mQ2pL7vN4zR8tY6wS1uV5wX7';\n", "utf8");
   const sourceSnippet = await clientBash.callTool({
     name: "read_many",
     arguments: { workspace_id: realWsId, items: [{ path: "secret-source.ts" }] }
   });
   assert.ok(!sourceSnippet.isError, "read_many must return the fixture source through its normal paged route");
   assert.equal(sourceSnippet.structuredContent.results[0].result.redacted, true, "read_many must mark masked source snippets");
-  assert.equal(sourceSnippet.structuredContent.results[0].result.text.includes("source-secret-that-must-not-leak"), false);
+  assert.equal(sourceSnippet.structuredContent.results[0].result.text.includes("sk-aB3xK9mQ2pL7vN4zR8tY6wS1uV5wX7"), false);
   assert.match(sourceSnippet.content[0].text, /source redacted: true/u, "read_many text must report that the snippet was masked");
   console.log("  PASS: JSON stdout stays parseable and source snippets truthfully mark whole-file redaction");
 
