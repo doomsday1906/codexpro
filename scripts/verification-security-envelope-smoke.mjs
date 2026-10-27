@@ -47,7 +47,7 @@ await fs.writeFile(
     scripts: {
       "leak-secret": `node -e "${secretScript}"`,
       "leak-json": `node -e "console.log(JSON.stringify({apiToken:'LEAK-api',cookie:'LEAK-cookie',Authorization:'Bearer LEAK-auth',sessionId:123456,passphrase:'LEAK-pass',signature:'LEAK-signature',otp:654321,pwd:'LEAK-pwd',pass:'LEAK-pass-field',jwt:'LEAK-jwt',mfa:'LEAK-mfa',accessKey:'LEAK-access-key',note:'Bearer LEAK-note',tokens:21,token_count:34}))"`,
-      "leak-escaped-json": "node -e 'console.log(\"log:\", JSON.stringify({data: JSON.stringify({apiToken:\"LEAK-verif-escaped\", \"user.cookie\":\"LEAK-verif-dotted\", \"session.id\":\"LEAK-verif-session\", payload: JSON.stringify({apiToken:\"LEAK-verif-deep-api\", authToken:\"LEAK-verif-deep-auth\", \"user.cookie\":\"LEAK-verif-deep-cookie\", tokens:21, token_count:34})})}))'",
+      "leak-escaped-json": "node -e 'console.log(\"log:\", JSON.stringify({data: JSON.stringify({apiToken:\"LEAK-verif-escaped\", \"user.cookie\":\"LEAK-verif-dotted\", \"session.id\":\"sk-test-verif-session-1234567890\", payload: JSON.stringify({apiToken:\"LEAK-verif-deep-api\", authToken:\"LEAK-verif-deep-auth\", \"user.cookie\":\"LEAK-verif-deep-cookie\", tokens:21, token_count:34})})}))'",
       "leak-mixed-escaped-json": `node -e "process.stdout.write(Buffer.from('${Buffer.from(mixedEscapedLog).toString("base64")}', 'base64').toString())"`,
       "quick": "node -e 'process.exit(0);'",
       "long": "node -e 'require(\"fs\").writeFileSync(\"cancel-started\",\"yes\"); setTimeout(() => {}, 60000);'"
@@ -342,7 +342,7 @@ async function runTests() {
   } });
   assert.ok(!escapedJobWait.structuredContent.stdout.includes("LEAK-verif-escaped"),
     "verification text fallback must redact credentials in escaped JSON log fields");
-  for (const secret of ["LEAK-verif-dotted", "LEAK-verif-session"]) {
+  for (const secret of ["LEAK-verif-dotted", "sk-test-verif-session-1234567890"]) {
     assert.ok(!escapedJobWait.structuredContent.stdout.includes(secret), `verification text fallback must redact ${secret}`);
   }
   for (const secret of ["LEAK-verif-deep-api", "LEAK-verif-deep-auth", "LEAK-verif-deep-cookie"]) {
@@ -425,9 +425,12 @@ async function runTests() {
   assert.ok(directJson, "multiline JSON must be recognized");
   const safeJson = JSON.parse(directJson.text);
   assert.equal(safeJson.access_token, "[REDACTED_SECRET]");
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "token_counts_value", "cookie", "setCookie", "sessionId", "auth", "passphrase", "signature", "otp", "accessKey", "pwd", "pass", "jwt", "mfa", "user.cookie", "session.id", "proxyAuthorization", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "cookie", "setCookie", "auth", "passphrase", "signature", "otp", "accessKey", "pwd", "pass", "jwt", "mfa", "user.cookie", "proxyAuthorization", "Authorization", "secrets"]) {
     assert.equal(safeJson[key], "[REDACTED_SECRET]", `multiline JSON ${key} field must be redacted`);
   }
+  assert.equal(safeJson.sessionId, 987654321);
+  assert.equal(safeJson["session.id"], "opaque-dotted-session");
+  assert.equal(safeJson.token_counts_value, 777666);
   assert.equal(safeJson.note, "Bearer [REDACTED_SECRET]");
   assert.equal(safeJson.quotedMessage, "Bearer [REDACTED_SECRET]");
   assert.equal(safeJson.nested.message, "prefix Bearer [REDACTED_SECRET] suffix");
@@ -482,12 +485,24 @@ async function runTests() {
   }), "diagnostic");
   assert.ok(secretFieldNames);
   const secretFields = JSON.parse(secretFieldNames.text);
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "token_counts_value", "cookie", "setCookie", "sessionId", "auth", "passphrase", "signature", "otp", "accessKey", "pwd", "pass", "jwt", "mfa", "proxyAuthorization", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "cookie", "setCookie", "auth", "passphrase", "signature", "otp", "accessKey", "pwd", "pass", "jwt", "mfa", "proxyAuthorization", "Authorization", "secrets"]) {
     assert.equal(secretFields[key], "[REDACTED_SECRET]", `${key} must be redacted by its field name`);
   }
   assert.equal(secretFields.token, "[REDACTED_SECRET]", "a numeric singular token field is a credential, not a usage metric");
   assert.equal(secretFields.tokens, 21, "numeric token metrics remain numeric");
   assert.equal(secretFields.token_count, 34, "numeric token_count remains numeric");
+  assert.equal(secretFields.sessionId, 123);
+  assert.equal(secretFields.token_counts_value, 123);
+  assert.equal(secretFields.apiTokens, 987654325);
+  assert.equal(secretFields.sessionTokens, 123456);
+  assert.equal(secretFields.clientTokens, 222333);
+  const usageAndSessions = { usage: { input_tokens: 120, output_tokens: 30, total_tokens: 150, tokens: 9,
+    inputTokenCount: 120, outputTokenCount: 30, token_usage: 150 },
+    bashSessionId: "bs_123", sessionId: "abc", session_count: 3 };
+  assert.deepEqual(JSON.parse(redactDiagnosticText(JSON.stringify(usageAndSessions))), usageAndSessions);
+  assert.equal(redactDiagnosticText("plain log Authorization: Bearer abc.def.ghi and done"),
+    "plain log Authorization: [REDACTED_SECRET] and done");
+  await fs.writeFile(path.join(realFixtureRoot, "usage-sessions.json"), JSON.stringify(usageAndSessions), "utf8");
   const reformattedJson = redactJsonText('{\n  "answer": 1\n}', "diagnostic");
   assert.equal(reformattedJson.changed, false, "lawful JSON spacing with no credentials must not report a credential change");
   assert.equal(reformattedJson.text, '{\n  "answer": 1\n}', "lawful JSON spacing with no credentials must be preserved byte-identical");
@@ -509,15 +524,22 @@ async function runTests() {
 
   await fs.writeFile(path.join(realFixtureRoot, "board.json"), multilineJson, "utf8");
   const { client: clientBash } = await createClientServer({ bashMode: "full", toolMode: "full" });
+  const usageOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat usage-sessions.json" } });
+  assert.ok(!usageOutput.isError);
+  assert.deepEqual(JSON.parse(usageOutput.structuredContent.stdout), usageAndSessions,
+    "public stdout must retain typed usage metrics and continuation identifiers");
   const jsonOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat board.json" } });
   assert.ok(!jsonOutput.isError, `full bash must return fixture JSON through its normal route: ${JSON.stringify(jsonOutput.structuredContent)}`);
   const safeStdout = jsonOutput.structuredContent.stdout;
   assert.doesNotThrow(() => JSON.parse(safeStdout), "safe structured stdout must remain valid JSON");
   const publicSafeJson = JSON.parse(safeStdout);
   assert.equal(publicSafeJson.access_token, "[REDACTED_SECRET]");
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "token_counts_value", "cookie", "setCookie", "sessionId", "auth", "passphrase", "signature", "otp", "proxyAuthorization", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "cookie", "setCookie", "auth", "passphrase", "signature", "otp", "proxyAuthorization", "Authorization", "secrets"]) {
     assert.equal(publicSafeJson[key], "[REDACTED_SECRET]", `public JSON ${key} field must be redacted`);
   }
+  assert.equal(publicSafeJson.sessionId, 987654321);
+  assert.equal(publicSafeJson["session.id"], "opaque-dotted-session");
+  assert.equal(publicSafeJson.token_counts_value, 777666);
   assert.equal(publicSafeJson.note, "Bearer [REDACTED_SECRET]");
   assert.equal(publicSafeJson.quotedMessage, "Bearer [REDACTED_SECRET]");
   assert.equal(publicSafeJson.nested.message, "prefix Bearer [REDACTED_SECRET] suffix");
@@ -535,7 +557,7 @@ async function runTests() {
   assert.ok(!safeStdout.includes("sk-abc1234567890123456789012345678901234567890"));
 
   const wrappedJsonText = JSON.stringify({ data: JSON.stringify({
-    cookie: "LEAK-nested-cookie", sessionId: "LEAK-nested-session", passphrase: "LEAK-nested-passphrase",
+    cookie: "LEAK-nested-cookie", sessionId: "sk-test-nested-session-1234567890", passphrase: "LEAK-nested-passphrase",
     signature: "LEAK-nested-signature", otp: "LEAK-nested-otp", accessKey: "LEAK-nested-access-key",
     Authorization: "Basic LEAK-nested-auth", tokens: 21, token_count: 34
   }) });
@@ -543,7 +565,7 @@ async function runTests() {
   const wrappedOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat wrapped-board.json" } });
   const wrappedOuter = JSON.parse(wrappedOutput.structuredContent.stdout);
   const wrappedInner = JSON.parse(wrappedOuter.data);
-  for (const secret of ["LEAK-nested-cookie", "LEAK-nested-session", "LEAK-nested-passphrase", "LEAK-nested-signature", "LEAK-nested-otp", "LEAK-nested-access-key", "LEAK-nested-auth"]) {
+  for (const secret of ["LEAK-nested-cookie", "sk-test-nested-session-1234567890", "LEAK-nested-passphrase", "LEAK-nested-signature", "LEAK-nested-otp", "LEAK-nested-access-key", "LEAK-nested-auth"]) {
     assert.ok(!wrappedOutput.structuredContent.stdout.includes(secret), `JSON-string credential ${secret} must be masked`);
   }
   assert.equal(wrappedInner.tokens, 21, "JSON-string payload must preserve numeric tokens usage");
@@ -617,7 +639,7 @@ async function runTests() {
 
   const largeJson = JSON.stringify({
     Authorization: "Bearer LEAK-large-auth", proxyAuthorization: "Basic LEAK-large-proxy",
-    cookie: "LEAK-large-cookie", "user.cookie": "LEAK-large-dotted", "session.id": "LEAK-large-dotted-session",
+    cookie: "LEAK-large-cookie", "user.cookie": "LEAK-large-dotted", "session.id": "sk-test-large-session-1234567890",
     sessionId: 998877, auth: "Basic LEAK-large-auth-field",
     passphrase: "LEAK-large-passphrase", signature: "LEAK-large-signature", otp: 776655,
     note: "Bearer LEAK-large-note", tokens: 21, token_count: 34,
@@ -630,7 +652,7 @@ async function runTests() {
   const largeOutput = await clientBash.callTool({ name: "bash", arguments: { workspace_id: realWsId, command: "cat large-board.json" } });
   assert.ok(Date.now() - largeCallStartedAt < 10_000, "large truncated JSON redaction must stay comfortably below the SDK request timeout");
   const largeStdout = largeOutput.structuredContent.stdout;
-  for (const secret of ["LEAK-large-auth", "LEAK-large-proxy", "LEAK-large-cookie", "LEAK-large-dotted", "LEAK-large-dotted-session", "LEAK-large-auth-field", "LEAK-large-passphrase", "LEAK-large-signature", "LEAK-large-note", "LEAK-large-escaped", "LEAK-large-deep-escaped"]) {
+  for (const secret of ["LEAK-large-auth", "LEAK-large-proxy", "LEAK-large-cookie", "LEAK-large-dotted", "sk-test-large-session-1234567890", "LEAK-large-auth-field", "LEAK-large-passphrase", "LEAK-large-signature", "LEAK-large-note", "LEAK-large-escaped", "LEAK-large-deep-escaped"]) {
     assert.ok(!largeStdout.includes(secret), `truncated JSON stdout must mask ${secret}`);
   }
   assert.match(largeStdout, /"tokens":21/u, "truncated JSON text must preserve numeric tokens usage");

@@ -105,13 +105,12 @@ function isCredentialFieldName(key: string): boolean {
     normalized.includes("jwt") || normalized.includes("mfa") ||
     normalized.includes("credential") || normalized.includes("bearer") ||
     normalized.includes("token") || normalized.includes("cookie") ||
-    normalized.includes("session") ||
     normalized.includes("signature") || normalized.includes("otp") ||
     (normalized.startsWith("auth") && !normalized.startsWith("author")) || normalized.endsWith("auth");
 }
 
 function isNumericUsageMetric(key: string, value: unknown): boolean {
-  return typeof value === "number" && /^(?:tokens|tokencount)$/u.test(normalizedFieldName(key));
+  return typeof value === "number" && /(?:tokens$|tokens?counts?|tokens?usage)/u.test(normalizedFieldName(key));
 }
 
 function backslashesBefore(text: string, position: number): number {
@@ -293,6 +292,18 @@ function redactDiagnosticPreservingMetrics(text: string): string {
     } else if (isCredentialFieldName(field.key)) {
       let placeholder = `__AW_CREDENTIAL_VALUE_${replacements.length}__`;
       while (text.includes(placeholder)) placeholder += "_";
+      // Plain headers have no JSON quoting; consume the whole marker and keep log suffixes.
+      const plainAuthorization = /^[A-Za-z]/u.test(text[field.keyStart] ?? "") && /authorization$/iu.test(field.key);
+      const headerValue = plainAuthorization
+        ? /^(\s*)(?:(?:Bearer|Basic|Digest|Negotiate|NTLM)\s+)?(?:\[REDACTED_SECRET\]|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)/iu.exec(text.slice(field.valueStart))
+        : null;
+      if (headerValue) {
+        const end = field.valueStart + headerValue[0].length;
+        replacements.push({ start: field.keyStart, end, placeholder,
+          replacement: `${text.slice(field.keyStart, field.valueStart)}${headerValue[1]}[REDACTED_SECRET]` });
+        coveredUntil = end;
+        continue;
+      }
       let quotePosition = field.valueStart;
       while (/\s/u.test(text[quotePosition] ?? "")) quotePosition += 1;
       quotePosition += backslashesAfter(text, quotePosition);

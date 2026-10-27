@@ -252,6 +252,16 @@ const exactLine = `const API_KEY = "${SK}"; const tokenCount = 21;`;
 assert.equal(redactSensitiveText(exactLine), 'const API_KEY = "[REDACTED_SECRET]"; const tokenCount = 21;');
 assert.equal(redactSensitiveText('https://user:supersecret123@example.com/path'), 'https://user:[REDACTED_SECRET]@example.com/path');
 assert.equal(redactSensitiveText('Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345'), 'Authorization: Bearer [REDACTED_SECRET]');
+assert.equal(redactDiagnosticText('plain log Authorization: Bearer abc.def.ghi and done'),
+  'plain log Authorization: [REDACTED_SECRET] and done');
+const lawfulDiagnostic = { usage: { input_tokens: 120, output_tokens: 30, total_tokens: 150, tokens: 9,
+  inputTokenCount: 120, token_usage: 150 }, bashSessionId: 'bs_123', sessionId: 'abc', session_count: 3 };
+assert.deepEqual(JSON.parse(redactDiagnosticText(JSON.stringify(lawfulDiagnostic))), lawfulDiagnostic);
+for (const key of ['input_tokens', 'inputTokenCount', 'token_usage', 'api_key', 'password', 'sessionId']) {
+  const value = key === 'sessionId' ? SK : 'opaque-credential';
+  assert.ok(!redactDiagnosticText(JSON.stringify({ [key]: value })).includes(value), `${key} secret must stay masked`);
+}
+
 assert.equal(redactSensitiveTextPreservingLines(`a\nconst API_KEY = "${SK}";\nb\n`), 'a\nconst API_KEY = "[REDACTED_SECRET]";\nb\n');
 const diffSource = [
   'diff --git a/app.js b/app.js',
