@@ -489,7 +489,23 @@ async function runTests() {
   assert.equal(secretFields.tokens, 21, "numeric token metrics remain numeric");
   assert.equal(secretFields.token_count, 34, "numeric token_count remains numeric");
   const reformattedJson = redactJsonText('{\n  "answer": 1\n}', "diagnostic");
-  assert.equal(reformattedJson.changed, true, "JSON normalization that changes bytes must be reported");
+  assert.equal(reformattedJson.changed, false, "lawful JSON spacing with no credentials must not report a credential change");
+  assert.equal(reformattedJson.text, '{\n  "answer": 1\n}', "lawful JSON spacing with no credentials must be preserved byte-identical");
+  // Tester W-01ca24 D1-D3 lawful-preservation regressions (candidate ccfb): lawful descriptors/metrics/tails stay readable.
+  assert.equal(redactDiagnosticText('{"secretName": "build"}'), '{"secretName": "build"}', 'D1 lawful secretName descriptor must stay readable with spacing');
+  assert.equal(redactDiagnosticText('tokens:21 token_count:34 max_tokens = 4096'), 'tokens:21 token_count:34 max_tokens = 4096', 'D2 ordinary metrics line must stay readable');
+  const d3Sk = 'sk-aB3xK9mQ2pL7vN4zR8tY6wS1uV5wX7';
+  const d3Input = `log prefix {"password":"${d3Sk}"}, trailing, {"token":"${d3Sk}"} end`;
+  const d3Out = redactDiagnosticText(d3Input);
+  assert.ok(!d3Out.includes(d3Sk), 'D3 both credential values must be masked');
+  assert.ok(d3Out.includes(', trailing, '), 'D3 trailing text after first secret must be preserved');
+  assert.ok(d3Out.endsWith(' end'), 'D3 tail after second secret must be preserved');
+  // Secret-shaped secretName values must still be masked (name/path exemption must not leak real credentials).
+  assert.ok(!redactDiagnosticText('{"secretName": "aB3xK9mQ2pL7vN4zR8tY6wS1"}').includes('aB3xK9mQ2pL7vN4zR8tY6wS1'), 'secret-shaped secretName value must stay masked');
+  // Malformed nested escaped quoted comma: escaped quotes plus comma must not split fields, leak, or eat numerics.
+  const escCommaOut = redactDiagnosticText('log prefix {"note":"Bearer \\"quoted, comma-secret-XYZ123\\"","tokens":21} trailing');
+  assert.ok(!escCommaOut.includes('comma-secret-XYZ123'), 'escaped quoted comma credential must be masked');
+  assert.ok(escCommaOut.includes('"tokens":21'), 'escaped quoted comma must preserve numeric tokens value');
 
   await fs.writeFile(path.join(realFixtureRoot, "board.json"), multilineJson, "utf8");
   const { client: clientBash } = await createClientServer({ bashMode: "full", toolMode: "full" });

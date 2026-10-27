@@ -144,7 +144,7 @@ function jsonValueEnd(text: string, start: number, escapeDepth: number): number 
       const nextField = /^,\s*\\*["'][\w.$-]+\\*["']\s*:/u.test(text.slice(afterQuote));
       // Mixed-depth malformed logs may close at a different depth; an escaped
       // quote inside a value must not expose the rest of that credential.
-      if (closingEscapeDepth === escapeDepth || (delimiter && nextField)) return index + 1;
+      if (closingEscapeDepth % (2 * (escapeDepth + 1)) === escapeDepth || (delimiter && nextField)) return index + 1;
     }
     return text.length;
   }
@@ -155,8 +155,8 @@ function jsonValueEnd(text: string, start: number, escapeDepth: number): number 
     for (let index = start + 1; index < text.length; index += 1) {
       const char = text[index];
       if (inString) {
-        if (char === '"' && backslashesBefore(text, index) === escapeDepth) inString = false;
-      } else if (char === '"' && backslashesBefore(text, index) === escapeDepth) inString = true;
+        if (char === '"' && backslashesBefore(text, index) % (2 * (escapeDepth + 1)) === escapeDepth) inString = false;
+      } else if (char === '"' && backslashesBefore(text, index) % (2 * (escapeDepth + 1)) === escapeDepth) inString = true;
       else if (char === "{") stack.push("}");
       else if (char === "[") stack.push("]");
       else if (char === stack.at(-1)) {
@@ -267,6 +267,17 @@ function replaceSpans(text: string, spans: Array<{ start: number; end: number; r
 }
 
 function redactDiagnosticPreservingMetrics(text: string): string {
+  const bearerSpans: Array<{ start: number; end: number }> = [];
+  for (const match of text.matchAll(/\bBearer\s+/giu)) {
+    const start = match.index + match[0].length;
+    const escapeDepth = backslashesAfter(text, start);
+    const quote = text[start + escapeDepth];
+    const end = quote === '"' || quote === "'"
+      ? jsonValueEnd(text, start, escapeDepth)
+      : start + (/^[A-Za-z0-9._~+/-]+=*/u.exec(text.slice(start))?.[0].length ?? 0);
+    if (end > start) bearerSpans.push({ start, end });
+  }
+  text = replaceSpans(text, bearerSpans, "[REDACTED_SECRET]");
   const replacements: Array<{ start: number; end: number; placeholder: string; replacement: string }> = [];
   let coveredUntil = 0;
   for (const field of diagnosticFields(text)) {
@@ -300,7 +311,7 @@ function redactDiagnosticPreservingMetrics(text: string): string {
   const protectedText = replaceSpans(text, replacements.map(({ start, end, placeholder }) => ({ start, end, replacement: placeholder })), "");
   let restored = policyRedactDiagnosticText(protectedText);
   for (const item of replacements) restored = restored.replace(item.placeholder, item.replacement);
-  return restored.replace(/\bBearer\s+(?:"[^"]*"|'[^']*'|[A-Za-z0-9._~+/-]+=*)/giu, "Bearer [REDACTED_SECRET]");
+  return restored;
 }
 
 /** Redact a complete JSON value without turning its replacement into invalid JSON. */
@@ -342,7 +353,9 @@ function redactJsonTextAtDepth(
         const safeKey = redactSensitiveText(key, options);
         const secretKey = safeKey !== key;
         const tokenMetric = isNumericUsageMetric(key, item);
-        const secretField = isCredentialFieldName(key) && !tokenMetric;
+        const secretField = (isCredentialFieldName(key) && !tokenMetric) ||
+          (typeof item === "string" && /(?:name|path)$/u.test(normalizedFieldName(key)) &&
+            hasSecretValue(JSON.stringify({ [key]: item }), options));
         const outputKey = secretKey ? "[REDACTED_SECRET]" : key;
         let uniqueKey = outputKey;
         for (let suffix = 2; Object.hasOwn(output, uniqueKey); suffix += 1) {
@@ -463,12 +476,19 @@ export function redactUnifiedDiffPreservingLines(
 export function redactDiagnosticText(text: string): string {
   const json = redactJsonText(text, "diagnostic");
   if (json) return json.text;
-  const objectStart = text.indexOf("{");
-  if (objectStart > 0) {
-    const embedded = redactJsonText(text.slice(objectStart), "diagnostic");
-    if (embedded) return redactDiagnosticPreservingMetrics(text.slice(0, objectStart)) + embedded.text;
+  let output = "";
+  let cursor = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] !== "{" && text[index] !== "[") continue;
+    const end = jsonValueEnd(text, index, 0);
+    const embedded = redactJsonText(text.slice(index, end), "diagnostic");
+    if (embedded) {
+      output += redactDiagnosticPreservingMetrics(text.slice(cursor, index)) + embedded.text;
+      cursor = end;
+    }
+    index = end - 1;
   }
-  return redactDiagnosticPreservingMetrics(text);
+  return output + redactDiagnosticPreservingMetrics(text.slice(cursor));
 }
 
 export function redactSearchQuery(query: string, safeMatchTexts: string[] = []): string {
