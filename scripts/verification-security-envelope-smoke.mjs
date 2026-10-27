@@ -425,9 +425,12 @@ async function runTests() {
   assert.ok(directJson, "multiline JSON must be recognized");
   const safeJson = JSON.parse(directJson.text);
   assert.equal(safeJson.access_token, "[REDACTED_SECRET]");
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "cookie", "setCookie", "auth", "passphrase", "signature", "otp", "accessKey", "pwd", "pass", "jwt", "mfa", "user.cookie", "proxyAuthorization", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "cookie", "setCookie", "auth", "passphrase", "signature", "otp", "accessKey", "pwd", "pass", "jwt", "mfa", "user.cookie", "proxyAuthorization", "Authorization", "secrets"]) {
     assert.equal(safeJson[key], "[REDACTED_SECRET]", `multiline JSON ${key} field must be redacted`);
   }
+  assert.equal(safeJson.apiTokens, 987654325);
+  assert.equal(safeJson.sessionTokens, 123456);
+  assert.equal(safeJson.clientTokens, 222333);
   assert.equal(safeJson.sessionId, 987654321);
   assert.equal(safeJson["session.id"], "opaque-dotted-session");
   assert.equal(safeJson.token_counts_value, 777666);
@@ -534,9 +537,12 @@ async function runTests() {
   assert.doesNotThrow(() => JSON.parse(safeStdout), "safe structured stdout must remain valid JSON");
   const publicSafeJson = JSON.parse(safeStdout);
   assert.equal(publicSafeJson.access_token, "[REDACTED_SECRET]");
-  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "apiTokens", "sessionTokens", "clientTokens", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "cookie", "setCookie", "auth", "passphrase", "signature", "otp", "proxyAuthorization", "Authorization", "secrets"]) {
+  for (const key of ["secretKey", "mySecret", "passwordHash", "tokenValue", "apiToken", "authToken", "accessToken", "refreshToken", "tokenValues", "token_counts", "tokenCounts", "tokens_count", "cookie", "setCookie", "auth", "passphrase", "signature", "otp", "proxyAuthorization", "Authorization", "secrets"]) {
     assert.equal(publicSafeJson[key], "[REDACTED_SECRET]", `public JSON ${key} field must be redacted`);
   }
+  assert.equal(publicSafeJson.apiTokens, 987654325);
+  assert.equal(publicSafeJson.sessionTokens, 123456);
+  assert.equal(publicSafeJson.clientTokens, 222333);
   assert.equal(publicSafeJson.sessionId, 987654321);
   assert.equal(publicSafeJson["session.id"], "opaque-dotted-session");
   assert.equal(publicSafeJson.token_counts_value, 777666);
