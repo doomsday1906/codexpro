@@ -96,6 +96,7 @@ function normalizedFieldName(key: string): string {
 
 function isCredentialFieldName(key: string): boolean {
   const normalized = normalizedFieldName(key);
+  if (/(?:name|path)$/u.test(normalized)) return false;
   return normalized.includes("authorization") || normalized.includes("secret") ||
     normalized.includes("password") || normalized.includes("passwd") ||
     normalized.includes("privatekey") || normalized.includes("apikey") ||
@@ -139,12 +140,11 @@ function jsonValueEnd(text: string, start: number, escapeDepth: number): number 
       let afterQuote = index + 1;
       while (/\s/u.test(text[afterQuote] ?? "")) afterQuote += 1;
       const delimiter = afterQuote === text.length || /[,}\]\r\n]/u.test(text[afterQuote] ?? "");
-      if (!delimiter) continue;
       const closingEscapeDepth = backslashesBefore(text, index);
       const nextField = /^,\s*\\*["'][\w.$-]+\\*["']\s*:/u.test(text.slice(afterQuote));
       // Mixed-depth malformed logs may close at a different depth; an escaped
       // quote inside a value must not expose the rest of that credential.
-      if (closingEscapeDepth === escapeDepth || nextField) return index + 1;
+      if (closingEscapeDepth === escapeDepth || (delimiter && nextField)) return index + 1;
     }
     return text.length;
   }
@@ -166,6 +166,8 @@ function jsonValueEnd(text: string, start: number, escapeDepth: number): number 
     }
     return text.length;
   }
+  const scalar = /^(?:-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)(?=\s|[,}\]]|$)/u.exec(text.slice(start));
+  if (scalar) return start + scalar[0].length;
   let end = start;
   while (end < text.length && !/[,}\]\r\n]/u.test(text[end])) end += 1;
   return end;
@@ -239,6 +241,13 @@ function diagnosticFields(text: string): DiagnosticField[] {
       continue;
     }
     const valueStart = cursor + 1;
+    let priorIndex = index - 1;
+    while (priorIndex >= 0 && /\s/u.test(text[priorIndex])) priorIndex -= 1;
+    const prior = text[priorIndex];
+    if (!quote && prior !== "{" && prior !== "," && !/authorization$/iu.test(key)) {
+      index = cursor + 1;
+      continue;
+    }
     let valueQuoteStart = valueStart;
     while (/\s/u.test(text[valueQuoteStart] ?? "")) valueQuoteStart += 1;
     const valueEscapeDepth = backslashesAfter(text, valueQuoteStart);
@@ -353,7 +362,7 @@ function redactJsonTextAtDepth(
   };
 
   const safeText = JSON.stringify(redactValue(parsed, startDepth));
-  return { text: safeText, changed: changed || safeText !== text, omittedNestedValues };
+  return { text: changed ? safeText : text, changed, omittedNestedValues };
 }
 
 export function redactJsonText(text: string, options: RedactionOptions | RedactionContext = {}): JsonTextRedactionResult | undefined {
