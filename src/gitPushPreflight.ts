@@ -162,6 +162,10 @@ const MAX_BRANCH_BYTES = 256;
 const MAX_HEAD_BYTES = 64;
 const MAX_REMOTE_OBSERVATION_BYTES = 16 * 1024;
 const MAX_CONFIG_SOURCE_BYTES = 128 * 1024;
+// The active-origin census can repeat the same origin once per configured
+// key. A 149-KiB mission-worktree census exceeds the ordinary 120-KiB Git
+// output limit, so this one internal query gets a bounded 256-KiB allowance.
+const MAX_CONFIG_INVENTORY_BYTES = 256 * 1024;
 const MAX_CONFIG_SOURCE_COUNT = 512;
 const MAX_CONFIG_SOURCE_PATH_BYTES = 8 * 1024;
 const MAX_CONFIG_INCLUDE_QUERY_BYTES = 32 * 1024;
@@ -286,10 +290,11 @@ function oneLine(result: GitExecutionResult): string {
 async function runGitExitAware(
   config: GitPushPreflightConfig,
   workspace: Workspace,
-  args: readonly string[]
+  args: readonly string[],
+  options?: { readonly stdoutMaxBytes?: number }
 ): Promise<GitExecutionResult> {
   try {
-    return await runGitMutation(config, workspace, args);
+    return await runGitMutation(config, workspace, args, options);
   } catch (error) {
     if (error instanceof GitExecutionError) return error.result;
     return fail("execution");
@@ -543,12 +548,12 @@ async function discoverGitPushConfigSources(
     "--null",
     "--list",
     "--includes"
-  ]);
+  ], { stdoutMaxBytes: MAX_CONFIG_INVENTORY_BYTES });
   if (sourceResult.exitCode !== 0 || sourceResult.signal !== null || sourceResult.timedOut || sourceResult.stdoutOverflow || sourceResult.stderrOverflow) {
     return fail("config-source-discovery");
   }
   const bytes = sourceResult.copyStdoutBytes();
-  if (bytes.length > MAX_CONFIG_SOURCE_BYTES) return fail("config-source-discovery");
+  if (bytes.length > MAX_CONFIG_INVENTORY_BYTES) return fail("config-source-discovery");
   let text: string;
   try {
     text = UTF8_FATAL.decode(bytes);
