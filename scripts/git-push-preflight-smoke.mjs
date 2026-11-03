@@ -76,6 +76,17 @@ function commandOutput(cwd, args) {
   return result.stdout;
 }
 
+function configInventoryByteCount(cwd) {
+  const result = spawnSync("git", ["-C", cwd, "config", "--show-origin", "--name-only", "--null", "--list", "--includes"], {
+    encoding: "buffer",
+    maxBuffer: 1024 * 1024
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`fixture config inventory measurement failed (exit=${result.status}): ${result.stderr?.toString("utf8") || result.error?.message || "no diagnostic"}`);
+  }
+  return result.stdout.length;
+}
+
 async function snapshot(root, remoteRoot) {
   return {
     head: commandOutput(root, ["rev-parse", "--verify", "HEAD"]),
@@ -172,6 +183,46 @@ async function main() {
       expected_remote_head: initialHead
     };
     const config = configFor(endpoint);
+    const globalConfigPath = path.join(isolatedHome, ".gitconfig");
+
+    // Reproduce a repeated active-origin census larger than both the ordinary
+    // Git output limit (120 KiB) and the per-file config-source limit (128 KiB).
+    // `--name-only` keeps this measurement and fixture free of config values.
+    const largeConfig = `[inventory]\n${Array.from({ length: 1_600 }, (_, index) => `\tkey-${index} = value`).join("\n")}\n`;
+    await fs.writeFile(globalConfigPath, largeConfig);
+    const largeInventoryBytes = configInventoryByteCount(workRoot);
+    assert.ok(largeInventoryBytes > 131_072, `large config inventory was only ${largeInventoryBytes} bytes`);
+    assert.ok(largeInventoryBytes <= 256 * 1024, `large config inventory unexpectedly exceeded the 256-KiB bound (${largeInventoryBytes} bytes)`);
+    const largeConfigSuccess = await preflightGitPush(config, workspace, request);
+    assert.equal(largeConfigSuccess.expected_local_head, localHead, "preflight rejected a bounded config inventory above the former limits");
+    console.log(`PASS bounded large config inventory: ${largeInventoryBytes} bytes accepted above 128 KiB`);
+
+    // The larger bound is still fail-closed. This response must be rejected
+    // without changing either repository. Malformed Git config must still
+    // fail closed during repository inspection before any push is authorized.
+    const oversizedConfig = `[inventory]\n${Array.from({ length: 3_200 }, (_, index) => `\tkey-${index} = value`).join("\n")}\n`;
+    await fs.writeFile(globalConfigPath, oversizedConfig);
+    const oversizedInventoryBytes = configInventoryByteCount(workRoot);
+    assert.ok(oversizedInventoryBytes > 256 * 1024, `oversized config inventory was only ${oversizedInventoryBytes} bytes`);
+    await expectFailure("oversized config inventory", request, "config-source-discovery");
+    console.log(`PASS oversized config inventory: ${oversizedInventoryBytes} bytes refused`);
+
+    await fs.rm(globalConfigPath);
+    const beforeMalformedConfig = await snapshot(workRoot, remoteRoot);
+    await fs.writeFile(globalConfigPath, "[inventory\n malformed = value\n");
+    let malformedConfigError;
+    try {
+      await preflightGitPush(config, workspace, request);
+      assert.fail("malformed config inventory source unexpectedly succeeded");
+    } catch (candidateError) {
+      malformedConfigError = candidateError;
+    } finally {
+      await fs.rm(globalConfigPath);
+    }
+    assert.ok(malformedConfigError instanceof GitPushPreflightError, "malformed config inventory did not return the bounded preflight error class");
+    assert.equal(malformedConfigError.reason, "execution", "malformed Git config returned an unexpected reason");
+    assert.deepEqual(await snapshot(workRoot, remoteRoot), beforeMalformedConfig, "malformed config inventory changed local or remote repository state");
+    console.log("PASS malformed Git config refused during repository inspection; direct local/remote snapshot unchanged");
 
     async function expectFailure(label, input, reason, expectedConfig = config) {
       const before = await snapshot(workRoot, remoteRoot);
